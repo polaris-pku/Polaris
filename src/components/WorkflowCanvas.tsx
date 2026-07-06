@@ -17,7 +17,7 @@ import {
   type Viewport,
 } from '@xyflow/react';
 import type { WorkflowNodeData } from '@/types';
-import { lanes, laneLabels } from '@/data/workflow';
+import { lanes, laneLabels, NODE_IDS } from '@/data/workflow';
 import { useDemoStore } from '@/store/useDemoStore';
 import { cn } from '@/lib/utils';
 
@@ -181,6 +181,7 @@ function WorkflowCanvasInner() {
   const revealedNodeCount = useDemoStore((s) => s.revealedNodeCount);
   const selectedNodeId = useDemoStore((s) => s.selectedNodeId);
   const selectNode = useDemoStore((s) => s.selectNode);
+  const goToCouncil = useDemoStore((s) => s.goToCouncil);
   const { fitView, getViewport } = useReactFlow();
   const prevRevealedCount = useRef(0);
 
@@ -330,29 +331,48 @@ function WorkflowCanvasInner() {
     setRfEdges(computedEdges);
   }, [computedEdges, setRfEdges]);
 
+  // 单击选中即展开；再次单击同一节点取消选中，机器节点随之收缩回胶囊
   const onNodeClick = useCallback<NodeMouseHandler>(
     (_, node) => {
-      if (node.type === 'step' || node.type === 'chip') selectNode(node.id);
+      if (node.type === 'step' || node.type === 'chip') {
+        selectNode(selectedNodeId === node.id ? null : node.id);
+      }
     },
-    [selectNode],
+    [selectNode, selectedNodeId],
+  );
+
+  // 双击 N14 Council 节点 → 前往 Council Board（与 DEMO CONTROLS 的 Go to Council 同一动作）
+  const onNodeDoubleClick = useCallback<NodeMouseHandler>(
+    (_, node) => {
+      if (node.id === NODE_IDS.council) goToCouncil();
+    },
+    [goToCouncil],
   );
 
   return (
     <div className="relative h-full w-full">
-      {/* 渐进披露开关：机器节点（A/B/C/D 内部握手）默认折叠成胶囊 */}
-      <button
-        type="button"
-        onClick={toggleMachineExpanded}
-        className={cn(
-          'absolute right-3 top-3 z-10 flex items-center gap-1.5 rounded-full border px-2.5 py-1 font-mono text-[10px] transition-colors',
-          machineExpanded
-            ? 'border-command/50 bg-command/15 text-command-soft'
-            : 'border-line-bright bg-ink-850/90 text-slate-400 hover:text-slate-200',
-        )}
-      >
-        <span className={cn('led h-1.5 w-1.5', machineExpanded ? 'bg-command' : 'bg-slate-600')} />
-        管道节点 · {machineExpanded ? '已展开' : '已折叠'}
-      </button>
+      <div className="absolute right-3 top-3 z-10 flex items-center gap-2">
+        {/* 双击手势提示：纯展示，不拦截事件 */}
+        <span className="pointer-events-none rounded-full border border-violet-500/40 bg-ink-850/90 px-2.5 py-1 font-mono text-[10px] text-violet-300/80">
+          双击 Council 节点 → 议会
+        </span>
+        {/* 渐进披露开关：机器节点（A/B/C/D 内部握手）默认折叠成胶囊 */}
+        <button
+          type="button"
+          onClick={toggleMachineExpanded}
+          className={cn(
+            'flex items-center gap-1.5 rounded-full border px-2.5 py-1 font-mono text-[10px] transition-colors',
+            machineExpanded
+              ? 'border-command/50 bg-command/15 text-command-soft'
+              : 'border-line-bright bg-ink-850/90 text-slate-400 hover:text-slate-200',
+          )}
+        >
+          <span
+            className={cn('led h-1.5 w-1.5', machineExpanded ? 'bg-command' : 'bg-slate-600')}
+          />
+          管道节点 · {machineExpanded ? '已展开' : '已折叠'}
+        </button>
+      </div>
       <ReactFlow
         nodes={rfNodes}
         edges={rfEdges}
@@ -363,6 +383,8 @@ function WorkflowCanvasInner() {
         defaultViewport={savedViewport ?? undefined}
         nodeTypes={nodeTypes}
         onNodeClick={onNodeClick}
+        onNodeDoubleClick={onNodeDoubleClick}
+        zoomOnDoubleClick={false}
         minZoom={0.4}
         maxZoom={1.4}
         proOptions={{ hideAttribution: true }}
