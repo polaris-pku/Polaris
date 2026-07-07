@@ -87,8 +87,8 @@ function WorkflowCanvasInner() {
   }, []);
 
   const { nodes: computedNodes, edges: computedEdges } = useMemo(
-    () => buildFlowGraph(wfNodes, selectedNodeId, machineExpanded),
-    [wfNodes, selectedNodeId, machineExpanded],
+    () => buildFlowGraph(wfNodes, selectedNodeId, machineExpanded, allNodes),
+    [wfNodes, selectedNodeId, machineExpanded, allNodes],
   );
 
   // 受控模式：把派生的 nodes/edges 全量同步进 React Flow 内部 store，

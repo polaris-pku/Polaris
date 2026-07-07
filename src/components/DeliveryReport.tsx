@@ -10,7 +10,7 @@ import {
   Undo2,
   Repeat,
 } from 'lucide-react';
-import { useDemoStore } from '@/store/useDemoStore';
+import { selectActiveReplay, useDemoStore } from '@/store/useDemoStore';
 import { deriveScenario, findOption } from '@/data/scenario';
 import { Button } from '@/components/ui/Button';
 import { Badge } from '@/components/ui/Badge';
@@ -28,7 +28,9 @@ export function DeliveryReport() {
   const confirmedId = useDemoStore((s) => s.confirmedCouncilOptionId);
   const resetDemo = useDemoStore((s) => s.resetDemo);
   const taskText = useDemoStore((s) => s.taskText);
-  const scenario = deriveScenario(taskText);
+  const replay = useDemoStore(selectActiveReplay);
+  // 回放任务用真实 run 的交付数据（worktree/产物/耗时），普通任务按需求文本推导
+  const scenario = replay?.scenario ?? deriveScenario(taskText);
   const deliveryReport = scenario.delivery;
   const confirmedOption = findOption(scenario, confirmedId) ?? null;
 
@@ -71,14 +73,20 @@ export function DeliveryReport() {
           </div>
         </Section>
 
-        {/* Test result */}
-        <Section icon={FlaskConical} title="测试结果" tone="emerald">
-          <div className="grid grid-cols-3 gap-2">
-            <Stat label="通过" value={`${deliveryReport.testResult.passed}`} tone="emerald" />
-            <Stat label="失败" value={`${deliveryReport.testResult.failed}`} tone="slate" />
-            <Stat label="覆盖率" value={deliveryReport.testResult.coverageDelta} tone="blue" />
-          </div>
-        </Section>
+        {/* Test result（回放任务：本次 run 后端未提供测试数据 → 如实说明，不显示编造的 0） */}
+        {replay ? (
+          <Section icon={FlaskConical} title="测试结果" tone="emerald">
+            <p className="text-xs text-slate-500">本次 run 未提供测试数据。</p>
+          </Section>
+        ) : (
+          <Section icon={FlaskConical} title="测试结果" tone="emerald">
+            <div className="grid grid-cols-3 gap-2">
+              <Stat label="通过" value={`${deliveryReport.testResult.passed}`} tone="emerald" />
+              <Stat label="失败" value={`${deliveryReport.testResult.failed}`} tone="slate" />
+              <Stat label="覆盖率" value={deliveryReport.testResult.coverageDelta} tone="blue" />
+            </div>
+          </Section>
+        )}
 
         {/* Intervention record */}
         <Section icon={Hand} title="用户介入记录" tone="amber">

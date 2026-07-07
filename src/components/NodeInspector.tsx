@@ -9,8 +9,10 @@ import {
   CircleDashed,
   Radio,
   GitBranch,
+  Database,
 } from 'lucide-react';
-import { useDemoStore } from '@/store/useDemoStore';
+import { selectActiveReplay, useDemoStore } from '@/store/useDemoStore';
+import { stripExecSuffix } from '@/data/workflow';
 import { NodeStatusPill, TaskStatusPill } from '@/components/StatusPill';
 import { NodeExecutionLog } from '@/components/NodeExecutionLog';
 import { FileOpsPanel } from '@/components/FileOpsPanel';
@@ -64,8 +66,11 @@ export function NodeInspector() {
   const selectedNodeId = useDemoStore((s) => s.selectedNodeId);
   const rules = useDemoStore((s) => s.interventionRules);
   const feedback = useDemoStore((s) => s.interventionFeedback);
+  const replay = useDemoStore(selectActiveReplay);
 
   const node = nodes.find((n) => n.id === selectedNodeId) ?? null;
+  // 回放任务：该节点后端给出的事实字段（快照原文；空数组 = 本次 run 未提供）
+  const facts = node && replay ? (replay.nodeFacts[stripExecSuffix(node.id)] ?? []) : null;
 
   return (
     <div className="flex h-full flex-col overflow-y-auto">
@@ -139,6 +144,31 @@ export function NodeInspector() {
             <p className="rounded-md border border-line bg-ink-900/60 p-3 text-xs leading-relaxed text-slate-300">
               {node.summary}
             </p>
+
+            {/* 回放任务：后端在本节点给出的全部事实（快照原文，动态渲染） */}
+            {facts !== null && (
+              <div className="rounded-md border border-emerald-500/25 bg-emerald-500/5 p-3">
+                <div className="callsign mb-2 flex items-center gap-1.5 text-[10px] text-emerald-300">
+                  <Database className="h-3.5 w-3.5" />
+                  本次 Run · 后端数据
+                </div>
+                {facts.length === 0 ? (
+                  <p className="text-[11px] text-slate-500">本次 run 未提供该节点数据。</p>
+                ) : (
+                  <div className="space-y-1">
+                    {facts.map((f, i) => (
+                      <div key={`${f.key}-${i}`} className="flex gap-2 font-mono text-[10px]">
+                        <span className="w-[38%] shrink-0 break-all text-slate-500">{f.key}</span>
+                        <span className="min-w-0 flex-1 whitespace-pre-wrap break-all text-slate-200">
+                          {f.value}
+                        </span>
+                        {f.time && <span className="shrink-0 text-slate-600">{f.time}</span>}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* Gate decision branches (N13 only) */}
             {node.gateDecision && (

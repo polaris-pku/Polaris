@@ -236,8 +236,9 @@ export function findFileOp(toolEventId: string): { nodeId: string; op: FileOpObs
 export function fileOpsForNode(
   nodeId: string,
   outcomes: Record<string, FilePermissionOutcome>,
+  script: Record<string, FileOpObservation[]> = nodeFileOps,
 ): FileOpObservation[] {
-  const ops = nodeFileOps[nodeId];
+  const ops = script[nodeId];
   if (!ops) return [];
   return ops.map((o) => {
     const outcome = outcomes[o.tool_event_id];

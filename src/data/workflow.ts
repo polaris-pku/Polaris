@@ -23,12 +23,8 @@ export const laneLabels: Record<Lane, string> = {
  * store 会基于此创建可变副本，仅改动 status 字段。
  */
 
-/** N4–N9 执行段模板：按角色生成一条并发子链（id 加 -be / -te 后缀） */
-function makeExecSegment(
-  suffix: 'be' | 'te',
-  lane: Extract<Lane, 'Backend' | 'Test'>,
-  ownerName: string,
-): WorkflowNodeData[] {
+/** N4–N9 执行段模板：按参与 agent 生成一条并发子链（id 加 -<suffix> 后缀） */
+function makeExecSegment(suffix: string, lane: Lane, ownerName: string): WorkflowNodeData[] {
   const s = (base: string) => `${base}-${suffix}`;
   return [
     {
@@ -630,3 +626,46 @@ export const NODE_IDS = {
   council: 'n14-council',
   complete: 'n18-run-complete',
 } as const;
+
+/** 执行段（N4–N9）基础 id；并发子链节点 id = `${base}-${suffix}`，suffix 由派单决定 */
+export const EXEC_BASE_IDS = [
+  'n4-claim',
+  'n5-contextpack',
+  'n6-start-driver',
+  'n7-executing',
+  'n8-driver-result',
+  'n9-artifact',
+] as const;
+
+/** 剥去执行子链后缀还原基础 id（-be / -te / 任意 agent 后缀均可），非执行段原样返回 */
+export function stripExecSuffix(id: string): string {
+  return EXEC_BASE_IDS.find((base) => id.startsWith(`${base}-`)) ?? id;
+}
+
+/** 一条执行子链的参与者规格：后端派单的一个 agent（lane 即该 agent 的泳道） */
+export type ExecAgentSpec = { suffix: string; lane: Lane; owner: string };
+
+/**
+ * 按参与执行的 agent 列表组合 N0–N18 工作流。
+ *
+ * E 的立场：执行子链/泳道的条数是后端 agent 自主决策的既成事实——后端派几个
+ * agent，这里就生成几条 N4–N9 子链；前端不预设条数。共享前段（N0–N3）与收敛
+ * 后段（N10–N18）取自模板，N10 的 deps 改指所有子链的 N9（fan-in）。
+ */
+export function composeRunWorkflowNodes(agents: ExecAgentSpec[]): WorkflowNodeData[] {
+  const segments = agents.map((a) => makeExecSegment(a.suffix, a.lane, a.owner));
+  // 并发子链按 column 交错，保证数组按 (column, agent 顺序) 有序
+  const interleaved = segments.length
+    ? segments[0].flatMap((_, i) => segments.map((seg) => seg[i]))
+    : [];
+  const shared = workflowNodes.filter((n) => stripExecSuffix(n.id) === n.id);
+  const pre = shared.filter((n) => n.column <= 3);
+  const post = shared
+    .filter((n) => n.column >= 10)
+    .map((n) =>
+      n.id === 'n10-task-completed'
+        ? { ...n, deps: agents.map((a) => `n9-artifact-${a.suffix}`) }
+        : n,
+    );
+  return [...pre, ...interleaved, ...post];
+}

@@ -1,11 +1,12 @@
-import type { DemoStage } from '@/types';
-import { nodeLogs } from '@/data/logs';
+import type { DemoStage, DemoTask, RunReplay } from '@/types';
+import { emitLocalEvent } from '@/api/events';
 import {
   MAX_COLUMN,
   NODE_IDS,
   indicesInColumn,
   primaryIndexInColumn,
   revealedCountThroughColumn,
+  stripExecSuffix,
 } from '@/data/workflow';
 import { resetTimelineSeq } from '@/lib/snapshot';
 import type { ExecutionSlice, PartialExecState, SliceCreator } from '@/store/types';
@@ -17,12 +18,18 @@ import { buildTimelineEvent, getNodeLog } from '@/store/lib/timeline';
 /** Auto Run 的调度句柄（模块级单例，与 store 生命周期一致）。 */
 let autoRunTimer: ReturnType<typeof setTimeout> | null = null;
 
+/** 活动任务挂载的真实 run 回放数据源（普通 mock 任务为 undefined）。 */
+const activeReplay = (s: {
+  tasks: DemoTask[];
+  activeTaskId: string | null;
+}): RunReplay | undefined => s.tasks.find((t) => t.id === s.activeTaskId)?.replay;
+
 /** 执行域：工作流推进引擎（单步/自动/回退 Checkpoint/交付）。 */
 export const createExecutionSlice: SliceCreator<ExecutionSlice> = (set, get) => ({
   useRecommendedWorkflow: () =>
     set((state) => {
       const nodes = state.nodes.map((n, i) => (i === 0 ? { ...n, status: 'active' as const } : n));
-      const nodeLog = nodeLogs[nodes[0].id];
+      const nodeLog = getNodeLog(nodes[0].id, activeReplay(state));
       const exec: PartialExecState = {
         stage: 'executing',
         currentPage: state.currentPage,
@@ -59,9 +66,16 @@ export const createExecutionSlice: SliceCreator<ExecutionSlice> = (set, get) => 
     const cur = state.activeStepIndex;
     if (cur < 0) return;
     const curCol = state.nodes[cur].column;
+    const replay = activeReplay(state);
+    // 真实 run 回放且 Gate=allow：Council 未触发，N14 直通不拦截
+    const councilBypassed = replay?.gateDecision === 'allow';
 
     // 活跃列为 Council 且尚未裁决 → 进入议会
-    if (state.nodes[cur].id === NODE_IDS.council && !state.confirmedCouncilOptionId) {
+    if (
+      state.nodes[cur].id === NODE_IDS.council &&
+      !state.confirmedCouncilOptionId &&
+      !councilBypassed
+    ) {
       get().goToCouncil();
       return;
     }
@@ -101,11 +115,11 @@ export const createExecutionSlice: SliceCreator<ExecutionSlice> = (set, get) => 
     });
     const primaryIndex = primaryIndexInColumn(nodes, nextCol);
     const primaryNode = nodes[primaryIndex];
-    const nodeLog = getNodeLog(primaryNode.id);
+    const nodeLog = getNodeLog(primaryNode.id, replay);
 
     let stage: DemoStage = 'executing';
     let currentPage = state.currentPage;
-    if (primaryNode.id === NODE_IDS.council) {
+    if (primaryNode.id === NODE_IDS.council && !councilBypassed) {
       stage = 'council';
       currentPage = 'council';
       get().stopAutoRun();
@@ -156,8 +170,12 @@ export const createExecutionSlice: SliceCreator<ExecutionSlice> = (set, get) => 
         after.agentFileWrites,
         target,
         after.recordAgentFileWrite,
+        replay?.nodeFileOps,
       );
     });
+
+    // 回放任务：该列点亮时，把真实 run 的契约事件喂入事件通道（按主节点整列只喂一次）
+    replay?.nodeEvents[stripExecSuffix(primaryNode.id)]?.forEach(emitLocalEvent);
   },
 
   autoRun: () => {
@@ -214,7 +232,7 @@ export const createExecutionSlice: SliceCreator<ExecutionSlice> = (set, get) => 
       const nodes = state.nodes.map((n) =>
         n.column === MAX_COLUMN ? { ...n, status: 'done' as const } : n,
       );
-      const nodeLog = nodeLogs[NODE_IDS.complete];
+      const nodeLog = getNodeLog(NODE_IDS.complete, activeReplay(state));
       const alreadyHasComplete = state.timeline.some(
         (e) => e.source === 'Orchestrator' && e.text.includes('Delivery Report'),
       );

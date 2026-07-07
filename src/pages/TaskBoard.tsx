@@ -15,7 +15,7 @@ import {
   Sparkles,
   FilePlus2,
 } from 'lucide-react';
-import { useDemoStore } from '@/store/useDemoStore';
+import { selectActiveReplay, useDemoStore } from '@/store/useDemoStore';
 import { Button } from '@/components/ui/Button';
 import { Textarea } from '@/components/ui/Textarea';
 import { Badge } from '@/components/ui/Badge';
@@ -67,6 +67,7 @@ function TaskBoardInner() {
   const activeTaskId = useDemoStore((s) => s.activeTaskId);
   const tasks = useDemoStore((s) => s.tasks);
   const activeTask = tasks.find((t) => t.id === activeTaskId);
+  const replay = useDemoStore(selectActiveReplay);
 
   const [interveneOpen, setInterveneOpen] = useState(false);
 
@@ -77,7 +78,9 @@ function TaskBoardInner() {
   const showExecuteControls = stage === 'executing';
   // 用 code 判断（并行执行段节点 id 带 -be/-te 后缀，code 仍为 N7）
   const showIntervene = activeNode?.code === 'N7';
-  const showCouncil = activeNode?.code === 'N13' || activeNode?.code === 'N14';
+  // 回放任务 Gate=allow：本次 run 未触发 Council，不提供入口
+  const showCouncil =
+    (activeNode?.code === 'N13' || activeNode?.code === 'N14') && replay?.gateDecision !== 'allow';
   const showDelivered = stage === 'delivery';
 
   const hasWorkflow = stage !== 'idle' && stage !== 'team_configured' && stage !== 'analyzing';
@@ -102,9 +105,15 @@ function TaskBoardInner() {
             ) : (
               <span className="callsign text-[9px] text-slate-500">COORD · 本地 · 未受理</span>
             )}
-            {assignedAgentIds.length < 3 && (
+            {/* 回放任务按真实 run 的 mode 组队（single_agent=1 人），不提示人数 */}
+            {!replay && assignedAgentIds.length < 3 && (
               <span className="text-xs text-human/80">
                 当前团队人数不足（建议至少 3 名）。可前往 Agent Board → 自定义团队
+              </span>
+            )}
+            {replay && (
+              <span className="callsign text-[9px] text-slate-500">
+                MODE · {replay.snapshot.run.mode} · driver={replay.snapshot.run.driver_id}
               </span>
             )}
           </div>
@@ -268,7 +277,9 @@ function TaskUnderstandingPanel() {
   const useRecommendedWorkflow = useDemoStore((s) => s.useRecommendedWorkflow);
   const stage = useDemoStore((s) => s.stage);
   const taskText = useDemoStore((s) => s.taskText);
-  const understanding = deriveScenario(taskText).understanding;
+  const replay = useDemoStore(selectActiveReplay);
+  // 回放任务用真实 run 的场景内容，普通任务按需求文本推导
+  const understanding = (replay?.scenario ?? deriveScenario(taskText)).understanding;
 
   const rows = [
     {

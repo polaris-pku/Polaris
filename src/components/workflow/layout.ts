@@ -1,6 +1,6 @@
 import type { Node, Edge } from '@xyflow/react';
-import type { WorkflowNodeData } from '@/types';
-import { lanes, laneLabels } from '@/data/workflow';
+import type { Lane, WorkflowNodeData } from '@/types';
+import { laneLabels } from '@/data/workflow';
 
 export const LANE_HEIGHT = 116;
 const NODE_W = 178;
@@ -23,8 +23,16 @@ export function buildFlowGraph(
   wfNodes: WorkflowNodeData[],
   selectedNodeId: string | null,
   machineExpanded: boolean,
+  taskNodes: WorkflowNodeData[] = wfNodes,
 ): { nodes: Node[]; edges: Edge[] } {
-  const laneIndex = (lane: string) => lanes.indexOf(lane as never);
+  // 泳道完全由任务节点派生（按首次出现顺序，节点数组本身按 column 有序）：
+  // 后端派几个 agent 就有几条执行泳道，E 只投影不预设。用任务全量节点
+  // （而非已揭示前缀）判定，防止揭示过程中泳道跳动。
+  const usedLanes: Lane[] = [];
+  for (const n of taskNodes) {
+    if (!usedLanes.includes(n.lane)) usedLanes.push(n.lane);
+  }
+  const laneIndex = (lane: Lane) => usedLanes.indexOf(lane);
 
   const isCompact = (wf: WorkflowNodeData) =>
     wf.tier === 'machine' && !machineExpanded && wf.status !== 'active' && selectedNodeId !== wf.id;
@@ -41,11 +49,12 @@ export function buildFlowGraph(
   }
   const totalWidth = cursor + COL_GAP;
 
-  const laneNodes: Node[] = lanes.map((lane, i) => ({
+  const laneNodes: Node[] = usedLanes.map((lane, i) => ({
     id: `lane-${lane}`,
     type: 'lane',
     position: { x: 0, y: i * LANE_HEIGHT },
-    data: { label: laneLabels[lane], lane, width: totalWidth },
+    // agent 泳道无预置标签，直接以 agent 身份为标签
+    data: { label: laneLabels[lane] ?? lane, lane, width: totalWidth },
     draggable: false,
     selectable: false,
     zIndex: 0,

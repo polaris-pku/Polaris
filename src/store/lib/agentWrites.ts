@@ -32,8 +32,9 @@ export function flushAgentWritesForNode(
   written: Record<string, AgentFileWriteResult>,
   target: AgentWriteTarget,
   record: (toolEventId: string, result: AgentFileWriteResult) => void,
+  script?: Record<string, FileOpObservation[]>,
 ): void {
-  fileOpsForNode(nodeId, outcomes)
+  fileOpsForNode(nodeId, outcomes, script)
     .filter((op) => isApprovedWrite(op) && !written[op.tool_event_id])
     .forEach((op) => {
       record(op.tool_event_id, { status: 'pending' });

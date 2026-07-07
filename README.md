@@ -76,6 +76,20 @@ Web 版全程 mock；桌面版（Electron）在同一份 UI 之上接通了真�
 
 > 边界立场不变：真实后端下文件读写由 **A（Driver/ACP 客户端）** 执行，前端（E）只观测、渲染、接住人机确认；mock 演示里由桌面壳代 A 落盘，不构成对后端的新契约诉求（`FileOpObservation.content` 镜像的是 A 本就有的 `content` 入参）。
 
+## 样例 · 后端真实 Run 回放
+
+启动页的 **「样例 · Run 回放」** 入口加载 BCD 一次真实 Integration v0 run 的落盘产物（`api/run_be712da2….zip` 里的 `frontend-snapshot.json`，契约镜像见 `src/api/types/snapshot.ts`）：prompt「贪吃蛇游戏」→ driver=claude 执行 45.5s → 产出 `snake.html`（diff 产物）→ **Gate 放行（未升级 Council）** → 物化 worktree → Checkpoint → completed。
+
+回放机制：样例任务挂一个 `RunReplay` 数据源，**全部内容由 `buildRunReplay(snapshot)`（`src/lib/runReplay.ts`）从快照程序化派生**——后端给什么展示什么，前端不补写叙事、不反向要求后端：
+
+- **执行泳道按后端派单生成**：执行子链条数是后端 agent 自主决策的既成事实——图由快照里被派单的 agent 正向组合（`composeRunWorkflowNodes`），本次 run 只派了 `acp-external`（driver=claude，Agent 池里有其档案）一个 agent，图上就只有它一条执行泳道；多 agent 的 run 快照进来会自然长出多条。E 只投影，不预设条数；
+- **文案全部取快照原文**：执行时间轴 / 节点执行日志显示 timeline 事件、mailbox 消息、checkpoint 清单的原文；Node Inspector 新增「本次 Run · 后端数据」区块，逐字段展示该节点后端给出的全部事实（含 `runtime_state`、`artifact_refs` 等），没给的节点如实显示「本次 run 未提供」；
+- **时间戳只在后端给了的地方显示**：timeline 事件本身无时间戳 → 显示序号 `#k`；mailbox 消息带 `created_at` → 显示真实时刻。不插值、不编造；
+- **契约有但 run 没给的不虚构**：无 tool_events → 不显示文件操作流；GateResult 未附 decision → 节点只陈述事件本身（Council 未触发是流程事实，仅用于推进控制）；无 Council 数据 → Council 页显示空态而非 mock 议程；无测试数据 → 交付报告如实说明；
+- **事件通道**：节点点亮时把该 run 的事件（真实 event_id/run_id，映射到冻结事件词表）喂入观测窗口。
+
+普通任务不受影响（无 `replay` 时走原 mock 剧本）。集成测试见 `src/store/sampleRun.test.ts`。
+
 ## 技术栈
 
 - Vite + React + TypeScript
@@ -142,7 +156,7 @@ git push --follow-tags     # 推送提交 + 标签，触发 Release 工作流
 
 ## 推荐演示路径
 
-1. **启动页**：新建项目（桌面版可自选保存位置），或「打开项目 → 从文件夹打开」一个本机目录
+1. **启动页**：新建项目（桌面版可自选保存位置），或「打开项目 → 从文件夹打开」一个本机目录；也可点 **「样例 · Run 回放」** 直接加载后端真实 run（贪吃蛇游戏，见上节）逐步回放
 2. **Agent Board**：查看 `Backend Eng A` 详情（含 Identity & Runtime / file_lease / capability_tags），依次 Assign `Backend Eng A` / `Test Agent` / `Security Audit Agent`（≥3 人 → 团队就绪）
 3. 切到 **Task Board**，使用默认任务，点击 **Start Task** → 查看需求分析
 4. 点击 **Use Recommended Workflow** → 沿 7 条 Lane 生成 N0–N18 全链路泳道图

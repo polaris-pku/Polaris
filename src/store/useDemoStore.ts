@@ -13,6 +13,13 @@ import { createCouncilSlice } from '@/store/slices/councilSlice';
 export { PROJECT_TRACE_FORMAT, type ProjectTrace } from '@/store/types';
 
 /**
+ * 活动任务的真实 run 回放数据源（普通 mock 任务为 undefined）。
+ * 各内容消费组件用它做「replay 优先、mock 回退」的选择。
+ */
+export const selectActiveReplay = (s: DemoState) =>
+  s.tasks.find((t) => t.id === s.activeTaskId)?.replay;
+
+/**
  * 全局演示 store：由六个领域切片组合而成，本文件只做组装与事件通道接线。
  *
  *   项目域  slices/projectSlice.ts      项目生命周期 + 文件树

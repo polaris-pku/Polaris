@@ -12,7 +12,7 @@ import {
   Link2,
   ShieldAlert,
 } from 'lucide-react';
-import { useDemoStore } from '@/store/useDemoStore';
+import { selectActiveReplay, useDemoStore } from '@/store/useDemoStore';
 import { SidePanel } from '@/components/SidePanel';
 import { verdictDefs } from '@/data/councilOptions';
 import { deriveScenario, findOption } from '@/data/scenario';
@@ -33,8 +33,10 @@ export function CouncilBoard() {
   const confirmedId = useDemoStore((s) => s.confirmedCouncilOptionId);
   const setPage = useDemoStore((s) => s.setPage);
   const taskText = useDemoStore((s) => s.taskText);
+  const replay = useDemoStore(selectActiveReplay);
 
-  const scenario = deriveScenario(taskText);
+  // 回放任务用快照派生的场景（后端给什么展示什么），普通任务按需求文本推导
+  const scenario = replay?.scenario ?? deriveScenario(taskText);
   const {
     context: councilContext,
     discussion,
@@ -45,9 +47,29 @@ export function CouncilBoard() {
   } = scenario.council;
 
   const [selectedId, setSelectedId] = useState(
-    councilOptions.find((o) => o.recommended)?.id ?? councilOptions[0].id,
+    councilOptions.find((o) => o.recommended)?.id ?? councilOptions[0]?.id ?? '',
   );
   const [verdict, setVerdict] = useState<CouncilVerdict>('select');
+
+  // 后端未给 Council 数据（回放任务 Gate 直通）→ 只呈现该事实，不用 mock 议程顶替
+  if (councilOptions.length === 0) {
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
+        <Scale className="h-8 w-8 text-slate-600" />
+        <div className="font-display text-base font-semibold text-slate-300">
+          {councilContext.title}
+        </div>
+        <p className="max-w-sm text-xs text-slate-500">{councilContext.description}</p>
+        <button
+          onClick={() => setPage('tasks')}
+          className="mt-2 rounded-md border border-line-bright px-3 py-1.5 text-xs text-slate-300 transition-colors hover:bg-ink-800"
+        >
+          返回 Task Board
+        </button>
+      </div>
+    );
+  }
+
   const selectedOption = findOption(scenario, selectedId)!;
   const verdictDef = verdictDefs.find((v) => v.id === verdict)!;
   // 仅 verdict=select 驱动主链路继续（select + delegated → MergeAuthorization）

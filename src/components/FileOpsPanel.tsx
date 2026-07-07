@@ -8,7 +8,7 @@ import {
   Loader2,
   XCircle,
 } from 'lucide-react';
-import { useDemoStore } from '@/store/useDemoStore';
+import { selectActiveReplay, useDemoStore } from '@/store/useDemoStore';
 import { fileOpsForNode } from '@/data/fileops';
 import { revealAgentFile } from '@/lib/agentFs';
 import { cn } from '@/lib/utils';
@@ -189,10 +189,15 @@ type Props = {
 
 export function FileOpsPanel({ nodeId, status }: Props) {
   const filePermissionOutcomes = useDemoStore((s) => s.filePermissionOutcomes);
+  const replay = useDemoStore(selectActiveReplay);
   const [open, setOpen] = useState(true);
 
-  // 节点尚未执行到（pending）不展示；无剧本的节点直接不渲染
-  const ops = status === 'pending' ? [] : fileOpsForNode(nodeId, filePermissionOutcomes ?? {});
+  // 节点尚未执行到（pending）不展示；无剧本的节点直接不渲染。
+  // 回放任务用真实 run 的观测流整体替换 mock 剧本。
+  const ops =
+    status === 'pending'
+      ? []
+      : fileOpsForNode(nodeId, filePermissionOutcomes ?? {}, replay?.nodeFileOps);
   if (ops.length === 0) return null;
 
   const awaiting = ops.filter((o) => o.permission && !o.permission_outcome).length;
