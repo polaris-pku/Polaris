@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Play,
   Workflow,
@@ -15,7 +15,7 @@ import {
   Sparkles,
   FilePlus2,
 } from 'lucide-react';
-import { useDemoStore } from '@/store/useDemoStore';
+import { selectActiveReplay, useDemoStore } from '@/store/useDemoStore';
 import { Button } from '@/components/ui/Button';
 import { Textarea } from '@/components/ui/Textarea';
 import { Badge } from '@/components/ui/Badge';
@@ -26,7 +26,8 @@ import { InterveneDialog } from '@/components/InterveneDialog';
 import { NewRequirementDialog } from '@/components/NewRequirementDialog';
 import { DeliveryReport } from '@/components/DeliveryReport';
 import { SidePanel } from '@/components/SidePanel';
-import { taskUnderstanding } from '@/data/deliveryReport';
+import { cn } from '@/lib/utils';
+import { deriveScenario } from '@/data/scenario';
 import type { DemoStage } from '@/types';
 
 const stageBadge: Record<
@@ -67,8 +68,28 @@ function TaskBoardInner() {
   const activeTaskId = useDemoStore((s) => s.activeTaskId);
   const tasks = useDemoStore((s) => s.tasks);
   const activeTask = tasks.find((t) => t.id === activeTaskId);
+  const replay = useDemoStore(selectActiveReplay);
+  const selectedNodeId = useDemoStore((s) => s.selectedNodeId);
 
   const [interveneOpen, setInterveneOpen] = useState(false);
+
+  // 交付阶段右侧面板视图：交付报告 / 节点详情。进入交付默认看报告，
+  // 点画布上「非入口」节点时自动切到节点详情（仍可用分段控件切回）。
+  const [deliveryTab, setDeliveryTab] = useState<'report' | 'node'>('report');
+  const deliveryEntryNode = useRef<string | null>(null);
+  useEffect(() => {
+    if (stage === 'delivery') {
+      deliveryEntryNode.current = useDemoStore.getState().selectedNodeId;
+      setDeliveryTab('report');
+    } else {
+      deliveryEntryNode.current = null;
+    }
+  }, [stage]);
+  useEffect(() => {
+    if (stage === 'delivery' && selectedNodeId && selectedNodeId !== deliveryEntryNode.current) {
+      setDeliveryTab('node');
+    }
+  }, [selectedNodeId, stage]);
 
   const activeNode = stage === 'executing' && activeStepIndex >= 0 ? nodes[activeStepIndex] : null;
 
@@ -77,7 +98,9 @@ function TaskBoardInner() {
   const showExecuteControls = stage === 'executing';
   // 用 code 判断（并行执行段节点 id 带 -be/-te 后缀，code 仍为 N7）
   const showIntervene = activeNode?.code === 'N7';
-  const showCouncil = activeNode?.code === 'N13' || activeNode?.code === 'N14';
+  // 回放任务 Gate=allow：本次 run 未触发 Council，不提供入口
+  const showCouncil =
+    (activeNode?.code === 'N13' || activeNode?.code === 'N14') && replay?.gateDecision !== 'allow';
   const showDelivered = stage === 'delivery';
 
   const hasWorkflow = stage !== 'idle' && stage !== 'team_configured' && stage !== 'analyzing';
@@ -89,22 +112,33 @@ function TaskBoardInner() {
         {/* Command Bar */}
         <div className="border-b border-line px-5 py-4">
           <div className="mb-2 flex items-center gap-3">
-            <div className="callsign text-[10px] text-command-soft">// 02 · 执行</div>
             <h1 className="font-display text-lg font-semibold tracking-tight text-white">
               {activeTask?.title ?? 'Task Board'}
             </h1>
             <Badge variant={stageBadge[stage].variant}>{stageBadge[stage].label}</Badge>
-            {assignedAgentIds.length < 3 && (
+            {/* N2 受理遥测：后端（C）回填权威 task_id 前显示本地态 */}
+            {activeTask?.contractTaskId ? (
+              <span className="callsign text-[9px] text-emerald-300/80">
+                COORD · {activeTask.contractTaskId}
+              </span>
+            ) : (
+              <span className="callsign text-[9px] text-slate-500">COORD · 本地 · 未受理</span>
+            )}
+            {/* 回放任务按真实 run 的 mode 组队（single_agent=1 人），不提示人数 */}
+            {!replay && assignedAgentIds.length < 3 && (
               <span className="text-xs text-human/80">
                 当前团队人数不足（建议至少 3 名）。可前往 Agent Board → 自定义团队
+              </span>
+            )}
+            {replay && (
+              <span className="callsign text-[9px] text-slate-500">
+                MODE · {replay.snapshot.run.mode} · driver={replay.snapshot.run.driver_id}
               </span>
             )}
           </div>
           <div className="flex items-end gap-3">
             <div className="flex-1">
-              <label className="callsign mb-1 block text-[9px] text-slate-500">
-                任务描述 · DIRECTIVE
-              </label>
+              <label className="callsign mb-1 block text-[9px] text-slate-500">任务描述</label>
               <Textarea
                 value={taskText}
                 onChange={(e) => setTaskText(e.target.value)}
@@ -138,8 +172,6 @@ function TaskBoardInner() {
 
         {/* Demo Controls */}
         <div className="flex flex-wrap items-center gap-2 border-t border-line bg-ink-900/60 px-5 py-3">
-          <span className="callsign mr-1 text-[9px] text-slate-500">▸ DEMO CONTROLS</span>
-
           {showExecuteControls && (
             <>
               <Button variant="secondary" size="sm" onClick={nextStep}>
@@ -189,14 +221,14 @@ function TaskBoardInner() {
       {/* Right column */}
       <SidePanel
         side="right"
-        title="详情面板 · Inspector"
+        title="节点详情"
         defaultWidth={400}
         minWidth={300}
         maxWidth={620}
         storageKey="task-inspector"
       >
         {stage === 'delivery' ? (
-          <DeliveryReport />
+          <DeliveryPanel tab={deliveryTab} onTab={setDeliveryTab} />
         ) : stage === 'analyzing' || stage === 'workflow_recommended' ? (
           <TaskUnderstandingPanel />
         ) : stage === 'idle' || stage === 'team_configured' ? (
@@ -208,6 +240,56 @@ function TaskBoardInner() {
 
       <InterveneDialog open={interveneOpen} onClose={() => setInterveneOpen(false)} />
     </div>
+  );
+}
+
+/** 交付阶段右侧面板：交付报告 / 节点详情 分段切换（都可访问，互不遮挡）。 */
+function DeliveryPanel({
+  tab,
+  onTab,
+}: {
+  tab: 'report' | 'node';
+  onTab: (t: 'report' | 'node') => void;
+}) {
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="flex shrink-0 gap-1 border-b border-line p-2">
+        <DeliveryTab active={tab === 'report'} onClick={() => onTab('report')}>
+          交付报告
+        </DeliveryTab>
+        <DeliveryTab active={tab === 'node'} onClick={() => onTab('node')}>
+          节点详情
+        </DeliveryTab>
+      </div>
+      <div className="min-h-0 flex-1">
+        {tab === 'report' ? <DeliveryReport /> : <NodeInspector />}
+      </div>
+    </div>
+  );
+}
+
+function DeliveryTab({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        'flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors',
+        active
+          ? 'bg-ink-800 text-slate-100'
+          : 'text-slate-500 hover:bg-ink-800/50 hover:text-slate-300',
+      )}
+    >
+      {children}
+    </button>
   );
 }
 
@@ -259,37 +341,41 @@ function EmptyCanvas({ stage }: { stage: DemoStage }) {
 function TaskUnderstandingPanel() {
   const useRecommendedWorkflow = useDemoStore((s) => s.useRecommendedWorkflow);
   const stage = useDemoStore((s) => s.stage);
+  const taskText = useDemoStore((s) => s.taskText);
+  const replay = useDemoStore(selectActiveReplay);
+  // 回放任务用真实 run 的场景内容，普通任务按需求文本推导
+  const understanding = (replay?.scenario ?? deriveScenario(taskText)).understanding;
 
   const rows = [
     {
       icon: Target,
       title: '需求目标',
       tone: 'text-blue-300',
-      content: taskUnderstanding.goal,
+      content: understanding.goal,
     },
     {
       icon: FolderTree,
       title: '涉及模块',
       tone: 'text-cyan-300',
-      content: taskUnderstanding.modules.join('、'),
+      content: understanding.modules.join('、'),
     },
     {
       icon: FlaskConical,
       title: '测试目录',
       tone: 'text-emerald-300',
-      content: taskUnderstanding.testDir,
+      content: understanding.testDir,
     },
     {
       icon: ShieldAlert,
       title: '潜在风险',
       tone: 'text-rose-300',
-      content: taskUnderstanding.risks.join('、'),
+      content: understanding.risks.join('、'),
     },
     {
       icon: Sparkles,
       title: '推荐 Workflow',
       tone: 'text-violet-300',
-      content: taskUnderstanding.workflow,
+      content: understanding.workflow,
     },
   ];
 

@@ -15,4 +15,17 @@ export default defineConfig(({ command }) => ({
     port: 5173,
     strictPort: true,
   },
+  build: {
+    rollupOptions: {
+      output: {
+        // 按依赖体量拆 vendor chunk：画布/图标/其余三方库独立缓存，也消除 500kB 大包警告
+        manualChunks(id: string) {
+          if (!id.includes('node_modules')) return undefined;
+          if (id.includes('@xyflow') || /node_modules\/d3-/.test(id)) return 'vendor-flow';
+          if (id.includes('lucide-react')) return 'vendor-icons';
+          return 'vendor';
+        },
+      },
+    },
+  },
 }));

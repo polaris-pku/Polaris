@@ -1,8 +1,8 @@
 {
-  "name": "hci-ide-mvp",
+  "name": "polaris",
   "private": true,
   "version": "0.1.0",
-  "description": "HCI IDE · 多 Agent 协作开发桌面工作台",
+  "description": "Polaris · 多 Agent 协作开发桌面工作台",
   "author": "fangz and zhangyc",
   "repository": {
     "type": "git",
@@ -33,12 +33,12 @@
     "prepare": "husky"
   },
   "build": {
-    "appId": "com.hciide.app",
-    "productName": "HCI IDE",
+    "appId": "com.polaris.app",
+    "productName": "Polaris",
     "directories": {
       "output": "release"
     },
-    "artifactName": "HCI-IDE-${version}-${os}-${arch}.${ext}",
+    "artifactName": "Polaris-${version}-${os}-${arch}.${ext}",
     "files": [
       "dist/**/*",
       "electron/**/*"

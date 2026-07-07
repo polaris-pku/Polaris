@@ -13,12 +13,14 @@ export function NewRequirementDialog({ open, onClose }: { open: boolean; onClose
   const createTask = useDemoStore((s) => s.createTask);
   const [text, setText] = useState('');
   const [title, setTitle] = useState('');
+  const [criteria, setCriteria] = useState('');
 
   const canSubmit = text.trim().length > 0;
 
   const reset = () => {
     setText('');
     setTitle('');
+    setCriteria('');
   };
 
   const handleClose = () => {
@@ -28,7 +30,7 @@ export function NewRequirementDialog({ open, onClose }: { open: boolean; onClose
 
   const handleCreate = () => {
     if (!canSubmit) return;
-    createTask(text, title);
+    createTask(text, title, criteria.split('\n'));
     reset();
     onClose();
   };
@@ -49,7 +51,6 @@ export function NewRequirementDialog({ open, onClose }: { open: boolean; onClose
             <FilePlus2 className="h-5 w-5" />
           </div>
           <div>
-            <div className="callsign text-[9px] text-command-soft/80">REQUIREMENT INTAKE</div>
             <h2 className="font-display text-base font-semibold text-white">
               新建需求 · N0 Intake
             </h2>
@@ -85,6 +86,21 @@ export function NewRequirementDialog({ open, onClose }: { open: boolean; onClose
           />
           <p className="mt-1.5 text-[11px] text-slate-600">
             提交后进入需求分析（N1 Triage），你可采用推荐 Workflow 或自行组建。
+          </p>
+        </div>
+
+        <div className="mt-4">
+          <label className="callsign mb-1.5 block text-[9px] text-slate-400">
+            验收标准 · COMPLETION_CRITERIA（可选 · 每行一条）
+          </label>
+          <Textarea
+            value={criteria}
+            onChange={(e) => setCriteria(e.target.value)}
+            rows={3}
+            placeholder={'未授权访问返回 403\n已有单测全部通过'}
+          />
+          <p className="mt-1.5 text-[11px] text-slate-600">
+            留空则由需求分析（N1 Triage）起草，随任务上送协调器。
           </p>
         </div>
 

@@ -32,5 +32,5 @@ my-session.json
 # 项目专属
 .claude
 design-comparison
-api/
+/api/
 hci_ide_mvp_plan.md

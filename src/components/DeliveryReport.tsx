@@ -9,26 +9,30 @@ import {
   Check,
   Undo2,
   Repeat,
-} from "lucide-react";
-import { useDemoStore } from "@/store/useDemoStore";
-import { deliveryReport } from "@/data/deliveryReport";
-import { getCouncilOption } from "@/data/councilOptions";
-import { Button } from "@/components/ui/Button";
-import { Badge } from "@/components/ui/Badge";
-import type { InterventionScope } from "@/types";
+} from 'lucide-react';
+import { selectActiveReplay, useDemoStore } from '@/store/useDemoStore';
+import { deriveScenario, findOption } from '@/data/scenario';
+import { Button } from '@/components/ui/Button';
+import { Badge } from '@/components/ui/Badge';
+import type { InterventionScope } from '@/types';
 
 const scopeLabels: Record<InterventionScope, string> = {
-  current_step: "仅当前步骤",
-  current_agent: "当前 Agent 后续",
-  whole_workflow: "整个 Workflow",
-  project_rule: "项目长期规则",
+  current_step: '仅当前步骤',
+  current_agent: '当前 Agent 后续',
+  whole_workflow: '整个 Workflow',
+  project_rule: '项目长期规则',
 };
 
 export function DeliveryReport() {
   const rules = useDemoStore((s) => s.interventionRules);
   const confirmedId = useDemoStore((s) => s.confirmedCouncilOptionId);
   const resetDemo = useDemoStore((s) => s.resetDemo);
-  const confirmedOption = confirmedId ? getCouncilOption(confirmedId) : null;
+  const taskText = useDemoStore((s) => s.taskText);
+  const replay = useDemoStore(selectActiveReplay);
+  // 回放任务用真实 run 的交付数据（worktree/产物/耗时），普通任务按需求文本推导
+  const scenario = replay?.scenario ?? deriveScenario(taskText);
+  const deliveryReport = scenario.delivery;
+  const confirmedOption = findOption(scenario, confirmedId) ?? null;
 
   return (
     <div className="flex h-full flex-col overflow-y-auto">
@@ -38,12 +42,7 @@ export function DeliveryReport() {
             <FileCheck2 className="h-5 w-5" />
           </div>
           <div>
-            <div className="callsign text-[9px] text-slate-600">
-              MISSION REPORT
-            </div>
-            <h2 className="font-display text-base font-semibold text-white">
-              Delivery Report
-            </h2>
+            <h2 className="font-display text-base font-semibold text-white">Delivery Report</h2>
             <p className="text-xs text-slate-500">AI 工程团队任务交付汇报</p>
           </div>
           <Badge variant="green" className="ml-auto">
@@ -55,9 +54,7 @@ export function DeliveryReport() {
       <div className="flex-1 space-y-5 p-5">
         {/* Summary */}
         <Section icon={FileCheck2} title="任务完成摘要" tone="emerald">
-          <p className="text-xs leading-relaxed text-slate-300">
-            {deliveryReport.summary}
-          </p>
+          <p className="text-xs leading-relaxed text-slate-300">{deliveryReport.summary}</p>
         </Section>
 
         {/* Changed files */}
@@ -75,18 +72,20 @@ export function DeliveryReport() {
           </div>
         </Section>
 
-        {/* Test result */}
-        <Section icon={FlaskConical} title="测试结果" tone="emerald">
-          <div className="grid grid-cols-3 gap-2">
-            <Stat label="通过" value={`${deliveryReport.testResult.passed}`} tone="emerald" />
-            <Stat label="失败" value={`${deliveryReport.testResult.failed}`} tone="slate" />
-            <Stat
-              label="覆盖率"
-              value={deliveryReport.testResult.coverageDelta}
-              tone="blue"
-            />
-          </div>
-        </Section>
+        {/* Test result（回放任务：本次 run 后端未提供测试数据 → 如实说明，不显示编造的 0） */}
+        {replay ? (
+          <Section icon={FlaskConical} title="测试结果" tone="emerald">
+            <p className="text-xs text-slate-500">本次 run 未提供测试数据。</p>
+          </Section>
+        ) : (
+          <Section icon={FlaskConical} title="测试结果" tone="emerald">
+            <div className="grid grid-cols-3 gap-2">
+              <Stat label="通过" value={`${deliveryReport.testResult.passed}`} tone="emerald" />
+              <Stat label="失败" value={`${deliveryReport.testResult.failed}`} tone="slate" />
+              <Stat label="覆盖率" value={deliveryReport.testResult.coverageDelta} tone="blue" />
+            </div>
+          </Section>
+        )}
 
         {/* Intervention record */}
         <Section icon={Hand} title="用户介入记录" tone="amber">
@@ -95,10 +94,7 @@ export function DeliveryReport() {
           ) : (
             <div className="space-y-2">
               {rules.map((r, i) => (
-                <div
-                  key={i}
-                  className="rounded-md border border-human/30 bg-human/5 p-2.5"
-                >
+                <div key={i} className="rounded-md border border-human/30 bg-human/5 p-2.5">
                   <p className="text-xs text-human-soft">{r.text}</p>
                   <div className="mt-1.5 flex flex-wrap gap-1.5">
                     <Badge variant="amber">{scopeLabels[r.scope]}</Badge>
@@ -127,9 +123,7 @@ export function DeliveryReport() {
                   {confirmedOption.title}
                 </span>
               </div>
-              <p className="mt-1.5 text-xs text-slate-300">
-                {confirmedOption.summary}
-              </p>
+              <p className="mt-1.5 text-xs text-slate-300">{confirmedOption.summary}</p>
             </div>
           ) : (
             <p className="text-xs text-slate-500">本次任务未触发 Council 裁决。</p>
@@ -140,10 +134,7 @@ export function DeliveryReport() {
         <Section icon={AlertTriangle} title="风险与建议" tone="rose">
           <ul className="space-y-1.5">
             {deliveryReport.riskNotes.map((n) => (
-              <li
-                key={n}
-                className="flex gap-2 text-xs text-rose-100/80"
-              >
+              <li key={n} className="flex gap-2 text-xs text-rose-100/80">
                 <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-rose-400" />
                 {n}
               </li>
@@ -173,12 +164,12 @@ export function DeliveryReport() {
 }
 
 const toneMap = {
-  emerald: "text-emerald-300",
-  blue: "text-command-soft",
-  amber: "text-human",
-  violet: "text-violet-300",
-  rose: "text-rose-300",
-  slate: "text-slate-300",
+  emerald: 'text-emerald-300',
+  blue: 'text-command-soft',
+  amber: 'text-human',
+  violet: 'text-violet-300',
+  rose: 'text-rose-300',
+  slate: 'text-slate-300',
 };
 
 function Section({
@@ -194,9 +185,7 @@ function Section({
 }) {
   return (
     <section>
-      <div
-        className={`callsign mb-2 flex items-center gap-1.5 text-[10px] ${toneMap[tone]}`}
-      >
+      <div className={`callsign mb-2 flex items-center gap-1.5 text-[10px] ${toneMap[tone]}`}>
         <Icon className="h-3.5 w-3.5" />
         {title}
       </div>
@@ -216,9 +205,7 @@ function Stat({
 }) {
   return (
     <div className="rounded-md border border-line bg-ink-900/60 p-2.5 text-center">
-      <div className={`font-mono text-lg font-bold tabular ${toneMap[tone]}`}>
-        {value}
-      </div>
+      <div className={`font-mono text-lg font-bold tabular ${toneMap[tone]}`}>{value}</div>
       <div className="callsign mt-0.5 text-[8px] text-slate-500">{label}</div>
     </div>
   );

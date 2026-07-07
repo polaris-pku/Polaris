@@ -1,5 +1,14 @@
 import { useState } from 'react';
-import { Boxes, FolderPlus, FolderOpen, FolderGit2, Clock, ArrowRight } from 'lucide-react';
+import {
+  Boxes,
+  FolderPlus,
+  FolderOpen,
+  FolderGit2,
+  FolderSearch,
+  Clock,
+  ArrowRight,
+  MonitorPlay,
+} from 'lucide-react';
 import { useDemoStore } from '@/store/useDemoStore';
 import { Dialog } from '@/components/ui/Dialog';
 import { NewProjectDialog } from '@/components/NewProjectDialog';
@@ -9,10 +18,12 @@ import type { Project } from '@/types';
 /**
  * IDE 启动页 · Project Launcher
  * 用户进入应用先在此新建 / 打开一个 Project，之后才进入 Agent 团队工作区。
+ * 「打开项目」= 已有项目列表 + 从本机文件夹打开（合并为一个入口）。
  */
 export function ProjectLauncher() {
   const projects = useDemoStore((s) => s.projects);
   const openProject = useDemoStore((s) => s.openProject);
+  const loadSampleRun = useDemoStore((s) => s.loadSampleRun);
   const [newOpen, setNewOpen] = useState(false);
   const [openPickerOpen, setOpenPickerOpen] = useState(false);
 
@@ -38,9 +49,8 @@ export function ProjectLauncher() {
             <Boxes className="h-8 w-8 text-white" />
           </div>
           <h1 className="mt-4 font-display text-2xl font-semibold tracking-tight text-white">
-            HCI · IDE
+            Polaris
           </h1>
-          <div className="callsign mt-1 text-[10px] text-slate-500">AGENT TEAM CONSOLE</div>
           <p className="mt-2 max-w-sm text-sm text-slate-500">
             多 Agent 协作开发工作台。先新建或打开一个项目开始。
           </p>
@@ -51,7 +61,6 @@ export function ProjectLauncher() {
           <LauncherCard
             icon={FolderPlus}
             title="新建项目"
-            subtitle="New Project"
             desc="创建一个新的协作项目"
             accent="command"
             onClick={() => setNewOpen(true)}
@@ -59,17 +68,36 @@ export function ProjectLauncher() {
           <LauncherCard
             icon={FolderOpen}
             title="打开项目"
-            subtitle="Open Project"
-            desc="从已有项目中选择进入"
+            desc="从已有项目或本机文件夹进入"
             accent="slate"
             onClick={() => setOpenPickerOpen(true)}
           />
         </div>
 
+        {/* 样例：后端真实 run 的回放（frontend-snapshot.json → 泳道图逐步回放） */}
+        <button
+          onClick={loadSampleRun}
+          className="group mt-4 flex w-full items-center gap-3 rounded-xl border border-emerald-500/25 bg-emerald-500/5 px-5 py-3.5 text-left transition-all hover:border-emerald-400/50 hover:bg-emerald-500/10"
+        >
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-emerald-500/15 text-emerald-300">
+            <MonitorPlay className="h-5 w-5" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-1.5 font-display text-base font-semibold text-white">
+              样例 · Run 回放
+              <ArrowRight className="h-4 w-4 -translate-x-1 opacity-0 transition-all group-hover:translate-x-0 group-hover:opacity-100" />
+            </div>
+            <p className="mt-1 truncate text-xs text-slate-500">
+              回放一次后端真实 run：「贪吃蛇游戏」 · driver=claude · 45.5s · Gate 直通 ·
+              run_be712da2…
+            </p>
+          </div>
+        </button>
+
         {/* 最近打开 */}
         {recent.length > 0 && (
           <div className="mt-10">
-            <div className="callsign mb-2 px-1 text-[9px] text-slate-600">// 最近打开</div>
+            <div className="callsign mb-2 px-1 text-[9px] text-slate-600">最近打开</div>
             <div className="space-y-1.5">
               {recent.map((p) => (
                 <RecentRow key={p.id} project={p} onOpen={() => openProject(p.id)} />
@@ -88,14 +116,12 @@ export function ProjectLauncher() {
 function LauncherCard({
   icon: Icon,
   title,
-  subtitle,
   desc,
   accent,
   onClick,
 }: {
   icon: typeof FolderPlus;
   title: string;
-  subtitle: string;
   desc: string;
   accent: 'command' | 'slate';
   onClick: () => void;
@@ -123,7 +149,6 @@ function LauncherCard({
           {title}
           <ArrowRight className="h-4 w-4 -translate-x-1 opacity-0 transition-all group-hover:translate-x-0 group-hover:opacity-100" />
         </div>
-        <div className="callsign text-[9px] text-slate-500">{subtitle}</div>
         <p className="mt-1.5 text-xs text-slate-500">{desc}</p>
       </div>
     </button>
@@ -141,8 +166,12 @@ function RecentRow({ project, onOpen }: { project: Project; onOpen: () => void }
       </div>
       <div className="min-w-0 flex-1">
         <div className="truncate font-mono text-sm text-slate-100">{project.name}</div>
-        {project.description && (
-          <div className="truncate text-xs text-slate-500">{project.description}</div>
+        {project.rootPath ? (
+          <div className="truncate font-mono text-[10px] text-slate-600">{project.rootPath}</div>
+        ) : (
+          project.description && (
+            <div className="truncate text-xs text-slate-500">{project.description}</div>
+          )
         )}
       </div>
       {project.tags.length > 0 && (
@@ -168,10 +197,19 @@ function RecentRow({ project, onOpen }: { project: Project; onOpen: () => void }
 function OpenProjectDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const projects = useDemoStore((s) => s.projects);
   const openProject = useDemoStore((s) => s.openProject);
+  const openProjectFromFolder = useDemoStore((s) => s.openProjectFromFolder);
+  const [folderError, setFolderError] = useState<string | null>(null);
 
   const handleOpen = (id: string) => {
     openProject(id);
     onClose();
+  };
+
+  // 打开成功后 activeProjectId 变化，启动页整体卸载；用户取消选择则停留在本对话框
+  const handleOpenFolder = async () => {
+    setFolderError(null);
+    const error = await openProjectFromFolder();
+    if (error) setFolderError(error);
   };
 
   return (
@@ -182,14 +220,34 @@ function OpenProjectDialog({ open, onClose }: { open: boolean; onClose: () => vo
             <FolderOpen className="h-5 w-5" />
           </div>
           <div>
-            <div className="callsign text-[9px] text-slate-500">OPEN PROJECT</div>
             <h2 className="font-display text-base font-semibold text-white">打开项目</h2>
           </div>
         </div>
 
-        <div className="mt-5 max-h-80 space-y-1.5 overflow-y-auto">
+        {/* 从本机文件夹打开（桌面版扫描目录为项目文件树） */}
+        <button
+          onClick={handleOpenFolder}
+          className="mt-5 flex w-full items-center gap-3 rounded-lg border border-line-bright bg-ink-900/60 px-3 py-2.5 text-left transition-colors hover:border-slate-500 hover:bg-ink-800/60"
+        >
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-ink-700 text-slate-300">
+            <FolderSearch className="h-4 w-4" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="text-sm text-slate-100">从文件夹打开 · Open Folder</div>
+            <div className="truncate text-xs text-slate-500">
+              选择本机目录，扫描为项目文件树（Agent 产出写回该目录）
+            </div>
+          </div>
+          <ArrowRight className="h-4 w-4 shrink-0 text-slate-600" />
+        </button>
+        {folderError && <p className="mt-2 text-xs text-rose-300">{folderError}</p>}
+
+        <div className="callsign mb-1.5 mt-4 px-1 text-[9px] text-slate-600">已有项目</div>
+        <div className="max-h-64 space-y-1.5 overflow-y-auto">
           {projects.length === 0 ? (
-            <p className="py-8 text-center text-sm text-slate-600">暂无项目，请先新建。</p>
+            <p className="py-6 text-center text-sm text-slate-600">
+              暂无项目 · 新建一个，或从文件夹打开
+            </p>
           ) : (
             projects.map((p) => (
               <RecentRow key={p.id} project={p} onOpen={() => handleOpen(p.id)} />

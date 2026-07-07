@@ -1,4 +1,20 @@
-export type PageKey = 'agents' | 'tasks' | 'council';
+// 与后端契约镜像对齐：UI 直接复用契约里"完全一致"的枚举，
+// 让后端契约漂移在编译期咬住前端。刻意换了词表的状态机（TaskStatusCore /
+// CouncilVerdict）不在此直接替换，改由 src/api/map.ts 的 Record 桥接映射兜住。
+import type {
+  AgentRuntimeStatus,
+  Event as ContractEvent,
+  FileOpObservation,
+  FilePermissionOutcome,
+  FrontendRunSnapshot,
+  GateDecision as ContractGateDecision,
+  LeaseScope,
+  LeaseStatus,
+} from '@/api/types';
+// 仅类型引用（编译期擦除），不构成运行时循环依赖
+import type { Scenario } from '@/data/scenario';
+
+export type PageKey = 'agents' | 'tasks' | 'council' | 'file';
 
 /** 文件树节点：有 children 即目录，无则为文件 */
 export type FileNode = {
@@ -15,10 +31,47 @@ export type Project = {
   lastOpened: string;
   /** 技术栈 / 标签，用于列表展示 */
   tags: string[];
-  /** 项目文件树（mock） */
+  /**
+   * 项目在本机磁盘上的根目录（用户自选，agent 生成的文件写到这里）。
+   * 缺省写入默认工作区 文档/polaris-workspace/<项目名>/。仅桌面版有意义。
+   */
+  rootPath?: string;
+  /** 项目文件树（mock；从文件夹打开时为磁盘扫描结果） */
   files: FileNode[];
   /** 项目 Agent 团队（引用全局 Agent 池的 id 子集） */
   agentIds: string[];
+};
+
+/**
+ * 回放节点的一条后端事实：字段名 = 快照原文值。
+ * `time` 仅在后端对该数据给了时间戳时存在（E 不插值、不编造时刻）。
+ */
+export type RunNodeFact = { key: string; value: string; time?: string };
+
+/**
+ * 真实后端 run 的回放数据源（样例任务用），全部内容由 `buildRunReplay(snapshot)`
+ * 从后端快照程序化派生——后端给什么展示什么，E 不补写、不预设。
+ * 挂在任务上后，泳道图推进的各内容查找点（时间线日志 / 节点执行日志 /
+ * 后端事实 / 场景 / 文件操作流 / 事件通道）只取这里的数据，缺失即为
+ * 「本次 run 未提供」。key 一律用去掉执行子链后缀的节点 id。
+ */
+export type RunReplay = {
+  /** 后端落盘的快照原件（frontend-snapshot.json），审计与展示的真相源 */
+  snapshot: FrontendRunSnapshot;
+  /** 节点 id → 执行时间轴日志（替换 data/logs.ts 的 mock 文案） */
+  nodeLogs: Record<string, LogEntry & { checkpoint?: TimelineCheckpoint }>;
+  /** 节点 id → Node Inspector 执行日志明细 */
+  nodeExecLogs: Record<string, NodeExecutionLogDetail>;
+  /** 节点 id → 后端给出的事实字段（Node Inspector「本次 Run · 后端数据」区块） */
+  nodeFacts: Record<string, RunNodeFact[]>;
+  /** 节点 id → 点亮该列时喂入事件通道的契约事件（按主节点 id 取，整列只喂一次） */
+  nodeEvents: Record<string, ContractEvent[]>;
+  /** 节点 id → 文件操作观测流（替换 data/fileops.ts 的 mock 剧本；含后缀 id） */
+  nodeFileOps: Record<string, FileOpObservation[]>;
+  /** 场景内容（需求分析/议会/交付报告），替代按需求文本推导的 deriveScenario */
+  scenario: Scenario;
+  /** 本次 run 的 Gate 实际走向；allow = 未升级 Council，推进时直通 N14 */
+  gateDecision: GateDecision;
 };
 
 /** 单个任务及其泳道图执行状态 */
@@ -28,6 +81,17 @@ export type DemoTask = {
   projectId: string;
   title: string;
   taskText: string;
+  /** 该任务绑定的 Agent 团队（按需求推荐，随任务走，可自定义） */
+  assignedAgentIds: string[];
+  /** 后端（C）受理后回填的权威 task_id；缺失表示尚未受理或提交失败 */
+  contractTaskId?: string;
+  /** 用户在 N0 自报的验收标准（随 TaskCreateRequest.completion_criteria 上送） */
+  completionCriteria?: string[];
+  /** 文件写入权限确认结果（tool_event_id → 人选的 outcome），随任务持久化。
+   *  可选：兼容旧版存盘文件（缺失按空记录处理） */
+  filePermissionOutcomes?: Record<string, FilePermissionOutcome>;
+  /** 真实后端 run 的回放数据源；缺失 = 普通 mock 剧本任务 */
+  replay?: RunReplay;
   stage: DemoStage;
   analysisReady: boolean;
   nodes: WorkflowNodeData[];
@@ -50,15 +114,19 @@ export type DemoStage =
   | 'council'
   | 'delivery';
 
-export type AgentStatus = 'idle' | 'working' | 'waiting' | 'reviewing' | 'done';
+/** 与契约镜像 `AgentRuntimeState.status` 同源（方向 B）。 */
+export type AgentStatus = AgentRuntimeStatus;
 
-/** N4 认领时签发的文件租约 FileLease（字段清单 N4.file_lease） */
+/**
+ * N4 认领时签发的文件租约 FileLease（字段清单 N4.file_lease）。
+ * scope/status 直接采用契约镜像的 `LeaseScope`/`LeaseStatus`（对齐 BCD core/lease.ts）。
+ */
 export type FileLease = {
   lease_id: string;
   path_glob: string;
-  scope: 'read' | 'write';
+  scope: LeaseScope;
   expires_at: string;
-  status: string;
+  status: LeaseStatus;
 };
 
 /** N4 AgentRecord + N6 Driver Session 的运行态身份（字段清单 N4.agent / N6） */
@@ -98,8 +166,12 @@ export type Agent = {
 
 export type WorkflowNodeStatus = 'pending' | 'active' | 'done' | 'blocked' | 'updated';
 
-/** 泳道 = 执行角色分区（User / 调度 / 后端 / 测试 / 安全 / 议会） */
-export type Lane = 'User' | 'System' | 'Backend' | 'Test' | 'Security' | 'Council';
+/**
+ * 泳道 = 执行角色分区。固定泳道（User / 调度 / 安全 / 议会）之外，
+ * 执行泳道由后端派单决定：每个参与执行的 agent 一条泳道（泳道名即 agent 身份），
+ * 故保持开放——后端派几个 agent 就画几条，E 只投影不预设。
+ */
+export type Lane = 'User' | 'System' | 'Backend' | 'Test' | 'Security' | 'Council' | (string & {});
 
 /** 协调器 Task 主状态机的 11 个核心态（见 需求到处理状态机 §3） */
 export type TaskStatusCore =
@@ -115,8 +187,8 @@ export type TaskStatusCore =
   | 'failed'
   | 'cancelled';
 
-/** Gate 四种决策（见 字段清单 N13） */
-export type GateDecision = 'allow' | 'deny' | 'ask' | 'defer';
+/** Gate 四种决策（见 字段清单 N13）—— 直接复用契约镜像的 `GateDecision`（方向 D）。 */
+export type GateDecision = ContractGateDecision;
 
 /** 节点责任方：A=Driver执行 B=角色记忆 C=主链路编排 D=Hook/Gate */
 export type NodeDirection = 'User' | 'A' | 'B' | 'C' | 'D' | 'Merger';
@@ -126,6 +198,15 @@ export type FrozenLevel = 'frozen' | 'partial' | 'tbd' | 'reserved';
 
 /** 字段清单中的一条字段（key + 中文释义/类型说明） */
 export type FieldSpec = { key: string; desc: string };
+
+/**
+ * 节点信息分层（泳道图渐进披露的依据）：
+ * - human：人的时刻（需求输入 / 可介入 / Gate ask / Council）——始终大卡片、琥珀前置
+ * - milestone：人关心结果的里程碑（分诊结论 / 产物 / 授权 / 交付）——大卡片
+ * - machine：A/B/C/D 内部握手（建 Run / ContextPack / Hook 匹配…）——默认折叠成小胶囊，
+ *   活动中 / 被选中 / 全局展开时还原为大卡片
+ */
+export type NodeTier = 'human' | 'milestone' | 'machine';
 
 export type WorkflowNodeData = {
   id: string;
@@ -139,6 +220,8 @@ export type WorkflowNodeData = {
   direction: NodeDirection;
   /** 网格列号（x 轴）；并行兄弟节点共用同一 column */
   column: number;
+  /** 信息分层（必填，保证每个节点都被显式归类） */
+  tier: NodeTier;
   /** 前驱节点 id 列表，作为连线与揭示门控的真相源 */
   deps: string[];
   owner: string;

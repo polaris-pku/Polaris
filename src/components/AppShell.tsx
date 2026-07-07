@@ -1,24 +1,21 @@
-import { type ReactNode } from 'react';
+import { type ReactNode, useState } from 'react';
 import {
-  Users,
-  Scale,
   RotateCcw,
   CircleDot,
   Boxes,
   ChevronRight,
   ChevronLeft,
   LayoutGrid,
+  Settings,
 } from 'lucide-react';
 import { useDemoStore } from '@/store/useDemoStore';
-import type { DemoStage, PageKey } from '@/types';
+import { apiConfig } from '@/api/config';
+import type { DemoStage } from '@/types';
 import { cn } from '@/lib/utils';
 import { useResizablePane } from '@/lib/useResizablePane';
 import { ProjectTree } from '@/components/ProjectTree';
-
-const otherNavItems: { key: PageKey; label: string; icon: typeof Users }[] = [
-  { key: 'agents', label: 'Agent Board', icon: Users },
-  { key: 'council', label: 'Council Board', icon: Scale },
-];
+import { SettingsDialog } from '@/components/SettingsDialog';
+import { APP_VERSION } from '@/lib/version';
 
 const stageLabels: Record<DemoStage, string> = {
   idle: '待组队',
@@ -46,8 +43,6 @@ const stageColors: Record<DemoStage, string> = {
 const humanStages: DemoStage[] = ['intervention', 'council'];
 
 export function AppShell({ children }: { children: ReactNode }) {
-  const currentPage = useDemoStore((s) => s.currentPage);
-  const setPage = useDemoStore((s) => s.setPage);
   const resetDemo = useDemoStore((s) => s.resetDemo);
   const stage = useDemoStore((s) => s.stage);
   const nodes = useDemoStore((s) => s.nodes);
@@ -56,6 +51,18 @@ export function AppShell({ children }: { children: ReactNode }) {
   const tasks = useDemoStore((s) => s.tasks);
   const activeTaskId = useDemoStore((s) => s.activeTaskId);
   const closeProject = useDemoStore((s) => s.closeProject);
+  const backendEvents = useDemoStore((s) => s.backendEvents);
+  const eventChannelStatus = useDemoStore((s) => s.eventChannelStatus);
+
+  // 事件链路遥测：mock 走本地喂入（LOCAL），真连接显示 WS 通道状态
+  const eventLink = apiConfig.useMock
+    ? { label: 'LOCAL', className: 'text-slate-400', dot: 'bg-slate-500' }
+    : eventChannelStatus === 'connected'
+      ? { label: 'LIVE', className: 'text-emerald-300', dot: 'bg-emerald-400' }
+      : eventChannelStatus === 'connecting'
+        ? { label: 'SYNC…', className: 'text-command-soft', dot: 'bg-command animate-blink' }
+        : { label: 'OFFLINE', className: 'text-slate-500', dot: 'bg-slate-600' };
+  const latestEvent = backendEvents[0];
 
   const {
     size: navWidth,
@@ -74,6 +81,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   const activeNode = activeStepIndex >= 0 ? nodes[activeStepIndex] : null;
   const humanLive = humanStages.includes(stage);
   const activeTask = tasks.find((t) => t.id === activeTaskId);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-ink-950 text-slate-200">
@@ -111,9 +119,8 @@ export function AppShell({ children }: { children: ReactNode }) {
           {!navCollapsed && (
             <div className="leading-tight">
               <div className="font-display text-sm font-semibold tracking-tight text-white">
-                HCI · IDE
+                Polaris
               </div>
-              <div className="callsign text-[9px] text-slate-500">AGENT TEAM CONSOLE</div>
             </div>
           )}
         </div>
@@ -122,42 +129,33 @@ export function AppShell({ children }: { children: ReactNode }) {
           className={cn('flex-1 space-y-1 overflow-y-auto py-4', navCollapsed ? 'px-2' : 'px-3')}
         >
           <ProjectTree collapsed={navCollapsed} />
-
-          {!navCollapsed && <div className="my-3 h-px bg-line" />}
-
-          {/* 全局入口 */}
-          {otherNavItems.map((item) => {
-            const Icon = item.icon;
-            const active = currentPage === item.key;
-            return (
-              <button
-                key={item.key}
-                onClick={() => setPage(item.key)}
-                title={navCollapsed ? item.label : undefined}
-                className={cn(
-                  'flex w-full items-center gap-3 rounded-lg py-2 text-sm transition-colors',
-                  navCollapsed ? 'justify-center px-0' : 'px-3',
-                  active
-                    ? 'bg-blue-600/15 text-blue-200 ring-1 ring-blue-500/30'
-                    : 'text-slate-400 hover:bg-ink-700 hover:text-slate-100',
-                )}
-              >
-                <Icon className="h-4 w-4 shrink-0" />
-                {!navCollapsed && item.label}
-              </button>
-            );
-          })}
         </nav>
 
         <div className="border-t border-line p-3">
           {!navCollapsed && (
             <div className="mb-2 flex items-center justify-between px-2">
-              <span className="callsign text-[9px] text-slate-600">CREW</span>
+              <span className="callsign text-[9px] text-slate-600">团队</span>
               <span className="font-mono text-[11px] text-slate-400 tabular">
                 {String(assignedAgentIds.length).padStart(2, '0')} / 04
               </span>
             </div>
           )}
+          <button
+            onClick={() => setSettingsOpen(true)}
+            title={navCollapsed ? `设置 · v${APP_VERSION}` : undefined}
+            className={cn(
+              'flex w-full items-center gap-3 rounded-md py-2 text-sm text-slate-400 transition-colors hover:bg-ink-700 hover:text-command-soft',
+              navCollapsed ? 'justify-center px-0' : 'px-3',
+            )}
+          >
+            <Settings className="h-4 w-4 shrink-0" />
+            {!navCollapsed && (
+              <span className="flex flex-1 items-center justify-between">
+                设置
+                <span className="font-mono text-[10px] text-slate-600">v{APP_VERSION}</span>
+              </span>
+            )}
+          </button>
           <button
             onClick={closeProject}
             title={navCollapsed ? '返回启动页' : undefined}
@@ -222,6 +220,15 @@ export function AppShell({ children }: { children: ReactNode }) {
             <span className="callsign text-[9px] text-slate-600">OWNER</span>
             <span className="text-slate-300">{activeNode ? activeNode.owner : '—'}</span>
           </span>
+          <span className="h-3.5 w-px bg-line-bright" />
+          <span className="flex items-center gap-2 px-4">
+            <span className={cn('led h-2 w-2', eventLink.dot)} />
+            <span className="callsign text-[9px] text-slate-600">EVENTS</span>
+            <span className={cn('callsign text-[10px]', eventLink.className)}>
+              {eventLink.label}
+            </span>
+            {latestEvent && <span className="text-slate-500">{latestEvent.event_type}</span>}
+          </span>
           <span className="ml-auto flex items-center gap-2 pl-4">
             <span
               className={cn('led h-2 w-2', humanLive ? 'animate-blink bg-human' : 'bg-emerald-400')}
@@ -234,6 +241,8 @@ export function AppShell({ children }: { children: ReactNode }) {
           </span>
         </footer>
       </div>
+
+      <SettingsDialog open={settingsOpen} onClose={() => setSettingsOpen(false)} />
     </div>
   );
 }

@@ -47,8 +47,8 @@ body {
 .callsign {
   font-family: var(--font-mono);
   text-transform: uppercase;
-  letter-spacing: 0.16em;
-  font-weight: 600;
+  letter-spacing: 0.1em;
+  font-weight: 500;
 }
 
 /* Status LED with soft halo */
