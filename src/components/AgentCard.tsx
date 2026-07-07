@@ -16,14 +16,20 @@ type Props = {
   recommended?: boolean;
 };
 
+/** 生命周期状态 → 状态灯颜色（与 StatusPill 同一语义）。 */
 const statusLed: Record<Agent['status'], string> = {
+  created: 'bg-slate-500',
+  active: 'bg-emerald-400',
   idle: 'bg-slate-500',
-  working: 'bg-command',
-  waiting: 'bg-human',
-  reviewing: 'bg-violet-400',
-  done: 'bg-emerald-400',
+  draining: 'bg-amber-400',
+  retired: 'bg-violet-400',
 };
 
+/**
+ * Agent 卡片 —— 对齐方向 B `AgentBoardListItem`（轻量摘要）：
+ * 身份 + 生命周期 + 一句 persona 摘要 + tags + 技能/经验计数。
+ * 指标簇/协作/token 属详情，卡片不铺陈。
+ */
 export function AgentCard({
   agent,
   selected,
@@ -49,60 +55,58 @@ export function AgentCard({
         assigned && 'bg-command/[0.04]',
       )}
     >
-      {/* dossier header strip — callsign + live status */}
-      <div className="flex items-center justify-between border-b border-line bg-ink-900/50 px-4 py-1.5">
-        <span className="flex items-center gap-1.5">
-          <span className="callsign text-[9px] text-slate-500">{agent.runtime.agent_id}</span>
-          {recommended && (
-            <Badge variant="violet">
-              <Star className="h-2.5 w-2.5" /> 推荐
-            </Badge>
-          )}
-        </span>
-        <span className="flex items-center gap-1.5">
-          <span className={cn('led h-1.5 w-1.5', statusLed[agent.status])} />
-          <AgentStatusPill status={agent.status} />
-        </span>
-      </div>
-
       <div className="p-4">
-        <div className="flex items-center gap-3">
-          <div className="flex h-10 w-10 items-center justify-center rounded-md border border-line-bright bg-gradient-to-br from-command/25 to-violet-500/15 font-mono text-sm font-bold text-command-soft">
+        {/* 身份行：头像 + 名称/role_id + 状态 */}
+        <div className="flex items-start gap-3">
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-line-bright bg-gradient-to-br from-command/25 to-violet-500/15 font-mono text-sm font-bold text-command-soft">
             {initials}
           </div>
-          <div className="min-w-0">
-            <div className="truncate font-display text-sm font-semibold text-slate-100">
-              {agent.name}
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-1.5">
+              <span className="truncate font-display text-sm font-semibold text-slate-100">
+                {agent.name}
+              </span>
+              {recommended && (
+                <Badge variant="violet">
+                  <Star className="h-2.5 w-2.5" /> 推荐
+                </Badge>
+              )}
             </div>
-            <div className="callsign text-[10px] text-slate-500">{agent.role}</div>
-            <div className="mt-0.5 truncate font-mono text-[9px] text-slate-600">
-              {agent.runtime.role_id} · {agent.runtime.driver_name}
+            <div className="mt-0.5 truncate font-mono text-[10px] text-slate-500">
+              {agent.role_id}
             </div>
           </div>
+          <span className="flex shrink-0 items-center gap-1.5">
+            <span className={cn('led h-1.5 w-1.5', statusLed[agent.status])} />
+            <AgentStatusPill status={agent.status} />
+          </span>
         </div>
 
-        {/* instrument cluster */}
-        <div className="mt-4 grid grid-cols-3 divide-x divide-line rounded-md border border-line bg-ink-900/40">
-          <Stat label="成功率" value={`${agent.successRate}%`} tone="text-emerald-300" />
-          <Stat label="历史任务" value={`${agent.historicalTasks}`} tone="text-slate-100" />
-          <Stat
-            label="失败数"
-            value={`${agent.failureCount}`}
-            tone={agent.failureCount > 0 ? 'text-rose-300' : 'text-slate-100'}
-          />
-        </div>
+        {/* persona 一句摘要 */}
+        <p className="mt-3 line-clamp-2 text-xs leading-relaxed text-slate-400">
+          {agent.persona.summary}
+        </p>
 
-        <div className="mt-3 flex flex-wrap gap-1.5">
-          {agent.skills.slice(0, 4).map((s) => (
-            <Badge key={s} variant="slate">
-              {s}
-            </Badge>
-          ))}
-        </div>
-
-        <div className="mt-3 flex items-center justify-between font-mono text-[10px] text-slate-500">
-          <span>协作 · {agent.collaboration}</span>
-          <span className="tabular">{agent.tokenCost}</span>
+        {/* tags + 技能/经验计数 */}
+        <div className="mt-3 flex items-center justify-between gap-2">
+          <div className="flex min-w-0 flex-wrap gap-1.5">
+            {agent.tags.slice(0, 4).map((t) => (
+              <span
+                key={t}
+                className="rounded border border-teal-500/25 bg-teal-500/5 px-1.5 py-0.5 font-mono text-[10px] text-teal-200/90"
+              >
+                {t}
+              </span>
+            ))}
+          </div>
+          <div className="flex shrink-0 items-center gap-2 font-mono text-[10px] text-slate-500">
+            <span className="tabular" title="技能数">
+              技 {agent.metrics.skill_count}
+            </span>
+            <span className="tabular" title="经验数">
+              验 {agent.metrics.experience_count}
+            </span>
+          </div>
         </div>
 
         {showAssign && (
@@ -128,14 +132,5 @@ export function AgentCard({
         )}
       </div>
     </Card>
-  );
-}
-
-function Stat({ label, value, tone }: { label: string; value: string; tone: string }) {
-  return (
-    <div className="px-2 py-2.5 text-center">
-      <div className={cn('font-mono text-base font-semibold tabular', tone)}>{value}</div>
-      <div className="callsign mt-0.5 text-[8px] text-slate-500">{label}</div>
-    </div>
   );
 }

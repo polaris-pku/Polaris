@@ -32,11 +32,11 @@ function defaultOpenKeys(projectId: string | null): string[] {
 }
 
 const agentDotColor: Record<AgentStatus, string> = {
+  created: 'text-slate-500',
+  active: 'text-emerald-400',
   idle: 'text-slate-500',
-  working: 'text-command-soft',
-  waiting: 'text-human',
-  reviewing: 'text-violet-300',
-  done: 'text-emerald-400',
+  draining: 'text-amber-300',
+  retired: 'text-violet-300',
 };
 
 const stageDotColor: Record<DemoStage, string> = {

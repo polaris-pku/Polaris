@@ -136,7 +136,7 @@ export function AgentBoard() {
                     >
                       <CheckCircle2 className="h-3.5 w-3.5" />
                       {a.name}
-                      <span className="text-xs text-blue-400/70">{a.role}</span>
+                      <span className="font-mono text-[11px] text-blue-400/70">{a.role_id}</span>
                     </div>
                   );
                 })}
