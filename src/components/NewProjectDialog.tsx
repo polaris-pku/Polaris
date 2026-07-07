@@ -110,7 +110,7 @@ export function NewProjectDialog({ open, onClose }: { open: boolean; onClose: ()
                 </div>
               ) : (
                 <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-slate-600">
-                  默认：文档/hci-ide-workspace/&lt;项目名&gt;/
+                  默认：文档/polaris-workspace/&lt;项目名&gt;/
                 </span>
               )}
             </div>

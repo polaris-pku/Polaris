@@ -49,7 +49,7 @@ export function ProjectLauncher() {
             <Boxes className="h-8 w-8 text-white" />
           </div>
           <h1 className="mt-4 font-display text-2xl font-semibold tracking-tight text-white">
-            HCI · IDE
+            Polaris
           </h1>
           <div className="callsign mt-1 text-[10px] text-slate-500">AGENT TEAM CONSOLE</div>
           <p className="mt-2 max-w-sm text-sm text-slate-500">

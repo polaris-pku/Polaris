@@ -2,7 +2,7 @@ import type { ProjectTrace } from '@/store/useDemoStore';
 
 /**
  * Agent 执行 trace 的存盘工具。
- * 桌面版：经 fs 桥写进项目根目录的 `.hci/`（点号目录，扫描文件树时自动隐藏）；
+ * 桌面版：经 fs 桥写进项目根目录的 `.polaris/`（点号目录，扫描文件树时自动隐藏）；
  * 浏览器：回退为下载 .json。trace 是只读审计快照，不支持导回应用。
  */
 
@@ -34,7 +34,7 @@ export type TraceSaveResult =
   | { ok: false; error: string };
 
 /**
- * 把执行 trace 落盘：桌面版写入项目根目录 `.hci/<文件名>`（默认工作区或已授权自定义目录），
+ * 把执行 trace 落盘：桌面版写入项目根目录 `.polaris/<文件名>`（默认工作区或已授权自定义目录），
  * 浏览器环境回退为下载。
  */
 export async function saveProjectTrace(trace: ProjectTrace): Promise<TraceSaveResult> {
@@ -47,7 +47,7 @@ export async function saveProjectTrace(trace: ProjectTrace): Promise<TraceSaveRe
   const res = await bridge.writeTextFile({
     projectName: trace.project.name,
     rootPath: trace.project.rootPath,
-    path: `.hci/${filename}`,
+    path: `.polaris/${filename}`,
     content: JSON.stringify(trace, null, 2),
   });
   return res.ok

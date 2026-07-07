@@ -165,7 +165,7 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
     setAddingFileFor(null);
   };
 
-  // 保存 agent 执行 trace：桌面版写入项目根目录 .hci/，浏览器回退为下载
+  // 保存 agent 执行 trace：桌面版写入项目根目录 .polaris/，浏览器回退为下载
   const exportTrace = async (project: Project) => {
     const trace = buildProjectTrace(project.id);
     if (!trace) return;

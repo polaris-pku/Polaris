@@ -29,7 +29,7 @@ export type TaskTrace = Pick<
 
 /** 项目级执行 trace 存盘载荷：任务时间线 + 人机确认 + 落盘回执 + 事件观测窗口。 */
 export type ProjectTrace = {
-  format: 'hci-agent-trace';
+  format: 'polaris-agent-trace';
   version: number;
   savedAt: string;
   project: Pick<Project, 'id' | 'name' | 'rootPath'>;
@@ -40,7 +40,7 @@ export type ProjectTrace = {
   backendEvents: ContractEvent[];
 };
 
-export const PROJECT_TRACE_FORMAT = 'hci-agent-trace' as const;
+export const PROJECT_TRACE_FORMAT = 'polaris-agent-trace' as const;
 
 /** 一次流程推进落盘的执行态切片（快照/时间线用同一形状）。 */
 export type PartialExecState = {
@@ -75,7 +75,7 @@ export type TaskFields = Pick<
 
 /** 项目域：项目生命周期与项目文件树。 */
 export type ProjectSlice = {
-  /** rootPath：用户自选的保存目录（经原生选择器授权）；缺省用 文档/hci-ide-workspace/<项目名> */
+  /** rootPath：用户自选的保存目录（经原生选择器授权）；缺省用 文档/polaris-workspace/<项目名> */
   createProject: (name: string, description?: string, rootPath?: string) => void;
   /**
    * 从本机文件夹打开项目（仅桌面版）：弹原生目录选择器 → 扫描文件树 → 建项目并进入。

@@ -33,7 +33,7 @@ export type Project = {
   tags: string[];
   /**
    * 项目在本机磁盘上的根目录（用户自选，agent 生成的文件写到这里）。
-   * 缺省写入默认工作区 文档/hci-ide-workspace/<项目名>/。仅桌面版有意义。
+   * 缺省写入默认工作区 文档/polaris-workspace/<项目名>/。仅桌面版有意义。
    */
   rootPath?: string;
   /** 项目文件树（mock；从文件夹打开时为磁盘扫描结果） */

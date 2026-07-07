@@ -6,7 +6,7 @@ import { APP_VERSION } from '@/lib/version';
 export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const rows: { label: string; value: string }[] = [
     { label: '版本 · Version', value: `v${APP_VERSION}` },
-    { label: '应用 · App', value: 'HCI · IDE' },
+    { label: '应用 · App', value: 'Polaris' },
     {
       label: '运行环境 · Runtime',
       value: navigator.userAgent.includes('Electron') ? 'Electron 桌面端' : '浏览器',
@@ -31,7 +31,7 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
             <Boxes className="h-5 w-5 text-white" />
           </div>
           <div>
-            <div className="font-display text-sm font-semibold text-white">HCI · IDE</div>
+            <div className="font-display text-sm font-semibold text-white">Polaris</div>
             <div className="callsign text-[9px] text-slate-500">AGENT TEAM CONSOLE</div>
           </div>
           <span className="ml-auto rounded-md border border-command/30 bg-command/10 px-2.5 py-1 font-mono text-xs text-command-soft">

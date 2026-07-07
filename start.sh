@@ -9,5 +9,5 @@ if [ ! -d node_modules ]; then
   npm install
 fi
 
-echo "启动 HCI IDE MVP -> http://localhost:5173/"
+echo "启动 Polaris -> http://localhost:5173/"
 npm run dev

@@ -152,7 +152,7 @@ describe('agent 生成文件落盘', () => {
     });
 
     const trace = s().buildProjectTrace(s().activeProjectId!);
-    expect(trace?.format).toBe('hci-agent-trace');
+    expect(trace?.format).toBe('polaris-agent-trace');
     expect(trace?.project.name).toBe('电商订单系统');
     expect(trace?.tasks).toHaveLength(1);
     expect(trace?.tasks[0].timeline.length).toBeGreaterThan(0);

@@ -3,7 +3,7 @@
 // mkdir -p + 覆盖写，没有独立 create。
 //
 // 写入根目录的两种来源：
-//   1) 默认工作区 用户文档/hci-ide-workspace/<项目名>/（无需授权）；
+//   1) 默认工作区 用户文档/polaris-workspace/<项目名>/（无需授权）；
 //   2) 用户自定义项目目录 —— 必须经由本进程的原生目录选择器（fs:chooseDirectory）
 //      选择过才进入 authorizedRoots，渲染层无法凭空指定任意磁盘路径。
 // 所有相对路径先做越界防护（拒绝绝对路径与 .. 逃逸）。
@@ -11,7 +11,7 @@ const { app, dialog, ipcMain, shell } = require("electron");
 const fs = require("fs/promises");
 const path = require("path");
 
-const WORKSPACE_DIRNAME = "hci-ide-workspace";
+const WORKSPACE_DIRNAME = "polaris-workspace";
 
 /** 用户通过原生目录选择器授权过的根目录（会话级；项目数据本身也不跨重启持久化）。 */
 const authorizedRoots = new Set();

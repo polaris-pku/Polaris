@@ -14,7 +14,7 @@ declare global {
   /** fs:writeTextFile 的入参（对齐 ACP fs/write_text_file 的 {path,content}，外加写入根定位） */
   type DesktopWriteTextFilePayload = {
     projectName: string;
-    /** 用户自定义项目根目录（须经 chooseDirectory 授权）；缺省写入 文档/hci-ide-workspace/<项目名>/ */
+    /** 用户自定义项目根目录（须经 chooseDirectory 授权）；缺省写入 文档/polaris-workspace/<项目名>/ */
     rootPath?: string;
     path: string;
     content: string;

@@ -1,4 +1,4 @@
-# HCI IDE MVP · AI 工程团队驾驶舱
+# Polaris · AI 工程团队驾驶舱
 
 一个**可演示的 Web 交互原型**：把「与单个 AI 聊天」升级为「像管理一支 AI 工程团队一样完成开发任务」。
 
@@ -10,12 +10,12 @@
 
 ## 下载与安装（桌面版）
 
-HCI IDE 提供 Windows / macOS 桌面安装包，**无需任何开发环境**：
+Polaris 提供 Windows / macOS 桌面安装包，**无需任何开发环境**：
 
 1. 打开 [Releases](https://github.com/ExtraZhangYC/hci-ide-mvp/releases) 页面
 2. 下载对应平台的安装包：
-   - **Windows** → `HCI-IDE-<版本>-win-x64.exe`
-   - **macOS**（Apple Silicon）→ `HCI-IDE-<版本>-mac-arm64.dmg`
+   - **Windows** → `Polaris-<版本>-win-x64.exe`
+   - **macOS**（Apple Silicon）→ `Polaris-<版本>-mac-arm64.dmg`
 3. 双击安装并启动
 
 > macOS 当前为**未签名**构建。首次打开若提示「无法验证开发者」，在 `系统设置 → 隐私与安全性` 点「仍要打开」，或右键应用图标选「打开」即可。
@@ -67,9 +67,9 @@ N0 需求到达 → N1 分诊 → N2 创建 Task → N3 创建 Run → N4 认领
 Web 版全程 mock；桌面版（Electron）在同一份 UI 之上接通了真实文件 I/O，语义对齐 A 方向的 ACP 文件方法（`fs/write_text_file` = mkdir -p + 覆盖写，无独立 create）：
 
 - **Agent 生成文件真实落盘**：任务推进到 N7 执行段时，`gate:allow` 的写操作自动写入磁盘；带权限请求的写操作挂起，等你在文件操作面板里点「允许」后才落盘（拒绝则不写）。每条写操作下方有落盘回执（写入中 / 已写入 + 绝对路径 / 失败原因），点路径可在系统文件管理器中定位；写成功的文件同步挂进左侧项目文件树。
-- **自定义保存位置**：新建项目时可选保存文件夹；缺省写入 `文档/hci-ide-workspace/<项目名>/`。
+- **自定义保存位置**：新建项目时可选保存文件夹；缺省写入 `文档/polaris-workspace/<项目名>/`。
 - **从文件夹打开项目**：启动页「打开项目」内选择本机目录，自动扫描为项目文件树（跳过 `node_modules`/`.git`/`dist` 等，深度 8 / 2000 条护栏）；同一目录再次打开会切回已有项目。
-- **保存执行 Trace**：侧栏项目行的 Trace 按钮把 agent 执行审计快照（任务时间线 / 人机确认 / 落盘回执 / 事件观测窗口）存为 JSON —— 桌面版写入项目根目录 `.hci/`，浏览器回退为下载。Trace 是只读复盘材料，不支持导回应用。
+- **保存执行 Trace**：侧栏项目行的 Trace 按钮把 agent 执行审计快照（任务时间线 / 人机确认 / 落盘回执 / 事件观测窗口）存为 JSON —— 桌面版写入项目根目录 `.polaris/`，浏览器回退为下载。Trace 是只读复盘材料，不支持导回应用。
 - **文件查看页**：点文件树中的文件即可只读浏览。内容来源按可信度降级：磁盘真实内容（`DISK` 徽标）→ agent 生成内容（`AGENT` 徽标，未落盘时的回退）→ 演示占位；落盘完成后自动从 AGENT 切到 DISK。
 
 安全模型：渲染进程**无法凭空指定任意磁盘路径**。自定义目录必须经过主进程的原生目录选择器（选择即授权，进入会话级 `authorizedRoots`）；默认工作区之外未经授权的路径，写入 / 读取 / 扫描 / 定位一律被主进程拒绝，授权目录内部也拒绝 `..` 逃逸。预览另有 512KB 大小与二进制两道护栏。实现见 `electron/fsBridge.cjs`（IPC）与 `src/lib/agentFs.ts`（渲染层适配）。
@@ -165,7 +165,7 @@ git push --follow-tags     # 推送提交 + 标签，触发 Release 工作流
 7. 在左侧文件树点击刚生成的文件（如 `src/auth/permissionService.ts`）→ **File Viewer** 查看真实磁盘内容（`DISK` 徽标）
 8. 推进到 **N13 Gate**（decision=defer）→ **Go to Council** → 在 Council Board 选择 `verdict=select` → 采纳 `option-a · Use RBAC`
 9. 返回 Task Board，推进到 **N18 Run Complete** → **View Delivery Report**
-10. 侧栏项目行点 **Trace 按钮** → 执行审计快照写入项目 `.hci/` 目录（浏览器为下载）
+10. 侧栏项目行点 **Trace 按钮** → 执行审计快照写入项目 `.polaris/` 目录（浏览器为下载）
 11. **Reset Demo** 可随时一键重置
 
 ## 目录结构

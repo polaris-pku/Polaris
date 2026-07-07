@@ -119,7 +119,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           {!navCollapsed && (
             <div className="leading-tight">
               <div className="font-display text-sm font-semibold tracking-tight text-white">
-                HCI · IDE
+                Polaris
               </div>
               <div className="callsign text-[9px] text-slate-500">AGENT TEAM CONSOLE</div>
             </div>
