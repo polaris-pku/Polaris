@@ -51,7 +51,6 @@ export function NewRequirementDialog({ open, onClose }: { open: boolean; onClose
             <FilePlus2 className="h-5 w-5" />
           </div>
           <div>
-            <div className="callsign text-[9px] text-command-soft/80">REQUIREMENT INTAKE</div>
             <h2 className="font-display text-base font-semibold text-white">
               新建需求 · N0 Intake
             </h2>

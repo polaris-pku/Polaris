@@ -42,7 +42,6 @@ export function DeliveryReport() {
             <FileCheck2 className="h-5 w-5" />
           </div>
           <div>
-            <div className="callsign text-[9px] text-slate-600">MISSION REPORT</div>
             <h2 className="font-display text-base font-semibold text-white">Delivery Report</h2>
             <p className="text-xs text-slate-500">AI 工程团队任务交付汇报</p>
           </div>

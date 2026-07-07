@@ -107,7 +107,7 @@ export function FileViewer() {
             <Sparkles className="h-3 w-3" /> AGENT · 生成内容（未读到磁盘）
           </span>
         )}
-        <span className="callsign shrink-0 text-[9px] text-slate-600">READ-ONLY</span>
+        <span className="callsign shrink-0 text-[9px] text-slate-600">只读</span>
         <button
           type="button"
           title="关闭"

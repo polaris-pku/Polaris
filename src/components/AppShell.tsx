@@ -121,7 +121,6 @@ export function AppShell({ children }: { children: ReactNode }) {
               <div className="font-display text-sm font-semibold tracking-tight text-white">
                 Polaris
               </div>
-              <div className="callsign text-[9px] text-slate-500">AGENT TEAM CONSOLE</div>
             </div>
           )}
         </div>
@@ -135,7 +134,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         <div className="border-t border-line p-3">
           {!navCollapsed && (
             <div className="mb-2 flex items-center justify-between px-2">
-              <span className="callsign text-[9px] text-slate-600">CREW</span>
+              <span className="callsign text-[9px] text-slate-600">团队</span>
               <span className="font-mono text-[11px] text-slate-400 tabular">
                 {String(assignedAgentIds.length).padStart(2, '0')} / 04
               </span>

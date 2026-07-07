@@ -79,7 +79,6 @@ export function CouncilBoard() {
     <div className="flex h-full flex-col overflow-hidden">
       {/* Header */}
       <header className="border-b border-line px-6 py-4">
-        <div className="callsign mb-1 text-[10px] text-violet-300">// 03 · 裁决 · N14</div>
         <div className="flex flex-wrap items-center gap-2">
           <Scale className="h-5 w-5 text-violet-400" />
           <h1 className="font-display text-lg font-semibold tracking-tight text-white">

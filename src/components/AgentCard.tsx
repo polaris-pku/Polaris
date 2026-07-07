@@ -52,7 +52,7 @@ export function AgentCard({
       {/* dossier header strip — callsign + live status */}
       <div className="flex items-center justify-between border-b border-line bg-ink-900/50 px-4 py-1.5">
         <span className="flex items-center gap-1.5">
-          <span className="callsign text-[9px] text-slate-500">DOSSIER · {initials}</span>
+          <span className="callsign text-[9px] text-slate-500">{agent.runtime.agent_id}</span>
           {recommended && (
             <Badge variant="violet">
               <Star className="h-2.5 w-2.5" /> 推荐

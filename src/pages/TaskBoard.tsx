@@ -92,7 +92,6 @@ function TaskBoardInner() {
         {/* Command Bar */}
         <div className="border-b border-line px-5 py-4">
           <div className="mb-2 flex items-center gap-3">
-            <div className="callsign text-[10px] text-command-soft">// 02 · 执行</div>
             <h1 className="font-display text-lg font-semibold tracking-tight text-white">
               {activeTask?.title ?? 'Task Board'}
             </h1>
@@ -119,9 +118,7 @@ function TaskBoardInner() {
           </div>
           <div className="flex items-end gap-3">
             <div className="flex-1">
-              <label className="callsign mb-1 block text-[9px] text-slate-500">
-                任务描述 · DIRECTIVE
-              </label>
+              <label className="callsign mb-1 block text-[9px] text-slate-500">任务描述</label>
               <Textarea
                 value={taskText}
                 onChange={(e) => setTaskText(e.target.value)}
@@ -155,8 +152,6 @@ function TaskBoardInner() {
 
         {/* Demo Controls */}
         <div className="flex flex-wrap items-center gap-2 border-t border-line bg-ink-900/60 px-5 py-3">
-          <span className="callsign mr-1 text-[9px] text-slate-500">▸ DEMO CONTROLS</span>
-
           {showExecuteControls && (
             <>
               <Button variant="secondary" size="sm" onClick={nextStep}>

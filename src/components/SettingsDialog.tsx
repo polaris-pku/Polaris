@@ -21,7 +21,6 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
             <Settings className="h-5 w-5" />
           </div>
           <div>
-            <div className="callsign text-[9px] text-command-soft/80">SETTINGS</div>
             <h2 className="font-display text-base font-semibold text-white">设置</h2>
           </div>
         </div>
@@ -32,7 +31,6 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
           </div>
           <div>
             <div className="font-display text-sm font-semibold text-white">Polaris</div>
-            <div className="callsign text-[9px] text-slate-500">AGENT TEAM CONSOLE</div>
           </div>
           <span className="ml-auto rounded-md border border-command/30 bg-command/10 px-2.5 py-1 font-mono text-xs text-command-soft">
             v{APP_VERSION}

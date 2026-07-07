@@ -54,13 +54,12 @@ export function NewProjectDialog({ open, onClose }: { open: boolean; onClose: ()
             <FolderPlus className="h-5 w-5" />
           </div>
           <div>
-            <div className="callsign text-[9px] text-command-soft/80">NEW PROJECT</div>
             <h2 className="font-display text-base font-semibold text-white">新建项目</h2>
           </div>
         </div>
 
         <div className="mt-5">
-          <label className="callsign mb-1.5 block text-[9px] text-slate-400">项目名称 · NAME</label>
+          <label className="callsign mb-1.5 block text-[9px] text-slate-400">项目名称</label>
           <input
             value={name}
             onChange={(e) => setName(e.target.value)}
@@ -83,9 +82,7 @@ export function NewProjectDialog({ open, onClose }: { open: boolean; onClose: ()
 
         {isDesktop && (
           <div className="mt-4">
-            <label className="callsign mb-1.5 block text-[9px] text-slate-400">
-              保存位置 · LOCATION
-            </label>
+            <label className="callsign mb-1.5 block text-[9px] text-slate-400">保存位置</label>
             <div className="flex items-center gap-2">
               <button
                 type="button"

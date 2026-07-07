@@ -51,7 +51,6 @@ export function ProjectLauncher() {
           <h1 className="mt-4 font-display text-2xl font-semibold tracking-tight text-white">
             Polaris
           </h1>
-          <div className="callsign mt-1 text-[10px] text-slate-500">AGENT TEAM CONSOLE</div>
           <p className="mt-2 max-w-sm text-sm text-slate-500">
             多 Agent 协作开发工作台。先新建或打开一个项目开始。
           </p>
@@ -62,7 +61,6 @@ export function ProjectLauncher() {
           <LauncherCard
             icon={FolderPlus}
             title="新建项目"
-            subtitle="New Project"
             desc="创建一个新的协作项目"
             accent="command"
             onClick={() => setNewOpen(true)}
@@ -70,7 +68,6 @@ export function ProjectLauncher() {
           <LauncherCard
             icon={FolderOpen}
             title="打开项目"
-            subtitle="Open Project"
             desc="从已有项目或本机文件夹进入"
             accent="slate"
             onClick={() => setOpenPickerOpen(true)}
@@ -90,7 +87,6 @@ export function ProjectLauncher() {
               样例 · Run 回放
               <ArrowRight className="h-4 w-4 -translate-x-1 opacity-0 transition-all group-hover:translate-x-0 group-hover:opacity-100" />
             </div>
-            <div className="callsign text-[9px] text-emerald-300/60">SAMPLE RUN REPLAY</div>
             <p className="mt-1 truncate text-xs text-slate-500">
               回放一次后端真实 run：「贪吃蛇游戏」 · driver=claude · 45.5s · Gate 直通 ·
               run_be712da2…
@@ -101,7 +97,7 @@ export function ProjectLauncher() {
         {/* 最近打开 */}
         {recent.length > 0 && (
           <div className="mt-10">
-            <div className="callsign mb-2 px-1 text-[9px] text-slate-600">// 最近打开</div>
+            <div className="callsign mb-2 px-1 text-[9px] text-slate-600">最近打开</div>
             <div className="space-y-1.5">
               {recent.map((p) => (
                 <RecentRow key={p.id} project={p} onOpen={() => openProject(p.id)} />
@@ -120,14 +116,12 @@ export function ProjectLauncher() {
 function LauncherCard({
   icon: Icon,
   title,
-  subtitle,
   desc,
   accent,
   onClick,
 }: {
   icon: typeof FolderPlus;
   title: string;
-  subtitle: string;
   desc: string;
   accent: 'command' | 'slate';
   onClick: () => void;
@@ -155,7 +149,6 @@ function LauncherCard({
           {title}
           <ArrowRight className="h-4 w-4 -translate-x-1 opacity-0 transition-all group-hover:translate-x-0 group-hover:opacity-100" />
         </div>
-        <div className="callsign text-[9px] text-slate-500">{subtitle}</div>
         <p className="mt-1.5 text-xs text-slate-500">{desc}</p>
       </div>
     </button>
@@ -227,7 +220,6 @@ function OpenProjectDialog({ open, onClose }: { open: boolean; onClose: () => vo
             <FolderOpen className="h-5 w-5" />
           </div>
           <div>
-            <div className="callsign text-[9px] text-slate-500">OPEN PROJECT</div>
             <h2 className="font-display text-base font-semibold text-white">打开项目</h2>
           </div>
         </div>
@@ -250,7 +242,7 @@ function OpenProjectDialog({ open, onClose }: { open: boolean; onClose: () => vo
         </button>
         {folderError && <p className="mt-2 text-xs text-rose-300">{folderError}</p>}
 
-        <div className="callsign mb-1.5 mt-4 px-1 text-[9px] text-slate-600">// 已有项目</div>
+        <div className="callsign mb-1.5 mt-4 px-1 text-[9px] text-slate-600">已有项目</div>
         <div className="max-h-64 space-y-1.5 overflow-y-auto">
           {projects.length === 0 ? (
             <p className="py-6 text-center text-sm text-slate-600">

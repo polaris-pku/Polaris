@@ -78,7 +78,6 @@ export function UpdateDialog() {
               )}
             </div>
             <div>
-              <div className="callsign text-[9px] text-command-soft/80">SOFTWARE UPDATE</div>
               <h2 className="font-display text-base font-semibold text-white">
                 {phase === 'downloaded' ? '更新已就绪' : '发现新版本'}
               </h2>

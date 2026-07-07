@@ -113,7 +113,7 @@ function WorkflowCanvasInner() {
     [selectNode, selectedNodeId],
   );
 
-  // 双击 N14 Council 节点 → 前往 Council Board（与 DEMO CONTROLS 的 Go to Council 同一动作）
+  // 双击 N14 Council 节点 → 前往 Council Board（与控制栏的 Go to Council 同一动作）
   const onNodeDoubleClick = useCallback<NodeMouseHandler>(
     (_, node) => {
       if (node.id === NODE_IDS.council) goToCouncil();

@@ -37,7 +37,6 @@ export function AgentBoard() {
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <header className="flex items-end justify-between border-b border-line px-6 py-5">
           <div>
-            <div className="callsign mb-1 text-[10px] text-command-soft">// 01 · 组队</div>
             <h1 className="font-display text-xl font-semibold tracking-tight text-white">
               Agent Board
             </h1>
@@ -189,7 +188,7 @@ function TeamSummary({ count, ready }: { count: number; ready: boolean }) {
       )}
     >
       <div className="text-right">
-        <div className="callsign text-[9px] text-slate-500">CREW</div>
+        <div className="callsign text-[9px] text-slate-500">团队</div>
         <div
           className={cn(
             'font-mono text-lg font-bold leading-none tabular',

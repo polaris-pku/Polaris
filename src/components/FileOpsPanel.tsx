@@ -95,7 +95,7 @@ function PermissionPrompt({ op }: { op: FileOpObservation }) {
     );
     return (
       <div className="mt-1.5 rounded border border-human/20 bg-human/5 px-2.5 py-1.5 text-[10px]">
-        <span className="callsign text-[8px] text-human/80">HUMAN CONFIRMED</span>
+        <span className="callsign text-[8px] text-human/80">已人工确认</span>
         <span className="ml-2 text-slate-300">
           {op.permission_outcome.outcome === 'cancelled'
             ? '已取消'
@@ -108,7 +108,7 @@ function PermissionPrompt({ op }: { op: FileOpObservation }) {
   // 待确认：暖琥珀色人机确认块（写入被挂起，等待人的选择）
   return (
     <div className="mt-1.5 rounded border border-human/40 bg-human/10 px-2.5 py-2">
-      <div className="callsign text-[8px] text-human">PERMISSION REQUEST · 写入前确认</div>
+      <div className="callsign text-[8px] text-human">写入前确认</div>
       <div className="mt-1 text-[11px] font-medium text-amber-100">{op.permission.title}</div>
       {op.permission.message && (
         <p className="mt-0.5 text-[10px] leading-relaxed text-amber-100/70">
