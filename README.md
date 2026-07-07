@@ -12,7 +12,7 @@
 
 Polaris 提供 Windows / macOS 桌面安装包，**无需任何开发环境**：
 
-1. 打开 [Releases](https://github.com/ExtraZhangYC/hci-ide-mvp/releases) 页面
+1. 打开 [Releases](https://github.com/ExtraZhangYC/Polaris/releases) 页面
 2. 下载对应平台的安装包：
    - **Windows** → `Polaris-<版本>-win-x64.exe`
    - **macOS**（Apple Silicon）→ `Polaris-<版本>-mac-arm64.dmg`

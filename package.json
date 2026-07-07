@@ -6,7 +6,7 @@
   "author": "fangz and zhangyc",
   "repository": {
     "type": "git",
-    "url": "https://github.com/ExtraZhangYC/hci-ide-mvp.git"
+    "url": "https://github.com/ExtraZhangYC/Polaris.git"
   },
   "type": "module",
   "main": "electron/main.cjs",
@@ -47,7 +47,7 @@
       {
         "provider": "github",
         "owner": "ExtraZhangYC",
-        "repo": "hci-ide-mvp"
+        "repo": "Polaris"
       }
     ],
     "win": {
