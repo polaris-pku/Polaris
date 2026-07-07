@@ -15,6 +15,77 @@ import { ACP_FS_METHOD_SCOPE, SCHEMA_VERSION } from '@/api/types';
 
 const at = (mmss: string) => `2026-07-02T10:${mmss}:00.000Z`;
 
+// ── Agent 生成的文件内容（fs/write_text_file 的 content 入参，写入本机工作区的即为这些字节） ──
+
+const permissionServiceContent = `import { getUserRole, type UserRole } from './userRole';
+import { PERMISSION_MATRIX, type ResourceAction } from './permissionMatrix';
+
+/**
+ * 角色 → 权限解析服务（RBAC）。
+ * 由权限矩阵驱动：判定某用户对某资源动作是否有权，供鉴权中间件调用。
+ */
+export function hasPermission(userId: string, action: ResourceAction): boolean {
+  const role = getUserRole(userId);
+  return PERMISSION_MATRIX[role]?.includes(action) ?? false;
+}
+
+/** 无权时抛出 403，由全局错误处理器转成 HTTP 响应。 */
+export function assertPermission(userId: string, action: ResourceAction): void {
+  if (!hasPermission(userId, action)) {
+    const err = new Error(\`Forbidden: \${action}\`) as Error & { status?: number };
+    err.status = 403;
+    throw err;
+  }
+}
+`;
+
+const permissionMatrixContent = `import type { UserRole } from './userRole';
+
+/** 订单资源上的可授权动作。 */
+export type ResourceAction =
+  | 'order:read'
+  | 'order:create'
+  | 'order:update'
+  | 'order:cancel'
+  | 'order:refund';
+
+/**
+ * 角色-资源权限矩阵（RBAC 唯一真相）。
+ * 调整授权只改这张表，不改解析逻辑（permissionService.ts）。
+ */
+export const PERMISSION_MATRIX: Record<UserRole, ResourceAction[]> = {
+  admin: ['order:read', 'order:create', 'order:update', 'order:cancel', 'order:refund'],
+  operator: ['order:read', 'order:create', 'order:update', 'order:cancel'],
+  support: ['order:read', 'order:refund'],
+  viewer: ['order:read'],
+};
+`;
+
+const permissionServiceTestContent = `import { describe, expect, it, vi } from 'vitest';
+import { assertPermission, hasPermission } from '../../src/auth/permissionService';
+import * as userRole from '../../src/auth/userRole';
+
+describe('permissionService (RBAC)', () => {
+  it('admin 拥有订单退款权限', () => {
+    vi.spyOn(userRole, 'getUserRole').mockReturnValue('admin');
+    expect(hasPermission('u-admin', 'order:refund')).toBe(true);
+  });
+
+  it('viewer 仅可读，不可创建订单', () => {
+    vi.spyOn(userRole, 'getUserRole').mockReturnValue('viewer');
+    expect(hasPermission('u-viewer', 'order:read')).toBe(true);
+    expect(hasPermission('u-viewer', 'order:create')).toBe(false);
+  });
+
+  it('未授权动作抛出 403', () => {
+    vi.spyOn(userRole, 'getUserRole').mockReturnValue('support');
+    expect(() => assertPermission('u-support', 'order:update')).toThrowError(
+      expect.objectContaining({ status: 403 }),
+    );
+  });
+});
+`;
+
 const op = (
   partial: Omit<FileOpObservation, 'required_scope' | 'schema_version'>,
 ): FileOpObservation => ({
@@ -51,6 +122,7 @@ export const nodeFileOps: Record<string, FileOpObservation[]> = {
       method: 'fs/write_text_file',
       intent: 'write',
       path: 'src/auth/permissionService.ts',
+      content: permissionServiceContent,
       lease_id: 'lease-be-02',
       gate_decision: 'allow',
       status: 'completed',
@@ -70,6 +142,7 @@ export const nodeFileOps: Record<string, FileOpObservation[]> = {
       method: 'fs/write_text_file',
       intent: 'create',
       path: 'src/auth/permissionMatrix.ts',
+      content: permissionMatrixContent,
       lease_id: 'lease-be-02',
       gate_decision: 'ask',
       status: 'pending',
@@ -112,6 +185,7 @@ export const nodeFileOps: Record<string, FileOpObservation[]> = {
       method: 'fs/write_text_file',
       intent: 'create',
       path: 'tests/auth/permissionService.test.ts',
+      content: permissionServiceTestContent,
       lease_id: 'lease-te-02',
       gate_decision: 'allow',
       status: 'completed',
@@ -128,6 +202,31 @@ export const nodeFileOps: Record<string, FileOpObservation[]> = {
     }),
   ],
 };
+
+/**
+ * 按项目内路径反查 agent 生成的文件内容（同路径多次写取最后一次）。
+ * 文件查看页的回退数据源：磁盘上读不到（浏览器环境 / 尚未落盘）时展示生成内容本身。
+ */
+export function agentContentForPath(filePath: string): string | null {
+  let content: string | null = null;
+  for (const ops of Object.values(nodeFileOps)) {
+    for (const op of ops) {
+      if (op.method === 'fs/write_text_file' && op.path === filePath && op.content != null) {
+        content = op.content;
+      }
+    }
+  }
+  return content;
+}
+
+/** 按 tool_event_id 反查观测条目及其所属节点（权限确认后定位要落盘的那条写操作）。 */
+export function findFileOp(toolEventId: string): { nodeId: string; op: FileOpObservation } | null {
+  for (const [nodeId, ops] of Object.entries(nodeFileOps)) {
+    const op = ops.find((o) => o.tool_event_id === toolEventId);
+    if (op) return { nodeId, op };
+  }
+  return null;
+}
 
 /**
  * 合成渲染态：把人机确认结果（store 持久化）叠加回观测流。

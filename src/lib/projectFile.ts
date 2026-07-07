@@ -1,4 +1,10 @@
-import { PROJECT_EXPORT_FORMAT, type ProjectExport } from '@/store/useDemoStore';
+import type { ProjectTrace } from '@/store/useDemoStore';
+
+/**
+ * Agent 执行 trace 的存盘工具。
+ * 桌面版：经 fs 桥写进项目根目录的 `.hci/`（点号目录，扫描文件树时自动隐藏）；
+ * 浏览器：回退为下载 .json。trace 是只读审计快照，不支持导回应用。
+ */
 
 /** 触发浏览器/Electron 下载，把数据存成 .json 文件到磁盘。 */
 export function downloadJson(filename: string, data: unknown): void {
@@ -14,47 +20,37 @@ export function downloadJson(filename: string, data: unknown): void {
   URL.revokeObjectURL(url);
 }
 
-/** 弹出文件选择框，读取一个 .json 文件的文本内容（取消返回 null）。 */
-export function openJsonFile(): Promise<string | null> {
-  return new Promise((resolve) => {
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = '.json,application/json';
-    input.onchange = () => {
-      const file = input.files?.[0];
-      if (!file) {
-        resolve(null);
-        return;
-      }
-      const reader = new FileReader();
-      reader.onload = () => resolve(typeof reader.result === 'string' ? reader.result : null);
-      reader.onerror = () => resolve(null);
-      reader.readAsText(file);
-    };
-    input.click();
-  });
-}
-
-/** 校验并解析项目存盘文件；不是本应用导出的文件则返回 null。 */
-export function parseProjectExport(text: string): ProjectExport | null {
-  try {
-    const data = JSON.parse(text);
-    if (
-      data &&
-      data.format === PROJECT_EXPORT_FORMAT &&
-      data.project &&
-      Array.isArray(data.tasks)
-    ) {
-      return data as ProjectExport;
-    }
-  } catch {
-    // 非法 JSON，走 null
-  }
-  return null;
-}
-
-/** 项目名 → 安全文件名。 */
-export function projectFileName(projectName: string): string {
+/** trace 文件名：<项目名>-trace-<时间戳>.json（文件名安全化）。 */
+export function traceFileName(projectName: string, savedAt: string): string {
   const safe = projectName.trim().replace(/[\\/:*?"<>|]+/g, '_') || 'project';
-  return `${safe}.hci.json`;
+  const ts = savedAt.replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
+  return `${safe}-trace-${ts}.json`;
+}
+
+/** 保存 trace 的结果（供 UI 提示）。 */
+export type TraceSaveResult =
+  | { ok: true; where: 'disk'; absPath: string }
+  | { ok: true; where: 'download'; filename: string }
+  | { ok: false; error: string };
+
+/**
+ * 把执行 trace 落盘：桌面版写入项目根目录 `.hci/<文件名>`（默认工作区或已授权自定义目录），
+ * 浏览器环境回退为下载。
+ */
+export async function saveProjectTrace(trace: ProjectTrace): Promise<TraceSaveResult> {
+  const filename = traceFileName(trace.project.name, trace.savedAt);
+  const bridge = window.desktop?.fs;
+  if (!bridge) {
+    downloadJson(filename, trace);
+    return { ok: true, where: 'download', filename };
+  }
+  const res = await bridge.writeTextFile({
+    projectName: trace.project.name,
+    rootPath: trace.project.rootPath,
+    path: `.hci/${filename}`,
+    content: JSON.stringify(trace, null, 2),
+  });
+  return res.ok
+    ? { ok: true, where: 'disk', absPath: res.absPath }
+    : { ok: false, error: res.error };
 }

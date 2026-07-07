@@ -13,17 +13,16 @@ import {
   Plus,
   CircleDot,
   Trash2,
-  Save,
-  Upload,
+  ScrollText,
 } from 'lucide-react';
 import { useDemoStore } from '@/store/useDemoStore';
 import { getAgentById } from '@/data/agents';
 import { NewProjectDialog } from '@/components/NewProjectDialog';
 import { NewRequirementDialog } from '@/components/NewRequirementDialog';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
-import { downloadJson, openJsonFile, parseProjectExport, projectFileName } from '@/lib/projectFile';
+import { saveProjectTrace } from '@/lib/projectFile';
 import { cn } from '@/lib/utils';
-import type { AgentStatus, DemoStage, FileNode } from '@/types';
+import type { AgentStatus, DemoStage, FileNode, Project } from '@/types';
 
 const GROUPS = ['files', 'tasks'] as const;
 
@@ -83,11 +82,13 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
   const deleteTask = useDemoStore((s) => s.deleteTask);
   const addFile = useDemoStore((s) => s.addFile);
   const deleteFile = useDemoStore((s) => s.deleteFile);
-  const exportProject = useDemoStore((s) => s.exportProject);
-  const importProject = useDemoStore((s) => s.importProject);
+  const openFile = useDemoStore((s) => s.openFile);
+  const openedFile = useDemoStore((s) => s.openedFile);
+  const buildProjectTrace = useDemoStore((s) => s.buildProjectTrace);
 
   const [open, setOpen] = useState<Set<string>>(() => new Set(defaultOpenKeys(activeProjectId)));
-  const [selectedFile, setSelectedFile] = useState<string | null>(null);
+  // 选中态派生自查看页正打开的文件（点文件 = 打开文件查看页）
+  const selectedFile = openedFile ? `${openedFile.projectId}:${openedFile.path}` : null;
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [newReqOpen, setNewReqOpen] = useState(false);
   const [addingFileFor, setAddingFileFor] = useState<string | null>(null);
@@ -164,26 +165,22 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
     setAddingFileFor(null);
   };
 
-  const saveProjectToFile = (projectId: string, projectName: string) => {
-    const payload = exportProject(projectId);
-    if (payload) downloadJson(projectFileName(projectName), payload);
-  };
-
-  const handleImportProject = async () => {
-    const text = await openJsonFile();
-    if (!text) return;
-    const data = parseProjectExport(text);
-    if (data) {
-      importProject(data);
-    } else {
-      setConfirm({
-        title: '无法识别的项目文件',
-        description: '请选择由本应用「保存到文件」导出的 .hci.json 文件。',
-        confirmLabel: '知道了',
-        danger: false,
-        onConfirm: () => {},
-      });
-    }
+  // 保存 agent 执行 trace：桌面版写入项目根目录 .hci/，浏览器回退为下载
+  const exportTrace = async (project: Project) => {
+    const trace = buildProjectTrace(project.id);
+    if (!trace) return;
+    const result = await saveProjectTrace(trace);
+    setConfirm({
+      title: result.ok ? '执行 Trace 已保存' : 'Trace 保存失败',
+      description: result.ok
+        ? result.where === 'disk'
+          ? result.absPath
+          : `已下载：${result.filename}`
+        : result.error,
+      confirmLabel: '知道了',
+      danger: !result.ok,
+      onConfirm: () => {},
+    });
   };
 
   // Agent Board 已从侧栏收起：通过点任务的团队跳转过去（并切到该任务，展示其团队）。
@@ -200,25 +197,16 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
 
   return (
     <div>
-      {/* 工作台标题 + 导入 / 新建项目 */}
+      {/* 工作台标题 + 新建项目 */}
       <div className="mb-1 flex items-center justify-between px-2">
         <span className="callsign text-[9px] text-slate-600">// 工作台</span>
-        <div className="flex items-center gap-0.5">
-          <button
-            onClick={handleImportProject}
-            title="打开项目文件（导入 .hci.json）"
-            className="rounded-md p-1 text-slate-500 transition-colors hover:bg-command/10 hover:text-command-soft"
-          >
-            <Upload className="h-3.5 w-3.5" />
-          </button>
-          <button
-            onClick={() => setNewProjectOpen(true)}
-            title="新建项目"
-            className="rounded-md p-1 text-slate-500 transition-colors hover:bg-command/10 hover:text-command-soft"
-          >
-            <Plus className="h-3.5 w-3.5" />
-          </button>
-        </div>
+        <button
+          onClick={() => setNewProjectOpen(true)}
+          title="新建项目"
+          className="rounded-md p-1 text-slate-500 transition-colors hover:bg-command/10 hover:text-command-soft"
+        >
+          <Plus className="h-3.5 w-3.5" />
+        </button>
       </div>
 
       <div className="space-y-0.5">
@@ -268,12 +256,12 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
-                    saveProjectToFile(project.id, project.name);
+                    void exportTrace(project);
                   }}
-                  title="保存项目到文件（导出 .hci.json）"
+                  title="保存执行 Trace（agent 执行审计流水）"
                   className="p-1 text-slate-600 opacity-0 transition-opacity hover:text-command-soft group-hover/proj:opacity-100"
                 >
-                  <Save className="h-3.5 w-3.5" />
+                  <ScrollText className="h-3.5 w-3.5" />
                 </button>
                 <button
                   onClick={(e) => {
@@ -345,7 +333,7 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
                       isOpen={isOpen}
                       toggle={toggle}
                       selectedFile={selectedFile}
-                      onSelectFile={setSelectedFile}
+                      onSelectFile={(path) => openFile(project.id, path)}
                       onDelete={(path) => deleteFile(project.id, path)}
                     />
                     {project.files.length === 0 && addingFileFor !== project.id && (
@@ -577,7 +565,8 @@ function FileTree({
               )}
             >
               <button
-                onClick={() => (isDir ? toggle(dirKey) : onSelectFile(`${projectId}:${nodePath}`))}
+                onClick={() => (isDir ? toggle(dirKey) : onSelectFile(nodePath))}
+                title={isDir ? undefined : '打开文件'}
                 className={cn(
                   'flex min-w-0 flex-1 items-center gap-1 py-0.5 text-left text-xs transition-colors',
                   selected ? 'text-blue-100' : 'text-slate-400 hover:text-slate-200',

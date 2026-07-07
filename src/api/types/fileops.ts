@@ -88,6 +88,12 @@ export interface FileOpObservation {
   intent: FileOpIntent;
   /** 目标路径（ACP 方法的 `path` 入参）。 */
   path: string;
+  /**
+   * 写入内容（`fs/write_text_file` 的 `content` 入参，A）。仅写/建操作携带。
+   * 真后端下由 A 执行写入、E 只观测；mock 演示里由桌面壳代 A 落盘到本机工作区，
+   * 使"agent 生成的文件"成为可见的既成事实 —— 这不改变 E 不执行的边界立场。
+   */
+  content?: string;
   /** 该方法所需租约范围，恒等于 `ACP_FS_METHOD_SCOPE[method]`。 */
   required_scope: LeaseScope;
   /** 覆盖此次操作的 `FileLease`（C 授权，F 只显示）。缺失表示未观测到对应租约。 */

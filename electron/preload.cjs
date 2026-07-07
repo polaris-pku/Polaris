@@ -10,6 +10,18 @@ contextBridge.exposeInMainWorld("desktop", {
     chrome: process.versions.chrome,
     node: process.versions.node,
   },
+  fs: {
+    /** 把 agent 生成的文本写入工作区（对齐 ACP fs/write_text_file：mkdir -p + 覆盖写） */
+    writeTextFile: (payload) => ipcRenderer.invoke("fs:writeTextFile", payload),
+    /** 读取项目内文本文件供预览（同一授权模型；超大/二进制拒绝） */
+    readTextFile: (payload) => ipcRenderer.invoke("fs:readTextFile", payload),
+    /** 原生目录选择器（选择即授权该目录的读写）；取消返回 null */
+    chooseDirectory: (options) => ipcRenderer.invoke("fs:chooseDirectory", options),
+    /** 把已授权目录扫描为文件树（打开磁盘项目用） */
+    readDirectoryTree: (rootPath) => ipcRenderer.invoke("fs:readDirectoryTree", rootPath),
+    /** 在系统文件管理器中定位已写入的文件 */
+    reveal: (absPath) => ipcRenderer.invoke("fs:revealPath", absPath),
+  },
   updates: {
     /** 订阅更新事件；返回取消订阅函数 */
     onEvent: (cb) => {

@@ -2,9 +2,11 @@
 
 一个**可演示的 Web 交互原型**：把「与单个 AI 聊天」升级为「像管理一支 AI 工程团队一样完成开发任务」。
 
-本项目是 **Scripted IDE Simulator**（假 IDE + 真实交互 + 预设 Agent 剧情）：不接真实 LLM / Agent / Git / 代码执行，所有数据均为 mock，演示流程稳定、可重复、可一键重置。
+本项目是 **Scripted IDE Simulator**（假 IDE + 真实交互 + 预设 Agent 剧情）：不接真实 LLM / Agent / Git / 代码执行，演示流程稳定、可重复、可一键重置。
 
 > 界面已对齐后端协作链路规范：Task Board 完整建模 **N0–N18 端到端主链路**与 **11 态协调器状态机**，字段、状态、Gate 决策、事件均取自 `api/` 下的规范文档。
+
+在 mock 剧本之上，**桌面版带真实文件系统能力**：agent 生成的文件会真正写入本机磁盘（含写入前人机确认）、项目可自定义保存目录或直接从磁盘文件夹打开、文件查看页可浏览真实文件内容 —— 见「[文件系统能力（桌面版）](#文件系统能力桌面版)」。
 
 ## 下载与安装（桌面版）
 
@@ -60,25 +62,40 @@ N0 需求到达 → N1 分诊 → N2 创建 Task → N3 创建 Run → N4 认领
 
 > Agent Board 上 **🟢 已对齐** 的区块来自字段清单已冻结字段；标 **`mock · 待 B 冻结`** 的区块属于 B 方向尚未冻结的画像/指标域，等 B 正式 Spec 冻结后再对齐到 `AgentMetrics`。
 
+## 文件系统能力（桌面版）
+
+Web 版全程 mock；桌面版（Electron）在同一份 UI 之上接通了真实文件 I/O，语义对齐 A 方向的 ACP 文件方法（`fs/write_text_file` = mkdir -p + 覆盖写，无独立 create）：
+
+- **Agent 生成文件真实落盘**：任务推进到 N7 执行段时，`gate:allow` 的写操作自动写入磁盘；带权限请求的写操作挂起，等你在文件操作面板里点「允许」后才落盘（拒绝则不写）。每条写操作下方有落盘回执（写入中 / 已写入 + 绝对路径 / 失败原因），点路径可在系统文件管理器中定位；写成功的文件同步挂进左侧项目文件树。
+- **自定义保存位置**：新建项目时可选保存文件夹；缺省写入 `文档/hci-ide-workspace/<项目名>/`。
+- **从文件夹打开项目**：启动页「打开项目」内选择本机目录，自动扫描为项目文件树（跳过 `node_modules`/`.git`/`dist` 等，深度 8 / 2000 条护栏）；同一目录再次打开会切回已有项目。
+- **保存执行 Trace**：侧栏项目行的 Trace 按钮把 agent 执行审计快照（任务时间线 / 人机确认 / 落盘回执 / 事件观测窗口）存为 JSON —— 桌面版写入项目根目录 `.hci/`，浏览器回退为下载。Trace 是只读复盘材料，不支持导回应用。
+- **文件查看页**：点文件树中的文件即可只读浏览。内容来源按可信度降级：磁盘真实内容（`DISK` 徽标）→ agent 生成内容（`AGENT` 徽标，未落盘时的回退）→ 演示占位；落盘完成后自动从 AGENT 切到 DISK。
+
+安全模型：渲染进程**无法凭空指定任意磁盘路径**。自定义目录必须经过主进程的原生目录选择器（选择即授权，进入会话级 `authorizedRoots`）；默认工作区之外未经授权的路径，写入 / 读取 / 扫描 / 定位一律被主进程拒绝，授权目录内部也拒绝 `..` 逃逸。预览另有 512KB 大小与二进制两道护栏。实现见 `electron/fsBridge.cjs`（IPC）与 `src/lib/agentFs.ts`（渲染层适配）。
+
+> 边界立场不变：真实后端下文件读写由 **A（Driver/ACP 客户端）** 执行，前端（E）只观测、渲染、接住人机确认；mock 演示里由桌面壳代 A 落盘，不构成对后端的新契约诉求（`FileOpObservation.content` 镜像的是 A 本就有的 `content` 入参）。
+
 ## 技术栈
 
 - Vite + React + TypeScript
 - Tailwind CSS（暗色 "Command Console" 风格）
 - @xyflow/react（Task Board 泳道图）
-- Zustand（Demo 状态机）
+- Zustand（Demo 状态机，按领域拆分为六个 slice）
 - lucide-react（图标）
-- Electron（桌面壳，Windows / macOS；渲染层复用同一份 React 应用）
+- Electron（桌面壳，Windows / macOS；渲染层复用同一份 React 应用，文件系统能力经 contextBridge + IPC 提供）
+- Vitest（store 集成测试：落盘链路 / 项目打开 / 文件查看页导航）
 
 ## 启动方式
 
-需要 Node 18+：
+需要 Node 20+ 与 pnpm 9+：
 
 ```bash
-npm install        # 首次运行
-npm run dev        # http://localhost:5173/
+pnpm install       # 首次运行
+pnpm dev           # http://localhost:5173/（Web 版，文件能力自动降级为 mock）
 ```
 
-构建生产版本：`npm run build`，预览：`npm run preview`。
+构建生产版本：`pnpm build`，预览：`pnpm preview`；提交前自检：`pnpm verify`（lint + typecheck + vitest）。
 
 > 若本机未全局安装 Node，项目可能内置一份本地运行时（`.node/`）。此时可运行 `./start.sh`，或先 `export PATH="$PWD/.node/bin:$PATH"` 再执行上面的命令。
 
@@ -113,35 +130,50 @@ git push --follow-tags     # 推送提交 + 标签，触发 Release 工作流
 
 跨平台构建全部交给 CI，本地不需要 Mac 也能出 macOS 版；代码签名 / 公证暂未启用（MVP 阶段）。
 
-## 三个页面
+## 页面
 
-| 页面          | 作用                             | 关键交互                                                                                                                                              |
-| ------------- | -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Agent Board   | 组建 AI 团队                     | 查看 Agent 档案与 **Identity & Runtime（N4/N6 字段：agent_id / role_id / driver_id / session_id / file_lease / capability_tags）**、Assign to Project |
-| Task Board    | 可观察、可介入的 N0–N18 执行地图 | Start Task → 需求分析 → 推荐 Workflow → Next Step / Auto Run → 在 N7 Intervene → Node Inspector                                                       |
-| Council Board | 基于证据组装 CouncilDecision     | 对比三方案、选择 `verdict`、查看 `evidence_refs` / `risk_signals`、提交 select                                                                        |
+| 页面             | 作用                             | 关键交互                                                                                                                                              |
+| ---------------- | -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Project Launcher | 启动页 · 项目入口                | 新建项目（可自选保存位置）、打开项目（已有项目列表 + **从文件夹打开**，同一入口）                                                                     |
+| Agent Board      | 组建 AI 团队                     | 查看 Agent 档案与 **Identity & Runtime（N4/N6 字段：agent_id / role_id / driver_id / session_id / file_lease / capability_tags）**、Assign to Project |
+| Task Board       | 可观察、可介入的 N0–N18 执行地图 | Start Task → 需求分析 → 推荐 Workflow → Next Step / Auto Run → 在 N7 Intervene / 确认写入权限 → Node Inspector                                        |
+| Council Board    | 基于证据组装 CouncilDecision     | 对比三方案、选择 `verdict`、查看 `evidence_refs` / `risk_signals`、提交 select                                                                        |
+| File Viewer      | 只读文件查看                     | 点侧栏文件树打开；DISK / AGENT 内容来源徽标、行号视图、文件管理器定位                                                                                 |
 
 ## 推荐演示路径
 
-1. **Agent Board**：查看 `Backend Eng A` 详情（含 Identity & Runtime / file_lease / capability_tags），依次 Assign `Backend Eng A` / `Test Agent` / `Security Audit Agent`（≥3 人 → 团队就绪）
-2. 切到 **Task Board**，使用默认任务，点击 **Start Task** → 查看需求分析
-3. 点击 **Use Recommended Workflow** → 沿 7 条 Lane 生成 N0–N18 全链路泳道图
-4. **Next Step / Auto Run** 逐步推进；点击任意节点查看 Node Inspector（含 decided/tbd 字段与事件）
-5. 推进到 **N7 Executing** → 点击 **Intervene** → 注入 Admin 规则（作用范围：整个 Workflow）→ 下游 N13/N15/N18 标记「已被介入」
-6. 推进到 **N13 Gate**（decision=defer）→ **Go to Council** → 在 Council Board 选择 `verdict=select` → 采纳 `option-a · Use RBAC`
-7. 返回 Task Board，推进到 **N18 Run Complete** → **View Delivery Report**
-8. **Reset Demo** 可随时一键重置
+1. **启动页**：新建项目（桌面版可自选保存位置），或「打开项目 → 从文件夹打开」一个本机目录
+2. **Agent Board**：查看 `Backend Eng A` 详情（含 Identity & Runtime / file_lease / capability_tags），依次 Assign `Backend Eng A` / `Test Agent` / `Security Audit Agent`（≥3 人 → 团队就绪）
+3. 切到 **Task Board**，使用默认任务，点击 **Start Task** → 查看需求分析
+4. 点击 **Use Recommended Workflow** → 沿 7 条 Lane 生成 N0–N18 全链路泳道图
+5. **Next Step / Auto Run** 逐步推进；点击任意节点查看 Node Inspector（含 decided/tbd 字段与事件）
+6. 推进到 **N7 Executing** → 文件操作面板出现读/写/建流水，`gate:allow` 的写操作自动落盘（桌面版）；`permissionMatrix.ts` 挂**写入前人机确认**（暖琥珀色）→ 点「允许本次」→ 落盘回执显示绝对路径；也可点击 **Intervene** 注入 Admin 规则 → 下游 N13/N15/N18 标记「已被介入」
+7. 在左侧文件树点击刚生成的文件（如 `src/auth/permissionService.ts`）→ **File Viewer** 查看真实磁盘内容（`DISK` 徽标）
+8. 推进到 **N13 Gate**（decision=defer）→ **Go to Council** → 在 Council Board 选择 `verdict=select` → 采纳 `option-a · Use RBAC`
+9. 返回 Task Board，推进到 **N18 Run Complete** → **View Delivery Report**
+10. 侧栏项目行点 **Trace 按钮** → 执行审计快照写入项目 `.hci/` 目录（浏览器为下载）
+11. **Reset Demo** 可随时一键重置
 
 ## 目录结构
 
 ```text
 api/                          # 后端协作链路规范（字段清单 + 流程图/状态机）— UI 的对齐基准
+electron/                     # 桌面壳
+├── main.cjs                  #   主进程（窗口 + 各桥注册）
+├── preload.cjs               #   contextBridge：window.desktop（fs / updates）
+├── fsBridge.cjs              #   文件系统 IPC（写入/读取/目录选择/扫描/定位 + 授权模型）
+└── updater.cjs               #   自动更新（electron-updater + GitHub Releases）
 src/
 ├── App.tsx / main.tsx / index.css
-├── types/index.ts            # 全局类型（含 TaskStatusCore / GateDecision / CouncilVerdict / AgentRuntime）
-├── store/useDemoStore.ts     # Zustand 演示状态机
-├── data/                     # 全部 mock data（workflow.ts = N0–N18 节点定义）
-├── pages/                    # AgentBoard / TaskBoard / CouncilBoard
-├── components/               # AppShell / WorkflowCanvas / NodeInspector / InterveneDialog / DeliveryReport ...
-└── lib/utils.ts
+├── types/                    # 全局 UI 类型（index.ts）+ 桌面桥类型（desktop.d.ts）
+├── api/                      # 后端契约的前端镜像（types/*）+ 词表桥接（map.ts）+ 事件通道（events.ts）
+├── store/
+│   ├── useDemoStore.ts       # Zustand store 组装 + 事件通道接线
+│   ├── slices/               # 六个领域切片：project / team / task / execution / intervention / council
+│   ├── lib/                  # 跨切片纯函数（taskSync / agentWrites 落盘调度 / fileTree / timeline …）
+│   └── agentWrites.test.ts   # 落盘链路集成测试（vitest）
+├── data/                     # 全部 mock data（workflow.ts = N0–N18 节点定义；fileops.ts = N7 文件操作剧本）
+├── pages/                    # ProjectLauncher / AgentBoard / TaskBoard / CouncilBoard / FileViewer
+├── components/               # AppShell / WorkflowCanvas / NodeInspector / FileOpsPanel / DeliveryReport ...
+└── lib/                      # utils / agentFs（桌面文件桥适配层）/ projectFile ...
 ```

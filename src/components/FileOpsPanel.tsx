@@ -1,7 +1,16 @@
 import { useState } from 'react';
-import { CheckCircle2, ChevronDown, CircleDashed, FolderCog, Loader2, XCircle } from 'lucide-react';
+import {
+  CheckCircle2,
+  ChevronDown,
+  CircleDashed,
+  FolderCog,
+  HardDriveDownload,
+  Loader2,
+  XCircle,
+} from 'lucide-react';
 import { useDemoStore } from '@/store/useDemoStore';
 import { fileOpsForNode } from '@/data/fileops';
+import { revealAgentFile } from '@/lib/agentFs';
 import { cn } from '@/lib/utils';
 import type { FileOpIntent, FileOpObservation, GateDecision } from '@/api/types';
 import type { WorkflowNodeStatus } from '@/types';
@@ -13,6 +22,7 @@ import type { WorkflowNodeStatus } from '@/types';
  * ACP 方法（A）+ 租约（C）+ Gate 判定（D）+ 产物（C），全部为后端既成事实。
  * 唯一的交互是接住写入前的权限请求（A 的 session/request_permission）——
  * 人机确认时刻按设计语言走暖琥珀色，选择结果经 resolveFilePermission 回传。
+ * 获准的写操作由桌面壳代 A 落盘到本机工作区，回执（WriteReceipt）随条目展示。
  */
 
 const intentChips: Record<FileOpIntent, { label: string; className: string }> = {
@@ -35,6 +45,43 @@ function StatusIcon({ status }: { status: FileOpObservation['status'] }) {
   if (status === 'in_progress')
     return <Loader2 className="h-3.5 w-3.5 animate-spin text-blue-400" />;
   return <CircleDashed className="h-3.5 w-3.5 text-amber-400" />;
+}
+
+/** 落盘回执：agent 生成内容真正写入本机工作区的结果（机器行为，走冷色遥测）。 */
+function WriteReceipt({ op }: { op: FileOpObservation }) {
+  const result = useDemoStore((s) => s.agentFileWrites[op.tool_event_id]);
+  if (!result) return null;
+
+  if (result.status === 'pending') {
+    return (
+      <div className="mt-1 flex items-center gap-1.5 font-mono text-[9px] text-slate-500">
+        <Loader2 className="h-3 w-3 animate-spin" />
+        <span>写入工作区…</span>
+      </div>
+    );
+  }
+  if (result.status === 'written') {
+    return (
+      <div className="mt-1 flex min-w-0 items-center gap-1.5 font-mono text-[9px] text-emerald-400/90">
+        <HardDriveDownload className="h-3 w-3 shrink-0" />
+        <span className="shrink-0">已写入</span>
+        <button
+          type="button"
+          title="在文件管理器中定位"
+          onClick={() => revealAgentFile(result.absPath)}
+          className="min-w-0 truncate text-left text-emerald-300/70 underline decoration-emerald-300/30 underline-offset-2 transition-colors hover:text-emerald-200"
+        >
+          {result.absPath}
+        </button>
+      </div>
+    );
+  }
+  if (result.status === 'failed') {
+    return (
+      <div className="mt-1 font-mono text-[9px] text-rose-400/90">落盘失败 · {result.error}</div>
+    );
+  }
+  return <div className="mt-1 font-mono text-[9px] text-slate-600">未落盘 · {result.reason}</div>;
 }
 
 function PermissionPrompt({ op }: { op: FileOpObservation }) {
@@ -128,6 +175,7 @@ function OpRow({ op }: { op: FileOpObservation }) {
       </div>
       <p className="mt-0.5 pl-[22px] text-[10px] text-slate-400">{op.summary}</p>
       <div className="pl-[22px]">
+        <WriteReceipt op={op} />
         <PermissionPrompt op={op} />
       </div>
     </div>
@@ -182,8 +230,8 @@ export function FileOpsPanel({ nodeId, status }: Props) {
             <OpRow key={op.tool_event_id} op={op} />
           ))}
           <p className="pt-0.5 text-[9px] leading-relaxed text-slate-600">
-            观测视图：文件读写由 Driver（A）执行，租约（C）与
-            Gate（D）为后端既成事实；此处仅确认写入权限。
+            观测视图：文件读写由 Driver（A）执行，租约（C）与 Gate（D）为后端既成事实；
+            此处确认写入权限，获准的写操作由桌面壳代 A 落盘到本机工作区。
           </p>
         </div>
       )}

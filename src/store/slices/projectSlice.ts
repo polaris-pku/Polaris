@@ -1,10 +1,9 @@
 import type { Project } from '@/types';
-import type { DemoTask } from '@/types';
-import { PROJECT_EXPORT_FORMAT, type SliceCreator, type ProjectSlice } from '@/store/types';
+import { PROJECT_TRACE_FORMAT, type SliceCreator, type ProjectSlice } from '@/store/types';
 import { uid } from '@/store/lib/ids';
+import { pickProjectDirectory, readProjectFolder } from '@/lib/agentFs';
 import { insertFileNode, removeFileNode } from '@/store/lib/fileTree';
 import {
-  cloneTask,
   emptyTaskFields,
   extractTaskFields,
   pickProjectTask,
@@ -13,7 +12,7 @@ import {
 
 /** 项目域：项目生命周期（建/开/关/删/导出/导入）与项目文件树。 */
 export const createProjectSlice: SliceCreator<ProjectSlice> = (set, get) => ({
-  createProject: (name, description) => {
+  createProject: (name, description, rootPath) => {
     const trimmed = name.trim();
     if (!trimmed) return;
     const state = get();
@@ -28,6 +27,7 @@ export const createProjectSlice: SliceCreator<ProjectSlice> = (set, get) => ({
       description: description?.trim() || undefined,
       lastOpened: '刚刚',
       tags: [],
+      rootPath: rootPath || undefined,
       // 新建项目从空白开始：没有文件、没有任务（团队随任务产生）。
       files: [],
       agentIds: [],
@@ -43,6 +43,51 @@ export const createProjectSlice: SliceCreator<ProjectSlice> = (set, get) => ({
       activeTaskId: null,
       ...emptyTaskFields(),
     });
+  },
+
+  openProjectFromFolder: async () => {
+    const picked = await pickProjectDirectory('选择项目文件夹');
+    if (!picked) {
+      // 非桌面环境给出提示；桌面端用户取消则静默
+      return window.desktop ? null : '浏览器环境无法打开本机文件夹（桌面版可用）';
+    }
+    const scanned = await readProjectFolder(picked.path);
+    if ('error' in scanned) return scanned.error;
+
+    const state = get();
+    // 同一磁盘目录已打开过：直接切回该项目，不重复创建
+    const existing = state.projects.find((p) => p.rootPath === picked.path);
+    if (existing) {
+      get().openProject(existing.id);
+      return null;
+    }
+
+    get().stopAutoRun();
+    const tasks = state.activeTaskId
+      ? syncTasks(state.tasks, state.activeTaskId, extractTaskFields(state))
+      : state.tasks;
+    const project: Project = {
+      id: uid('proj'),
+      name: picked.name,
+      description: scanned.truncated ? '磁盘项目（文件树超限截断）' : '磁盘项目',
+      lastOpened: '刚刚',
+      tags: [],
+      rootPath: picked.path,
+      files: scanned.tree,
+      agentIds: [],
+    };
+    set({
+      projects: [project, ...state.projects],
+      tasks,
+      activeProjectId: project.id,
+      currentPage: 'agents',
+      teamCustomizationEnabled: false,
+      selectedAgentId: null,
+      isAutoRunning: false,
+      activeTaskId: null,
+      ...emptyTaskFields(),
+    });
+    return null;
   },
 
   openProject: (projectId) => {
@@ -102,51 +147,37 @@ export const createProjectSlice: SliceCreator<ProjectSlice> = (set, get) => ({
     }
   },
 
-  exportProject: (projectId) => {
+  buildProjectTrace: (projectId) => {
     const state = get();
     const project = state.projects.find((p) => p.id === projectId);
     if (!project) return null;
-    // 先回写当前活动任务的实时状态，确保导出的是最新进度
+    // 先回写当前活动任务的实时状态，确保 trace 是最新进度
     const tasks = state.activeTaskId
       ? syncTasks(state.tasks, state.activeTaskId, extractTaskFields(state))
       : state.tasks;
     return {
-      format: PROJECT_EXPORT_FORMAT,
+      format: PROJECT_TRACE_FORMAT,
       version: 1,
       savedAt: new Date().toISOString(),
-      project,
-      tasks: tasks.filter((t) => t.projectId === projectId),
+      project: { id: project.id, name: project.name, rootPath: project.rootPath },
+      tasks: tasks
+        .filter((t) => t.projectId === projectId)
+        .map((t) => ({
+          id: t.id,
+          contractTaskId: t.contractTaskId,
+          title: t.title,
+          taskText: t.taskText,
+          completionCriteria: t.completionCriteria,
+          assignedAgentIds: t.assignedAgentIds,
+          stage: t.stage,
+          interventionRules: t.interventionRules,
+          filePermissionOutcomes: t.filePermissionOutcomes,
+          confirmedCouncilOptionId: t.confirmedCouncilOptionId,
+          timeline: t.timeline,
+        })),
+      agentFileWrites: state.agentFileWrites,
+      backendEvents: state.backendEvents,
     };
-  },
-
-  importProject: (data) => {
-    if (!data || data.format !== PROJECT_EXPORT_FORMAT || !data.project) return;
-    const state = get();
-    get().stopAutoRun();
-    const existingTasks = state.activeTaskId
-      ? syncTasks(state.tasks, state.activeTaskId, extractTaskFields(state))
-      : state.tasks;
-    // 重映射 id，避免与现有项目/任务冲突
-    const newProjectId = uid('proj');
-    const importedTasks: DemoTask[] = (data.tasks ?? []).map((t) => ({
-      ...cloneTask(t),
-      id: uid('task'),
-      projectId: newProjectId,
-    }));
-    const newProject: Project = { ...data.project, id: newProjectId, lastOpened: '刚刚' };
-    const allTasks = [...existingTasks, ...importedTasks];
-    const { activeTaskId, taskState } = pickProjectTask(allTasks, newProjectId);
-    set({
-      projects: [newProject, ...state.projects],
-      tasks: allTasks,
-      activeProjectId: newProjectId,
-      activeTaskId,
-      currentPage: 'agents',
-      teamCustomizationEnabled: false,
-      selectedAgentId: null,
-      isAutoRunning: false,
-      ...taskState,
-    });
   },
 
   addFile: (projectId, rawName) => {
@@ -169,6 +200,26 @@ export const createProjectSlice: SliceCreator<ProjectSlice> = (set, get) => ({
       projects: state.projects.map((p) =>
         p.id === projectId ? { ...p, files: removeFileNode(p.files, parts) } : p,
       ),
+      // 删的是查看页正打开的文件：一并关掉，避免展示已删除内容
+      ...(state.openedFile?.projectId === projectId && state.openedFile.path === path
+        ? {
+            openedFile: null,
+            currentPage: state.activeTaskId ? ('tasks' as const) : ('agents' as const),
+          }
+        : {}),
     }));
   },
+
+  openFile: (projectId, path) => {
+    const state = get();
+    // 点了非聚焦项目的文件：先切过去（沿用 openProject 的任务/团队装载逻辑）
+    if (projectId !== state.activeProjectId) get().openProject(projectId);
+    set({ openedFile: { projectId, path }, currentPage: 'file' });
+  },
+
+  closeFile: () =>
+    set((state) => ({
+      openedFile: null,
+      currentPage: state.activeTaskId ? 'tasks' : 'agents',
+    })),
 });

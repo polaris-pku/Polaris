@@ -9,7 +9,7 @@ import type {
   LeaseStatus,
 } from '@/api/types';
 
-export type PageKey = 'agents' | 'tasks' | 'council';
+export type PageKey = 'agents' | 'tasks' | 'council' | 'file';
 
 /** 文件树节点：有 children 即目录，无则为文件 */
 export type FileNode = {
@@ -26,7 +26,12 @@ export type Project = {
   lastOpened: string;
   /** 技术栈 / 标签，用于列表展示 */
   tags: string[];
-  /** 项目文件树（mock） */
+  /**
+   * 项目在本机磁盘上的根目录（用户自选，agent 生成的文件写到这里）。
+   * 缺省写入默认工作区 文档/hci-ide-workspace/<项目名>/。仅桌面版有意义。
+   */
+  rootPath?: string;
+  /** 项目文件树（mock；从文件夹打开时为磁盘扫描结果） */
   files: FileNode[];
   /** 项目 Agent 团队（引用全局 Agent 池的 id 子集） */
   agentIds: string[];

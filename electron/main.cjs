@@ -3,6 +3,7 @@
 const { app, BrowserWindow, shell } = require("electron");
 const path = require("path");
 const { setupAutoUpdater } = require("./updater.cjs");
+const { setupFsBridge } = require("./fsBridge.cjs");
 
 const isDev = !app.isPackaged;
 const DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL || "http://localhost:5173";
@@ -64,6 +65,7 @@ if (!app.requestSingleInstanceLock()) {
   app.whenReady().then(() => {
     createWindow();
     setupAutoUpdater(() => mainWindow);
+    setupFsBridge(() => mainWindow);
     app.on("activate", () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
     });

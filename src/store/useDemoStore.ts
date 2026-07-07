@@ -10,7 +10,7 @@ import { createInterventionSlice } from '@/store/slices/interventionSlice';
 import { createCouncilSlice } from '@/store/slices/councilSlice';
 
 // 对外类型与常量保持原路径可用（historical import site: '@/store/useDemoStore'）
-export { PROJECT_EXPORT_FORMAT, type ProjectExport } from '@/store/types';
+export { PROJECT_TRACE_FORMAT, type ProjectTrace } from '@/store/types';
 
 /**
  * 全局演示 store：由六个领域切片组合而成，本文件只做组装与事件通道接线。

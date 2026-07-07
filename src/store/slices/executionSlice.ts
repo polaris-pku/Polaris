@@ -9,6 +9,7 @@ import {
 } from '@/data/workflow';
 import { resetTimelineSeq } from '@/lib/snapshot';
 import type { ExecutionSlice, PartialExecState, SliceCreator } from '@/store/types';
+import { flushAgentWritesForNode, writeTargetOf } from '@/store/lib/agentWrites';
 import { blankState } from '@/store/lib/blankState';
 import { extractTaskFields, syncTasks } from '@/store/lib/taskSync';
 import { buildTimelineEvent, getNodeLog } from '@/store/lib/timeline';
@@ -143,6 +144,19 @@ export const createExecutionSlice: SliceCreator<ExecutionSlice> = (set, get) => 
       ...exec,
       timeline,
       tasks: syncTasks(state.tasks, state.activeTaskId, taskFields),
+    });
+
+    // 新点亮的节点若带文件操作剧本（N7 执行段），把无需人机确认的写操作落盘
+    const after = get();
+    const target = writeTargetOf(after.projects.find((p) => p.id === after.activeProjectId));
+    indicesInColumn(nodes, nextCol).forEach((i) => {
+      flushAgentWritesForNode(
+        nodes[i].id,
+        after.filePermissionOutcomes ?? {},
+        after.agentFileWrites,
+        target,
+        after.recordAgentFileWrite,
+      );
     });
   },
 
