@@ -2,14 +2,16 @@
 // 让后端契约漂移在编译期咬住前端。刻意换了词表的状态机（TaskStatusCore /
 // CouncilVerdict）不在此直接替换，改由 src/api/map.ts 的 Record 桥接映射兜住。
 import type {
-  AgentRuntimeStatus,
+  AgentLifecycle,
+  AgentMetrics,
   Event as ContractEvent,
+  ExperienceView,
   FileOpObservation,
   FilePermissionOutcome,
   FrontendRunSnapshot,
   GateDecision as ContractGateDecision,
-  LeaseScope,
-  LeaseStatus,
+  PersonaDef,
+  SkillView,
 } from '@/api/types';
 // 仅类型引用（编译期擦除），不构成运行时循环依赖
 import type { Scenario } from '@/data/scenario';
@@ -114,54 +116,32 @@ export type DemoStage =
   | 'council'
   | 'delivery';
 
-/** 与契约镜像 `AgentRuntimeState.status` 同源（方向 B）。 */
-export type AgentStatus = AgentRuntimeStatus;
+/** Agent 生命周期状态（方向 B `AgentStatusSchema`）。 */
+export type AgentStatus = AgentLifecycle;
 
 /**
- * N4 认领时签发的文件租约 FileLease（字段清单 N4.file_lease）。
- * scope/status 直接采用契约镜像的 `LeaseScope`/`LeaseStatus`（对齐 BCD core/lease.ts）。
+ * Agent Board 的一名 AI 员工 —— 只承载方向 B 刻画的画像/记忆。
+ * 形状对齐 BCD `agent-board-query.ts` 的 `AgentBoardAgentView`（+ 懒加载的技能/经验列表）。
+ * 运行态 session/worktree/lease 属 A/C，不在 Agent Board 展示。
+ *
+ * `id` 是 E 侧稳定句柄（store/scenario 用）；`role_id` 是 B 契约身份键。
  */
-export type FileLease = {
-  lease_id: string;
-  path_glob: string;
-  scope: LeaseScope;
-  expires_at: string;
-  status: LeaseStatus;
-};
-
-/** N4 AgentRecord + N6 Driver Session 的运行态身份（字段清单 N4.agent / N6） */
-export type AgentRuntime = {
-  agent_id: string;
-  role_id: string;
-  driver_id: string;
-  /** Driver 展示名（字段清单外，便于人读） */
-  driver_name: string;
-  session_id?: string;
-  worktree_id?: string;
-  last_heartbeat?: string;
-};
-
 export type Agent = {
   id: string;
+  role_id: string;
   name: string;
-  role: string;
   status: AgentStatus;
-  successRate: number;
-  acceptedRate: number;
-  avgCompletionTime: string;
-  tokenCost: string;
-  skills: string[];
-  historicalTasks: number;
-  failureCount: number;
-  collaboration: '优秀' | '良好' | '一般';
-  recentTask: string;
-  description: string;
-  /** N4/N6 运行态身份 */
-  runtime: AgentRuntime;
-  /** N5 ContextPack.capability_tags */
-  capabilityTags: string[];
-  /** 当前持有的文件租约（未认领时为空） */
-  fileLease?: FileLease;
+  /** B `tags` —— 取代旧的 capabilityTags + 技能墙 */
+  tags: string[];
+  created_at: string;
+  /** B 角色画像 */
+  persona: PersonaDef;
+  /** B 原始指标（比率类由 calculateDerivedMetrics 派生） */
+  metrics: AgentMetrics;
+  /** 懒加载技能列表（SkillView 精简投影） */
+  skills: SkillView[];
+  /** 懒加载经验列表（ExperienceView 精简投影） */
+  experiences: ExperienceView[];
 };
 
 export type WorkflowNodeStatus = 'pending' | 'active' | 'done' | 'blocked' | 'updated';
