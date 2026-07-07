@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Play,
   Workflow,
@@ -26,6 +26,7 @@ import { InterveneDialog } from '@/components/InterveneDialog';
 import { NewRequirementDialog } from '@/components/NewRequirementDialog';
 import { DeliveryReport } from '@/components/DeliveryReport';
 import { SidePanel } from '@/components/SidePanel';
+import { cn } from '@/lib/utils';
 import { deriveScenario } from '@/data/scenario';
 import type { DemoStage } from '@/types';
 
@@ -68,8 +69,27 @@ function TaskBoardInner() {
   const tasks = useDemoStore((s) => s.tasks);
   const activeTask = tasks.find((t) => t.id === activeTaskId);
   const replay = useDemoStore(selectActiveReplay);
+  const selectedNodeId = useDemoStore((s) => s.selectedNodeId);
 
   const [interveneOpen, setInterveneOpen] = useState(false);
+
+  // 交付阶段右侧面板视图：交付报告 / 节点详情。进入交付默认看报告，
+  // 点画布上「非入口」节点时自动切到节点详情（仍可用分段控件切回）。
+  const [deliveryTab, setDeliveryTab] = useState<'report' | 'node'>('report');
+  const deliveryEntryNode = useRef<string | null>(null);
+  useEffect(() => {
+    if (stage === 'delivery') {
+      deliveryEntryNode.current = useDemoStore.getState().selectedNodeId;
+      setDeliveryTab('report');
+    } else {
+      deliveryEntryNode.current = null;
+    }
+  }, [stage]);
+  useEffect(() => {
+    if (stage === 'delivery' && selectedNodeId && selectedNodeId !== deliveryEntryNode.current) {
+      setDeliveryTab('node');
+    }
+  }, [selectedNodeId, stage]);
 
   const activeNode = stage === 'executing' && activeStepIndex >= 0 ? nodes[activeStepIndex] : null;
 
@@ -201,14 +221,14 @@ function TaskBoardInner() {
       {/* Right column */}
       <SidePanel
         side="right"
-        title="详情面板 · Inspector"
+        title="节点详情"
         defaultWidth={400}
         minWidth={300}
         maxWidth={620}
         storageKey="task-inspector"
       >
         {stage === 'delivery' ? (
-          <DeliveryReport />
+          <DeliveryPanel tab={deliveryTab} onTab={setDeliveryTab} />
         ) : stage === 'analyzing' || stage === 'workflow_recommended' ? (
           <TaskUnderstandingPanel />
         ) : stage === 'idle' || stage === 'team_configured' ? (
@@ -220,6 +240,56 @@ function TaskBoardInner() {
 
       <InterveneDialog open={interveneOpen} onClose={() => setInterveneOpen(false)} />
     </div>
+  );
+}
+
+/** 交付阶段右侧面板：交付报告 / 节点详情 分段切换（都可访问，互不遮挡）。 */
+function DeliveryPanel({
+  tab,
+  onTab,
+}: {
+  tab: 'report' | 'node';
+  onTab: (t: 'report' | 'node') => void;
+}) {
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="flex shrink-0 gap-1 border-b border-line p-2">
+        <DeliveryTab active={tab === 'report'} onClick={() => onTab('report')}>
+          交付报告
+        </DeliveryTab>
+        <DeliveryTab active={tab === 'node'} onClick={() => onTab('node')}>
+          节点详情
+        </DeliveryTab>
+      </div>
+      <div className="min-h-0 flex-1">
+        {tab === 'report' ? <DeliveryReport /> : <NodeInspector />}
+      </div>
+    </div>
+  );
+}
+
+function DeliveryTab({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        'flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors',
+        active
+          ? 'bg-ink-800 text-slate-100'
+          : 'text-slate-500 hover:bg-ink-800/50 hover:text-slate-300',
+      )}
+    >
+      {children}
+    </button>
   );
 }
 

@@ -59,7 +59,7 @@ export function NodeExecutionLog({ nodeId, status }: Props) {
       >
         <div className="flex items-center gap-1.5">
           <ScrollText className="h-3.5 w-3.5 text-slate-500" />
-          <span className="text-[11px] font-semibold text-slate-300">节点执行日志</span>
+          <span className="text-[11px] font-semibold text-slate-300">执行日志</span>
           {hasContent && (
             <span className="rounded bg-slate-800 px-1.5 py-0.5 text-[10px] text-slate-500">
               {lines.length} 条

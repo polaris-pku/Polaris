@@ -211,7 +211,7 @@ export function FileOpsPanel({ nodeId, status }: Props) {
       >
         <div className="flex items-center gap-1.5">
           <FolderCog className="h-3.5 w-3.5 text-slate-500" />
-          <span className="text-[11px] font-semibold text-slate-300">文件操作 · FILE OPS</span>
+          <span className="text-[11px] font-semibold text-slate-300">文件操作</span>
           <span className="rounded bg-slate-800 px-1.5 py-0.5 text-[10px] text-slate-500">
             {ops.length} 条
           </span>

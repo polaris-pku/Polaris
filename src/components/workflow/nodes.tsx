@@ -12,16 +12,6 @@ export const laneAccent: Record<string, string> = {
   Council: 'border-l-violet-500/60',
 };
 
-// 责任方角标配色（A/B/C/D/User/Merger）
-const directionStyles: Record<string, string> = {
-  User: 'bg-human/15 text-human-soft',
-  A: 'bg-sky-500/15 text-sky-300',
-  B: 'bg-teal-500/15 text-teal-300',
-  C: 'bg-command/15 text-command-soft',
-  D: 'bg-indigo-500/15 text-indigo-300',
-  Merger: 'bg-emerald-500/15 text-emerald-300',
-};
-
 const statusStyles: Record<
   WorkflowNodeData['status'],
   { box: string; dot: string; label: string }
@@ -62,37 +52,26 @@ export type StepNodeData = {
 function StepNode({ data }: NodeProps<Node<StepNodeData>>) {
   const { wf, selected, isNew } = data;
   const s = statusStyles[wf.status];
-  // 节点上展示的状态码：优先 canonical TaskStatus，否则用 statusNote 占位
-  const statusCode = wf.taskStatus ?? wf.statusNote ?? '—';
   return (
     <div
       className={cn(
-        'w-[182px] rounded-md border px-3 py-2.5 transition-all cursor-pointer',
+        'w-[188px] rounded-lg border px-3.5 py-3 transition-all cursor-pointer',
         s.box,
         selected && 'ring-2 ring-white/40',
         isNew && 'animate-fade-in',
       )}
     >
       <Handle type="target" position={Position.Left} className="!opacity-0" />
-      <div className="flex items-center justify-between gap-1">
-        <span className="flex items-center gap-1">
-          <span className="font-mono text-[9px] font-semibold text-slate-300">{wf.code}</span>
-          <span
-            className={cn(
-              'rounded px-1 py-px font-mono text-[8px] font-semibold',
-              directionStyles[wf.direction] ?? 'bg-slate-700/40 text-slate-400',
-            )}
-          >
-            {wf.direction}
-          </span>
-          {/* 人的时刻标记（tier=human）：琥珀菱形，与介入/确认的暖色语义一致 */}
-          {wf.tier === 'human' && <span className="text-[8px] leading-none text-human">◆</span>}
+      {/* 顶行：节点编号（安静）+ 状态灯 */}
+      <div className="flex items-center justify-between">
+        <span className="font-mono text-[10px] font-medium tracking-[0.14em] opacity-45">
+          {wf.code}
         </span>
-        <span className={cn('led h-2 w-2', s.dot)} />
+        <span className={cn('led h-1.5 w-1.5 shrink-0', s.dot)} />
       </div>
-      <div className="mt-1 font-display text-[13px] font-semibold leading-tight">{wf.label}</div>
-      <div className="truncate text-[10px] text-slate-400">{wf.labelCn}</div>
-      <div className="mt-1.5 truncate font-mono text-[9px] text-slate-500">{statusCode}</div>
+      {/* 标题 + 中文名（颜色随状态，构成一张统一色调的卡） */}
+      <div className="mt-2 font-display text-[15px] font-semibold leading-tight">{wf.label}</div>
+      <div className="mt-0.5 truncate text-[11px] opacity-60">{wf.labelCn}</div>
       <Handle type="source" position={Position.Right} className="!opacity-0" />
     </div>
   );
