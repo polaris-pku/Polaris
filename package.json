@@ -47,7 +47,8 @@
       {
         "provider": "github",
         "owner": "ExtraZhangYC",
-        "repo": "Polaris"
+        "repo": "Polaris",
+        "releaseType": "release"
       }
     ],
     "win": {

@@ -14,8 +14,9 @@ jobs:
   release:
     strategy:
       fail-fast: false
-      # 串行：先跑的 job 创建 Release，后跑的复用同一个 Release 上传资产。
-      # 并行会各自为同一 tag 建 Release，裂成两个只含一半产物的 draft。
+      # 串行：先跑的 job 创建 Release，后跑的按 tag 找到它再追加资产。
+      # 关键前提是 Release 以「已发布」状态创建（package.json publish.releaseType=release）——
+      # GitHub 的「按 tag 取 release」API 对 draft 返回 404，故 draft 无法跨 job 复用，会裂成两个半资产 Release。
       max-parallel: 1
       matrix:
         include:
