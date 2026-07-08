@@ -14,6 +14,9 @@ jobs:
   release:
     strategy:
       fail-fast: false
+      # 串行：先跑的 job 创建 Release，后跑的复用同一个 Release 上传资产。
+      # 并行会各自为同一 tag 建 Release，裂成两个只含一半产物的 draft。
+      max-parallel: 1
       matrix:
         include:
           - os: windows-latest
