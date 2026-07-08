@@ -11,13 +11,27 @@ permissions:
   contents: write
 
 jobs:
+  # 先把 Release 建好（published，非 draft）。
+  # electron-builder 并发上传时，每个上传线程若发现 Release 不存在会各自去创建同一 tag，
+  # 撞 422 already_exists 导致发布失败、资产残缺。预建 Release 让 electron-builder 只上传、不创建，
+  # 从源头消除这个竞态；也因此两个平台 job 可以安全并行。
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create release if absent
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh release view "$TAG" --repo "$REPO" \
+            || gh release create "$TAG" --repo "$REPO" --verify-tag \
+                 --title "$TAG" --notes "Polaris $TAG · 自动发布（桌面自动更新源）"
+
   release:
+    needs: create-release
     strategy:
       fail-fast: false
-      # 串行：先跑的 job 创建 Release，后跑的按 tag 找到它再追加资产。
-      # 关键前提是 Release 以「已发布」状态创建（package.json publish.releaseType=release）——
-      # GitHub 的「按 tag 取 release」API 对 draft 返回 404，故 draft 无法跨 job 复用，会裂成两个半资产 Release。
-      max-parallel: 1
       matrix:
         include:
           - os: windows-latest
