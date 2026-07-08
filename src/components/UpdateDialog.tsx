@@ -55,11 +55,19 @@ export function UpdateDialog() {
   if (phase === 'idle') return null;
 
   const label = version ? `v${version}` : '新版本';
+  // macOS 未签名构建无法自动安装更新，只做"发现新版本 → 引导手动下载"；
+  // Windows(NSIS) 仍走后台下载 + 重启自动安装。
+  const isMac = window.desktop?.platform === 'darwin';
 
   const startDownload = () => {
     setPhase('downloading');
     setPercent(0);
     window.desktop?.updates.download();
+  };
+
+  const openDownloadPage = () => {
+    window.desktop?.updates.openDownloadPage();
+    setOpen(false);
   };
 
   return (
@@ -87,7 +95,9 @@ export function UpdateDialog() {
           {phase === 'available' && (
             <p className="mt-4 text-sm leading-relaxed text-slate-300">
               检测到新版本 <span className="font-mono text-command-soft">{label}</span>
-              ，是否现在下载？下载在后台进行，完成后可选择重启更新。
+              {isMac
+                ? '，前往下载页获取安装包（dmg），下载后拖入 Applications 覆盖即可。'
+                : '，是否现在下载？下载在后台进行，完成后可选择重启更新。'}
             </p>
           )}
 
@@ -119,9 +129,15 @@ export function UpdateDialog() {
                 <Button variant="ghost" onClick={() => setOpen(false)}>
                   稍后
                 </Button>
-                <Button variant="primary" onClick={startDownload}>
-                  <Download className="h-4 w-4" /> 下载更新
-                </Button>
+                {isMac ? (
+                  <Button variant="primary" onClick={openDownloadPage}>
+                    <Download className="h-4 w-4" /> 打开下载页
+                  </Button>
+                ) : (
+                  <Button variant="primary" onClick={startDownload}>
+                    <Download className="h-4 w-4" /> 下载更新
+                  </Button>
+                )}
               </>
             )}
             {phase === 'downloading' && (

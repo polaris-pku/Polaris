@@ -31,8 +31,10 @@ contextBridge.exposeInMainWorld("desktop", {
     },
     /** 拉取当前更新状态（挂载时补齐早于订阅发生的事件） */
     getState: () => ipcRenderer.invoke("update:getState"),
-    /** 用户确认后开始下载更新 */
+    /** 用户确认后开始下载更新（Windows 自动安装路径） */
     download: () => ipcRenderer.invoke("update:download"),
+    /** 打开 Releases 最新页手动下载（macOS 未签名，无法自动安装，走此路径） */
+    openDownloadPage: () => ipcRenderer.invoke("update:openDownload"),
     /** 立即重启并安装已下载的更新 */
     restart: () => ipcRenderer.invoke("update:restart"),
     /** 手动触发一次检查 */
