@@ -5,7 +5,6 @@ import {
   buildCouncilConfirmLogLines,
   buildInterventionLogLines,
   buildUpdatedPendingLines,
-  nodeExecutionLogs,
 } from '@/data/nodeExecutionLogs';
 import { stripExecSuffix } from '@/data/workflow';
 import type { NodeExecLogLevel, NodeExecLogLine, RunReplay, WorkflowNodeStatus } from '@/types';
@@ -153,11 +152,9 @@ function buildLogContent(
   emptyMessage: string;
 } {
   // 执行子链节点 id 带派单后缀，剥去后复用同一执行段的日志；
-  // 回放任务只用真实 run 的执行日志（不回落 mock，本次 run 无记录即为空）
+  // 只用真实 run 的执行日志 —— 没有 run 就没有日志（不再回落任何 mock）。
   const baseId = stripExecSuffix(nodeId);
-  const base = replay
-    ? (replay.nodeExecLogs[nodeId] ?? replay.nodeExecLogs[baseId])
-    : (nodeExecutionLogs[nodeId] ?? nodeExecutionLogs[baseId]);
+  const base = replay?.nodeExecLogs[nodeId] ?? replay?.nodeExecLogs[baseId];
 
   if (status === 'pending') {
     return {

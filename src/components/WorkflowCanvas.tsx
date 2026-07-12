@@ -15,7 +15,6 @@ import {
 } from '@xyflow/react';
 import { NODE_IDS, PHASES, phaseOfNode, stripExecSuffix, type PhaseKey } from '@/data/workflow';
 import type { NodeExecLogLine } from '@/types';
-import { nodeExecutionLogs } from '@/data/nodeExecutionLogs';
 import { selectActiveReplay, useDemoStore } from '@/store/useDemoStore';
 import { cn } from '@/lib/utils';
 import { nodeTypes } from '@/components/workflow/nodes';
@@ -145,12 +144,14 @@ function WorkflowCanvasInner() {
   // 每个节点背后的人话事件行（复用 Inspector 那份 nodeExecLogs；节点 id 可能带执行后缀，两个键都试）
   const replay = useDemoStore(selectActiveReplay);
   const nodeExpansion = useMemo(() => {
-    // 真实 run 用后端事件派生的 nodeExecLogs；mock 剧本回落到演示日志 —— 与节点详情面板同源。
-    const src = replay?.nodeExecLogs ?? nodeExecutionLogs;
+    // 只用后端事件派生的 nodeExecLogs（与节点详情面板同源）；没有真实 run 就没有可展开的事件。
+    const src = replay?.nodeExecLogs;
     const linesByNode: Record<string, NodeExecLogLine[]> = {};
-    for (const n of allNodes) {
-      const detail = src[n.id] ?? src[stripExecSuffix(n.id)];
-      if (detail?.lines.length) linesByNode[n.id] = detail.lines;
+    if (src) {
+      for (const n of allNodes) {
+        const detail = src[n.id] ?? src[stripExecSuffix(n.id)];
+        if (detail?.lines.length) linesByNode[n.id] = detail.lines;
+      }
     }
     return { linesByNode, expanded: expandedNodes };
   }, [replay, allNodes, expandedNodes]);

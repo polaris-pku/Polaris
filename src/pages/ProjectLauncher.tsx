@@ -7,7 +7,6 @@ import {
   FolderSearch,
   Clock,
   ArrowRight,
-  MonitorPlay,
 } from 'lucide-react';
 import { useDemoStore } from '@/store/useDemoStore';
 import { Dialog } from '@/components/ui/Dialog';
@@ -23,7 +22,6 @@ import type { Project } from '@/types';
 export function ProjectLauncher() {
   const projects = useDemoStore((s) => s.projects);
   const openProject = useDemoStore((s) => s.openProject);
-  const loadSampleRun = useDemoStore((s) => s.loadSampleRun);
   const [newOpen, setNewOpen] = useState(false);
   const [openPickerOpen, setOpenPickerOpen] = useState(false);
 
@@ -74,26 +72,6 @@ export function ProjectLauncher() {
             onClick={() => setOpenPickerOpen(true)}
           />
         </div>
-
-        {/* 样例：后端真实 run 的回放（frontend-snapshot.json → 泳道图逐步回放） */}
-        <button
-          onClick={loadSampleRun}
-          className="group mt-4 flex w-full items-center gap-3 rounded-xl border border-emerald-500/25 bg-emerald-500/5 px-5 py-3.5 text-left transition-all hover:border-emerald-400/50 hover:bg-emerald-500/10"
-        >
-          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-emerald-500/15 text-emerald-300">
-            <MonitorPlay className="h-5 w-5" />
-          </div>
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-1.5 font-display text-base font-semibold text-white">
-              样例 · Run 回放
-              <ArrowRight className="h-4 w-4 -translate-x-1 opacity-0 transition-all group-hover:translate-x-0 group-hover:opacity-100" />
-            </div>
-            <p className="mt-1 truncate text-xs text-slate-500">
-              回放一次后端真实 run：「贪吃蛇游戏」 · driver=claude · 45.5s · Gate 直通 ·
-              run_be712da2…
-            </p>
-          </div>
-        </button>
 
         {/* 最近打开 */}
         {recent.length > 0 && (

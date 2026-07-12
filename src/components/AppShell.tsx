@@ -1,13 +1,5 @@
 import { type ReactNode, useState } from 'react';
-import {
-  RotateCcw,
-  CircleDot,
-  Boxes,
-  ChevronRight,
-  ChevronLeft,
-  LayoutGrid,
-  Settings,
-} from 'lucide-react';
+import { CircleDot, Boxes, ChevronRight, ChevronLeft, LayoutGrid, Settings } from 'lucide-react';
 import { useDemoStore } from '@/store/useDemoStore';
 import { isMockMode } from '@/api/config';
 import type { DemoStage } from '@/types';
@@ -43,7 +35,6 @@ const stageColors: Record<DemoStage, string> = {
 const humanStages: DemoStage[] = ['intervention', 'council'];
 
 export function AppShell({ children }: { children: ReactNode }) {
-  const resetDemo = useDemoStore((s) => s.resetDemo);
   const stage = useDemoStore((s) => s.stage);
   const nodes = useDemoStore((s) => s.nodes);
   const activeStepIndex = useDemoStore((s) => s.activeStepIndex);
@@ -167,17 +158,6 @@ export function AppShell({ children }: { children: ReactNode }) {
           >
             <LayoutGrid className="h-4 w-4 shrink-0" />
             {!navCollapsed && '返回启动页'}
-          </button>
-          <button
-            onClick={resetDemo}
-            title={navCollapsed ? 'Reset Demo' : undefined}
-            className={cn(
-              'flex w-full items-center gap-3 rounded-md py-2 text-sm text-slate-400 transition-colors hover:bg-rose-600/15 hover:text-rose-200',
-              navCollapsed ? 'justify-center px-0' : 'px-3',
-            )}
-          >
-            <RotateCcw className="h-4 w-4 shrink-0" />
-            {!navCollapsed && 'Reset Demo'}
           </button>
         </div>
 

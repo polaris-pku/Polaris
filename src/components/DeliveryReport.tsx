@@ -11,7 +11,7 @@ import {
   Repeat,
 } from 'lucide-react';
 import { selectActiveReplay, useDemoStore } from '@/store/useDemoStore';
-import { deriveScenario, findOption } from '@/data/scenario';
+import { findOption } from '@/data/scenario';
 import { Button } from '@/components/ui/Button';
 import { Badge } from '@/components/ui/Badge';
 import { cn } from '@/lib/utils';
@@ -29,17 +29,28 @@ export function DeliveryReport() {
   const rules = useDemoStore((s) => s.interventionRules);
   const confirmedId = useDemoStore((s) => s.confirmedCouncilOptionId);
   const resetDemo = useDemoStore((s) => s.resetDemo);
-  const taskText = useDemoStore((s) => s.taskText);
   const replay = useDemoStore(selectActiveReplay);
-  // 回放任务用真实 run 的交付数据（worktree/产物/耗时），普通任务按需求文本推导
-  const scenario = replay?.scenario ?? deriveScenario(taskText);
+
+  // 交付数据只来自真实 run 的快照。没有 run（还没提交/后端没跑起来）就不编造交付报告。
+  if (!replay) {
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-2 p-8 text-center">
+        <FileCheck2 className="h-8 w-8 text-slate-600" />
+        <p className="text-sm text-slate-400">本任务还没有后端 run 的交付数据。</p>
+        <p className="text-xs text-slate-600">
+          提交需求并等待 agent 执行完成后，这里会显示真实交付结果。
+        </p>
+      </div>
+    );
+  }
+
+  const scenario = replay.scenario;
   const deliveryReport = scenario.delivery;
   const confirmedOption = findOption(scenario, confirmedId) ?? null;
 
-  // 徽章必须反映**真实** run 状态。以前写死绿色「已完成」，于是 ARTIFACT_NOT_SELECTED
-  // 这类失败 run 落到交付页时头部仍打绿标，跟同页 LiveRunPanel 的红色失败自相矛盾，
-  // 用户会把失败看成成功。mock 剧本任务（无 replay）本就是成功演示，保持「已完成」。
-  const runStatus = replay?.meta.status ?? 'completed';
+  // 徽章反映**真实** run 状态。以前写死绿色「已完成」，于是 ARTIFACT_NOT_SELECTED
+  // 这类失败 run 落到交付页时头部仍打绿标，跟同页 LiveRunPanel 的红色失败自相矛盾。
+  const runStatus = replay.meta.status;
   const statusBadge =
     runStatus === 'failed'
       ? { variant: 'red' as const, label: '未完成', tone: 'text-rose-300', bg: 'bg-rose-500/15' }
@@ -59,7 +70,7 @@ export function DeliveryReport() {
 
   // 失败 run：把后端错误码翻成人话，放在报告最上方。否则用户只看到一句
   // `run.status=failed · errors=ARTIFACT_NOT_SELECTED` 的开发者字符串（见「任务完成摘要」）。
-  const failureErrors = replay?.liveSnapshot?.errors ?? [];
+  const failureErrors = replay.liveSnapshot?.errors ?? [];
   const failure =
     runStatus === 'failed' && failureErrors.length ? explainError(failureErrors[0]) : null;
 

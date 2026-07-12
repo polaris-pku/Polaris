@@ -1,6 +1,5 @@
 import type { Project } from '@/types';
 import { createRequirementTask } from '@/data/tasks';
-import { createSampleRunTask, sampleRunProjectMeta, sampleRunSnapshot } from '@/data/sampleRun';
 
 import { createRun as apiCreateRun } from '@/api/client';
 import { watchRun } from '@/api/events';
@@ -300,43 +299,6 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
       activeTaskId: taskId,
       currentPage: 'tasks',
       ...taskToState(next),
-      isAutoRunning: false,
-    });
-  },
-
-  loadSampleRun: () => {
-    const state = get();
-    // 已加载过同一 run 的回放任务 → 直接切换过去（selectTask 会带出项目与任务态）
-    const existing = state.tasks.find((t) => t.replay?.meta.runId === sampleRunSnapshot.run_id);
-    if (existing) {
-      get().selectTask(existing.id);
-      return;
-    }
-    get().stopAutoRun();
-    const persisted = state.activeTaskId
-      ? syncTasks(state.tasks, state.activeTaskId, extractTaskFields(state))
-      : state.tasks;
-    const project: Project = {
-      id: uid('proj'),
-      name: sampleRunProjectMeta.name,
-      description: sampleRunProjectMeta.description,
-      lastOpened: '刚刚',
-      tags: [...sampleRunProjectMeta.tags],
-      // runs 目录结构随样例快照给出（structuredClone 防止跨次加载共享引用）
-      files: structuredClone(sampleRunProjectMeta.files),
-      agentIds: [],
-    };
-    const task = createSampleRunTask(uid('task'), project.id);
-    // 回放任务不上送 TaskCreateRequest：任务在后端世界已存在（contractTaskId 即真实 task_id）
-    set({
-      projects: [project, ...state.projects],
-      tasks: [...persisted, task],
-      activeProjectId: project.id,
-      activeTaskId: task.id,
-      currentPage: 'tasks',
-      teamCustomizationEnabled: false,
-      selectedAgentId: null,
-      ...taskToState(task),
       isAutoRunning: false,
     });
   },

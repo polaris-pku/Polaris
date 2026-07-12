@@ -140,8 +140,6 @@ export type TaskSlice = {
   startTask: () => void;
   selectTask: (taskId: string) => void;
   deleteTask: (taskId: string) => void;
-  /** 加载后端真实 run 的样例回放（建样例项目 + 回放任务；已加载过则直接切换过去） */
-  loadSampleRun: () => void;
 };
 
 /** 执行域：工作流推进引擎（单步/自动/回退/交付）。 */

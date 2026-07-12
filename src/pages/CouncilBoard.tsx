@@ -15,7 +15,7 @@ import {
 import { selectActiveReplay, useDemoStore } from '@/store/useDemoStore';
 import { SidePanel } from '@/components/SidePanel';
 import { verdictDefs } from '@/data/councilOptions';
-import { deriveScenario, findOption } from '@/data/scenario';
+import { findOption } from '@/data/scenario';
 import { Button } from '@/components/ui/Button';
 import { Badge } from '@/components/ui/Badge';
 import { cn } from '@/lib/utils';
@@ -32,34 +32,29 @@ export function CouncilBoard() {
   const confirmCouncilOption = useDemoStore((s) => s.confirmCouncilOption);
   const confirmedId = useDemoStore((s) => s.confirmedCouncilOptionId);
   const setPage = useDemoStore((s) => s.setPage);
-  const taskText = useDemoStore((s) => s.taskText);
   const replay = useDemoStore(selectActiveReplay);
 
-  // 回放任务用快照派生的场景（后端给什么展示什么），普通任务按需求文本推导
-  const scenario = replay?.scenario ?? deriveScenario(taskText);
-  const {
-    context: councilContext,
-    discussion,
-    options: councilOptions,
-    evidenceRefs,
-    riskSignals,
-    recommendedReason,
-  } = scenario.council;
+  // Council 数据只来自真实 run 的快照（后端给什么展示什么），不用 mock 议程顶替
+  const scenario = replay?.scenario;
+  const council = scenario?.council;
+  const councilOptions = council?.options ?? [];
 
   const [selectedId, setSelectedId] = useState(
     councilOptions.find((o) => o.recommended)?.id ?? councilOptions[0]?.id ?? '',
   );
   const [verdict, setVerdict] = useState<CouncilVerdict>('select');
 
-  // 后端未给 Council 数据（回放任务 Gate 直通）→ 只呈现该事实，不用 mock 议程顶替
-  if (councilOptions.length === 0) {
+  // 本次 run 没有 Council 数据（未触发议会 / Gate 直通 / 还没跑）→ 只呈现该事实
+  if (!scenario || !council || councilOptions.length === 0) {
     return (
       <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
         <Scale className="h-8 w-8 text-slate-600" />
         <div className="font-display text-base font-semibold text-slate-300">
-          {councilContext.title}
+          {council?.context.title ?? '本次任务未触发 Council 裁决'}
         </div>
-        <p className="max-w-sm text-xs text-slate-500">{councilContext.description}</p>
+        <p className="max-w-sm text-xs text-slate-500">
+          {council?.context.description ?? '单 agent 模式或 Gate 直通的 run 不产生议会议程。'}
+        </p>
         <button
           onClick={() => setPage('tasks')}
           className="mt-2 rounded-md border border-line-bright px-3 py-1.5 text-xs text-slate-300 transition-colors hover:bg-ink-800"
@@ -70,6 +65,13 @@ export function CouncilBoard() {
     );
   }
 
+  const {
+    context: councilContext,
+    discussion,
+    evidenceRefs,
+    riskSignals,
+    recommendedReason,
+  } = council;
   const selectedOption = findOption(scenario, selectedId)!;
   const verdictDef = verdictDefs.find((v) => v.id === verdict)!;
   // 仅 verdict=select 驱动主链路继续（select + delegated → MergeAuthorization）

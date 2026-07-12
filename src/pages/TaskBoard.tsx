@@ -29,7 +29,6 @@ import { DeliveryReport } from '@/components/DeliveryReport';
 import { LiveRunPanel } from '@/components/LiveRunPanel';
 import { SidePanel } from '@/components/SidePanel';
 import { cn } from '@/lib/utils';
-import { deriveScenario } from '@/data/scenario';
 import type { DemoStage } from '@/types';
 
 const stageBadge: Record<
@@ -373,10 +372,19 @@ function EmptyCanvas({ stage }: { stage: DemoStage }) {
 function TaskUnderstandingPanel() {
   const useRecommendedWorkflow = useDemoStore((s) => s.useRecommendedWorkflow);
   const stage = useDemoStore((s) => s.stage);
-  const taskText = useDemoStore((s) => s.taskText);
   const replay = useDemoStore(selectActiveReplay);
-  // 回放任务用真实 run 的场景内容，普通任务按需求文本推导
-  const understanding = (replay?.scenario ?? deriveScenario(taskText)).understanding;
+
+  // 需求分析只来自真实 run 的快照；没有 run 就不编造分析结果。
+  if (!replay) {
+    return (
+      <div className="flex h-full flex-col items-center justify-center gap-2 p-8 text-center">
+        <Sparkles className="h-8 w-8 text-slate-600" />
+        <p className="text-sm text-slate-400">等待后端 run 的需求分析结果。</p>
+        <p className="text-xs text-slate-600">提交需求后，agent 的结构化分析会显示在这里。</p>
+      </div>
+    );
+  }
+  const understanding = replay.scenario.understanding;
 
   const rows = [
     {
@@ -418,7 +426,7 @@ function TaskUnderstandingPanel() {
           <Sparkles className="h-4 w-4 text-blue-400" />
           <h2 className="text-base font-semibold text-white">Task Understanding</h2>
         </div>
-        <p className="mt-1 text-xs text-slate-500">系统已完成需求结构化分析（mock）</p>
+        <p className="mt-1 text-xs text-slate-500">agent 对需求的结构化分析</p>
       </div>
 
       <div className="flex-1 space-y-3 overflow-y-auto p-5">
