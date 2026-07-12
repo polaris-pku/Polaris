@@ -323,6 +323,13 @@ function start({ workspace, agentId } = {}, { force = false } = {}) {
   const resolvedWorkspace = workspace || defaultWorkspace();
   const resolvedAgentId = agentId || process.env.ACP_AGENT_ID || 'claude';
 
+  // 只认随包分发的 agent。A 的其余 adapter（gemini/codex/…）默认命令是 `npx -y …`，
+  // 而打包后的机器上没有 npx —— 放进去只会换来一个 ENOENT。宁可在这里就说清楚。
+  if (!AGENTS.some((a) => a.id === resolvedAgentId)) {
+    setStatus('error', `未知的 agent「${resolvedAgentId}」；本版本只随包分发：${AGENTS.map((a) => a.id).join('、')}`);
+    return;
+  }
+
   // 同配置去重：切项目会触发 configure，而 UI 完全可能对同一项目重复调用。
   // 每次都重启的话，后一次会把前一次正在启动的后端直接杀掉，表现为「run.create 时后端未运行」。
   if (
@@ -350,6 +357,23 @@ function start({ workspace, agentId } = {}, { force = false } = {}) {
     return;
   }
 
+  // BCD 把审计（.newide/runs）和物化产物（.newide/worktrees）写在 **cwd 的相对路径**下，
+  // 而且这个默认值散在好几处（coordinator / run-audit-writer / run-terminal-output-writer /
+  // council 输出各有一份），逐个注入是打地鼠。直接把 cwd 挪到 userData 下的状态目录，
+  // 所有相对默认值自然跟着走 —— 一处改动，全覆盖，且不用动 BCD 一行源码。
+  //
+  // 为什么必须挪：原来的 cwd 是包内 backend 目录，也就是**已安装的应用目录**。今天没炸只是因为
+  // NSIS 默认装到 %LOCALAPPDATA%\Programs 恰好可写；一旦按机器安装（Program Files）或 macOS
+  // 只读挂载，mkdir 直接 EPERM，而 BCD 把它吞进 try/catch 变成 MATERIALIZATION_FAILED ——
+  // 又是一次没有报错栈的静默失败。而且每次自动更新都会把这些产物冲掉。
+  const stateDir = path.join(app.getPath('userData'), 'backend-state');
+  try {
+    fs.mkdirSync(stateDir, { recursive: true });
+  } catch (err) {
+    setStatus('error', `无法创建后端状态目录 ${stateDir}：${err.message}`);
+    return;
+  }
+
   const auth = readAuthEnv();
   const env = {
     ...process.env,
@@ -357,6 +381,7 @@ function start({ workspace, agentId } = {}, { force = false } = {}) {
     POLARIS_NODE_BIN: NODE_BIN,
     POLARIS_ACP_RUNNER: ACP_RUNNER,
     POLARIS_AGENT_DIR: AGENT_DIR,
+    POLARIS_STATE_DIR: stateDir,
     ACP_AGENT_ID: resolvedAgentId,
     ACP_WORKSPACE: resolvedWorkspace,
     // 用户在设置里配的服务商 + key —— 分发出去的用户没有本机登录态，只能靠它认证
@@ -368,10 +393,10 @@ function start({ workspace, agentId } = {}, { force = false } = {}) {
   for (const name of auth.unset) delete env[name];
 
   // 直接用包内的 Node 跑编译好的后端 —— 不再经过 pnpm（打包后的机器上没有 pnpm）。
-  // cwd 落在 BACKEND_DIR：BCD 的 .newide/runs 审计产物写在那里。
+  // cwd 落在 stateDir（见上）：BCD 所有相对路径的产物都写在那里，不碰安装目录。
   // detached：后端还会 spawn agent 子进程，按进程组杀才不留孤儿（见 stop）。
   const proc = spawn(NODE_BIN, [BACKEND_HOST], {
-    cwd: BACKEND_DIR,
+    cwd: stateDir,
     env,
     stdio: ['pipe', 'pipe', 'pipe'],
     // shell:false —— 直接执行二进制。Windows 上开 shell 反而会因路径含空格出问题。

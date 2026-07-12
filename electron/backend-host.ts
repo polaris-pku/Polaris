@@ -37,6 +37,24 @@ const agentId = process.env.ACP_AGENT_ID ?? 'claude';
 const isWin = process.platform === 'win32';
 const agentModules = path.join(agentDir, 'node_modules');
 
+/**
+ * 把包内 Node 前置进**本进程自己**的 PATH —— 必须在任何 spawn/exec 之前。
+ *
+ * 曾经这行只写进了下面 driverEnv 那个局部对象，于是只覆盖了「宿主 → A → agent」这一条边。
+ * 但还有第二个消费者读的是**宿主进程自己的 process.env**：
+ * BCD 的默认 hook 在 task.completed 上挂了一个 command gate（`node -e "process.exit(0)"`，
+ * 见 coordinator/integration-v0-flow.ts 的 HookEngine 默认配置），而 gate/command-runner.ts
+ * 用 `child_process.exec(cmd, { timeout })` 执行 —— **不传 env**，继承的就是本进程的 env。
+ *
+ * 后果极其隐蔽：用户机器上没装 Node ⇒ 这条 no-op 命令报「'node' 不是内部或外部命令」⇒
+ * gate 判 deny ⇒ GATE_DENIED ⇒ 选中 0 个产物。agent 明明干完了活，界面却报运行失败、产出为空。
+ * 开发机因为自己装了 Node 而永远测不出来。
+ *
+ * 写 process.env.PATH（而不是往 spawn 的 env 对象里塞一个 PATH 键）还顺带避开了 Windows 的坑：
+ * 那边原始键名是 `Path`，对象里塞 `PATH` 会两个键并存，靠 Node 的排序去重侥幸生效。
+ */
+process.env.PATH = [path.dirname(nodeBin), process.env.PATH].filter(Boolean).join(path.delimiter);
+
 /** claude-agent-acp 的 JS 入口（ACP 协议外壳，用包内 node 跑） */
 const acpAgentEntry = path.join(
   agentModules,
@@ -50,6 +68,8 @@ const claudeBinary = path.join(
 );
 
 const driverEnv: NodeJS.ProcessEnv = {
+  // PATH 已在上面修好（claude-agent-acp 内部会裸 spawn `node`——SDK 的 getDefaultExecutable
+  // 写死了 "node"），这里继承即可，不要再单独列一个 PATH 键。
   ...process.env,
   ACP_AGENT_ID: agentId,
   ACP_WORKSPACE: workspace,
@@ -65,10 +85,6 @@ const driverEnv: NodeJS.ProcessEnv = {
 
   // 让 agent 用**包内**的 Claude Code，而不是去找用户机器上的安装（claude-agent-acp 自带这个覆盖口）
   CLAUDE_CODE_EXECUTABLE: claudeBinary,
-
-  // claude-agent-acp 内部会 spawn `node`（SDK 的 getDefaultExecutable 写死了 "node"）——
-  // 实测 PATH 上没有 node 就必失败。把包内的 Node 放到 PATH 最前面。
-  PATH: [path.dirname(nodeBin), process.env.PATH].filter(Boolean).join(path.delimiter),
 };
 
 const driver = new ExternalDriverRuntime({
@@ -78,7 +94,9 @@ const driver = new ExternalDriverRuntime({
     // 而是「包内 node + 包内编译好的 A」。用户机器上不需要 pnpm / tsc / npx / node。
     command: nodeBin,
     args: [acpRunner],
-    cwd: process.cwd(),
+    // 显式给包内 backend 目录，而不是 process.cwd() —— 宿主的 cwd 已被挪去状态目录
+    // （见 backendBridge.cjs），driver 不该跟着漂。它真正写文件的地方由 ACP_WORKSPACE 决定。
+    cwd: path.dirname(acpRunner),
     env: driverEnv,
   }),
 });
