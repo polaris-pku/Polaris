@@ -8,7 +8,7 @@ const COL_GAP = 212;
 const X_OFFSET = 170;
 // 折叠列（该列全部为收起的机器节点）的窄列宽与胶囊尺寸
 const COMPACT_COL_GAP = 108;
-const CHIP_W = 76;
+const CHIP_W = 96;
 const CHIP_Y_OFFSET = 58; // 胶囊相对卡片的垂直居中补偿
 // 折叠阶段卡：整段（4–6 列）收成一张卡，只占一个列位
 const PHASE_W = 150;

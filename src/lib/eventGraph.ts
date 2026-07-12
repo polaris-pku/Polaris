@@ -1,15 +1,17 @@
 /**
- * 由**后端事件**生成泳道图 —— 触发了什么就展示什么，没发生的不出现。
+ * 由后端事件派生**人能读懂的执行步骤** —— 不是「一个事件一个节点」。
  *
- * 为什么不再用 N0–N18 固定模板：
- *  - 一次 run 不一定触发所有节点。实测单 agent 模式下 N1（分诊）与 N14（议会）**永远不亮** ——
- *    前者后端根本没这一步，后者要 council 模式才有。它们灰着占位，看起来像「没跑完」，
- *    实际是「不适用」。把事件硬塞进模板，就必然产生这种永久空位。
- *  - 后端新增事件类型时，模板要跟着改；事件驱动则天然容纳。
+ * 为什么要再抽象一层：一次 run 后端发 22 个事件，但人真正关心的只有六件事 ——
+ * 需求受理了吗 / 谁接的 / agent 在干活吗、干了多久 / 产出了什么 / 有没有被拦住 / 交付了吗。
+ * 把 `mailbox.message_acked` 这种管道事件画成节点，是拿机器的语言对人说话。
  *
- * 附带把「时间」带了回来：有开始/结束成对的事件（agent 执行、议会）合并成**跨度节点**，
- * 带真实耗时。原来的节点图把 15 秒的 agent 执行画得和一个 0 毫秒的 mailbox 一样大 ——
- * 而那 15 秒恰恰是整次 run 的 99%。
+ * 所以：**事件 → 语义步骤**。多个事件汇聚成一步，原始事件一条不丢（全部收进 Inspector）。
+ * 仍然 100% 由事件派生 —— 一个步骤只有在**有事件佐证**时才存在，没触发的步骤压根不出现
+ * （单 agent 模式下就没有「议会」这一步）。
+ *
+ * 时间也回来了：agent 执行是一个**跨度**（requested→completed），带真实耗时；
+ * 未闭合时节点上有实时秒表 —— 后端在 agent 干活的十几秒里一个事件都不发，
+ * 没有它，界面在最关键的时段是死的。
  */
 import type { RunEvent } from '@/api/types/rpc';
 import type { PhaseKey } from '@/data/workflow';
@@ -17,198 +19,317 @@ import type { Lane, NodeDirection, NodeTier, WorkflowNodeData, WorkflowNodeStatu
 
 export type LiveRunStatus = 'running' | 'completed' | 'failed' | 'cancelled';
 
-/** 一个节点背后的原始事件（一个或多个：跨度节点、同类连续事件合并） */
+/** 一个步骤背后的原始事件（Inspector 里逐条可查，一条不丢） */
 export type EventGroup = {
   nodeId: string;
   events: RunEvent[];
-  /** 跨度节点：开始事件已到、结束事件未到 → 该节点正在进行中 */
+  /** 跨度步骤：开始事件已到、结束事件未到 → agent 此刻正在做这件事 */
   open: boolean;
 };
 
-// ── 事件词表 ──
+// ── 语义步骤定义 ──
 
-type EventMeta = {
-  /** 中文名（展示用；取不到就退回事件类型原文，不编造） */
+type StepKey = 'intake' | 'prepare' | 'execute' | 'produce' | 'review' | 'council' | 'deliver';
+
+type StepDef = {
   labelCn: string;
+  label: string;
   tier: NodeTier;
   phase: PhaseKey;
-  /** 对应主链路 N 编号（有就标，纯展示；没有就用序号） */
-  code?: string;
+  direction: NodeDirection;
+  /** 按 agent 角色分身：后端派几个角色，这一步就有几个节点（多 agent 时扇出成多条泳道） */
+  perAgent: boolean;
+  lane: Lane;
 };
 
-const EVENT_META: Record<string, EventMeta> = {
-  'task.created': { labelCn: '创建 Task', tier: 'milestone', phase: 'intake', code: 'N2' },
-  'run.created': { labelCn: '创建 Run', tier: 'machine', phase: 'intake', code: 'N3' },
-  'run.started': { labelCn: 'Run 启动', tier: 'machine', phase: 'intake', code: 'N3' },
-  'mailbox.message_sent': { labelCn: '消息投递', tier: 'machine', phase: 'execution' },
-  'mailbox.message_acked': { labelCn: '消息确认', tier: 'machine', phase: 'execution' },
-  'memory.context_pack_built': {
-    labelCn: '构建 ContextPack',
+const STEPS: Record<StepKey, StepDef> = {
+  intake: {
+    labelCn: '需求受理',
+    label: 'Intake',
+    tier: 'milestone',
+    phase: 'intake',
+    direction: 'C',
+    perAgent: false,
+    lane: 'System',
+  },
+  prepare: {
+    labelCn: '分派与上下文',
+    label: 'Dispatch',
     tier: 'machine',
     phase: 'execution',
-    code: 'N5',
+    direction: 'B',
+    perAgent: true,
+    lane: 'Memory',
   },
-  'driver.session_started': {
-    labelCn: '启动 Driver Session',
-    tier: 'machine',
-    phase: 'execution',
-    code: 'N6',
-  },
-  'agent.execution_requested': {
+  execute: {
     labelCn: 'Agent 执行',
+    label: 'Agent Work',
     tier: 'human',
     phase: 'execution',
-    code: 'N7',
+    direction: 'A',
+    perAgent: true,
+    lane: 'Agent',
   },
-  'driver.run_result': {
-    labelCn: 'Driver 运行结果',
-    tier: 'machine',
-    phase: 'execution',
-    code: 'N8',
-  },
-  'artifact.registered': {
-    labelCn: '注册 Artifact',
+  produce: {
+    labelCn: '产出',
+    label: 'Artifacts',
     tier: 'milestone',
     phase: 'execution',
-    code: 'N9',
+    direction: 'A',
+    perAgent: false,
+    lane: 'Driver',
   },
-  'task.completed': { labelCn: 'Task 完成', tier: 'machine', phase: 'review', code: 'N10' },
-  'hook.matched': { labelCn: 'Hook 匹配', tier: 'machine', phase: 'review', code: 'N11' },
-  'gate.requested': { labelCn: 'Gate 请求', tier: 'machine', phase: 'review', code: 'N12' },
-  'gate.result': { labelCn: 'Gate 决策', tier: 'human', phase: 'review', code: 'N13' },
-  'council.started': { labelCn: '议会', tier: 'human', phase: 'review', code: 'N14' },
-  'council.decision': { labelCn: '议会决策', tier: 'human', phase: 'review', code: 'N14' },
-  'artifact.selected': { labelCn: '选定产物', tier: 'milestone', phase: 'delivery', code: 'N15' },
-  'checkpoint.saved': {
-    labelCn: '保存 Checkpoint',
+  review: {
+    labelCn: '审查',
+    label: 'Review',
+    tier: 'human',
+    phase: 'review',
+    direction: 'D',
+    perAgent: false,
+    lane: 'Security',
+  },
+  council: {
+    labelCn: '议会',
+    label: 'Council',
+    tier: 'human',
+    phase: 'review',
+    direction: 'C',
+    perAgent: false,
+    lane: 'Council',
+  },
+  deliver: {
+    labelCn: '交付',
+    label: 'Delivery',
     tier: 'milestone',
     phase: 'delivery',
-    code: 'N16',
+    direction: 'C',
+    perAgent: false,
+    lane: 'System',
   },
-  'coord.checkpoint_observed': {
-    labelCn: 'Checkpoint 观测',
-    tier: 'machine',
-    phase: 'delivery',
-    code: 'N16',
-  },
-  'worktree.materialized': {
-    labelCn: '物化 Worktree',
-    tier: 'machine',
-    phase: 'delivery',
-    code: 'N17',
-  },
-  'run.completed': { labelCn: 'Run 完成', tier: 'milestone', phase: 'delivery', code: 'N18' },
-  'run.failed': { labelCn: 'Run 失败', tier: 'milestone', phase: 'delivery', code: 'N18' },
-  'run.cancelled': { labelCn: 'Run 取消', tier: 'milestone', phase: 'delivery', code: 'N18' },
 };
 
-/** 未登记的事件类型：不丢弃、不编造 —— 原样展示类型名，归到当前阶段的机器层。 */
-function metaOf(type: string): EventMeta {
-  return EVENT_META[type] ?? { labelCn: type, tier: 'machine', phase: 'review' };
+/** 事件 → 步骤。mailbox 靠 payload.message_type 细分（后端就是这么标的）。 */
+function stepOf(event: RunEvent): StepKey | undefined {
+  const messageType = String((event.payload as { message_type?: unknown }).message_type ?? '');
+  switch (event.type) {
+    case 'task.created':
+    case 'run.created':
+    case 'run.started':
+      return 'intake';
+
+    case 'memory.context_pack_built':
+    case 'driver.session_started':
+      return 'prepare';
+    case 'mailbox.message_sent':
+    case 'mailbox.message_acked':
+      if (messageType === 'driver.completed') return 'produce';
+      return 'prepare';
+
+    case 'agent.execution_requested':
+    case 'agent.execution_completed':
+    case 'agent.execution_failed':
+      return 'execute';
+
+    case 'driver.run_result':
+    case 'artifact.registered':
+      return 'produce';
+
+    case 'task.completed':
+    case 'hook.matched':
+    case 'gate.requested':
+    case 'gate.result':
+      return 'review';
+
+    case 'council.started':
+    case 'council.decision':
+    case 'council.completed':
+      return 'council';
+
+    case 'artifact.selected':
+    case 'worktree.materialized':
+    case 'checkpoint.saved':
+    case 'coord.checkpoint_observed':
+    case 'run.completed':
+    case 'run.failed':
+    case 'run.cancelled':
+      return 'deliver';
+
+    // 未登记的事件类型：不丢弃、不编造 —— 收进「审查」步骤，原始事件在 Inspector 里可查
+    default:
+      return 'review';
+  }
 }
 
+/** 跨度：开始事件到了、结束事件还没到 = 这一步正在进行中 */
+const SPAN_STARTS = new Set(['agent.execution_requested', 'council.started']);
+const SPAN_ENDS = new Set([
+  'agent.execution_completed',
+  'agent.execution_failed',
+  'council.completed',
+]);
+
+// ── 角色归属 ──
+
+const roleIdOf = (event: RunEvent): string =>
+  String((event.payload as { role_id?: unknown }).role_id ?? '');
+
 /**
- * 成对事件 → 跨度节点。
- * 开始事件到了、结束事件还没到 = agent 此刻正在做这件事（那 15 秒的真相）。
+ * 事件属于哪个 agent 角色。
+ *
+ * 只有部分事件自带 role_id（context_pack / agent.execution_*）；mailbox、driver.session_started
+ * 这类管道事件没有。它们按**最近的带角色事件**归属（优先向后找，其次向前）——
+ * 这是「展示位置」的路由决定（E 的自由度），不产生后端没说过的内容。
  */
-const SPANS: Record<string, { ends: string[]; keyOf: (e: RunEvent) => string }> = {
-  'agent.execution_requested': {
-    ends: ['agent.execution_completed', 'agent.execution_failed'],
-    keyOf: (e) => String((e.payload as { role_id?: unknown }).role_id ?? ''),
-  },
-  'council.started': { ends: ['council.completed'], keyOf: () => '' },
+function resolveRoles(events: RunEvent[]): Map<string, string> {
+  const roleByEventId = new Map<string, string>();
+  const own = events.map(roleIdOf);
+
+  events.forEach((event, index) => {
+    if (own[index]) {
+      roleByEventId.set(event.event_id, own[index]);
+      return;
+    }
+    const next = own.slice(index + 1).find(Boolean);
+    const prev = [...own.slice(0, index)].reverse().find(Boolean);
+    roleByEventId.set(event.event_id, next ?? prev ?? '');
+  });
+
+  return roleByEventId;
+}
+
+// ── 展示文案（全部取自后端 payload，不叙事化）──
+
+const asRecord = (v: unknown): Record<string, unknown> =>
+  typeof v === 'object' && v !== null ? (v as Record<string, unknown>) : {};
+
+/** payload 值 → 展示文本。数组展平成逗号串，不把 JSON 括号甩给用户看。 */
+const text = (v: unknown): string => {
+  if (v == null) return '';
+  if (typeof v === 'string') return v;
+  if (Array.isArray(v)) return v.map(text).filter(Boolean).join(', ');
+  return JSON.stringify(v);
 };
 
-const SPAN_END_TYPES = new Set(Object.values(SPANS).flatMap((s) => s.ends));
+const fmtDuration = (ms: number) => (ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${String(ms)}ms`);
 
-// ── 泳道与责任方（由 event.source 决定，不预设）──
+/** 从某个事件类型的 payload 里取一个字段 */
+function pick(events: RunEvent[], type: string, key: string): string {
+  const event = events.find((e) => e.type === type);
+  return event ? text(asRecord(event.payload)[key]) : '';
+}
 
-const DIRECTION_BY_SOURCE: Record<string, NodeDirection> = {
-  coordinator: 'C',
-  memory: 'B',
-  driver: 'A',
-  agent: 'A',
-  gate: 'D',
-  council: 'C',
-};
+/** 该步骤的「关键事实」一行 —— 人扫一眼就知道这步发生了什么。 */
+function summaryOf(step: StepKey, events: RunEvent[]): string {
+  switch (step) {
+    case 'intake': {
+      const spec = pick(events, 'task.created', 'spec');
+      const risk = pick(events, 'task.created', 'risk_level');
+      return [spec, risk && `风险 ${risk}`].filter(Boolean).join(' · ');
+    }
+    case 'prepare': {
+      const driver = pick(events, 'driver.session_started', 'driver_id');
+      const refs = pick(events, 'memory.context_pack_built', 'memory_refs');
+      return [refs && `ContextPack ${refs}`, driver && `driver=${driver}`]
+        .filter(Boolean)
+        .join(' · ');
+    }
+    case 'execute': {
+      const status = events.find((e) => e.type.startsWith('agent.execution_c'))?.payload;
+      return status ? text(asRecord(status).status) : '执行中';
+    }
+    case 'produce': {
+      const artifacts = events.filter((e) => e.type === 'artifact.registered');
+      // 只有 diff 产物是「agent 写出的代码」；transcript 产物的 uri 尾段是 session id，
+      // 不是文件名 —— 混进来就成了一串没人看得懂的乱码。
+      const files = artifacts
+        .filter((e) => text(asRecord(e.payload).type) === 'diff')
+        .map((e) => {
+          const uri = text(asRecord(e.payload).uri);
+          try {
+            return decodeURIComponent(uri.split('/').pop() ?? '')
+              .split('/')
+              .pop();
+          } catch {
+            return '';
+          }
+        })
+        .filter((name): name is string => !!name);
 
-const LANE_BY_SOURCE: Record<string, Lane> = {
-  coordinator: 'System',
-  memory: 'Memory',
-  driver: 'Driver',
-  gate: 'Security',
-  council: 'Council',
-};
-
-/** agent 事件按 role_id 分泳道 —— 后端派几个角色就有几条，前端不预设条数。 */
-function laneOf(event: RunEvent): Lane {
-  if (event.source === 'agent') {
-    const roleId = (event.payload as { role_id?: unknown }).role_id;
-    return typeof roleId === 'string' && roleId ? roleId : 'Agent';
+      const others = artifacts.length - files.length;
+      return (
+        [files.join(' · '), others > 0 && `+${String(others)} 个记录产物`]
+          .filter(Boolean)
+          .join(' · ') || `${String(artifacts.length)} 个产物`
+      );
+    }
+    case 'review': {
+      const decision = pick(events, 'gate.result', 'decision');
+      const reason = pick(events, 'gate.result', 'reason');
+      return [decision && `Gate ${decision}`, reason].filter(Boolean).join(' · ');
+    }
+    case 'council': {
+      const verdict = pick(events, 'council.decision', 'verdict');
+      return verdict ? `裁决 ${verdict}` : '议会进行中';
+    }
+    case 'deliver': {
+      const files = pick(events, 'worktree.materialized', 'files_written');
+      const terminal = events.find((e) => e.type.startsWith('run.'));
+      const status = terminal ? text(asRecord(terminal.payload).status) : '';
+      return [status, files && `${files} 个文件落盘`].filter(Boolean).join(' · ');
+    }
   }
-  return LANE_BY_SOURCE[event.source] ?? 'System';
+}
+
+/** 这一步是谁在做 —— 卡片上最先看到的东西。 */
+function ownerOf(step: StepKey, role: string, events: RunEvent[]): string {
+  const driver = pick(events, 'driver.session_started', 'driver_id');
+  switch (step) {
+    case 'intake':
+    case 'deliver':
+      return '协调器';
+    case 'prepare':
+      return role || '调度';
+    case 'execute':
+      return [role, driver].filter(Boolean).join(' · ') || 'Agent';
+    case 'produce':
+      return driver || 'Driver';
+    case 'review':
+      return 'Gate';
+    case 'council':
+      return '议会';
+  }
 }
 
 // ── 分组 ──
 
-/** payload 摘要（原文，不叙事化） */
-function payloadText(payload: Record<string, unknown>): string {
-  return Object.entries(payload)
-    .map(([k, v]) => `${k}=${typeof v === 'string' ? v : JSON.stringify(v)}`)
-    .join(' · ');
-}
-
 /**
- * 事件流 → 分组。
- *  - 成对事件合成跨度节点（开始+结束）
- *  - 同源同类的**连续**事件合并（如一次注册 2 个 artifact → 一个节点，不铺两个）
+ * 事件流 → 语义步骤分组。
+ * 步骤按「首个事件的到达顺序」排列 —— 后端的 sequence 是权威顺序，前端不重排。
  */
 export function groupEvents(events: RunEvent[]): EventGroup[] {
   const sorted = [...events].sort((a, b) => a.sequence - b.sequence);
+  const roles = resolveRoles(sorted);
+
   const groups: EventGroup[] = [];
-  /** 待配对的跨度组：`${startType}|${key}` → group */
-  const openSpans = new Map<string, EventGroup>();
+  const byKey = new Map<string, EventGroup>();
 
   for (const event of sorted) {
-    // 跨度结束事件：并回它的开始节点，不单独成节点
-    if (SPAN_END_TYPES.has(event.type)) {
-      const matched = [...openSpans.entries()].find(([mapKey, group]) => {
-        const startType = mapKey.split('|')[0];
-        const span = SPANS[startType];
-        return (
-          span.ends.includes(event.type) && mapKey === `${startType}|${span.keyOf(group.events[0])}`
-        );
-      });
-      if (matched) {
-        matched[1].events.push(event);
-        matched[1].open = false;
-        openSpans.delete(matched[0]);
-        continue;
-      }
-      // 没有配上开始事件（理论上不该发生）→ 独立成节点，不丢
-    }
+    const step = stepOf(event);
+    if (!step) continue;
+    const def = STEPS[step];
+    const role = def.perAgent ? (roles.get(event.event_id) ?? '') : '';
+    const key = `${step}|${role}`;
 
-    const span = SPANS[event.type];
-    if (span) {
-      const group: EventGroup = { nodeId: `ev-${event.event_id}`, events: [event], open: true };
+    let group = byKey.get(key);
+    if (!group) {
+      group = { nodeId: `step-${key}`, events: [], open: false };
+      byKey.set(key, group);
       groups.push(group);
-      openSpans.set(`${event.type}|${span.keyOf(event)}`, group);
-      continue;
     }
+    group.events.push(event);
 
-    // 同源同类的连续事件合并
-    const prev = groups[groups.length - 1];
-    if (
-      prev &&
-      !prev.open &&
-      prev.events[0].type === event.type &&
-      prev.events[0].source === event.source
-    ) {
-      prev.events.push(event);
-      continue;
-    }
-
-    groups.push({ nodeId: `ev-${event.event_id}`, events: [event], open: false });
+    if (SPAN_STARTS.has(event.type)) group.open = true;
+    if (SPAN_ENDS.has(event.type)) group.open = false;
   }
 
   return groups;
@@ -216,30 +337,33 @@ export function groupEvents(events: RunEvent[]): EventGroup[] {
 
 // ── 建图 ──
 
+function stepKeyOf(group: EventGroup): StepKey {
+  return group.nodeId.slice('step-'.length).split('|')[0] as StepKey;
+}
+
+function roleKeyOf(group: EventGroup): string {
+  return group.nodeId.slice('step-'.length).split('|')[1] ?? '';
+}
+
 function statusOf(group: EventGroup, runStatus: LiveRunStatus): WorkflowNodeStatus {
-  const first = group.events[0];
-  const last = group.events[group.events.length - 1];
-  // 跨度未闭合：run 还在跑 → 这就是 agent 此刻正在做的事
   if (group.open) return runStatus === 'running' ? 'active' : 'blocked';
-  if (last.type.endsWith('.failed') || first.type.endsWith('.failed')) return 'blocked';
+  if (group.events.some((e) => e.type.endsWith('.failed'))) return 'blocked';
   return 'done';
 }
 
-/** 跨度耗时（毫秒）；未闭合或非跨度节点返回 undefined。 */
+/** 跨度耗时：requested → completed 的真实间隔。 */
 function durationOf(group: EventGroup): number | undefined {
-  if (group.events.length < 2 || !SPANS[group.events[0].type]) return undefined;
-  const start = group.events[0];
-  const end = group.events[group.events.length - 1];
+  const start = group.events.find((e) => SPAN_STARTS.has(e.type));
+  const end = group.events.find((e) => SPAN_ENDS.has(e.type));
+  if (!start || !end) return undefined;
   return new Date(end.created_at).getTime() - new Date(start.created_at).getTime();
 }
 
-const fmtDuration = (ms: number) => (ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`);
-
 /**
- * 由事件生成泳道图节点。
+ * 由事件派生泳道图的语义步骤节点。
  *
- * 列 = 事件顺序（后端的 sequence 是权威顺序）；泳道 = 事件来源；连线 = 顺序链。
- * 没有事件的东西不会出现 —— 这是与旧模板最根本的差别。
+ * 泳道 = 这一步的执行者（协调器 / 各 agent 角色 / Driver / Gate / 议会）——
+ * 后端派几个角色，「分派」「执行」就扇出成几条泳道，前端不预设条数。
  */
 export function buildEventGraph(
   events: RunEvent[],
@@ -248,41 +372,42 @@ export function buildEventGraph(
   const groups = groupEvents(events);
 
   const nodes: WorkflowNodeData[] = groups.map((group, index) => {
-    const first = group.events[0];
-    const meta = metaOf(first.type);
+    const step = stepKeyOf(group);
+    const role = roleKeyOf(group);
+    const def = STEPS[step];
     const status = statusOf(group, runStatus);
     const durationMs = durationOf(group);
-    const count = group.events.length;
-
-    // 中文名带上「本次的事实」：跨度耗时 / 合并条数 —— 这些都是后端给的，不是编的
-    const suffix = durationMs !== undefined ? ` · ${fmtDuration(durationMs)}` : '';
-    const merged = !SPANS[first.type] && count > 1 ? ` ×${String(count)}` : '';
+    const first = group.events[0];
 
     return {
       id: group.nodeId,
-      code: meta.code ?? `#${String(first.sequence)}`,
-      label: first.type,
-      labelCn: `${meta.labelCn}${merged}${suffix}`,
-      lane: laneOf(first),
-      direction: DIRECTION_BY_SOURCE[first.source] ?? 'C',
+      // 不再有 N 编号 —— 人不需要背协议节点号。卡片上显示的是「谁在做」。
+      code: '',
+      label: def.label,
+      labelCn: def.labelCn,
+      // perAgent 的步骤以角色为泳道；后端没给角色就退回该步骤的默认泳道
+      lane: def.perAgent && role ? role : def.lane,
+      direction: def.direction,
       column: index,
-      tier: meta.tier,
-      phase: meta.phase,
+      tier: def.tier,
+      phase: def.phase,
       deps: index > 0 ? [groups[index - 1].nodeId] : [],
-      owner: first.source,
+      owner: ownerOf(step, role, group.events),
       status,
       taskStatus: null,
-      // 跨度未闭合 → 让节点卡展示实时计时（那 15 秒界面不能是死的）
       ...(group.open ? { spanStartedAt: first.created_at } : {}),
+      ...(durationMs !== undefined ? { statusNote: fmtDuration(durationMs) } : {}),
       frozen: 'frozen' as const,
-      summary: payloadText(first.payload) || first.type,
+      summary: summaryOf(step, group.events),
       // 后端事件没有「输入/输出/风险/下一步」这些模板字段 —— 不虚构，留空
       input: [],
       output: [],
-      decided: Object.entries(first.payload).map(([key, value]) => ({
-        key,
-        desc: typeof value === 'string' ? value : JSON.stringify(value),
-      })),
+      decided: group.events.flatMap((e) =>
+        Object.entries(asRecord(e.payload)).map(([key, value]) => ({
+          key,
+          desc: text(value),
+        })),
+      ),
       tbd: [],
       events: [...new Set(group.events.map((e) => e.type))],
       risk: '',

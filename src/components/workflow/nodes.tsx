@@ -70,36 +70,53 @@ function Elapsed({ since }: { since: string }) {
   return <span className="font-mono tabular-nums">{seconds.toFixed(0)}s</span>;
 }
 
+/**
+ * 步骤卡。
+ *
+ * 表达顺序按「人想知道什么」排：**谁在做 → 多久 → 做了什么 → 关键事实**。
+ * 不再有 N 编号 —— 人不需要背协议节点号；节点编号是给协议作者看的，不是给用户看的。
+ */
 function StepNode({ data }: NodeProps<Node<StepNodeData>>) {
   const { wf, selected, isNew } = data;
   const s = statusStyles[wf.status];
   return (
     <div
       className={cn(
-        'w-[188px] rounded-lg border px-3.5 py-3 transition-all cursor-pointer',
+        'w-[188px] cursor-pointer rounded-lg border px-3.5 py-3 transition-all',
         s.box,
         selected && 'ring-2 ring-white/40',
         isNew && 'animate-fade-in',
       )}
     >
       <Handle type="target" position={Position.Left} className="!opacity-0" />
-      {/* 顶行：节点编号（安静）+ 进行中计时 + 状态灯 */}
-      <div className="flex items-center justify-between">
-        <span className="font-mono text-[10px] font-medium tracking-[0.14em] opacity-45">
-          {wf.code}
+      {/* 顶行：谁在做 · 耗时（进行中则实时秒表）· 状态灯 */}
+      <div className="flex items-center justify-between gap-1.5">
+        <span className="truncate font-mono text-[10px] opacity-55" title={wf.owner}>
+          {wf.owner}
         </span>
-        <div className="flex items-center gap-1.5">
-          {wf.spanStartedAt && wf.status === 'active' && (
-            <span className="text-[10px] opacity-70">
+        <div className="flex shrink-0 items-center gap-1.5">
+          {wf.status === 'active' && wf.spanStartedAt ? (
+            <span className="text-[10px] opacity-80">
               <Elapsed since={wf.spanStartedAt} />
             </span>
+          ) : (
+            wf.statusNote && (
+              <span className="font-mono text-[10px] opacity-70">{wf.statusNote}</span>
+            )
           )}
           <span className={cn('led h-1.5 w-1.5 shrink-0', s.dot)} />
         </div>
       </div>
-      {/* 标题 + 中文名（颜色随状态，构成一张统一色调的卡） */}
-      <div className="mt-2 font-display text-[15px] font-semibold leading-tight">{wf.label}</div>
-      <div className="mt-0.5 truncate text-[11px] opacity-60">{wf.labelCn}</div>
+      {/* 这一步是什么 */}
+      <div className="mt-1.5 font-display text-[15px] font-semibold leading-tight">
+        {wf.labelCn}
+      </div>
+      {/* 关键事实（后端原文，扫一眼就知道发生了什么） */}
+      {wf.summary && (
+        <div className="mt-1 line-clamp-2 text-[11px] leading-snug opacity-60" title={wf.summary}>
+          {wf.summary}
+        </div>
+      )}
       <Handle type="source" position={Position.Right} className="!opacity-0" />
     </div>
   );
@@ -114,9 +131,9 @@ function ChipNode({ data }: NodeProps<Node<StepNodeData>>) {
   const s = statusStyles[wf.status];
   return (
     <div
-      title={`${wf.code} ${wf.label} · ${wf.labelCn}（${wf.owner}）`}
+      title={`${wf.labelCn}（${wf.owner}）${wf.summary ? `\n${wf.summary}` : ''}`}
       className={cn(
-        'flex w-[76px] cursor-pointer items-center justify-center gap-1.5 rounded-full border px-2 py-1 transition-all',
+        'flex w-[96px] cursor-pointer items-center justify-center gap-1.5 rounded-full border px-2 py-1 transition-all',
         s.box,
         selected && 'ring-2 ring-white/40',
         isNew && 'animate-fade-in',
@@ -124,7 +141,8 @@ function ChipNode({ data }: NodeProps<Node<StepNodeData>>) {
     >
       <Handle type="target" position={Position.Left} className="!opacity-0" />
       <span className={cn('led h-1.5 w-1.5 shrink-0', s.dot)} />
-      <span className="font-mono text-[9px] font-semibold">{wf.code}</span>
+      {/* 折叠态也用人话，不是节点编号 */}
+      <span className="truncate text-[10px] font-medium">{wf.labelCn}</span>
       <Handle type="source" position={Position.Right} className="!opacity-0" />
     </div>
   );
