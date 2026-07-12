@@ -41,3 +41,6 @@ design-comparison
 polaris_plan.md
 merge_plan.md
 *_plan.md
+
+# 打包后端产物（scripts/build-backend.mjs 生成）
+backend/

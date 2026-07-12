@@ -14,13 +14,28 @@ const { resolveProjectRoot } = require('./fsBridge.cjs');
 
 const isDev = !app.isPackaged;
 
-/** 仓库根：dev 下是项目根；打包后 packages/ 会随 extraResources 落到 resourcesPath。 */
-function repoRoot() {
-  return isDev ? path.join(__dirname, '..') : process.resourcesPath;
-}
+/**
+ * 自包含后端目录（scripts/build-backend.mjs 产出，打包时随 extraResources 落到 resourcesPath）。
+ *
+ *   backend/backend-host.cjs   BCD 后端（driver 已注入为「包内 node 跑包内 A」）
+ *   backend/acp-runner.cjs     A 的 ACP runner
+ *   backend/runtime/node       Node 运行时
+ *   backend/agent/             claude-agent-acp + Claude Code 原生二进制
+ *
+ * 用户机器上**不需要** pnpm / tsc / npx / node，也不需要预先安装 Claude Code。
+ */
+const BACKEND_DIR = isDev
+  ? path.join(__dirname, '..', 'backend')
+  : path.join(process.resourcesPath, 'backend');
 
-const BCD_DIR = path.join(repoRoot(), 'packages', 'newide-bcd');
-const ACP_DIR = path.join(repoRoot(), 'packages', 'acp-client');
+const NODE_BIN = path.join(
+  BACKEND_DIR,
+  'runtime',
+  process.platform === 'win32' ? 'node.exe' : 'node',
+);
+const BACKEND_HOST = path.join(BACKEND_DIR, 'backend-host.cjs');
+const ACP_RUNNER = path.join(BACKEND_DIR, 'acp-runner.cjs');
+const AGENT_DIR = path.join(BACKEND_DIR, 'agent');
 
 /** BCD 只能被创建/取消，没有人类回写通道 —— 这里的方法名即当前后端的全部能力面。 */
 const RPC_METHODS = [
@@ -87,6 +102,42 @@ function pushEvent(params) {
   getWindow()?.webContents.send('backend:event', params);
 }
 
+// ── 认证 ──
+//
+// 分发出去的用户机器上没有 Claude Code 登录态，只能靠 API key。存在 userData 下，
+// 启动后端时注入到子进程环境；A 的 adapter 会把它转交给 agent（base-adapter 的 authEnvMap）。
+
+/** agent id → 它认的环境变量名（对齐 A 的 authEnvMap） */
+const AUTH_ENV_BY_AGENT = {
+  claude: 'ANTHROPIC_API_KEY',
+  gemini: 'GEMINI_API_KEY',
+  codex: 'OPENAI_API_KEY',
+  kimi: 'MOONSHOT_API_KEY',
+};
+
+function settingsPath() {
+  return path.join(app.getPath('userData'), 'settings.json');
+}
+
+function readSettings() {
+  try {
+    return JSON.parse(fs.readFileSync(settingsPath(), 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+/** 把用户填的 key 变成 agent 认的环境变量。没填就不注入（本机若已有登录态仍可用）。 */
+function readAuthEnv() {
+  const { apiKeys = {} } = readSettings();
+  const env = {};
+  for (const [agentId, value] of Object.entries(apiKeys)) {
+    const name = AUTH_ENV_BY_AGENT[agentId];
+    if (name && value) env[name] = String(value);
+  }
+  return env;
+}
+
 /** 还没选项目时的兜底工作区（与 fsBridge 的默认工作区同根）。 */
 function defaultWorkspace() {
   return path.join(app.getPath('documents'), 'polaris-workspace', 'default');
@@ -94,15 +145,16 @@ function defaultWorkspace() {
 
 /** 后端启动前的硬前置：BCD 若找不到 ACP runner 会在启动瞬间抛异常并退出。 */
 function preflight() {
-  if (!fs.existsSync(BCD_DIR)) return `找不到 BCD 后端目录：${BCD_DIR}`;
-  if (!fs.existsSync(ACP_DIR)) return `找不到 ACP runner 目录：${ACP_DIR}`;
-  const runnerPkg = path.join(ACP_DIR, 'package.json');
-  if (!fs.existsSync(runnerPkg)) return `ACP runner 缺少 package.json：${runnerPkg}`;
-  try {
-    const pkg = JSON.parse(fs.readFileSync(runnerPkg, 'utf8'));
-    if (!pkg.scripts?.['driver:run']) return `ACP runner 没有 driver:run 脚本：${ACP_DIR}`;
-  } catch (err) {
-    return `ACP runner package.json 解析失败：${err.message}`;
+  const missing = [
+    [NODE_BIN, 'Node 运行时'],
+    [BACKEND_HOST, 'BCD 后端'],
+    [ACP_RUNNER, 'ACP runner'],
+    [AGENT_DIR, 'agent 运行时'],
+  ].find(([p]) => !fs.existsSync(p));
+
+  if (missing) {
+    const hint = isDev ? '\n开发环境请先运行：pnpm build:backend' : '';
+    return `后端不完整，缺少${missing[1]}：${missing[0]}${hint}`;
   }
   return null;
 }
@@ -154,19 +206,24 @@ function start({ workspace, agentId } = {}, { force = false } = {}) {
 
   const env = {
     ...process.env,
-    ACP_DRIVER_RUNNER_DIR: ACP_DIR,
+    // 后端宿主自己会据此拼出 agent 的路径（见 electron/backend-host.ts）
+    POLARIS_NODE_BIN: NODE_BIN,
+    POLARIS_ACP_RUNNER: ACP_RUNNER,
+    POLARIS_AGENT_DIR: AGENT_DIR,
     ACP_AGENT_ID: resolvedAgentId,
     ACP_WORKSPACE: resolvedWorkspace,
+    // 用户在设置里填的 token —— 分发出去的用户没有本机 Claude 登录态，只能靠它认证
+    ...readAuthEnv(),
   };
 
-  // 用 pnpm --dir 拉起：子进程 cwd 落在 BCD 目录，其 .newide/runs 审计产物也写在那里。
-  // detached：pnpm 会再 spawn 一个 node 子进程，只杀 pnpm 会留下孤儿后端。
-  // 建独立进程组，停止时按组杀（见 stop）。
-  const proc = spawn('pnpm', ['--dir', BCD_DIR, 'backend:rpc'], {
-    cwd: BCD_DIR,
+  // 直接用包内的 Node 跑编译好的后端 —— 不再经过 pnpm（打包后的机器上没有 pnpm）。
+  // cwd 落在 BACKEND_DIR：BCD 的 .newide/runs 审计产物写在那里。
+  // detached：后端还会 spawn agent 子进程，按进程组杀才不留孤儿（见 stop）。
+  const proc = spawn(NODE_BIN, [BACKEND_HOST], {
+    cwd: BACKEND_DIR,
     env,
     stdio: ['pipe', 'pipe', 'pipe'],
-    shell: process.platform === 'win32',
+    // shell:false —— 直接执行二进制。Windows 上开 shell 反而会因路径含空格出问题。
     detached: process.platform !== 'win32',
   });
   child = proc;
@@ -285,6 +342,33 @@ function setupBackendBridge(windowGetter) {
   });
 
   ipcMain.handle('backend:getStatus', () => status);
+
+  // 设置：agent 的 API key。存 userData，不进仓库、不进日志。
+  ipcMain.handle('backend:getSettings', () => {
+    const { apiKeys = {}, agentId = 'claude' } = readSettings();
+    // 只回「有没有填」，绝不把 key 本身回给渲染层
+    return {
+      agentId,
+      configured: Object.fromEntries(
+        Object.entries(AUTH_ENV_BY_AGENT).map(([id]) => [id, !!apiKeys[id]]),
+      ),
+    };
+  });
+
+  ipcMain.handle('backend:saveSettings', (_event, next = {}) => {
+    const current = readSettings();
+    const apiKeys = { ...(current.apiKeys ?? {}) };
+    for (const [agentId, value] of Object.entries(next.apiKeys ?? {})) {
+      if (value === '') delete apiKeys[agentId];
+      else if (typeof value === 'string') apiKeys[agentId] = value;
+    }
+    const merged = { ...current, apiKeys, agentId: next.agentId ?? current.agentId ?? 'claude' };
+    fs.mkdirSync(path.dirname(settingsPath()), { recursive: true });
+    fs.writeFileSync(settingsPath(), JSON.stringify(merged, null, 2), { mode: 0o600 });
+    // key/agent 变了必须重启后端才生效（子进程环境只在启动时读一次）
+    start({ ...(currentConfig ?? {}), agentId: merged.agentId }, { force: true });
+    return status;
+  });
 
   // 用户打开项目后把 agent 工作区绑到该项目根目录（BCD 只在启动时读 ACP_WORKSPACE，故需重启）。
   // 复用 fsBridge 的落点解析：agent 写进哪里 = E 观测面板读哪里。

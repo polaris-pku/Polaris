@@ -20,17 +20,18 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "electron:dev": "concurrently -k -n vite,electron -c cyan,magenta \"vite\" \"wait-on tcp:127.0.0.1:5173 && electron .\"",
-    "electron:build": "vite build && electron-builder",
-    "electron:build:win": "vite build && electron-builder --win",
+    "electron:build": "pnpm build:backend && vite build && electron-builder",
+    "electron:build:win": "pnpm build:backend --target-os=win32 --target-cpu=x64 && vite build && electron-builder --win",
     "electron:build:mac": "vite build && electron-builder --mac",
-    "electron:build:dir": "vite build && electron-builder --dir",
+    "electron:build:dir": "pnpm build:backend && vite build && electron-builder --dir",
     "typecheck": "tsc -b",
     "lint": "eslint .",
     "format": "prettier --check .",
     "format:fix": "prettier --write .",
     "test": "vitest run --passWithNoTests",
     "verify": "pnpm lint && pnpm typecheck && pnpm test",
-    "prepare": "husky"
+    "prepare": "husky",
+    "build:backend": "node scripts/build-backend.mjs"
   },
   "build": {
     "appId": "com.polaris.app",
@@ -74,7 +75,14 @@
         "AppImage"
       ],
       "category": "Development"
-    }
+    },
+    "extraResources": [
+      {
+        "from": "backend",
+        "to": "backend"
+      }
+    ],
+    "asarUnpack": []
   },
   "dependencies": {
     "@xyflow/react": "^12.3.5",
@@ -99,6 +107,7 @@
     "concurrently": "^10.0.3",
     "electron": "^43.0.0",
     "electron-builder": "^26.15.3",
+    "esbuild": "0.24.0",
     "eslint": "^9.15.0",
     "eslint-config-prettier": "^9.1.0",
     "eslint-plugin-react-hooks": "^5.0.0",
