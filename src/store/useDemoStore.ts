@@ -100,6 +100,8 @@ onRunEvent((event) => {
       useDemoStore.setState((s) =>
         s.liveRun?.runId === event.run_id ? { liveRun: { ...s.liveRun, snapshot } } : {},
       );
+      // 用后端事实接管整个界面：泳道图 / 节点日志 / Inspector / 交付报告不再是 mock 剧本。
+      useDemoStore.getState().attachLiveRun(event.run_id, snapshot);
     })
     .catch((err: unknown) => {
       const message = err instanceof Error ? err.message : String(err);

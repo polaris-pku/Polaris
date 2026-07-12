@@ -14,6 +14,7 @@ import type {
   SkillView,
 } from '@/api/types';
 // 仅类型引用（编译期擦除），不构成运行时循环依赖
+import type { RunSnapshot as RpcRunSnapshot } from '@/api/types/rpc';
 import type { Scenario } from '@/data/scenario';
 
 export type PageKey = 'agents' | 'tasks' | 'council' | 'file';
@@ -26,12 +27,11 @@ export type FileNode = {
    * 文件的来源。真实后端 run 与 mock 演示剧本会写进**同一个工作区**，
    * 产物混在一起、肉眼无法分辨 —— 所以能确知来源的必须标出来。
    *
+   * 'live' = 本次真实 run 的 agent 写出（后端快照 `artifacts[].source_path` 给的绝对路径）。
    * 'demo' = 由 mock 演示剧本写入（桌面壳代 A 落盘）。
-   * 缺省 = 来源未知（从磁盘扫描来的文件，可能是真实 agent 写的，也可能本来就有）。
-   * 注意：**没有 'live' 这一档** —— 后端只给出 worktree 内的产物引用，
-   * 不给工作区里最终文件的路径，前端无从判定，不猜。
+   * 缺省   = 来源未知（从磁盘扫描来的既有文件）。
    */
-  origin?: 'demo';
+  origin?: 'live' | 'demo';
 };
 
 /** 一个工作项目（IDE 启动页选择/新建的单位） */
@@ -68,8 +68,26 @@ export type RunNodeFact = { key: string; value: string; time?: string };
  * 「本次 run 未提供」。key 一律用去掉执行子链后缀的节点 id。
  */
 export type RunReplay = {
-  /** 后端落盘的快照原件（frontend-snapshot.json），审计与展示的真相源 */
-  snapshot: FrontendRunSnapshot;
+  /**
+   * 数据来自哪次 run：
+   *  - 'live'   本次真实后端 run（RPC 快照 frontend-workflow.v0.1，见 lib/liveReplay.ts）
+   *  - 'sample' 仓库自带的样例落盘快照（coordinator.frontend_run_snapshot.v0，见 lib/runReplay.ts）
+   * 两种来源产出同一个 RunReplay 形状，界面消费方无需区分。
+   */
+  source: 'live' | 'sample';
+  /** 展示用的 run 元信息（两种来源都能给出） */
+  meta: {
+    runId: string;
+    taskId: string;
+    mode: string;
+    status: string;
+    /** 后端未必给（样例快照有，RPC 快照要从 driver.session_started 事件里取） */
+    driverId?: string;
+  };
+  /** 样例回放的落盘快照原件；live 回放没有这个（它的原件是 liveSnapshot） */
+  snapshot?: FrontendRunSnapshot;
+  /** 本次真实 run 的 RPC 快照原件；sample 回放没有 */
+  liveSnapshot?: RpcRunSnapshot;
   /** 节点 id → 执行时间轴日志（替换 data/logs.ts 的 mock 文案） */
   nodeLogs: Record<string, LogEntry & { checkpoint?: TimelineCheckpoint }>;
   /** 节点 id → Node Inspector 执行日志明细 */

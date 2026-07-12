@@ -129,6 +129,8 @@ export type TaskSlice = {
   setPage: (page: PageKey) => void;
   setTaskText: (text: string) => void;
   createTask: (rawText: string, title?: string, completionCriteria?: string[]) => void;
+  /** 真实 run 终态：用后端快照把该任务切换成「后端事实回放」（泳道图/日志/交付全部换成真数据） */
+  attachLiveRun: (runId: string, snapshot: RunSnapshot) => void;
   startTask: () => void;
   selectTask: (taskId: string) => void;
   deleteTask: (taskId: string) => void;

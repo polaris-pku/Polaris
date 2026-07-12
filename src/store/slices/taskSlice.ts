@@ -1,12 +1,24 @@
 import type { Project } from '@/types';
 import { createRequirementTask } from '@/data/tasks';
 import { createSampleRunTask, sampleRunProjectMeta, sampleRunSnapshot } from '@/data/sampleRun';
+import { composeRunWorkflowNodes } from '@/data/workflow';
 import { createRun as apiCreateRun } from '@/api/client';
 import { watchRun } from '@/api/events';
 import { toTaskCreateRequest } from '@/api/map';
+import { buildLiveRunReplay, liveExecAgents, liveProducedFiles } from '@/lib/liveReplay';
+import { isFrontendWorkflowV01 } from '@/api/types/rpc';
 import type { SliceCreator, TaskSlice } from '@/store/types';
 import { uid } from '@/store/lib/ids';
+import { insertFileNode } from '@/store/lib/fileTree';
 import { extractTaskFields, pickProjectTask, syncTasks, taskToState } from '@/store/lib/taskSync';
+
+/** 绝对路径 → 相对项目根的分段（agent 写在工作区根下，取项目名之后的部分）。 */
+function relativeParts(absPath: string, project: Project | undefined): string[] {
+  const parts = absPath.split('/').filter(Boolean);
+  const rootName = project?.rootPath?.split('/').filter(Boolean).pop() ?? project?.name;
+  const at = rootName ? parts.lastIndexOf(rootName) : -1;
+  return at >= 0 ? parts.slice(at + 1) : parts.slice(-1);
+}
 
 /** 任务域：任务生命周期（新建/开始/切换/删除）与页面导航。 */
 export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
@@ -72,6 +84,71 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
       });
   },
 
+  /**
+   * 真实 run 走到终态：把整个任务切换成「后端事实回放」。
+   *
+   * 这是「界面不再是 mock」的关键一步 —— 在此之前，泳道图/节点日志/Inspector/交付报告
+   * 全部来自 data/*.ts 的演示剧本；挂上 replay 之后，它们的内容一律改由后端快照派生
+   * （消费方本就是「replay 优先、mock 回退」）。
+   *
+   * 泳道图按后端实际派单的 agent 正向组图：后端派几个，图上就长几条执行泳道。
+   * agent 真写到工作区的文件（artifacts[].source_path）同时挂进项目文件树，标 origin='live'。
+   */
+  attachLiveRun: (runId, snapshot) => {
+    const replay = buildLiveRunReplay(snapshot);
+    // 瘦快照（run 早早被取消，缺 task/run/flow）派生不出可展示内容 → 保持原状，不硬切
+    if (!replay || !isFrontendWorkflowV01(snapshot)) return;
+
+    const state = get();
+    const task = state.tasks.find((t) => t.contractRunId === runId);
+    if (!task) return;
+
+    const agents = liveExecAgents(snapshot);
+    const nodes = composeRunWorkflowNodes(agents).map((n) => ({
+      ...n,
+      input: [...n.input],
+      output: [...n.output],
+      deps: [...n.deps],
+    }));
+
+    const project = state.projects.find((p) => p.id === task.projectId);
+    const producedParts = liveProducedFiles(snapshot)
+      .map((abs) => relativeParts(abs, project))
+      .filter((parts) => parts.length > 0);
+
+    const nextTask = {
+      ...task,
+      // 需求原文以后端 task.spec 为准（后端是权威）
+      taskText: snapshot.task.spec,
+      assignedAgentIds: agents.map((a) => a.suffix),
+      stage: 'analyzing' as const,
+      analysisReady: true,
+      nodes,
+      revealedNodeCount: 0,
+      activeStepIndex: -1,
+      selectedNodeId: null,
+      timeline: [],
+      replay,
+    };
+
+    set({
+      tasks: state.tasks.map((t) => (t.id === task.id ? nextTask : t)),
+      projects: state.projects.map((p) =>
+        p.id === task.projectId
+          ? {
+              ...p,
+              files: producedParts.reduce(
+                (files, parts) => insertFileNode(files, parts, false, 'live'),
+                p.files,
+              ),
+            }
+          : p,
+      ),
+      // 切的是当前任务 → 同步把实时态也换过去，界面立刻变成真实 run
+      ...(state.activeTaskId === task.id ? taskToState(nextTask) : {}),
+    });
+  },
+
   startTask: () =>
     set((state) => {
       const taskFields = extractTaskFields({
@@ -122,9 +199,7 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
   loadSampleRun: () => {
     const state = get();
     // 已加载过同一 run 的回放任务 → 直接切换过去（selectTask 会带出项目与任务态）
-    const existing = state.tasks.find(
-      (t) => t.replay?.snapshot.run_id === sampleRunSnapshot.run_id,
-    );
+    const existing = state.tasks.find((t) => t.replay?.meta.runId === sampleRunSnapshot.run_id);
     if (existing) {
       get().selectTask(existing.id);
       return;

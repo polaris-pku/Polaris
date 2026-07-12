@@ -20,7 +20,7 @@ describe('样例 run 回放（run_be712da2）', () => {
     s().loadSampleRun();
     expect(s().activeProjectId).toBeTruthy();
     const task = s().tasks.find((t) => t.id === s().activeTaskId);
-    expect(task?.replay?.snapshot.run_id).toBe(sampleRunSnapshot.run_id);
+    expect(task?.replay?.meta.runId).toBe(sampleRunSnapshot.run_id);
     expect(task?.contractTaskId).toBe(sampleRunSnapshot.task_id);
     expect(s().stage).toBe('analyzing');
     expect(s().currentPage).toBe('tasks');

@@ -141,7 +141,8 @@ function TaskBoardInner() {
             )}
             {replay && (
               <span className="callsign text-[9px] text-slate-500">
-                MODE · {replay.snapshot.run.mode} · driver={replay.snapshot.run.driver_id}
+                MODE · {replay.meta.mode}
+                {replay.meta.driverId ? ` · driver=${replay.meta.driverId}` : ''}
               </span>
             )}
           </div>

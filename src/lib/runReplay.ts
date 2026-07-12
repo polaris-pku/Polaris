@@ -355,6 +355,14 @@ export function buildRunReplay(snapshot: FrontendRunSnapshot): RunReplay {
   };
 
   return {
+    source: 'sample',
+    meta: {
+      runId: snapshot.run_id,
+      taskId: snapshot.task_id,
+      mode: snapshot.run.mode,
+      status: snapshot.run.status,
+      driverId: snapshot.run.driver_id,
+    },
     snapshot,
     nodeLogs,
     nodeExecLogs,
