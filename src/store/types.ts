@@ -129,6 +129,12 @@ export type TaskSlice = {
   setPage: (page: PageKey) => void;
   setTaskText: (text: string) => void;
   createTask: (rawText: string, title?: string, completionCriteria?: string[]) => void;
+  /** 每条后端事件都重投影一次泳道图（幂等）——「泳道图实时跟着后端走」的落点 */
+  applyLiveProgress: (
+    runId: string,
+    events: RunEvent[],
+    runStatus: 'running' | 'completed' | 'failed' | 'cancelled',
+  ) => void;
   /** 真实 run 终态：用后端快照把该任务切换成「后端事实回放」（泳道图/日志/交付全部换成真数据） */
   attachLiveRun: (runId: string, snapshot: RunSnapshot) => void;
   startTask: () => void;

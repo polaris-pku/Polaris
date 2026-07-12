@@ -134,13 +134,13 @@ function textOf(event: RunEvent): string {
  * 泳道图的执行 agent：取后端派单事件（mailbox `task.assigned`）里的收件 agent。
  * 后端派几个，图上就长几条执行泳道 —— 前端不预设条数。
  */
-export function liveExecAgents(snapshot: FrontendWorkflowV01Snapshot): ExecAgentSpec[] {
-  const driverId = snapshot.timeline
+export function liveExecAgentsFromEvents(events: RunEvent[]): ExecAgentSpec[] {
+  const driverId = events
     .filter((e) => e.type === 'driver.session_started')
     .map((e) => str(asRecord(e.payload).driver_id, ''))
     .find(Boolean);
 
-  const assigned = snapshot.timeline
+  const assigned = events
     .filter(
       (e) =>
         e.type === 'mailbox.message_sent' &&
@@ -149,26 +149,29 @@ export function liveExecAgents(snapshot: FrontendWorkflowV01Snapshot): ExecAgent
     .map((e) => str(asRecord(e.payload).to_agent_id, ''))
     .filter(Boolean);
 
-  const unique = [...new Set(assigned)];
-  return unique.map((agentId) => ({
+  return [...new Set(assigned)].map((agentId) => ({
     suffix: agentId,
     lane: agentId,
     owner: driverId && driverId !== agentId ? `${agentId} · ${driverId}` : agentId,
   }));
 }
 
-// ── 派生主入口 ──
+/** 同上，从终态快照取（快照的 timeline 就是全部事件）。 */
+export function liveExecAgents(snapshot: FrontendWorkflowV01Snapshot): ExecAgentSpec[] {
+  return liveExecAgentsFromEvents(snapshot.timeline);
+}
+
+// ── 事件 → 节点视图（实时与终态共用）──
 
 /**
- * 从本次真实 run 的 RPC 快照派生回放数据源。
+ * 只靠**事件流**派生节点视图。
  *
- * 只接受完整形态（`frontend-workflow.v0.1`）—— 瘦快照（早期被取消的 run）缺 task/run/flow，
- * 派生不出可展示的东西，返回 null，调用方保持 mock 兜底。
+ * 关键点：实时阶段（run 还在跑）我们只有 `run.event` 推来的事件，**没有快照** ——
+ * 快照要等终态才拉。所以泳道图的实时点亮必须完全建立在事件之上。
+ * 终态时再用快照补齐事件里没有的东西（产物 / checkpoint / 交付报告）。
  */
-export function buildLiveRunReplay(snapshot: RunSnapshot): RunReplay | null {
-  if (!isFrontendWorkflowV01(snapshot)) return null;
-
-  const routed = snapshot.timeline
+function deriveEventViews(events: RunEvent[]) {
+  const routed = events
     .slice()
     .sort((a, b) => a.sequence - b.sequence)
     .map((event) => ({ event, nodeId: routeOf(event), time: hms(event.created_at) }));
@@ -231,6 +234,150 @@ export function buildLiveRunReplay(snapshot: RunSnapshot): RunReplay | null {
         { key: event.type, value: event.event_id, time },
         ...payloadFacts(asRecord(event.payload), time),
       ]);
+
+  // 事件通道：后端事件原样包成前端 Event 形状（不改写内容）
+  const nodeEvents: Record<string, ContractEvent[]> = {};
+  for (const { event, nodeId } of routed) {
+    if (!nodeId) continue;
+    (nodeEvents[nodeId] ??= []).push({
+      event_id: event.event_id,
+      event_type: event.type as ContractEvent['event_type'],
+      subject_id: event.run_id,
+      run_id: event.run_id,
+      task_id: event.task_id,
+      payload: event.payload,
+      created_at: event.created_at,
+      schema_version: event.schema_version as ContractEvent['schema_version'],
+    });
+  }
+
+  return { routed, nodeLogs, nodeExecLogs, facts, nodeEvents };
+}
+
+/** 后端事件里已经抵达过的 N 节点（base id，不含执行子链后缀）。 */
+export function reachedNodeIds(events: RunEvent[]): Set<string> {
+  const reached = new Set<string>();
+  for (const event of events) {
+    const nodeId = routeOf(event);
+    if (nodeId) reached.add(nodeId);
+  }
+  return reached;
+}
+
+/**
+ * 有「开始 / 结束」两个事件的节点 —— 只有结束事件到了才算完成。
+ *
+ * 这很重要：`agent.execution_requested` 只表示 agent **开始**干活（后面它可能要写好几十秒），
+ * 把它当成「N7 抵达 = 已完成」，用户就会看到「执行中」这个节点显示已完成、而 agent 其实还在写。
+ */
+const SPANNING_NODES: Record<string, { start: string; end: string[] }> = {
+  'n7-executing': {
+    start: 'agent.execution_requested',
+    end: ['agent.execution_completed', 'agent.execution_failed'],
+  },
+  'n14-council': { start: 'council.started', end: ['council.completed'] },
+};
+
+/** 已开始但尚未结束的节点（base id）—— 这些是 agent 此刻正在做的事。 */
+export function inProgressNodeIds(events: RunEvent[]): Set<string> {
+  const types = new Set(events.map((e) => e.type));
+  const inProgress = new Set<string>();
+  for (const [nodeId, span] of Object.entries(SPANNING_NODES)) {
+    if (types.has(span.start) && !span.end.some((t) => types.has(t))) inProgress.add(nodeId);
+  }
+  return inProgress;
+}
+
+/**
+ * 实时回放数据源：**只靠事件流**，run 还在跑时就能用。
+ *
+ * 与终态版（buildLiveRunReplay）的差别：拿不到快照才有的东西（产物 source_path、
+ * checkpoint、交付报告），所以那几块留空 —— 不猜、不用 mock 顶替。终态时会被完整版替换。
+ */
+export function buildLiveProgressReplay(
+  events: RunEvent[],
+  meta: { runId: string; taskId: string; mode: string; status: string },
+): RunReplay {
+  const { routed, nodeLogs, nodeExecLogs, facts, nodeEvents } = deriveEventViews(events);
+
+  const spec = routed
+    .filter((r) => r.event.type === 'task.created')
+    .map((r) => str(asRecord(r.event.payload).spec, ''))
+    .find(Boolean);
+
+  const nodeFacts: Record<string, RunNodeFact[]> = {};
+  for (const { nodeId } of routed) {
+    if (nodeId && !nodeFacts[nodeId]) nodeFacts[nodeId] = facts(nodeId);
+  }
+
+  const gateDecision: GateDecision = routed
+    .filter((r) => r.event.type === 'gate.result')
+    .map((r) => str(asRecord(r.event.payload).decision, ''))
+    .includes('defer')
+    ? 'defer'
+    : 'allow';
+
+  return {
+    source: 'live',
+    meta: {
+      ...meta,
+      driverId: routed
+        .filter((r) => r.event.type === 'driver.session_started')
+        .map((r) => str(asRecord(r.event.payload).driver_id, ''))
+        .find(Boolean),
+    },
+    nodeLogs,
+    nodeExecLogs,
+    nodeFacts,
+    nodeEvents,
+    nodeFileOps: {},
+    scenario: {
+      subject: spec ?? meta.taskId,
+      domain: `${meta.mode} · run=${meta.status}`,
+      understanding: {
+        goal: spec ?? '—',
+        // 产物路径要等快照，运行中还不知道 —— 留空而不是编造
+        modules: [],
+        testDir: '—',
+        risks: [],
+        workflow: meta.mode,
+      },
+      council: {
+        context: {
+          title: '本次 run 未触发 Council',
+          description: '运行中；如触发 Council，事件到达后此处会更新。',
+          decisionMode: '—',
+          councilId: '—',
+        },
+        discussion: [],
+        options: [],
+        evidenceRefs: [],
+        riskSignals: [],
+        recommendedReason: '—',
+      },
+      delivery: {
+        summary: `run.status=${meta.status} · mode=${meta.mode}（执行中，交付数据待 run 结束）`,
+        changedFiles: [],
+        testResult: { passed: 0, failed: 0, coverageDelta: '—' },
+        riskNotes: [],
+      },
+    },
+    gateDecision,
+  };
+}
+
+// ── 派生主入口（终态：事件 + 快照）──
+
+/**
+ * 从本次真实 run 的 RPC 快照派生回放数据源。
+ *
+ * 只接受完整形态（`frontend-workflow.v0.1`）—— 瘦快照（早期被取消的 run）缺 task/run/flow，
+ * 派生不出可展示的东西，返回 null，调用方保持 mock 兜底。
+ */
+export function buildLiveRunReplay(snapshot: RunSnapshot): RunReplay | null {
+  if (!isFrontendWorkflowV01(snapshot)) return null;
+
+  const { nodeLogs, nodeExecLogs, facts, nodeEvents } = deriveEventViews(snapshot.timeline);
 
   const checkpoint = asRecord(snapshot.checkpoint);
   const mechanical = asRecord(checkpoint.mechanical_snapshot);
@@ -310,22 +457,6 @@ export function buildLiveRunReplay(snapshot: RunSnapshot): RunReplay | null {
       })),
     ],
   };
-
-  // 事件通道：后端事件原样包成前端 Event 形状（不改写内容）
-  const nodeEvents: Record<string, ContractEvent[]> = {};
-  for (const { event, nodeId } of routed) {
-    if (!nodeId) continue;
-    (nodeEvents[nodeId] ??= []).push({
-      event_id: event.event_id,
-      event_type: event.type as ContractEvent['event_type'],
-      subject_id: event.run_id,
-      run_id: event.run_id,
-      task_id: event.task_id,
-      payload: event.payload,
-      created_at: event.created_at,
-      schema_version: event.schema_version as ContractEvent['schema_version'],
-    });
-  }
 
   // agent 真正写到工作区的文件（artifacts[].source_path，type=diff）
   const producedFiles = snapshot.artifacts

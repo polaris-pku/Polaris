@@ -1,15 +1,18 @@
 import type { Project } from '@/types';
 import { createRequirementTask } from '@/data/tasks';
 import { createSampleRunTask, sampleRunProjectMeta, sampleRunSnapshot } from '@/data/sampleRun';
-import { composeRunWorkflowNodes } from '@/data/workflow';
+
 import { createRun as apiCreateRun } from '@/api/client';
 import { watchRun } from '@/api/events';
 import { toTaskCreateRequest } from '@/api/map';
-import { buildLiveRunReplay, liveExecAgents, liveProducedFiles } from '@/lib/liveReplay';
+import { buildLiveProgressReplay, buildLiveRunReplay, liveProducedFiles } from '@/lib/liveReplay';
+import { projectLiveBoard } from '@/lib/liveBoard';
+import { resetTimelineSeq } from '@/lib/snapshot';
 import { isFrontendWorkflowV01 } from '@/api/types/rpc';
-import type { SliceCreator, TaskSlice } from '@/store/types';
+import type { PartialExecState, SliceCreator, TaskSlice } from '@/store/types';
 import { uid } from '@/store/lib/ids';
 import { insertFileNode } from '@/store/lib/fileTree';
+import { buildTimelineEvent, getNodeLog } from '@/store/lib/timeline';
 import { extractTaskFields, pickProjectTask, syncTasks, taskToState } from '@/store/lib/taskSync';
 
 /** 绝对路径 → 相对项目根的分段（agent 写在工作区根下，取项目名之后的部分）。 */
@@ -85,6 +88,73 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
   },
 
   /**
+   * 每来一条后端事件就把泳道图重投影一次 —— 这是「实时」的落点。
+   *
+   * 幂等：用**全部已收到的事件**重算，不做增量累积，所以丢事件/乱序/重订阅重放都不会漂移。
+   * 后端尚未派单（还没有 mailbox `task.assigned`）时 projectLiveBoard 返回 null ——
+   * 执行泳道有几条由后端决定，前端不预设、不先画假的。这通常只持续到第 4 个事件。
+   *
+   * 真实 run 由后端驱动，人不需要点 Next Step；手动控制在 TaskBoard 上对 live 任务隐藏。
+   */
+  applyLiveProgress: (runId, events, runStatus) => {
+    const state = get();
+    const task = state.tasks.find((t) => t.contractRunId === runId);
+    if (!task || events.length === 0) return;
+
+    const projection = projectLiveBoard(events, runStatus);
+    if (!projection) return;
+
+    const first = events[0];
+    const replay = buildLiveProgressReplay(events, {
+      runId,
+      taskId: first.task_id,
+      mode: task.replay?.meta.mode ?? 'single_agent',
+      status: runStatus,
+    });
+
+    // 时间线：已点亮的节点各一条，取后端事件原文（顺序 = 泳道图列序）
+    resetTimelineSeq();
+    const exec: PartialExecState = {
+      stage: projection.stage,
+      currentPage: state.currentPage,
+      nodes: projection.nodes,
+      revealedNodeCount: projection.revealedNodeCount,
+      activeStepIndex: projection.activeStepIndex,
+      selectedNodeId: state.selectedNodeId,
+      interventionRules: task.interventionRules,
+      confirmedCouncilOptionId: task.confirmedCouncilOptionId,
+      interventionFeedback: task.interventionFeedback,
+    };
+    const timeline = projection.nodes
+      .filter((n) => n.status === 'done' || n.status === 'blocked')
+      .map((n) => {
+        const log = getNodeLog(n.id, replay);
+        if (!log) return null;
+        const { checkpoint, ...entry } = log;
+        return buildTimelineEvent(entry, exec, checkpoint);
+      })
+      .filter((e): e is NonNullable<typeof e> => e !== null);
+
+    const nextTask = {
+      ...task,
+      taskText: replay.scenario.subject,
+      assignedAgentIds: projection.agents.map((a) => a.suffix),
+      stage: projection.stage,
+      analysisReady: true,
+      nodes: projection.nodes,
+      revealedNodeCount: projection.revealedNodeCount,
+      activeStepIndex: projection.activeStepIndex,
+      timeline,
+      replay,
+    };
+
+    set({
+      tasks: state.tasks.map((t) => (t.id === task.id ? nextTask : t)),
+      ...(state.activeTaskId === task.id ? taskToState(nextTask) : {}),
+    });
+  },
+
+  /**
    * 真实 run 走到终态：把整个任务切换成「后端事实回放」。
    *
    * 这是「界面不再是 mock」的关键一步 —— 在此之前，泳道图/节点日志/Inspector/交付报告
@@ -103,31 +173,50 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
     const task = state.tasks.find((t) => t.contractRunId === runId);
     if (!task) return;
 
-    const agents = liveExecAgents(snapshot);
-    const nodes = composeRunWorkflowNodes(agents).map((n) => ({
-      ...n,
-      input: [...n.input],
-      output: [...n.output],
-      deps: [...n.deps],
-    }));
+    // 终态节点状态仍由事件投影决定（与实时阶段同一套逻辑），只是内容换成更全的快照版 replay。
+    // 不能在这里重新 compose 一张全 pending 的图 —— 那会把已经点亮的进度抹掉。
+    const projection = projectLiveBoard(snapshot.timeline, snapshot.status);
+    if (!projection) return;
 
     const project = state.projects.find((p) => p.id === task.projectId);
     const producedParts = liveProducedFiles(snapshot)
       .map((abs) => relativeParts(abs, project))
       .filter((parts) => parts.length > 0);
 
+    // 时间线：已点亮的节点各一条，内容换成快照版 replay 的原文
+    resetTimelineSeq();
+    const exec: PartialExecState = {
+      stage: projection.stage,
+      currentPage: state.currentPage,
+      nodes: projection.nodes,
+      revealedNodeCount: projection.revealedNodeCount,
+      activeStepIndex: projection.activeStepIndex,
+      selectedNodeId: state.selectedNodeId,
+      interventionRules: task.interventionRules,
+      confirmedCouncilOptionId: task.confirmedCouncilOptionId,
+      interventionFeedback: task.interventionFeedback,
+    };
+    const timeline = projection.nodes
+      .filter((n) => n.status === 'done' || n.status === 'blocked')
+      .map((n) => {
+        const log = getNodeLog(n.id, replay);
+        if (!log) return null;
+        const { checkpoint, ...entry } = log;
+        return buildTimelineEvent(entry, exec, checkpoint);
+      })
+      .filter((e): e is NonNullable<typeof e> => e !== null);
+
     const nextTask = {
       ...task,
       // 需求原文以后端 task.spec 为准（后端是权威）
       taskText: snapshot.task.spec,
-      assignedAgentIds: agents.map((a) => a.suffix),
-      stage: 'analyzing' as const,
+      assignedAgentIds: projection.agents.map((a) => a.suffix),
+      stage: projection.stage,
       analysisReady: true,
-      nodes,
-      revealedNodeCount: 0,
-      activeStepIndex: -1,
-      selectedNodeId: null,
-      timeline: [],
+      nodes: projection.nodes,
+      revealedNodeCount: projection.revealedNodeCount,
+      activeStepIndex: projection.activeStepIndex,
+      timeline,
       replay,
     };
 

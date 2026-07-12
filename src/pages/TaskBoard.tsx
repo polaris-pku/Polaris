@@ -14,6 +14,7 @@ import {
   ShieldAlert,
   Sparkles,
   FilePlus2,
+  Loader2,
 } from 'lucide-react';
 import { selectActiveReplay, useDemoStore } from '@/store/useDemoStore';
 import { Button } from '@/components/ui/Button';
@@ -69,6 +70,7 @@ function TaskBoardInner() {
   const activeTaskId = useDemoStore((s) => s.activeTaskId);
   const tasks = useDemoStore((s) => s.tasks);
   const activeTask = tasks.find((t) => t.id === activeTaskId);
+  const liveRun = useDemoStore((s) => s.liveRun);
   const replay = useDemoStore(selectActiveReplay);
   const selectedNodeId = useDemoStore((s) => s.selectedNodeId);
 
@@ -94,9 +96,12 @@ function TaskBoardInner() {
 
   const activeNode = stage === 'executing' && activeStepIndex >= 0 ? nodes[activeStepIndex] : null;
 
-  const showStart = stage === 'idle' || stage === 'team_configured';
-  const showRecommend = stage === 'analyzing' || stage === 'workflow_recommended';
-  const showExecuteControls = stage === 'executing';
+  // 真实后端 run：泳道图由后端事件实时驱动，人不需要（也不应该）手动推进。
+  // 这些按钮只属于 mock 演示剧本那条路。
+  const isLiveRun = !!activeTask?.contractRunId;
+  const showStart = !isLiveRun && (stage === 'idle' || stage === 'team_configured');
+  const showRecommend = !isLiveRun && (stage === 'analyzing' || stage === 'workflow_recommended');
+  const showExecuteControls = !isLiveRun && stage === 'executing';
   // 用 code 判断（并行执行段节点 id 带 -be/-te 后缀，code 仍为 N7）
   const showIntervene = activeNode?.code === 'N7';
   // 回放任务 Gate=allow：本次 run 未触发 Council，不提供入口
@@ -217,7 +222,16 @@ function TaskBoardInner() {
             </Button>
           )}
 
-          {!showExecuteControls &&
+          {/* 真实 run：进度由后端事件驱动，没有可点的推进按钮 —— 说清楚为什么 */}
+          {isLiveRun && liveRun?.status === 'running' && (
+            <span className="flex items-center gap-1.5 text-xs text-command-soft">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              后端执行中 · 泳道图随 agent 实时推进（已收到 {liveRun.timeline.length} 个事件）
+            </span>
+          )}
+
+          {!isLiveRun &&
+            !showExecuteControls &&
             !showIntervene &&
             !showCouncil &&
             !showDelivered &&

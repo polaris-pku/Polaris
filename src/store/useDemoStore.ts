@@ -92,6 +92,12 @@ onRunEvent((event) => {
     return { liveRun: { ...prev, timeline, status: terminal ?? prev.status } };
   });
 
+  // 泳道图实时跟着后端走：每条事件都用「全部已收到的事件」重投影一次节点状态。
+  const live = useDemoStore.getState().liveRun;
+  if (live?.runId === event.run_id) {
+    useDemoStore.getState().applyLiveProgress(event.run_id, live.timeline, live.status);
+  }
+
   if (!TERMINAL_EVENTS[event.type]) return;
 
   // 终态：拉完整快照。失败不影响已收到的事件时间线。
