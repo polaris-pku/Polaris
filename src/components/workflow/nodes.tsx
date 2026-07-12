@@ -1,7 +1,17 @@
 import { useEffect, useState } from 'react';
+import { ChevronRight } from 'lucide-react';
 import { Handle, Position, type Node, type NodeProps } from '@xyflow/react';
-import type { WorkflowNodeData } from '@/types';
+import type { NodeExecLogLine, WorkflowNodeData } from '@/types';
 import { cn } from '@/lib/utils';
+
+/** 展开态里每一行原始事件（「小节点」）的级别配色 */
+const lineLevelDot: Record<NodeExecLogLine['level'], string> = {
+  info: 'bg-slate-500',
+  success: 'bg-emerald-400',
+  warning: 'bg-amber-400',
+  council: 'bg-violet-400',
+  debug: 'bg-slate-600',
+};
 
 /** 泳道左缘的责任色条 */
 export const laneAccent: Record<string, string> = {
@@ -52,6 +62,10 @@ export type StepNodeData = {
   wf: WorkflowNodeData;
   selected: boolean;
   isNew?: boolean;
+  /** 这一步背后的原始事件（人话执行日志行）——展开时逐条铺开成「小节点」 */
+  lines?: NodeExecLogLine[];
+  /** 是否已展开（默认收缩）；由画布状态控制，点击节点上的展开钮切换 */
+  expanded?: boolean;
 };
 
 /**
@@ -77,12 +91,13 @@ function Elapsed({ since }: { since: string }) {
  * 不再有 N 编号 —— 人不需要背协议节点号；节点编号是给协议作者看的，不是给用户看的。
  */
 function StepNode({ data }: NodeProps<Node<StepNodeData>>) {
-  const { wf, selected, isNew } = data;
+  const { wf, selected, isNew, lines = [], expanded } = data;
   const s = statusStyles[wf.status];
+  const hasLines = lines.length > 0;
   return (
     <div
       className={cn(
-        'w-[188px] cursor-pointer rounded-lg border px-3.5 py-3 transition-all',
+        'relative w-[188px] cursor-pointer rounded-lg border px-3.5 py-3 transition-all',
         s.box,
         selected && 'ring-2 ring-white/40',
         isNew && 'animate-fade-in',
@@ -115,6 +130,49 @@ function StepNode({ data }: NodeProps<Node<StepNodeData>>) {
       {wf.summary && (
         <div className="mt-1 line-clamp-2 text-[11px] leading-snug opacity-60" title={wf.summary}>
           {wf.summary}
+        </div>
+      )}
+
+      {/* 展开钮：点它把这一步背后的原始事件铺开成「小节点」（默认收缩）。
+          带 data-role 让画布的 onNodeClick 能把这次点击当成「展开」而非「选中」。 */}
+      {hasLines && (
+        <div
+          data-role="node-expand"
+          className="mt-2 flex items-center gap-1 border-t border-current/15 pt-1.5 text-[10px] opacity-70 hover:opacity-100"
+        >
+          <ChevronRight className={cn('h-3 w-3 transition-transform', expanded && 'rotate-90')} />
+          <span className="font-mono">{lines.length} 个事件</span>
+          <span className="opacity-60">{expanded ? '点击收起' : '点击展开'}</span>
+        </div>
+      )}
+
+      {/* 展开面板：绝对定位在卡片下方、高 z-index 悬浮，内部滚动 —— 不挤动泳道布局，
+          也不破坏相机跟随。每行是一个原始事件「小节点」。 */}
+      {expanded && hasLines && (
+        <div className="absolute left-0 right-0 top-full z-50 mt-1 max-h-56 w-[248px] overflow-y-auto rounded-lg border border-line-bright bg-ink-900/95 p-1.5 shadow-panel backdrop-blur">
+          <ol className="space-y-0.5">
+            {lines.map((ln, i) => (
+              <li
+                key={i}
+                className="flex items-baseline gap-1.5 rounded px-1.5 py-1 hover:bg-white/5"
+              >
+                <span
+                  className={cn('mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full', lineLevelDot[ln.level])}
+                />
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-baseline gap-1.5">
+                    <span className="callsign shrink-0 text-[8px] text-slate-500">{ln.tag}</span>
+                    <span className="ml-auto shrink-0 font-mono text-[8px] text-slate-600">
+                      {ln.time}
+                    </span>
+                  </div>
+                  <p className="mt-0.5 break-words text-[10px] leading-snug text-slate-300">
+                    {ln.message}
+                  </p>
+                </div>
+              </li>
+            ))}
+          </ol>
         </div>
       )}
       <Handle type="source" position={Position.Right} className="!opacity-0" />

@@ -1,6 +1,12 @@
 import type { Node, Edge } from '@xyflow/react';
-import type { Lane, WorkflowNodeData, WorkflowNodeStatus } from '@/types';
+import type { Lane, NodeExecLogLine, WorkflowNodeData, WorkflowNodeStatus } from '@/types';
 import { laneLabels, phaseOfNode, PHASES, type PhaseKey } from '@/data/workflow';
+
+/** 节点级展开：每个节点背后的原始事件行 + 当前展开集合（默认空 = 全收缩） */
+export type NodeExpansion = {
+  linesByNode: Record<string, NodeExecLogLine[]>;
+  expanded: ReadonlySet<string>;
+};
 
 export const LANE_HEIGHT = 116;
 const NODE_W = 178;
@@ -38,6 +44,7 @@ export function buildFlowGraph(
   machineExpanded: boolean,
   taskNodes: WorkflowNodeData[] = wfNodes,
   collapsedPhases: ReadonlySet<PhaseKey> = new Set(),
+  nodeExpansion: NodeExpansion = { linesByNode: {}, expanded: new Set() },
 ): { nodes: Node[]; edges: Edge[] } {
   // 泳道完全由任务节点派生（按首次出现顺序，节点数组本身按 column 有序）：
   // 后端派几个 agent 就有几条执行泳道，E 只投影不预设。用任务全量节点
@@ -108,6 +115,9 @@ export function buildFlowGraph(
     // 胶囊水平居中的参照：整列折叠时对窄列宽居中，混合列时对卡片宽度居中
     const compactCol = visibleNodes.filter((n) => n.column === wf.column).every(isCompact);
     const chipX = colX[wf.column] + ((compactCol ? COMPACT_COL_GAP : NODE_W) - CHIP_W) / 2;
+    // 展开态节点的事件浮层要盖过相邻节点 → 抬高 zIndex（仅展开时）
+    const isExpanded = nodeExpansion.expanded.has(wf.id);
+    const zIndex = isExpanded ? 40 : 5;
     return {
       id: wf.id,
       type: compact ? 'chip' : 'step',
@@ -119,10 +129,13 @@ export function buildFlowGraph(
         wf,
         selected: selectedNodeId === wf.id,
         isNew: wf.id === visibleNodes[visibleNodes.length - 1]?.id,
+        // 胶囊态不展开（太小放不下）；大卡片才带事件行
+        lines: compact ? undefined : nodeExpansion.linesByNode[wf.id],
+        expanded: isExpanded,
       },
       draggable: false,
-      zIndex: 5,
-      style: { zIndex: 5, width: compact ? CHIP_W : NODE_W },
+      zIndex,
+      style: { zIndex, width: compact ? CHIP_W : NODE_W },
     };
   });
 

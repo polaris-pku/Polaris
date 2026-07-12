@@ -13,8 +13,10 @@ import {
   type NodeMouseHandler,
   type Viewport,
 } from '@xyflow/react';
-import { NODE_IDS, PHASES, phaseOfNode, type PhaseKey } from '@/data/workflow';
-import { useDemoStore } from '@/store/useDemoStore';
+import { NODE_IDS, PHASES, phaseOfNode, stripExecSuffix, type PhaseKey } from '@/data/workflow';
+import type { NodeExecLogLine } from '@/types';
+import { nodeExecutionLogs } from '@/data/nodeExecutionLogs';
+import { selectActiveReplay, useDemoStore } from '@/store/useDemoStore';
 import { cn } from '@/lib/utils';
 import { nodeTypes } from '@/components/workflow/nodes';
 import { buildFlowGraph } from '@/components/workflow/layout';
@@ -128,6 +130,31 @@ function WorkflowCanvasInner() {
     return collapsed;
   }, [manualPhases, activePhase]);
 
+  // ── 节点级展开：把一个步骤背后的原始事件铺开成「小节点」 ──
+  // 默认全部收缩（空集合）；点击节点上的展开钮把它加入/移出这个集合。
+  const [expandedNodes, setExpandedNodes] = useState<ReadonlySet<string>>(new Set());
+  const toggleNodeExpanded = useCallback((id: string) => {
+    setExpandedNodes((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  // 每个节点背后的人话事件行（复用 Inspector 那份 nodeExecLogs；节点 id 可能带执行后缀，两个键都试）
+  const replay = useDemoStore(selectActiveReplay);
+  const nodeExpansion = useMemo(() => {
+    // 真实 run 用后端事件派生的 nodeExecLogs；mock 剧本回落到演示日志 —— 与节点详情面板同源。
+    const src = replay?.nodeExecLogs ?? nodeExecutionLogs;
+    const linesByNode: Record<string, NodeExecLogLine[]> = {};
+    for (const n of allNodes) {
+      const detail = src[n.id] ?? src[stripExecSuffix(n.id)];
+      if (detail?.lines.length) linesByNode[n.id] = detail.lines;
+    }
+    return { linesByNode, expanded: expandedNodes };
+  }, [replay, allNodes, expandedNodes]);
+
   const togglePhase = useCallback(
     (key: PhaseKey) => {
       setManualPhases((prev) => {
@@ -140,8 +167,16 @@ function WorkflowCanvasInner() {
   );
 
   const { nodes: computedNodes, edges: computedEdges } = useMemo(
-    () => buildFlowGraph(wfNodes, selectedNodeId, machineExpanded, allNodes, collapsedPhases),
-    [wfNodes, selectedNodeId, machineExpanded, allNodes, collapsedPhases],
+    () =>
+      buildFlowGraph(
+        wfNodes,
+        selectedNodeId,
+        machineExpanded,
+        allNodes,
+        collapsedPhases,
+        nodeExpansion,
+      ),
+    [wfNodes, selectedNodeId, machineExpanded, allNodes, collapsedPhases, nodeExpansion],
   );
 
   // 受控模式：把派生的 nodes/edges 全量同步进 React Flow 内部 store，
@@ -214,8 +249,13 @@ function WorkflowCanvasInner() {
   // 单击选中即展开；再次单击同一节点取消选中，机器节点随之收缩回胶囊。
   // 点击折叠的阶段卡 → 展开该阶段。
   const onNodeClick = useCallback<NodeMouseHandler>(
-    (_, node) => {
+    (event, node) => {
       if (node.type === 'step' || node.type === 'chip') {
+        // 点在「展开钮」上 = 就地铺开/收起这一步的原始事件，不切换选中（Inspector 不受影响）
+        if ((event.target as HTMLElement | null)?.closest('[data-role="node-expand"]')) {
+          toggleNodeExpanded(node.id);
+          return;
+        }
         selectNode(selectedNodeId === node.id ? null : node.id);
         return;
       }
@@ -223,7 +263,7 @@ function WorkflowCanvasInner() {
         togglePhase((node.data as { phase: PhaseKey }).phase);
       }
     },
-    [selectNode, selectedNodeId, togglePhase],
+    [selectNode, selectedNodeId, togglePhase, toggleNodeExpanded],
   );
 
   // 双击 N14 Council 节点 → 前往 Council Board（与控制栏的 Go to Council 同一动作）
