@@ -25,14 +25,27 @@ let savedViewport: Viewport | null = null;
 // 「展开机器节点」偏好同样跨重挂存活（会话级，不入存盘）
 let savedMachineExpanded = false;
 
+/** 真实 run 镜头跟随时的缩放：够近能读清节点，又留得下周边上下文 */
+const FOCUS_ZOOM = 0.85;
+
 function WorkflowCanvasInner() {
   const allNodes = useDemoStore((s) => s.nodes);
   const revealedNodeCount = useDemoStore((s) => s.revealedNodeCount);
   const selectedNodeId = useDemoStore((s) => s.selectedNodeId);
   const selectNode = useDemoStore((s) => s.selectNode);
   const goToCouncil = useDemoStore((s) => s.goToCouncil);
-  const { fitView, getViewport } = useReactFlow();
-  const prevRevealedCount = useRef(0);
+  const activeTaskId = useDemoStore((s) => s.activeTaskId);
+  // 真实后端 run：节点是后端推进时**自己冒出来**的，不是用户点出来的
+  const isLiveRun = useDemoStore(
+    (s) => !!s.tasks.find((t) => t.id === s.activeTaskId)?.contractRunId,
+  );
+  const { fitView, getViewport, setCenter, getInternalNode } = useReactFlow();
+  /** React Flow 上一次实际持有的节点数（视口适配以它为准，见下方 effect） */
+  const prevRfCount = useRef(0);
+  /**
+   * 已**成功居中**过的节点 id（不是「尝试过」——见下方镜头跟随 effect 的注释）。
+   */
+  const focusedId = useRef<string | null>(null);
 
   // 卸载（切走 Task Board）时记下当前视口，切回时由 defaultViewport 恢复
   useEffect(() => {
@@ -64,16 +77,18 @@ function WorkflowCanvasInner() {
     return () => clearTimeout(t);
   }, [machineExpanded, fitView]);
 
-  // 回退 Checkpoint（节点数变少）时自动 fit；正常前进新增节点不重置用户缩放。
+  // 换任务：视口是模块级的（供切页面时恢复），跨任务残留会让新任务的画布停在上一个任务
+  // 拖到的位置 —— 节点长在视野外，看起来就是「泳道图漂移、找不到节点」。换任务必须重置。
+  const prevTaskId = useRef<string | null>(null);
   useEffect(() => {
-    const prev = prevRevealedCount.current;
-    prevRevealedCount.current = revealedNodeCount;
-
-    if (revealedNodeCount < prev) {
-      const t = setTimeout(() => fitView({ padding: 0.15, maxZoom: 1, duration: 300 }), 50);
-      return () => clearTimeout(t);
-    }
-  }, [revealedNodeCount, fitView]);
+    if (prevTaskId.current === activeTaskId) return;
+    prevTaskId.current = activeTaskId;
+    savedViewport = null;
+    prevRfCount.current = 0;
+    focusedId.current = null;
+    const t = setTimeout(() => fitView({ padding: 0.15, maxZoom: 1, duration: 300 }), 50);
+    return () => clearTimeout(t);
+  }, [activeTaskId, fitView]);
 
   // 画布就绪时：首次（无保留视口）以「全屏适配」视角呈现；
   // 切回页面时 defaultViewport 已恢复上次视口，这里不再覆盖。
@@ -102,6 +117,61 @@ function WorkflowCanvasInner() {
   useEffect(() => {
     setRfEdges(computedEdges);
   }, [computedEdges, setRfEdges]);
+
+  // 回退 Checkpoint（节点数变少）→ 重新适配。正常前进不动用户的缩放。
+  useEffect(() => {
+    const prev = prevRfCount.current;
+    prevRfCount.current = rfNodes.length;
+    if (rfNodes.length >= prev) return;
+    const t = setTimeout(() => fitView({ padding: 0.15, maxZoom: 1, duration: 300 }), 60);
+    return () => clearTimeout(t);
+  }, [rfNodes.length, fitView]);
+
+  /**
+   * 真实 run：镜头跟着后端推进的节点走，让它停在视野中心。
+   *
+   * 不用「把全图塞进视野」——N0–N18 这张图很宽，整图适配会缩到 0.4 倍**还是塞不下**
+   * （实测：左边 N0/N1 与右边 N17/N18 同时溢出，23 个节点只有 19 个可见），
+   * 而且塞得进也小到看不清。真正有用的是：**agent 现在做到哪，镜头就在哪。**
+   *
+   * focusNodeId 即 store 的 selectedNodeId —— applyLiveProgress 里让它跟随 active 节点；
+   * 用户手动点选时它同样变化，于是「点谁就居中谁」，两种情况行为一致。
+   * 依赖里带上 rfNodes.length：新节点刚进 React Flow 时还没量好尺寸，节点数变化后要重定位。
+   */
+  // 判重必须按**已成功居中**，不能按「尝试过」：
+  // 焦点变化与节点入场常在同一帧 —— 那时 React Flow 里还没有这个节点，居中必然失败；
+  // 紧接着 rfNodes.length 变化会让本 effect 重跑（并 cleanup 掉上一次的 rAF 重试），
+  // 若按「尝试过」判重，重跑就会认为「焦点没变」直接 return —— 结果一次都没居中成。
+  // 这正是实测「焦点节点在跟着后端走，但镜头纹丝不动」的原因。
+  useEffect(() => {
+    if (!isLiveRun || !selectedNodeId) return;
+    if (focusedId.current === selectedNodeId) return;
+
+    let cancelled = false;
+    let tries = 0;
+
+    const focus = (): boolean => {
+      const node = getInternalNode(selectedNodeId);
+      const width = node?.measured?.width;
+      const height = node?.measured?.height;
+      // 节点刚进 React Flow 时尺寸还没量好（measured 为空）→ 这一帧定位不了，下一帧再试
+      if (!node || !width || !height) return false;
+      const { x, y } = node.internals.positionAbsolute;
+      setCenter(x + width / 2, y + height / 2, { zoom: FOCUS_ZOOM, duration: 450 });
+      focusedId.current = selectedNodeId;
+      return true;
+    };
+
+    const tick = () => {
+      if (cancelled || focus() || ++tries > 60) return;
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedNodeId, isLiveRun, rfNodes.length, getInternalNode, setCenter]);
 
   // 单击选中即展开；再次单击同一节点取消选中，机器节点随之收缩回胶囊
   const onNodeClick = useCallback<NodeMouseHandler>(

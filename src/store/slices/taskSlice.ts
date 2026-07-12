@@ -112,6 +112,13 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
       status: runStatus,
     });
 
+    // 聚焦：选中节点跟着 agent 走 —— 右侧 Inspector 显示的就是它此刻正在做的那个节点。
+    // 后端推进到哪，视线就跟到哪；run 结束后落在最后完成的节点上。
+    const focusNode =
+      projection.nodes.find((n) => n.status === 'active') ??
+      [...projection.nodes].reverse().find((n) => n.status === 'done' || n.status === 'blocked');
+    const selectedNodeId = focusNode?.id ?? state.selectedNodeId;
+
     // 时间线：已点亮的节点各一条，取后端事件原文（顺序 = 泳道图列序）
     resetTimelineSeq();
     const exec: PartialExecState = {
@@ -120,7 +127,7 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
       nodes: projection.nodes,
       revealedNodeCount: projection.revealedNodeCount,
       activeStepIndex: projection.activeStepIndex,
-      selectedNodeId: state.selectedNodeId,
+      selectedNodeId,
       interventionRules: task.interventionRules,
       confirmedCouncilOptionId: task.confirmedCouncilOptionId,
       interventionFeedback: task.interventionFeedback,
@@ -144,6 +151,7 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
       nodes: projection.nodes,
       revealedNodeCount: projection.revealedNodeCount,
       activeStepIndex: projection.activeStepIndex,
+      selectedNodeId,
       timeline,
       replay,
     };
