@@ -43,6 +43,10 @@ export function projectLiveBoard(
   if (agents.length === 0) return null;
 
   const reached = reachedNodeIds(events);
+  // N0「需求到达」后端不单独发事件，但它有据可依：task.created 的 payload 里就带着需求原文
+  // —— 需求确实到达了。有事件即成立。
+  // （N1「分诊」不补：这个后端没有分诊步骤，它一直是灰的就是事实，不编造。）
+  if (events.length > 0) reached.add('n0-intake');
   // 已开始但没结束的节点（典型：N7 执行中 —— agent 正在写代码，可能还要几十秒）
   const inProgress = runStatus === 'running' ? inProgressNodeIds(events) : new Set<string>();
   const base = composeRunWorkflowNodes(agents);

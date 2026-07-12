@@ -102,6 +102,58 @@ function ChipNode({ data }: NodeProps<Node<StepNodeData>>) {
   );
 }
 
+export type PhaseNodeData = {
+  phase: string;
+  label: string;
+  labelCn: string;
+  done: number;
+  total: number;
+  status: WorkflowNodeData['status'];
+};
+
+/**
+ * 折叠态的**阶段卡**：一整段（受理 / 执行 / 评审 / 交付）收成一张卡。
+ *
+ * 存在的理由：18 个节点一次性铺开信息量过载，真实 run 里更是被后端一次性推出来的。
+ * 折叠后任何时刻只有 agent 正在做的那个阶段是展开的，其余是四张带进度的卡。
+ * 点击展开。
+ */
+function PhaseNode({ data }: NodeProps<Node<PhaseNodeData>>) {
+  // 部分完成不能显示成「未开始」的灰色 —— 有些节点后端本就不发事件（如 N1 分诊，
+  // 当前后端没有这个步骤），它们永远是 pending。若照搬聚合状态，跑完的阶段仍然一片灰，
+  // 看起来像出错。所以：只要有节点完成过，卡片就走「已推进」的绿色，进度条如实显示 2/4。
+  const partial = data.status === 'pending' && data.done > 0;
+  const s = partial ? statusStyles.done : statusStyles[data.status];
+  const pct = data.total > 0 ? (data.done / data.total) * 100 : 0;
+  return (
+    <div
+      title={
+        `${data.labelCn} · ${data.done}/${data.total} 已完成（点击展开）` +
+        (partial ? '\n未完成的节点：当前后端未就该节点发出事件' : '')
+      }
+      className={cn(
+        'w-[150px] cursor-pointer rounded-md border px-2.5 py-2 transition-all hover:brightness-125',
+        s.box,
+      )}
+    >
+      <Handle type="target" position={Position.Left} className="!opacity-0" />
+      <div className="flex items-center gap-1.5">
+        <span className={cn('led h-1.5 w-1.5 shrink-0', s.dot)} />
+        <span className="callsign text-[9px]">{data.labelCn}</span>
+        <span className="ml-auto font-mono text-[9px] opacity-70">
+          {data.done}/{data.total}
+        </span>
+      </div>
+      {/* 进度条：一眼看出这段跑到哪了，不用展开 */}
+      <div className="mt-1.5 h-0.5 w-full overflow-hidden rounded-full bg-black/30">
+        <div className={cn('h-full transition-all', s.dot)} style={{ width: `${String(pct)}%` }} />
+      </div>
+      <div className="mt-1 text-[8px] opacity-50">▸ 点击展开</div>
+      <Handle type="source" position={Position.Right} className="!opacity-0" />
+    </div>
+  );
+}
+
 function LaneNode({ data }: NodeProps<Node<{ label: string; lane: string; width: number }>>) {
   return (
     <div
@@ -116,9 +168,10 @@ function LaneNode({ data }: NodeProps<Node<{ label: string; lane: string; width:
   );
 }
 
-/** React Flow 自定义节点注册表：step 大卡片 / chip 折叠胶囊 / lane 泳道底板 */
+/** React Flow 自定义节点注册表：step 大卡片 / chip 折叠胶囊 / phase 折叠阶段卡 / lane 泳道底板 */
 export const nodeTypes = {
   step: StepNode,
   chip: ChipNode,
+  phase: PhaseNode,
   lane: LaneNode,
 };

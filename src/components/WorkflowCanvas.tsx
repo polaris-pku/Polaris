@@ -13,7 +13,7 @@ import {
   type NodeMouseHandler,
   type Viewport,
 } from '@xyflow/react';
-import { NODE_IDS } from '@/data/workflow';
+import { NODE_IDS, PHASES, phaseOf, type PhaseKey } from '@/data/workflow';
 import { useDemoStore } from '@/store/useDemoStore';
 import { cn } from '@/lib/utils';
 import { nodeTypes } from '@/components/workflow/nodes';
@@ -101,9 +101,46 @@ function WorkflowCanvasInner() {
     savedViewport = vp;
   }, []);
 
+  /**
+   * 阶段折叠（渐进披露）。
+   *
+   * 默认：只展开 agent 此刻所在的那个阶段，其余三段收成阶段卡。run 推进到下一阶段时，
+   * 上一阶段自动收回。这样任何时刻画布上只有 4–6 个节点 + 3 张卡，而不是 18 个节点一次涌现。
+   *
+   * 用户点开/收起某个阶段后，该阶段进入「手动模式」，不再被自动收回 —— 人的意图优先于自动策略。
+   */
+  const [manualPhases, setManualPhases] = useState<Partial<Record<PhaseKey, boolean>>>({});
+  const activePhase = useMemo(() => {
+    // 焦点节点所在的阶段就是「当前阶段」（live run 里焦点跟随后端推进）
+    const focus = allNodes.find((n) => n.id === selectedNodeId);
+    const running = allNodes.find((n) => n.status === 'active');
+    return phaseOf((focus ?? running)?.id ?? '');
+  }, [allNodes, selectedNodeId]);
+
+  const collapsedPhases = useMemo(() => {
+    const collapsed = new Set<PhaseKey>();
+    for (const phase of PHASES) {
+      const manual = manualPhases[phase.key];
+      const expanded = manual ?? phase.key === activePhase;
+      if (!expanded) collapsed.add(phase.key);
+    }
+    return collapsed;
+  }, [manualPhases, activePhase]);
+
+  const togglePhase = useCallback(
+    (key: PhaseKey) => {
+      setManualPhases((prev) => {
+        // 以「当前实际展开与否」为准取反 —— 否则从自动态第一次点击会没反应
+        const expanded = prev[key] ?? key === activePhase;
+        return { ...prev, [key]: !expanded };
+      });
+    },
+    [activePhase],
+  );
+
   const { nodes: computedNodes, edges: computedEdges } = useMemo(
-    () => buildFlowGraph(wfNodes, selectedNodeId, machineExpanded, allNodes),
-    [wfNodes, selectedNodeId, machineExpanded, allNodes],
+    () => buildFlowGraph(wfNodes, selectedNodeId, machineExpanded, allNodes, collapsedPhases),
+    [wfNodes, selectedNodeId, machineExpanded, allNodes, collapsedPhases],
   );
 
   // 受控模式：把派生的 nodes/edges 全量同步进 React Flow 内部 store，
@@ -173,14 +210,19 @@ function WorkflowCanvasInner() {
     };
   }, [selectedNodeId, isLiveRun, rfNodes.length, getInternalNode, setCenter]);
 
-  // 单击选中即展开；再次单击同一节点取消选中，机器节点随之收缩回胶囊
+  // 单击选中即展开；再次单击同一节点取消选中，机器节点随之收缩回胶囊。
+  // 点击折叠的阶段卡 → 展开该阶段。
   const onNodeClick = useCallback<NodeMouseHandler>(
     (_, node) => {
       if (node.type === 'step' || node.type === 'chip') {
         selectNode(selectedNodeId === node.id ? null : node.id);
+        return;
+      }
+      if (node.type === 'phase') {
+        togglePhase((node.data as { phase: PhaseKey }).phase);
       }
     },
-    [selectNode, selectedNodeId],
+    [selectNode, selectedNodeId, togglePhase],
   );
 
   // 双击 N14 Council 节点 → 前往 Council Board（与控制栏的 Go to Council 同一动作）
@@ -193,6 +235,31 @@ function WorkflowCanvasInner() {
 
   return (
     <div className="relative h-full w-full">
+      {/* 阶段开关：四段各一个，可随时展开/收起。默认只展开 agent 所在的那段（渐进披露）。 */}
+      <div className="absolute left-3 top-3 z-10 flex items-center gap-1">
+        {PHASES.map((phase) => {
+          const expanded = !collapsedPhases.has(phase.key);
+          const isActive = phase.key === activePhase;
+          return (
+            <button
+              key={phase.key}
+              type="button"
+              onClick={() => togglePhase(phase.key)}
+              title={`${phase.labelCn}（${expanded ? '已展开，点击收起' : '已折叠，点击展开'}）`}
+              className={cn(
+                'flex items-center gap-1 rounded-full border px-2 py-1 font-mono text-[10px] transition-colors',
+                expanded
+                  ? 'border-command/50 bg-command/15 text-command-soft'
+                  : 'border-line-bright bg-ink-850/90 text-slate-500 hover:text-slate-300',
+              )}
+            >
+              {isActive && <span className="led h-1.5 w-1.5 bg-command animate-pulse-ring" />}
+              {phase.labelCn}
+            </button>
+          );
+        })}
+      </div>
+
       <div className="absolute right-3 top-3 z-10 flex items-center gap-2">
         {/* 双击手势提示：纯展示，不拦截事件 */}
         <span className="pointer-events-none rounded-full border border-violet-500/40 bg-ink-850/90 px-2.5 py-1 font-mono text-[10px] text-violet-300/80">

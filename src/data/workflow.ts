@@ -642,6 +642,54 @@ export function stripExecSuffix(id: string): string {
   return EXEC_BASE_IDS.find((base) => id.startsWith(`${base}-`)) ?? id;
 }
 
+// ── 阶段分组（泳道图的折叠单元）──
+
+/**
+ * N0–N18 主链路的四个阶段。
+ *
+ * 18 个节点一次性铺开信息量过载 —— 尤其真实 run 里节点是后端一次性推出来的，
+ * 用户眼前会「突然涌现一大堆」。所以按阶段收纳：任何时刻只展开 agent 正在做的那个阶段，
+ * 其余折叠成一张带进度的阶段卡（渐进披露）。
+ *
+ * 阶段边界与 N 编号严格对齐，是流程的自然分段，不是为了折叠硬凑的：
+ *   受理 N0–N3 · 执行 N4–N9（每个 agent 一条子链）· 评审 N10–N14 · 交付 N15–N18
+ */
+export type PhaseKey = 'intake' | 'execution' | 'review' | 'delivery';
+
+export const PHASES: { key: PhaseKey; label: string; labelCn: string }[] = [
+  { key: 'intake', label: 'INTAKE', labelCn: '受理' },
+  { key: 'execution', label: 'EXECUTION', labelCn: '执行' },
+  { key: 'review', label: 'REVIEW', labelCn: '评审' },
+  { key: 'delivery', label: 'DELIVERY', labelCn: '交付' },
+];
+
+/** 基础节点 id → 阶段（执行子链的分身先 stripExecSuffix 还原） */
+const PHASE_BY_BASE_ID: Record<string, PhaseKey> = {
+  'n0-intake': 'intake',
+  'n1-triage': 'intake',
+  'n2-create-task': 'intake',
+  'n3-create-run': 'intake',
+  'n4-claim': 'execution',
+  'n5-contextpack': 'execution',
+  'n6-start-driver': 'execution',
+  'n7-executing': 'execution',
+  'n8-driver-result': 'execution',
+  'n9-artifact': 'execution',
+  'n10-task-completed': 'review',
+  'n11-hook-gate': 'review',
+  'n13-gate': 'review',
+  'n14-council': 'review',
+  'n15-merge-auth': 'delivery',
+  'n16-checkpoint': 'delivery',
+  'n17-merge-boundary': 'delivery',
+  'n18-run-complete': 'delivery',
+};
+
+/** 节点属于哪个阶段。未登记的节点返回 undefined —— 调用方按「不可折叠」处理，不猜。 */
+export function phaseOf(nodeId: string): PhaseKey | undefined {
+  return PHASE_BY_BASE_ID[stripExecSuffix(nodeId)];
+}
+
 /** 一条执行子链的参与者规格：后端派单的一个 agent（lane 即该 agent 的泳道） */
 export type ExecAgentSpec = { suffix: string; lane: Lane; owner: string };
 
