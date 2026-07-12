@@ -48,12 +48,33 @@ declare global {
     | { ok: true; result: unknown }
     | { ok: false; error: string; code?: number };
 
+  /** 随包分发的 agent */
+  type DesktopAgent = {
+    id: string;
+    name: string;
+    /** 它认的环境变量名（如 ANTHROPIC_API_KEY） */
+    envVar: string;
+  };
+
+  /** 认证状态：没就绪的话，用户提交需求必然失败 —— 界面要能提前拦住 */
+  type DesktopAuthState = {
+    agentId: string;
+    /** 用户在设置里填了 key */
+    hasKey: boolean;
+    /** 本机已有该 agent 的登录态（开发机常见；分发出去的用户不会有） */
+    hasLocalCredentials: boolean;
+    /** 能不能干活 = hasKey || hasLocalCredentials */
+    ready: boolean;
+  };
+
   /** BCD 后端子进程的运行状态 */
   type DesktopBackendStatus = {
     state: 'stopped' | 'starting' | 'ready' | 'error';
     message: string;
     /** agent 当前的工作区绝对路径（即「文件会写到哪」）。空 = 后端未启动。 */
     workspace: string;
+    auth: DesktopAuthState;
+    agents: DesktopAgent[];
   };
 
   interface DesktopBridge {
@@ -93,6 +114,13 @@ declare global {
       }) => Promise<DesktopBackendStatus>;
       /** 重启后端进程 */
       restart: () => Promise<DesktopBackendStatus>;
+      /** 读设置（只回「有没有填 key」，绝不回 key 本身） */
+      getSettings: () => Promise<{ agentId: string; configured: Record<string, boolean> }>;
+      /** 存设置（填 key / 换 agent）；存完自动重启后端使其生效。key 传空串 = 删除 */
+      saveSettings: (next: {
+        agentId?: string;
+        apiKeys?: Record<string, string>;
+      }) => Promise<DesktopBackendStatus>;
       /** 订阅 BCD 推来的 run.event；返回取消订阅函数 */
       onEvent: (cb: (payload: { run_id: string; event: unknown }) => void) => () => void;
       /** 订阅后端进程状态变化；返回取消订阅函数 */

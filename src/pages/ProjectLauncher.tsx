@@ -30,7 +30,8 @@ export function ProjectLauncher() {
   const recent = projects.slice(0, 4);
 
   return (
-    <div className="relative flex min-h-screen w-screen items-center justify-center overflow-hidden bg-ink-950 text-slate-200">
+    // h-full（不是 min-h-screen）：外层 App 已占满视口，顶部可能有认证提示条
+    <div className="relative flex h-full w-full items-center justify-center overflow-hidden bg-ink-950 text-slate-200">
       {/* 背景机械感光晕 + 网格 */}
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(60%_50%_at_50%_0%,rgba(37,99,235,0.12),transparent_70%)]" />
       <div

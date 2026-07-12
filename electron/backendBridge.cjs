@@ -55,14 +55,30 @@ const pending = new Map();
 /** @type {() => import('electron').BrowserWindow | null} */
 let getWindow = () => null;
 
-let status = { state: 'stopped', message: '', workspace: '' };
+let status = {
+  state: 'stopped',
+  message: '',
+  workspace: '',
+  auth: { agentId: 'claude', hasKey: false, hasLocalCredentials: false, ready: false },
+  agents: [],
+};
 /** 等待后端就绪的订阅者（starting 期间到达的调用挂在这里，而不是被直接拒掉）。 */
 let readyWaiters = [];
 
 function setStatus(state, message = '') {
   // workspace 必须随状态一起暴露给渲染层：「agent 写到哪」是后端的全局状态，
   // 用户在界面上看不见它的话，文件写错项目也毫无察觉（run 照样显示 completed）。
-  status = { state, message, workspace: currentConfig?.workspace ?? '' };
+  //
+  // auth 同理，而且更要命：没配 key 的用户提交需求后只会看到一个语焉不详的失败，
+  // 完全不知道自己缺什么。把「认证是否就绪」做成可观测状态，界面才能提前拦住他。
+  const agentId = currentConfig?.agentId ?? readSettings().agentId ?? 'claude';
+  status = {
+    state,
+    message,
+    workspace: currentConfig?.workspace ?? '',
+    auth: authState(agentId),
+    agents: AGENTS,
+  };
   if (isDev) console.log(`[backend] ${state}${message ? `: ${message}` : ''}`);
   getWindow()?.webContents.send('backend:status', status);
   if (state === 'starting') return;
@@ -107,13 +123,48 @@ function pushEvent(params) {
 // 分发出去的用户机器上没有 Claude Code 登录态，只能靠 API key。存在 userData 下，
 // 启动后端时注入到子进程环境；A 的 adapter 会把它转交给 agent（base-adapter 的 authEnvMap）。
 
-/** agent id → 它认的环境变量名（对齐 A 的 authEnvMap） */
-const AUTH_ENV_BY_AGENT = {
-  claude: 'ANTHROPIC_API_KEY',
-  gemini: 'GEMINI_API_KEY',
-  codex: 'OPENAI_API_KEY',
-  kimi: 'MOONSHOT_API_KEY',
-};
+/**
+ * 随包分发的 agent 目录。
+ *
+ * 打包版只带了 claude —— 其余 agent（gemini / codex …）的 CLI 要靠 npx 现拉，
+ * 而打包后的机器上没有 npx。**不要列出来给用户选一个跑不起来的东西**。
+ * 以后把别的 agent 也打进包（build-backend 里加），再往这里加。
+ */
+const AGENTS = [
+  {
+    id: 'claude',
+    name: 'Claude Code',
+    /** 它认的环境变量（对齐 A 的 base-adapter authEnvMap） */
+    envVar: 'ANTHROPIC_API_KEY',
+  },
+];
+
+const AUTH_ENV_BY_AGENT = Object.fromEntries(AGENTS.map((a) => [a.id, a.envVar]));
+
+/**
+ * 本机是否已有该 agent 的登录态（开发机上常见：装过 Claude Code 并登录过）。
+ * 有的话不填 key 也能跑 —— 但分发出去的用户机器上不会有，所以这只是开发期的便利。
+ */
+function hasLocalCredentials(agentId) {
+  if (agentId !== 'claude') return false;
+  try {
+    return fs.existsSync(path.join(app.getPath('home'), '.claude', '.credentials.json'));
+  } catch {
+    return false;
+  }
+}
+
+/** 认证是否就绪：用户填了 key，或本机已有登录态。 */
+function authState(agentId) {
+  const { apiKeys = {} } = readSettings();
+  const hasKey = !!apiKeys[agentId];
+  return {
+    agentId,
+    hasKey,
+    hasLocalCredentials: hasLocalCredentials(agentId),
+    ready: hasKey || hasLocalCredentials(agentId),
+  };
+}
 
 function settingsPath() {
   return path.join(app.getPath('userData'), 'settings.json');

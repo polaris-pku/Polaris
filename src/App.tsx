@@ -1,4 +1,7 @@
+import { useState } from 'react';
 import { AppShell } from '@/components/AppShell';
+import { AuthBanner } from '@/components/AuthBanner';
+import { SettingsDialog } from '@/components/SettingsDialog';
 import { AgentBoard } from '@/pages/AgentBoard';
 import { TaskBoard } from '@/pages/TaskBoard';
 import { CouncilBoard } from '@/pages/CouncilBoard';
@@ -10,16 +13,34 @@ export default function App() {
   const activeProjectId = useDemoStore((s) => s.activeProjectId);
   const currentPage = useDemoStore((s) => s.currentPage);
 
-  if (!activeProjectId) {
-    return <ProjectLauncher />;
-  }
+  /**
+   * 认证提示条必须挂在**最顶层**，不能挂在 AppShell 里。
+   *
+   * 新用户第一眼看到的是启动页（ProjectLauncher），而它完全在 AppShell 之外 ——
+   * 提示条若挂在 AppShell 里，最需要看到它的人恰好看不到，而且启动页上连设置入口都没有。
+   * 这正是「用户根本不知道自己需要哪些认证 token」的根源。
+   */
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   return (
-    <AppShell>
-      {currentPage === 'agents' && <AgentBoard />}
-      {currentPage === 'tasks' && <TaskBoard />}
-      {currentPage === 'council' && <CouncilBoard />}
-      {currentPage === 'file' && <FileViewer />}
-    </AppShell>
+    <div className="flex h-screen flex-col overflow-hidden">
+      <AuthBanner onConfigure={() => setSettingsOpen(true)} />
+
+      <div className="min-h-0 flex-1">
+        {!activeProjectId ? (
+          <ProjectLauncher />
+        ) : (
+          <AppShell>
+            {currentPage === 'agents' && <AgentBoard />}
+            {currentPage === 'tasks' && <TaskBoard />}
+            {currentPage === 'council' && <CouncilBoard />}
+            {currentPage === 'file' && <FileViewer />}
+          </AppShell>
+        )}
+      </div>
+
+      {/* 启动页上也要能打开设置 —— 否则用户点了提示条却没地方填 key */}
+      <SettingsDialog open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+    </div>
   );
 }

@@ -31,6 +31,10 @@ contextBridge.exposeInMainWorld("desktop", {
     configure: (options) => ipcRenderer.invoke("backend:configure", options),
     /** 重启后端进程 */
     restart: () => ipcRenderer.invoke("backend:restart"),
+    /** 读设置（只回「有没有填 key」，绝不回 key 本身） */
+    getSettings: () => ipcRenderer.invoke("backend:getSettings"),
+    /** 存设置（填 key / 换 agent）；存完自动重启后端使其生效 */
+    saveSettings: (next) => ipcRenderer.invoke("backend:saveSettings", next),
     /** 订阅 BCD 推来的 run.event；返回取消订阅函数 */
     onEvent: (cb) => {
       const listener = (_event, payload) => cb(payload);

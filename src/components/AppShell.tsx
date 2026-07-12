@@ -84,7 +84,8 @@ export function AppShell({ children }: { children: ReactNode }) {
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   return (
-    <div className="flex h-screen w-screen overflow-hidden bg-ink-950 text-slate-200">
+    // h-full（不是 h-screen）：外层 App 已经占满视口，且顶部可能有认证提示条
+    <div className="flex h-full w-full overflow-hidden bg-ink-950 text-slate-200">
       {/* Command deck */}
       <aside
         className={cn(

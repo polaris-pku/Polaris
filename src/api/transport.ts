@@ -22,11 +22,31 @@ import type {
 
 export type BackendState = 'stopped' | 'starting' | 'ready' | 'error';
 
+/** 随包分发的 agent（主进程给；没打进包的不列，别让用户选一个跑不起来的东西） */
+export interface BackendAgent {
+  id: string;
+  name: string;
+  /** 它认的环境变量名（如 ANTHROPIC_API_KEY） */
+  envVar: string;
+}
+
+/** 认证状态：没就绪的话用户提交需求必然失败 —— 界面要能提前拦住 */
+export interface BackendAuth {
+  agentId: string;
+  hasKey: boolean;
+  /** 本机已有该 agent 的登录态（开发机常见；分发出去的用户不会有） */
+  hasLocalCredentials: boolean;
+  ready: boolean;
+}
+
 export interface BackendStatus {
   state: BackendState;
   message: string;
   /** agent 当前工作区（文件会写到哪）——必须能在界面上看见，否则写错项目也无从察觉。 */
   workspace: string;
+  /** 认证是否就绪。用户装完应用后唯一必须做的事就是配这个。 */
+  auth: BackendAuth;
+  agents: BackendAgent[];
 }
 
 export interface RunTransport {
@@ -88,6 +108,15 @@ function createIpcTransport(bridge: NonNullable<DesktopBridge['backend']>): RunT
 // 不发任何请求，本地伪造一个与后端受理行为同形的结果，让调用方走完全相同的代码路径。
 // 真实剧本推进仍由 store 里的 mock 状态机负责，这里只提供协议层的同形应答。
 
+/** mock 传输的固定状态：浏览器里不接后端，认证也就无从谈起（走演示剧本）。 */
+const MOCK_STATUS: BackendStatus = {
+  state: 'ready',
+  message: 'mock',
+  workspace: '',
+  auth: { agentId: 'mock', hasKey: false, hasLocalCredentials: false, ready: true },
+  agents: [],
+};
+
 function createMockTransport(): RunTransport {
   const eventHandlers = new Set<(event: RunEvent) => void>();
   let seq = 0;
@@ -125,10 +154,10 @@ function createMockTransport(): RunTransport {
       return () => eventHandlers.delete(handler);
     },
     onStatus: (handler) => {
-      queueMicrotask(() => handler({ state: 'ready', message: 'mock', workspace: '' }));
+      queueMicrotask(() => handler(MOCK_STATUS));
       return () => {};
     },
-    getStatus: async () => ({ state: 'ready', message: 'mock', workspace: '' }),
+    getStatus: async () => MOCK_STATUS,
   };
 }
 

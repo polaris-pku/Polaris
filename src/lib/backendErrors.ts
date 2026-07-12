@@ -32,12 +32,14 @@ const EXPLANATIONS: Record<string, Omit<ExplainedError, 'code' | 'raw'>> = {
   },
   DRIVER_FAILED: {
     title: 'Agent 没能完成执行',
-    hint: 'agent 进程被拉起但执行失败。常见原因：agent 凭据缺失/过期，或工作区不可写。可在设置里换一个 agent，或检查 packages/acp-client/.env。',
+    // 最常见的原因是**没配 API key**。AuthBanner 本该在提交前就拦住，
+    // 但 key 失效/额度用尽也会走到这里 —— 所以这里也要把认证摆在第一位。
+    hint: 'agent 进程被拉起但执行失败。最常见的原因是 API key 缺失、失效或额度用尽 —— 打开右上角「设置 → Agent 认证」检查。其次是工作区不可写。',
     actionable: true,
   },
   EXTERNAL_DRIVER_TRANSPORT_ERROR: {
     title: '无法与 Agent 进程通信',
-    hint: 'ACP runner 起不来或异常退出。检查 Node 版本（需 22.22.1+）与 packages/acp-client 是否能正常构建。',
+    hint: 'ACP runner 起不来或异常退出。桌面版请在「设置」里确认 agent 认证已配置；开发环境请检查 Node 版本（需 22.22.1+）。',
     actionable: true,
   },
   GATE_DENIED: {
