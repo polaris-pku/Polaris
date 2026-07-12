@@ -10,6 +10,11 @@ export const laneLabels: Record<Lane, string> = {
   Test: 'Test · 测试 Agent',
   Security: 'Security · 安全 / Gate',
   Council: 'Council · 议会',
+  // 事件驱动图的泳道（= event.source）。agent 泳道以后端给的 role_id 为名，
+  // 后端派几个角色就有几条，前端不预设。
+  Memory: 'Memory · B · 角色记忆',
+  Driver: 'Driver · A · 执行运行时',
+  Agent: 'Agent · 执行',
 };
 
 /**
@@ -688,6 +693,14 @@ const PHASE_BY_BASE_ID: Record<string, PhaseKey> = {
 /** 节点属于哪个阶段。未登记的节点返回 undefined —— 调用方按「不可折叠」处理，不猜。 */
 export function phaseOf(nodeId: string): PhaseKey | undefined {
   return PHASE_BY_BASE_ID[stripExecSuffix(nodeId)];
+}
+
+/**
+ * 节点的阶段：事件驱动生成的节点自带 `phase`；mock 模板节点按 id 反查。
+ * 泳道图的折叠一律走这个入口。
+ */
+export function phaseOfNode(node: { id: string; phase?: PhaseKey }): PhaseKey | undefined {
+  return node.phase ?? phaseOf(node.id);
 }
 
 /** 一条执行子链的参与者规格：后端派单的一个 agent（lane 即该 agent 的泳道） */

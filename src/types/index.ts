@@ -15,6 +15,7 @@ import type {
 } from '@/api/types';
 // 仅类型引用（编译期擦除），不构成运行时循环依赖
 import type { RunSnapshot as RpcRunSnapshot } from '@/api/types/rpc';
+import type { PhaseKey } from '@/data/workflow';
 import type { Scenario } from '@/data/scenario';
 
 export type PageKey = 'agents' | 'tasks' | 'council' | 'file';
@@ -241,6 +242,17 @@ export type WorkflowNodeData = {
   taskStatus: TaskStatusCore | null;
   /** 状态补充说明（如 N13 的分支落点、N17 的 reserved 提示） */
   statusNote?: string;
+  /**
+   * 所属阶段（泳道图的折叠单元）。事件驱动生成的节点自带；
+   * mock 模板节点不带，由 phaseOf(id) 按 id 反查。
+   */
+  phase?: PhaseKey;
+  /**
+   * 跨度节点尚未闭合时的开始时刻（ISO）。
+   * agent 执行那十几秒里后端一个事件都不发 —— 有它，节点卡才能显示实时计时，
+   * 界面不至于看起来是死的。
+   */
+  spanStartedAt?: string;
   frozen: FrozenLevel;
   summary: string;
   input: string[];

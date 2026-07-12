@@ -250,36 +250,45 @@ export function NodeInspector() {
               </div>
             </Collapsible>
 
-            {/* 数据流：input → output */}
-            <Collapsible
-              icon={ArrowLeftRight}
-              title="数据流"
-              gloss="I/O"
-              meta={`${node.input.length} → ${node.output.length}`}
-            >
-              <div className="space-y-2.5">
-                <ChipList label="输入" items={node.input} tone="text-blue-300" />
-                <ChipList label="输出" items={node.output} tone="text-emerald-300" />
-              </div>
-            </Collapsible>
+            {/* 数据流：input → output。事件驱动生成的节点没有这些模板字段 —— 空的就不显示，
+                不摆一个「0 → 0」的空壳。 */}
+            {(node.input.length > 0 || node.output.length > 0) && (
+              <Collapsible
+                icon={ArrowLeftRight}
+                title="数据流"
+                gloss="I/O"
+                meta={`${node.input.length} → ${node.output.length}`}
+              >
+                <div className="space-y-2.5">
+                  <ChipList label="输入" items={node.input} tone="text-blue-300" />
+                  <ChipList label="输出" items={node.output} tone="text-emerald-300" />
+                </div>
+              </Collapsible>
+            )}
 
-            {/* 研判：风险 + 下一步 */}
-            <Collapsible icon={AlertTriangle} title="风险研判" gloss="Assessment">
-              <div className="space-y-2.5">
-                <div>
-                  <div className="mb-1 flex items-center gap-1.5 text-[10px] font-semibold text-rose-300">
-                    <AlertTriangle className="h-3 w-3" /> 风险
-                  </div>
-                  <p className="text-xs leading-relaxed text-rose-100/80">{node.risk}</p>
+            {/* 研判：风险 + 下一步（同上：后端事件没有这些字段，空则不显示） */}
+            {(node.risk || node.nextAction) && (
+              <Collapsible icon={AlertTriangle} title="风险研判" gloss="Assessment">
+                <div className="space-y-2.5">
+                  {node.risk && (
+                    <div>
+                      <div className="mb-1 flex items-center gap-1.5 text-[10px] font-semibold text-rose-300">
+                        <AlertTriangle className="h-3 w-3" /> 风险
+                      </div>
+                      <p className="text-xs leading-relaxed text-rose-100/80">{node.risk}</p>
+                    </div>
+                  )}
+                  {node.nextAction && (
+                    <div>
+                      <div className="mb-1 flex items-center gap-1.5 text-[10px] font-semibold text-command-soft">
+                        <ArrowRight className="h-3 w-3" /> 下一步
+                      </div>
+                      <p className="text-xs leading-relaxed text-slate-300">{node.nextAction}</p>
+                    </div>
+                  )}
                 </div>
-                <div>
-                  <div className="mb-1 flex items-center gap-1.5 text-[10px] font-semibold text-command-soft">
-                    <ArrowRight className="h-3 w-3" /> 下一步
-                  </div>
-                  <p className="text-xs leading-relaxed text-slate-300">{node.nextAction}</p>
-                </div>
-              </div>
-            </Collapsible>
+              </Collapsible>
+            )}
 
             {/* 活动：文件操作 / 执行日志（组件自带折叠，样式一致） */}
             <FileOpsPanel nodeId={node.id} status={node.status} />

@@ -156,7 +156,7 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
     const nextTask = {
       ...task,
       taskText: replay.scenario.subject,
-      assignedAgentIds: projection.agents.map((a) => a.suffix),
+      assignedAgentIds: projection.agents,
       stage: projection.stage,
       analysisReady: true,
       nodes: projection.nodes,
@@ -229,7 +229,7 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
       ...task,
       // 需求原文以后端 task.spec 为准（后端是权威）
       taskText: snapshot.task.spec,
-      assignedAgentIds: projection.agents.map((a) => a.suffix),
+      assignedAgentIds: projection.agents,
       stage: projection.stage,
       analysisReady: true,
       nodes: projection.nodes,

@@ -13,7 +13,7 @@ import {
   type NodeMouseHandler,
   type Viewport,
 } from '@xyflow/react';
-import { NODE_IDS, PHASES, phaseOf, type PhaseKey } from '@/data/workflow';
+import { NODE_IDS, PHASES, phaseOfNode, type PhaseKey } from '@/data/workflow';
 import { useDemoStore } from '@/store/useDemoStore';
 import { cn } from '@/lib/utils';
 import { nodeTypes } from '@/components/workflow/nodes';
@@ -114,7 +114,8 @@ function WorkflowCanvasInner() {
     // 焦点节点所在的阶段就是「当前阶段」（live run 里焦点跟随后端推进）
     const focus = allNodes.find((n) => n.id === selectedNodeId);
     const running = allNodes.find((n) => n.status === 'active');
-    return phaseOf((focus ?? running)?.id ?? '');
+    const node = focus ?? running;
+    return node ? phaseOfNode(node) : undefined;
   }, [allNodes, selectedNodeId]);
 
   const collapsedPhases = useMemo(() => {

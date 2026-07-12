@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react';
 import { Handle, Position, type Node, type NodeProps } from '@xyflow/react';
 import type { WorkflowNodeData } from '@/types';
 import { cn } from '@/lib/utils';
@@ -10,6 +11,10 @@ export const laneAccent: Record<string, string> = {
   Test: 'border-l-teal-500/60', // 测试 Agent
   Security: 'border-l-indigo-500/60', // 安全 / Gate
   Council: 'border-l-violet-500/60',
+  // 事件驱动图的泳道（= event.source）
+  Memory: 'border-l-sky-500/60', // B · 角色记忆
+  Driver: 'border-l-emerald-500/60', // A · 执行运行时
+  Agent: 'border-l-teal-500/60', // agent 角色（无 role_id 时的兜底）
 };
 
 const statusStyles: Record<
@@ -49,6 +54,22 @@ export type StepNodeData = {
   isNew?: boolean;
 };
 
+/**
+ * 未闭合跨度节点的实时计时。
+ *
+ * agent 执行那十几秒里后端**一个事件都不发** —— 没有这个计时器，界面在最关键的那段时间
+ * 完全是死的，用户会以为卡住了。这里按秒自走，数据源是后端给的开始时刻，不是编的。
+ */
+function Elapsed({ since }: { since: string }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
+  const seconds = Math.max(0, (now - new Date(since).getTime()) / 1000);
+  return <span className="font-mono tabular-nums">{seconds.toFixed(0)}s</span>;
+}
+
 function StepNode({ data }: NodeProps<Node<StepNodeData>>) {
   const { wf, selected, isNew } = data;
   const s = statusStyles[wf.status];
@@ -62,12 +83,19 @@ function StepNode({ data }: NodeProps<Node<StepNodeData>>) {
       )}
     >
       <Handle type="target" position={Position.Left} className="!opacity-0" />
-      {/* 顶行：节点编号（安静）+ 状态灯 */}
+      {/* 顶行：节点编号（安静）+ 进行中计时 + 状态灯 */}
       <div className="flex items-center justify-between">
         <span className="font-mono text-[10px] font-medium tracking-[0.14em] opacity-45">
           {wf.code}
         </span>
-        <span className={cn('led h-1.5 w-1.5 shrink-0', s.dot)} />
+        <div className="flex items-center gap-1.5">
+          {wf.spanStartedAt && wf.status === 'active' && (
+            <span className="text-[10px] opacity-70">
+              <Elapsed since={wf.spanStartedAt} />
+            </span>
+          )}
+          <span className={cn('led h-1.5 w-1.5 shrink-0', s.dot)} />
+        </div>
       </div>
       {/* 标题 + 中文名（颜色随状态，构成一张统一色调的卡） */}
       <div className="mt-2 font-display text-[15px] font-semibold leading-tight">{wf.label}</div>

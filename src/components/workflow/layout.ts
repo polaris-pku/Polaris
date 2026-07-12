@@ -1,6 +1,6 @@
 import type { Node, Edge } from '@xyflow/react';
 import type { Lane, WorkflowNodeData, WorkflowNodeStatus } from '@/types';
-import { laneLabels, phaseOf, PHASES, type PhaseKey } from '@/data/workflow';
+import { laneLabels, phaseOfNode, PHASES, type PhaseKey } from '@/data/workflow';
 
 export const LANE_HEIGHT = 116;
 const NODE_W = 178;
@@ -50,7 +50,7 @@ export function buildFlowGraph(
 
   /** 该节点是否被它所属阶段折叠掉了 */
   const isFolded = (n: WorkflowNodeData) => {
-    const phase = phaseOf(n.id);
+    const phase = phaseOfNode(n);
     return !!phase && collapsedPhases.has(phase);
   };
 
@@ -63,7 +63,7 @@ export function buildFlowGraph(
   // 列 → 阶段（用任务全量节点判定，避免揭示过程中列归属跳变）
   const phaseOfColumn = new Map<number, PhaseKey>();
   for (const n of taskNodes) {
-    const phase = phaseOf(n.id);
+    const phase = phaseOfNode(n);
     if (phase) phaseOfColumn.set(n.column, phase);
   }
 
@@ -130,10 +130,10 @@ export function buildFlowGraph(
   const phaseNodes: Node[] = [];
   for (const phase of PHASES) {
     if (!collapsedPhases.has(phase.key)) continue;
-    const revealed = foldedNodes.filter((n) => phaseOf(n.id) === phase.key);
+    const revealed = foldedNodes.filter((n) => phaseOfNode(n) === phase.key);
     if (revealed.length === 0) continue; // 一个都还没揭示 → 阶段卡也不出现
 
-    const all = taskNodes.filter((n) => phaseOf(n.id) === phase.key);
+    const all = taskNodes.filter((n) => phaseOfNode(n) === phase.key);
     const lanes = revealed.map((n) => laneIndex(n.lane));
     const midLane = (Math.min(...lanes) + Math.max(...lanes)) / 2;
     const firstCol = Math.min(...revealed.map((n) => n.column));
@@ -162,7 +162,7 @@ export function buildFlowGraph(
 
   // 连线：折叠阶段内的节点一律改指它的阶段卡；阶段内部连线丢弃
   const nodeKey = (n: WorkflowNodeData) => {
-    const phase = phaseOf(n.id);
+    const phase = phaseOfNode(n);
     return phase && collapsedPhases.has(phase) ? `phase-${phase}` : n.id;
   };
 
