@@ -26,17 +26,42 @@ export type BackendState = 'stopped' | 'starting' | 'ready' | 'error';
 export interface BackendAgent {
   id: string;
   name: string;
-  /** 它认的环境变量名（如 ANTHROPIC_API_KEY） */
-  envVar: string;
+}
+
+/**
+ * 模型服务商。
+ *
+ * Claude Code 只会说 Anthropic 的 Messages API —— 不能直接塞一个 DeepSeek 的 key。
+ * 但它认 ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN，所以任何提供 **Anthropic 兼容端点**
+ * 的服务都能接（DeepSeek 官方就有一个）。
+ */
+export interface BackendProvider {
+  id: string;
+  name: string;
+  keyLabel: string;
+  keyHint: string;
+  consoleUrl: string;
+  consoleName: string;
+  /** 固定端点（官方/DeepSeek）；custom 为空，由用户填 */
+  baseUrl: string;
+  editableBaseUrl: boolean;
+  defaultModel: string;
+  defaultFastModel: string;
 }
 
 /** 认证状态：没就绪的话用户提交需求必然失败 —— 界面要能提前拦住 */
 export interface BackendAuth {
-  agentId: string;
+  providerId: string;
   hasKey: boolean;
-  /** 本机已有该 agent 的登录态（开发机常见；分发出去的用户不会有） */
+  /** 填了 key 但 baseUrl/模型没填全 —— 界面要能指出来，别让人以为配好了 */
+  incomplete: boolean;
+  /** 本机已有 Claude Code 登录态（开发机常见；分发出去的用户不会有；只对 Anthropic 官方端点有效） */
   hasLocalCredentials: boolean;
   ready: boolean;
+  /** 回显（不含 key） */
+  baseUrl: string;
+  model: string;
+  fastModel: string;
 }
 
 export interface BackendStatus {
@@ -47,6 +72,7 @@ export interface BackendStatus {
   /** 认证是否就绪。用户装完应用后唯一必须做的事就是配这个。 */
   auth: BackendAuth;
   agents: BackendAgent[];
+  providers: BackendProvider[];
 }
 
 export interface RunTransport {
@@ -113,8 +139,18 @@ const MOCK_STATUS: BackendStatus = {
   state: 'ready',
   message: 'mock',
   workspace: '',
-  auth: { agentId: 'mock', hasKey: false, hasLocalCredentials: false, ready: true },
+  auth: {
+    providerId: 'mock',
+    hasKey: false,
+    incomplete: false,
+    hasLocalCredentials: false,
+    ready: true,
+    baseUrl: '',
+    model: '',
+    fastModel: '',
+  },
   agents: [],
+  providers: [],
 };
 
 function createMockTransport(): RunTransport {

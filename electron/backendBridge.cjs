@@ -59,8 +59,18 @@ let status = {
   state: 'stopped',
   message: '',
   workspace: '',
-  auth: { agentId: 'claude', hasKey: false, hasLocalCredentials: false, ready: false },
+  auth: {
+    providerId: 'anthropic',
+    hasKey: false,
+    incomplete: false,
+    hasLocalCredentials: false,
+    ready: false,
+    baseUrl: '',
+    model: '',
+    fastModel: '',
+  },
   agents: [],
+  providers: [],
 };
 /** 等待后端就绪的订阅者（starting 期间到达的调用挂在这里，而不是被直接拒掉）。 */
 let readyWaiters = [];
@@ -71,13 +81,13 @@ function setStatus(state, message = '') {
   //
   // auth 同理，而且更要命：没配 key 的用户提交需求后只会看到一个语焉不详的失败，
   // 完全不知道自己缺什么。把「认证是否就绪」做成可观测状态，界面才能提前拦住他。
-  const agentId = currentConfig?.agentId ?? readSettings().agentId ?? 'claude';
   status = {
     state,
     message,
     workspace: currentConfig?.workspace ?? '',
-    auth: authState(agentId),
+    auth: authState(),
     agents: AGENTS,
+    providers: PROVIDERS,
   };
   if (isDev) console.log(`[backend] ${state}${message ? `: ${message}` : ''}`);
   getWindow()?.webContents.send('backend:status', status);
@@ -124,47 +134,61 @@ function pushEvent(params) {
 // 启动后端时注入到子进程环境；A 的 adapter 会把它转交给 agent（base-adapter 的 authEnvMap）。
 
 /**
- * 随包分发的 agent 目录。
+ * 模型服务商。
  *
- * 打包版只带了 claude —— 其余 agent（gemini / codex …）的 CLI 要靠 npx 现拉，
- * 而打包后的机器上没有 npx。**不要列出来给用户选一个跑不起来的东西**。
- * 以后把别的 agent 也打进包（build-backend 里加），再往这里加。
+ * Claude Code 只会说 **Anthropic 的 Messages API** —— 不能直接塞一个 DeepSeek 的 key 进去。
+ * 但它认 `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN`，所以任何提供
+ * **Anthropic 兼容端点**的服务都能接（DeepSeek 官方就提供了一个）。
+ *
+ * 模型名会变（deepseek-v4-pro 之类），所以 defaults 只是预填，用户可改。
  */
-const AGENTS = [
+const PROVIDERS = [
   {
-    id: 'claude',
-    name: 'Claude Code',
-    /** 它认的环境变量（对齐 A 的 base-adapter authEnvMap） */
-    envVar: 'ANTHROPIC_API_KEY',
+    id: 'anthropic',
+    name: 'Anthropic（官方）',
+    keyLabel: 'Anthropic API Key',
+    keyHint: '以 sk-ant- 开头',
+    consoleUrl: 'https://console.anthropic.com/settings/keys',
+    consoleName: 'Anthropic Console',
+    /** 官方端点：不需要 base URL / 模型名，直接用 ANTHROPIC_API_KEY */
+    baseUrl: '',
+    editableBaseUrl: false,
+    defaultModel: '',
+    defaultFastModel: '',
+  },
+  {
+    id: 'deepseek',
+    name: 'DeepSeek',
+    keyLabel: 'DeepSeek API Key',
+    keyHint: '以 sk- 开头',
+    consoleUrl: 'https://platform.deepseek.com/api_keys',
+    consoleName: 'DeepSeek 开放平台',
+    baseUrl: 'https://api.deepseek.com/anthropic',
+    editableBaseUrl: false,
+    defaultModel: 'deepseek-v4-pro',
+    defaultFastModel: 'deepseek-v4-flash',
+  },
+  {
+    id: 'custom',
+    name: '自定义（Anthropic 兼容端点）',
+    keyLabel: 'API Key / Token',
+    keyHint: '',
+    consoleUrl: '',
+    consoleName: '',
+    baseUrl: '',
+    editableBaseUrl: true,
+    defaultModel: '',
+    defaultFastModel: '',
   },
 ];
 
-const AUTH_ENV_BY_AGENT = Object.fromEntries(AGENTS.map((a) => [a.id, a.envVar]));
-
 /**
- * 本机是否已有该 agent 的登录态（开发机上常见：装过 Claude Code 并登录过）。
- * 有的话不填 key 也能跑 —— 但分发出去的用户机器上不会有，所以这只是开发期的便利。
+ * 随包分发的 agent。
+ *
+ * 打包版只带了 claude —— 其余 agent（gemini / codex …）的 CLI 要靠 npx 现拉，
+ * 而打包后的机器上没有 npx。**不要列出来给用户选一个跑不起来的东西**。
  */
-function hasLocalCredentials(agentId) {
-  if (agentId !== 'claude') return false;
-  try {
-    return fs.existsSync(path.join(app.getPath('home'), '.claude', '.credentials.json'));
-  } catch {
-    return false;
-  }
-}
-
-/** 认证是否就绪：用户填了 key，或本机已有登录态。 */
-function authState(agentId) {
-  const { apiKeys = {} } = readSettings();
-  const hasKey = !!apiKeys[agentId];
-  return {
-    agentId,
-    hasKey,
-    hasLocalCredentials: hasLocalCredentials(agentId),
-    ready: hasKey || hasLocalCredentials(agentId),
-  };
-}
+const AGENTS = [{ id: 'claude', name: 'Claude Code' }];
 
 function settingsPath() {
   return path.join(app.getPath('userData'), 'settings.json');
@@ -178,15 +202,86 @@ function readSettings() {
   }
 }
 
-/** 把用户填的 key 变成 agent 认的环境变量。没填就不注入（本机若已有登录态仍可用）。 */
-function readAuthEnv() {
-  const { apiKeys = {} } = readSettings();
-  const env = {};
-  for (const [agentId, value] of Object.entries(apiKeys)) {
-    const name = AUTH_ENV_BY_AGENT[agentId];
-    if (name && value) env[name] = String(value);
+/** 当前服务商 + 它的配置（key / baseUrl / model）。 */
+function currentProvider() {
+  const s = readSettings();
+  const id = s.provider ?? 'anthropic';
+  const def = PROVIDERS.find((p) => p.id === id) ?? PROVIDERS[0];
+  const cfg = s.providers?.[id] ?? {};
+  return {
+    def,
+    key: cfg.key ?? '',
+    baseUrl: def.editableBaseUrl ? (cfg.baseUrl ?? '') : def.baseUrl,
+    model: cfg.model || def.defaultModel,
+    fastModel: cfg.fastModel || def.defaultFastModel || cfg.model || def.defaultModel,
+  };
+}
+
+/**
+ * 本机是否已有 Claude Code 的登录态（开发机常见）。
+ * 只有走 Anthropic 官方端点时才算数 —— 指向 DeepSeek 却用本机 Anthropic 登录态是矛盾的。
+ */
+function hasLocalCredentials(providerId) {
+  if (providerId !== 'anthropic') return false;
+  try {
+    return fs.existsSync(path.join(app.getPath('home'), '.claude', '.credentials.json'));
+  } catch {
+    return false;
   }
-  return env;
+}
+
+/** 配置是否完整：非官方端点必须同时有 key / baseUrl / model，缺一不可。 */
+function providerComplete(p) {
+  if (!p.key) return false;
+  if (p.def.id === 'anthropic') return true;
+  return !!p.baseUrl && !!p.model;
+}
+
+/** 认证是否就绪：配置完整，或本机已有登录态。 */
+function authState() {
+  const p = currentProvider();
+  const local = hasLocalCredentials(p.def.id);
+  return {
+    providerId: p.def.id,
+    hasKey: !!p.key,
+    /** 填了 key 但 baseUrl/模型没填全 —— 界面要能指出来，别让人以为配好了 */
+    incomplete: !!p.key && !providerComplete(p),
+    hasLocalCredentials: local,
+    ready: providerComplete(p) || local,
+    /** 回显给界面（不含 key） */
+    baseUrl: p.baseUrl,
+    model: p.model,
+    fastModel: p.fastModel,
+  };
+}
+
+/**
+ * 认证环境变量。
+ *
+ * 返回 `unset`：走第三方端点时必须**清掉** ANTHROPIC_API_KEY 与本机登录态相关的变量 ——
+ * 否则 Claude Code 可能优先拿它去打 Anthropic 官方，用户会看到一个莫名其妙的 401，
+ * 而且完全想不到是因为「本机还留着旧凭据」。
+ */
+function readAuthEnv() {
+  const p = currentProvider();
+  if (!providerComplete(p)) return { set: {}, unset: [] };
+
+  if (p.def.id === 'anthropic') {
+    return { set: { ANTHROPIC_API_KEY: p.key }, unset: ['ANTHROPIC_BASE_URL'] };
+  }
+
+  return {
+    set: {
+      ANTHROPIC_BASE_URL: p.baseUrl,
+      ANTHROPIC_AUTH_TOKEN: p.key,
+      ANTHROPIC_MODEL: p.model,
+      ANTHROPIC_DEFAULT_OPUS_MODEL: p.model,
+      ANTHROPIC_DEFAULT_SONNET_MODEL: p.model,
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: p.fastModel,
+      CLAUDE_CODE_SUBAGENT_MODEL: p.fastModel,
+    },
+    unset: ['ANTHROPIC_API_KEY'],
+  };
 }
 
 /** 还没选项目时的兜底工作区（与 fsBridge 的默认工作区同根）。 */
@@ -255,6 +350,7 @@ function start({ workspace, agentId } = {}, { force = false } = {}) {
     return;
   }
 
+  const auth = readAuthEnv();
   const env = {
     ...process.env,
     // 后端宿主自己会据此拼出 agent 的路径（见 electron/backend-host.ts）
@@ -263,9 +359,13 @@ function start({ workspace, agentId } = {}, { force = false } = {}) {
     POLARIS_AGENT_DIR: AGENT_DIR,
     ACP_AGENT_ID: resolvedAgentId,
     ACP_WORKSPACE: resolvedWorkspace,
-    // 用户在设置里填的 token —— 分发出去的用户没有本机 Claude 登录态，只能靠它认证
-    ...readAuthEnv(),
+    // 用户在设置里配的服务商 + key —— 分发出去的用户没有本机登录态，只能靠它认证
+    ...auth.set,
   };
+  // 走第三方端点时必须**删掉** ANTHROPIC_API_KEY（而不是置空）——
+  // 留着它 Claude Code 可能优先拿去打 Anthropic 官方，用户会看到一个莫名其妙的 401，
+  // 而且完全想不到是「本机还留着旧凭据」。
+  for (const name of auth.unset) delete env[name];
 
   // 直接用包内的 Node 跑编译好的后端 —— 不再经过 pnpm（打包后的机器上没有 pnpm）。
   // cwd 落在 BACKEND_DIR：BCD 的 .newide/runs 审计产物写在那里。
@@ -395,29 +495,61 @@ function setupBackendBridge(windowGetter) {
   ipcMain.handle('backend:getStatus', () => status);
 
   // 设置：agent 的 API key。存 userData，不进仓库、不进日志。
+  // 读设置：**绝不把 key 本身回给渲染层**，只回「填没填」+ baseUrl/模型这些非机密项。
   ipcMain.handle('backend:getSettings', () => {
-    const { apiKeys = {}, agentId = 'claude' } = readSettings();
-    // 只回「有没有填」，绝不把 key 本身回给渲染层
+    const s = readSettings();
     return {
-      agentId,
+      provider: s.provider ?? 'anthropic',
+      // 每个服务商各自的配置（key 一律只回布尔）
       configured: Object.fromEntries(
-        Object.entries(AUTH_ENV_BY_AGENT).map(([id]) => [id, !!apiKeys[id]]),
+        PROVIDERS.map((p) => {
+          const cfg = s.providers?.[p.id] ?? {};
+          return [
+            p.id,
+            {
+              hasKey: !!cfg.key,
+              baseUrl: p.editableBaseUrl ? (cfg.baseUrl ?? '') : p.baseUrl,
+              model: cfg.model || p.defaultModel,
+              fastModel: cfg.fastModel || p.defaultFastModel,
+            },
+          ];
+        }),
       ),
     };
   });
 
+  /**
+   * 存设置。
+   *
+   * key 传空串 = 删除该服务商的 key；不传 key = 保留原值（切服务商 / 改模型时不必重填 key）。
+   * 存完必须重启后端 —— 子进程的环境变量只在启动时读一次。
+   */
   ipcMain.handle('backend:saveSettings', (_event, next = {}) => {
     const current = readSettings();
-    const apiKeys = { ...(current.apiKeys ?? {}) };
-    for (const [agentId, value] of Object.entries(next.apiKeys ?? {})) {
-      if (value === '') delete apiKeys[agentId];
-      else if (typeof value === 'string') apiKeys[agentId] = value;
+    const providers = { ...(current.providers ?? {}) };
+
+    for (const [id, patch] of Object.entries(next.providers ?? {})) {
+      if (!PROVIDERS.some((p) => p.id === id)) continue; // 未知服务商：忽略，不写进配置
+      const cfg = { ...(providers[id] ?? {}) };
+      if (typeof patch.key === 'string') {
+        if (patch.key === '') delete cfg.key;
+        else cfg.key = patch.key;
+      }
+      if (typeof patch.baseUrl === 'string') cfg.baseUrl = patch.baseUrl.trim();
+      if (typeof patch.model === 'string') cfg.model = patch.model.trim();
+      if (typeof patch.fastModel === 'string') cfg.fastModel = patch.fastModel.trim();
+      providers[id] = cfg;
     }
-    const merged = { ...current, apiKeys, agentId: next.agentId ?? current.agentId ?? 'claude' };
+
+    const merged = {
+      ...current,
+      providers,
+      provider: next.provider ?? current.provider ?? 'anthropic',
+    };
     fs.mkdirSync(path.dirname(settingsPath()), { recursive: true });
     fs.writeFileSync(settingsPath(), JSON.stringify(merged, null, 2), { mode: 0o600 });
-    // key/agent 变了必须重启后端才生效（子进程环境只在启动时读一次）
-    start({ ...(currentConfig ?? {}), agentId: merged.agentId }, { force: true });
+
+    start(currentConfig ?? {}, { force: true });
     return status;
   });
 

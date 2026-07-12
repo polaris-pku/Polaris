@@ -49,22 +49,42 @@ declare global {
     | { ok: false; error: string; code?: number };
 
   /** 随包分发的 agent */
-  type DesktopAgent = {
+  type DesktopAgent = { id: string; name: string };
+
+  /** 模型服务商（Anthropic 官方 / DeepSeek / 自定义 Anthropic 兼容端点） */
+  type DesktopProvider = {
     id: string;
     name: string;
-    /** 它认的环境变量名（如 ANTHROPIC_API_KEY） */
-    envVar: string;
+    keyLabel: string;
+    keyHint: string;
+    consoleUrl: string;
+    consoleName: string;
+    baseUrl: string;
+    editableBaseUrl: boolean;
+    defaultModel: string;
+    defaultFastModel: string;
   };
 
   /** 认证状态：没就绪的话，用户提交需求必然失败 —— 界面要能提前拦住 */
   type DesktopAuthState = {
-    agentId: string;
-    /** 用户在设置里填了 key */
+    providerId: string;
     hasKey: boolean;
-    /** 本机已有该 agent 的登录态（开发机常见；分发出去的用户不会有） */
+    /** 填了 key 但 baseUrl/模型没填全 */
+    incomplete: boolean;
+    /** 本机已有 Claude Code 登录态（只对 Anthropic 官方端点有效） */
     hasLocalCredentials: boolean;
-    /** 能不能干活 = hasKey || hasLocalCredentials */
     ready: boolean;
+    baseUrl: string;
+    model: string;
+    fastModel: string;
+  };
+
+  /** 某个服务商已保存的配置（key 只回布尔，绝不回明文） */
+  type DesktopProviderConfig = {
+    hasKey: boolean;
+    baseUrl: string;
+    model: string;
+    fastModel: string;
   };
 
   /** BCD 后端子进程的运行状态 */
@@ -75,6 +95,7 @@ declare global {
     workspace: string;
     auth: DesktopAuthState;
     agents: DesktopAgent[];
+    providers: DesktopProvider[];
   };
 
   interface DesktopBridge {
@@ -114,12 +135,21 @@ declare global {
       }) => Promise<DesktopBackendStatus>;
       /** 重启后端进程 */
       restart: () => Promise<DesktopBackendStatus>;
-      /** 读设置（只回「有没有填 key」，绝不回 key 本身） */
-      getSettings: () => Promise<{ agentId: string; configured: Record<string, boolean> }>;
-      /** 存设置（填 key / 换 agent）；存完自动重启后端使其生效。key 传空串 = 删除 */
+      /** 读设置（key 只回布尔，绝不回明文） */
+      getSettings: () => Promise<{
+        provider: string;
+        configured: Record<string, DesktopProviderConfig>;
+      }>;
+      /**
+       * 存设置（换服务商 / 改 key / 改模型）；存完自动重启后端使其生效。
+       * key 传空串 = 删除；不传 key = 保留原值（切服务商、改模型时不必重填）。
+       */
       saveSettings: (next: {
-        agentId?: string;
-        apiKeys?: Record<string, string>;
+        provider?: string;
+        providers?: Record<
+          string,
+          { key?: string; baseUrl?: string; model?: string; fastModel?: string }
+        >;
       }) => Promise<DesktopBackendStatus>;
       /** 订阅 BCD 推来的 run.event；返回取消订阅函数 */
       onEvent: (cb: (payload: { run_id: string; event: unknown }) => void) => () => void;
