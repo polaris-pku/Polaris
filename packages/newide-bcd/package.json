@@ -1,0 +1,59 @@
+{
+  "name": "newide-bcd",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.5.1",
+  "engines": {
+    "node": ">=22.22.1",
+    "pnpm": ">=9"
+  },
+  "scripts": {
+    "build": "tsc -b",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "format": "prettier --check .",
+    "format:fix": "prettier --write .",
+    "test": "vitest run",
+    "verify": "pnpm lint && pnpm typecheck && pnpm test",
+    "example:basic": "tsx src/examples/basic-flow.ts",
+    "example:integration-v0": "tsx src/examples/integration-v0.ts",
+    "backend:rpc": "node --import tsx src/app/backend-rpc-stdio.ts",
+    "rpc:smoke": "node --import tsx scripts/rpc-smoke.ts",
+    "prepare": "husky"
+  },
+  "lint-staged": {
+    "*.{ts,tsx,js,json,md}": [
+      "prettier --write"
+    ],
+    "*.{ts,tsx}": [
+      "eslint --fix"
+    ]
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^4.0.9",
+    "@ai-sdk/openai": "^4.0.8",
+    "ai": "^7.0.17",
+    "js-yaml": "^5.2.1",
+    "pg": "^8.22.0",
+    "zod": "^4.0.5"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^21.0.2",
+    "@commitlint/config-conventional": "^21.0.2",
+    "@eslint/js": "^9.29.0",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^24.0.1",
+    "@types/pg": "^8.20.0",
+    "eslint": "^9.29.0",
+    "eslint-config-prettier": "^10.1.8",
+    "globals": "^16.2.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^17.0.7",
+    "prettier": "^3.5.3",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.34.0",
+    "vitest": "^4.1.9"
+  }
+}
