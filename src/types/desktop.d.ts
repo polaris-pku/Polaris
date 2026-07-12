@@ -52,6 +52,8 @@ declare global {
   type DesktopBackendStatus = {
     state: 'stopped' | 'starting' | 'ready' | 'error';
     message: string;
+    /** agent 当前的工作区绝对路径（即「文件会写到哪」）。空 = 后端未启动。 */
+    workspace: string;
   };
 
   interface DesktopBridge {

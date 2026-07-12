@@ -25,6 +25,8 @@ export type BackendState = 'stopped' | 'starting' | 'ready' | 'error';
 export interface BackendStatus {
   state: BackendState;
   message: string;
+  /** agent 当前工作区（文件会写到哪）——必须能在界面上看见，否则写错项目也无从察觉。 */
+  workspace: string;
 }
 
 export interface RunTransport {
@@ -123,10 +125,10 @@ function createMockTransport(): RunTransport {
       return () => eventHandlers.delete(handler);
     },
     onStatus: (handler) => {
-      queueMicrotask(() => handler({ state: 'ready', message: 'mock' }));
+      queueMicrotask(() => handler({ state: 'ready', message: 'mock', workspace: '' }));
       return () => {};
     },
-    getStatus: async () => ({ state: 'ready', message: 'mock' }),
+    getStatus: async () => ({ state: 'ready', message: 'mock', workspace: '' }),
   };
 }
 

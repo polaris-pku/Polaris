@@ -40,12 +40,14 @@ const pending = new Map();
 /** @type {() => import('electron').BrowserWindow | null} */
 let getWindow = () => null;
 
-let status = { state: 'stopped', message: '' };
+let status = { state: 'stopped', message: '', workspace: '' };
 /** 等待后端就绪的订阅者（starting 期间到达的调用挂在这里，而不是被直接拒掉）。 */
 let readyWaiters = [];
 
 function setStatus(state, message = '') {
-  status = { state, message };
+  // workspace 必须随状态一起暴露给渲染层：「agent 写到哪」是后端的全局状态，
+  // 用户在界面上看不见它的话，文件写错项目也毫无察觉（run 照样显示 completed）。
+  status = { state, message, workspace: currentConfig?.workspace ?? '' };
   if (isDev) console.log(`[backend] ${state}${message ? `: ${message}` : ''}`);
   getWindow()?.webContents.send('backend:status', status);
   if (state === 'starting') return;
@@ -136,6 +138,9 @@ function start({ workspace, agentId } = {}, { force = false } = {}) {
   }
 
   stop();
+  // 先记下目标配置，再置 starting —— setStatus 会把 workspace 一起播给渲染层，
+  // 早一步记下，界面在「启动中」阶段就能显示 agent 即将写入哪个目录。
+  currentConfig = { workspace: resolvedWorkspace, agentId: resolvedAgentId };
   setStatus('starting');
 
   // agent 的写工具（ACP fs/write_text_file）不会 mkdir 工作区本身 —— 目录不存在时
@@ -146,8 +151,6 @@ function start({ workspace, agentId } = {}, { force = false } = {}) {
     setStatus('error', `无法创建 agent 工作区 ${resolvedWorkspace}：${err.message}`);
     return;
   }
-
-  currentConfig = { workspace: resolvedWorkspace, agentId: resolvedAgentId };
 
   const env = {
     ...process.env,

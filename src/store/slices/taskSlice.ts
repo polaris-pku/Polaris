@@ -5,6 +5,7 @@ import { createSampleRunTask, sampleRunProjectMeta, sampleRunSnapshot } from '@/
 import { createRun as apiCreateRun } from '@/api/client';
 import { watchRun } from '@/api/events';
 import { toTaskCreateRequest } from '@/api/map';
+import { bindBackendWorkspace } from '@/lib/backendWorkspace';
 import { buildLiveProgressReplay, buildLiveRunReplay, liveProducedFiles } from '@/lib/liveReplay';
 import { projectLiveBoard } from '@/lib/liveBoard';
 import { resetTimelineSeq } from '@/lib/snapshot';
@@ -67,11 +68,21 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
     // run.create 一次性建 Task + Run 并立刻开跑，所以受理成功即回填 task_id + run_id，
     // 并把事件通道切到这个 run（订阅后后端会重放它已发生的全部事件，去重在 events.ts 里做）。
     // 提交失败不回滚本地任务（mock 演示流仍可走），仅留日志。
-    void apiCreateRun(toTaskCreateRequest(text, completionCriteria), {
-      projectId: state.activeProjectId,
-      clientTaskId: newTask.id,
-      title: newTask.title,
-    })
+    //
+    // ⚠️ 提交前必须先把后端工作区对齐到当前项目。
+    // 「agent 写到哪」是后端的**全局状态**（BCD 只在启动时读一次 ACP_WORKSPACE），不跟着任务走。
+    // 只要期间有任何东西 re-configure 过后端（切项目、外部进程、手动重启），这次需求就会把文件
+    // 写进**别的项目目录** —— 而界面上完全看不出来：run 照样 completed，产物却不在你的项目里。
+    // 曾实测到：用户在 A 项目提的需求，文件落到了 B 项目下。
+    const project = state.projects.find((p) => p.id === state.activeProjectId);
+    void bindBackendWorkspace(project)
+      .then(() =>
+        apiCreateRun(toTaskCreateRequest(text, completionCriteria), {
+          projectId: state.activeProjectId ?? undefined,
+          clientTaskId: newTask.id,
+          title: newTask.title,
+        }),
+      )
       .then((created) => {
         set((s) => ({
           tasks: s.tasks.map((t) =>

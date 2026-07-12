@@ -2,6 +2,7 @@ import type { Project } from '@/types';
 import { PROJECT_TRACE_FORMAT, type SliceCreator, type ProjectSlice } from '@/store/types';
 import { uid } from '@/store/lib/ids';
 import { pickProjectDirectory, readProjectFolder } from '@/lib/agentFs';
+import { bindBackendWorkspace } from '@/lib/backendWorkspace';
 import { insertFileNode, removeFileNode } from '@/store/lib/fileTree';
 import {
   emptyTaskFields,
@@ -9,22 +10,6 @@ import {
   pickProjectTask,
   syncTasks,
 } from '@/store/lib/taskSync';
-
-/**
- * 把 BCD 的 agent 工作区绑到某个项目。
- *
- * 后端只在启动时读一次 ACP_WORKSPACE，所以换项目 = 重启后端子进程。
- * 浏览器里没有桌面桥（mock 模式），静默跳过。
- */
-async function bindBackendWorkspace(project: Project): Promise<void> {
-  const backend = window.desktop?.backend;
-  if (!backend) return;
-  try {
-    await backend.configure({ projectName: project.name, rootPath: project.rootPath });
-  } catch (err) {
-    console.warn('[backend] 绑定 agent 工作区失败：', err);
-  }
-}
 
 /** 项目域：项目生命周期（建/开/关/删/导出/导入）与项目文件树。 */
 export const createProjectSlice: SliceCreator<ProjectSlice> = (set, get) => ({
@@ -59,6 +44,9 @@ export const createProjectSlice: SliceCreator<ProjectSlice> = (set, get) => ({
       activeTaskId: null,
       ...emptyTaskFields(),
     });
+    // 新建即进入该项目 —— 工作区必须跟着绑过去。漏了这一步的话，从启动页新建项目后
+    // 直接提需求，agent 会把文件写进**上一个项目**的目录里（提交时还会再对齐一次兜底）。
+    void bindBackendWorkspace(project);
   },
 
   openProjectFromFolder: async () => {

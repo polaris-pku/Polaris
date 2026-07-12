@@ -5,8 +5,17 @@
  * 两者并存且长得很像 —— 不分开呈现，用户会把演示当成真实执行（反过来也会）。
  * 这个面板只展示后端给了什么：状态、真实事件流、错误、产物。**后端没说的不补写。**
  */
-import { AlertTriangle, CheckCircle2, Loader2, ServerCrash, XCircle } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import {
+  AlertTriangle,
+  CheckCircle2,
+  FolderOpen,
+  Loader2,
+  ServerCrash,
+  XCircle,
+} from 'lucide-react';
 import { Badge } from '@/components/ui/Badge';
+import { onBackendStatus } from '@/api/events';
 import { useDemoStore } from '@/store/useDemoStore';
 import { explainError } from '@/lib/backendErrors';
 import { cn } from '@/lib/utils';
@@ -31,6 +40,10 @@ const SOURCE_COLOR: Record<RunEventSource, string> = {
 
 export function LiveRunPanel() {
   const liveRun = useDemoStore((s) => s.liveRun);
+  // agent 的工作区（文件真正写到哪）。它是后端的全局状态，界面上看不见的话，
+  // 文件写错项目也毫无察觉 —— run 照样显示 completed，产物却在别的目录里。
+  const [workspace, setWorkspace] = useState('');
+  useEffect(() => onBackendStatus((s) => setWorkspace(s.workspace)), []);
 
   // 没有真实 run（纯 mock 剧本任务）→ 整个面板不出现，避免占位噪音。
   if (!liveRun) return null;
@@ -51,12 +64,18 @@ export function LiveRunPanel() {
         </span>
       </div>
 
-      {/* 与 mock 剧本划清界限：这句话是这个面板存在的全部意义 */}
-      <p className="px-4 pb-2 text-[10px] leading-relaxed text-slate-500">
-        这里是 agent 在后端的<strong className="text-slate-300">真实执行</strong>
-        。左侧泳道图与执行时间线走的是
-        <strong className="text-slate-300">演示剧本</strong>，两者独立、互不影响。
-      </p>
+      {/* agent 到底把文件写到哪 —— 必须写在明面上 */}
+      {workspace && (
+        <div className="flex items-start gap-1.5 px-4 pb-2">
+          <FolderOpen className="mt-0.5 h-3 w-3 shrink-0 text-slate-500" />
+          <div className="min-w-0">
+            <p className="callsign text-[9px] text-slate-500">agent 工作区</p>
+            <p className="break-all font-mono text-[10px] text-slate-400" title={workspace}>
+              {workspace}
+            </p>
+          </div>
+        </div>
+      )}
 
       {/* 失败原因：翻译成人话 + 保留后端原始码 */}
       {errors.map((error) => {
