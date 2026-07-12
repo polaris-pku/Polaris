@@ -23,11 +23,13 @@ export type ExplainedError = {
 };
 
 const EXPLANATIONS: Record<string, Omit<ExplainedError, 'code' | 'raw'>> = {
-  // 最常见的一个：需求是闲聊/问答，agent 没改任何文件 → 没有 diff → 没有产物。
-  // 这不是故障，是 BCD 要求每个 run 至少产出一个代码产物。
+  // 后端要求每个 run 至少产出一个代码产物（diff）。走到这里有两种情况，文案都要覆盖：
+  // (a) 需求本就是问答/解释类，agent 正常回答了、无需落盘；
+  // (b) 需求确实要代码，但 agent 把代码贴在了回复里、**没有调用写文件工具**（同一句话有时写、
+  //     有时不写，是模型当场的随机选择，不该让用户靠斟酌措辞去兜底）。
   ARTIFACT_NOT_SELECTED: {
-    title: '这个需求没有产生任何代码改动',
-    hint: '后端要求每次执行都要产出代码产物。纯问答／闲聊类的需求（如「你是谁」）会走到这里。请换成一个具体的编码任务，例如「创建 src/utils/format.ts，实现 formatBytes(n) 并加单元测试」。',
+    title: 'agent 只给了回复，没有把文件写进工作区',
+    hint: '本次执行没有产生任何文件改动。可能是需求本身是问答／解释类（无需落盘），也可能是 agent 把代码写在了回复里却没调用写文件工具。如果你要的是文件，在需求里点明「请创建 xxx 并写入实现」通常更稳，或直接重试一次。',
     actionable: true,
   },
   DRIVER_FAILED: {

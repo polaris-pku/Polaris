@@ -40,13 +40,20 @@ const SOURCE_COLOR: Record<RunEventSource, string> = {
 
 export function LiveRunPanel() {
   const liveRun = useDemoStore((s) => s.liveRun);
+  // 当前选中任务自己那次 run 的 id。liveRun 是**全局单槽**（谁的事件最后到达谁占槽），
+  // 连跑两次 run 时它会指向另一次 —— 必须拿它跟当前任务比对，否则右侧会显示成隔壁 run。
+  const activeRunId = useDemoStore(
+    (s) => s.tasks.find((t) => t.id === s.activeTaskId)?.contractRunId,
+  );
   // agent 的工作区（文件真正写到哪）。它是后端的全局状态，界面上看不见的话，
   // 文件写错项目也毫无察觉 —— run 照样显示 completed，产物却在别的目录里。
   const [workspace, setWorkspace] = useState('');
   useEffect(() => onBackendStatus((s) => setWorkspace(s.workspace)), []);
 
-  // 没有真实 run（纯 mock 剧本任务）→ 整个面板不出现，避免占位噪音。
-  if (!liveRun) return null;
+  // 没有真实 run（纯 mock 剧本任务）→ 不出现。
+  // 全局 liveRun 属于**别的**并发 run（runId 对不上当前任务）→ 也不显示：
+  // 宁可暂时空白，也不要把另一次 run 的状态/事件/产物安在当前任务头上。
+  if (!liveRun || liveRun.runId !== activeRunId) return null;
 
   const meta = STATUS_META[liveRun.status];
   const { Icon } = meta;

@@ -222,13 +222,18 @@ function TaskBoardInner() {
             </Button>
           )}
 
-          {/* 真实 run：进度由后端事件驱动，没有可点的推进按钮 —— 说清楚为什么 */}
-          {isLiveRun && liveRun?.status === 'running' && (
-            <span className="flex items-center gap-1.5 text-xs text-command-soft">
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              后端执行中 · 泳道图随 agent 实时推进（已收到 {liveRun.timeline.length} 个事件）
-            </span>
-          )}
+          {/* 真实 run：进度由后端事件驱动，没有可点的推进按钮 —— 说清楚为什么。
+              liveRun 是全局单槽，必须限定到当前任务自己那次 run，否则并发跑第二个任务时
+              这里会用另一次 run 的事件数谎报当前任务的进度。 */}
+          {isLiveRun &&
+            liveRun &&
+            liveRun.runId === activeTask?.contractRunId &&
+            liveRun.status === 'running' && (
+              <span className="flex items-center gap-1.5 text-xs text-command-soft">
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                后端执行中 · 泳道图随 agent 实时推进（已收到 {liveRun.timeline.length} 个事件）
+              </span>
+            )}
 
           {!isLiveRun &&
             !showExecuteControls &&
