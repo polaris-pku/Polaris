@@ -36,26 +36,50 @@ jobs:
         include:
           - os: windows-latest
             platform: win
+            target-os: win32
+            arch: x64
+          # macOS 只出 arm64。随包的 agent（Claude Code）是**平台专属原生二进制**，
+          # universal 壳配单架构后端 = 在另一半机器上直接起不来。
+          # 要支持 Intel Mac，就再加一个 target-os=darwin / arch=x64 的矩阵项，各自带自己的后端。
           - os: macos-latest
             platform: mac
+            target-os: darwin
+            arch: arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - uses: pnpm/action-setup@v4
 
+      # Node 22：packages/ 下的 A 与 BCD 的 engines 要求 >=22.22.1
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile
 
-      # 先构建渲染层（dist/），electron-builder 再据此打包
+      # 渲染层（dist/）
       - run: pnpm build
 
-      - name: Build & publish (${{ matrix.platform }})
-        run: pnpm exec electron-builder --${{ matrix.platform }} --publish always
+      # 自包含后端（backend/）：编译好的 A + BCD + Node 运行时 + agent 本体。
+      # 用户机器上不需要 pnpm / tsc / npx / node，也不需要预先安装 Claude Code。
+      # 在各自平台的 runner 上原生构建 → 平台专属二进制（node、claude）自动就是对的。
+      - name: Build self-contained backend
+        run: pnpm build:backend --target-os=${{ matrix.target-os }} --target-cpu=${{ matrix.arch }}
+
+      # 兜底：agent 本体没打进去的话，用户装完拿到的是个空壳（每个 run 都以 DRIVER_FAILED 收场）。
+      # 与其让用户去发现，不如让 CI 当场失败。
+      - name: Assert agent binary is bundled
+        shell: bash
+        run: |
+          BIN="backend/agent/node_modules/@anthropic-ai/claude-agent-sdk-${{ matrix.target-os }}-${{ matrix.arch }}/claude"
+          [ "${{ matrix.target-os }}" = "win32" ] && BIN="$BIN.exe"
+          test -f "$BIN" || { echo "::error::agent 二进制缺失：$BIN"; exit 1; }
+          echo "✅ $BIN ($(du -h "$BIN" | cut -f1))"
+
+      - name: Build & publish (${{ matrix.platform }}-${{ matrix.arch }})
+        run: pnpm exec electron-builder --${{ matrix.platform }} --${{ matrix.arch }} --publish always
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # MVP 阶段不做代码签名 / 公证，避免 CI 去查找签名身份

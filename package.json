@@ -59,14 +59,8 @@
     },
     "mac": {
       "target": [
-        {
-          "target": "dmg",
-          "arch": "universal"
-        },
-        {
-          "target": "zip",
-          "arch": "universal"
-        }
+        "dmg",
+        "zip"
       ],
       "category": "public.app-category.developer-tools"
     },

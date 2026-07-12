@@ -19,8 +19,23 @@ Polaris 提供 Windows / macOS 桌面安装包，**无需任何开发环境**：
    - **Windows** → `Polaris-<版本>-win-x64.exe`
    - **macOS**（Apple Silicon）→ `Polaris-<版本>-mac-arm64.dmg`
 3. 双击安装并启动
+4. **在设置里填一个 API key** —— 然后就能用了
 
-> macOS 当前为**未签名**构建。首次打开若提示「无法验证开发者」，在 `系统设置 → 隐私与安全性` 点「仍要打开」，或右键应用图标选「打开」即可。
+**coding agent 随包分发**：Claude Code 的本体（平台专属原生二进制）已经打进安装包里，
+你**不需要**另外安装 Claude Code、Node.js、npm/npx，也不需要联网现拉任何东西。
+安装包因此比较大（Windows ≈ 178 MB，其中 agent 本体就占 226 MB 未压缩）。
+
+装完只差一个凭据：设置 → 填入对应 agent 的 API key（`claude` → Anthropic API key）。
+key 存在本机 userData 下（权限 0600），只进主进程、不回传渲染层、不进日志。
+
+> **未签名构建**。Windows 首次运行 SmartScreen 会拦，点「更多信息 → 仍要运行」；
+> macOS 提示「无法验证开发者」时，在 `系统设置 → 隐私与安全性` 点「仍要打开」，或右键图标选「打开」。
+>
+> macOS 只提供 **Apple Silicon (arm64)** 版本：随包的 agent 是平台专属原生二进制，
+> universal 壳配单架构后端会在另一半机器上直接起不来，所以不再出 universal 包。
+>
+> 打包版只支持走 stdio 的 **ACP 协议 agent**（claude / gemini / codex 等）。
+> 需要 PTY 的 agent（如 aider）未随包提供 —— 见 `scripts/stub-node-pty.cjs` 里的说明。
 
 ## 规范对齐（Single Source of Truth）
 
