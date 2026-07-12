@@ -51,10 +51,10 @@ jobs:
 
       - uses: pnpm/action-setup@v4
 
-      # Node 22：packages/ 下的 A 与 BCD 的 engines 要求 >=22.22.1
+      # Node 版本只认 .nvmrc（packages/ 下的 A 与 BCD 要求 >=22.22.1，pnpm 11 要求 >=22.13）
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version-file: .nvmrc
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile
