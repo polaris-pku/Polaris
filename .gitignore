@@ -33,4 +33,8 @@ my-session.json
 .claude
 design-comparison
 /api/
+
+# 规划类文档：本地参考，不进仓
 polaris_plan.md
+merge_plan.md
+*_plan.md
