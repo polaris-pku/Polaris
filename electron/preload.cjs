@@ -22,6 +22,28 @@ contextBridge.exposeInMainWorld("desktop", {
     /** 在系统文件管理器中定位已写入的文件 */
     reveal: (absPath) => ipcRenderer.invoke("fs:revealPath", absPath),
   },
+  backend: {
+    /** 调用 BCD 的 JSON-RPC 方法（主进程侧有方法白名单）；返回 {ok, result} 或 {ok:false, error} */
+    call: (method, params) => ipcRenderer.invoke("backend:call", { method, params }),
+    /** 拉取后端进程状态（挂载时补齐早于订阅发生的状态） */
+    getStatus: () => ipcRenderer.invoke("backend:getStatus"),
+    /** 把 agent 工作区绑到某个项目并重启后端（BCD 只在启动时读 ACP_WORKSPACE） */
+    configure: (options) => ipcRenderer.invoke("backend:configure", options),
+    /** 重启后端进程 */
+    restart: () => ipcRenderer.invoke("backend:restart"),
+    /** 订阅 BCD 推来的 run.event；返回取消订阅函数 */
+    onEvent: (cb) => {
+      const listener = (_event, payload) => cb(payload);
+      ipcRenderer.on("backend:event", listener);
+      return () => ipcRenderer.removeListener("backend:event", listener);
+    },
+    /** 订阅后端进程状态变化；返回取消订阅函数 */
+    onStatus: (cb) => {
+      const listener = (_event, payload) => cb(payload);
+      ipcRenderer.on("backend:status", listener);
+      return () => ipcRenderer.removeListener("backend:status", listener);
+    },
+  },
   updates: {
     /** 订阅更新事件；返回取消订阅函数 */
     onEvent: (cb) => {

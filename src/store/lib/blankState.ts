@@ -1,6 +1,7 @@
 import type { DemoTask, PageKey, Project } from '@/types';
 import type { EventChannelStatus } from '@/api/events';
 import type { Event as ContractEvent } from '@/api/types';
+import type { LiveRunState } from '@/store/types';
 import type { AgentFileWriteResult } from '@/lib/agentFs';
 import { emptyTaskFields } from '@/store/lib/taskSync';
 
@@ -16,6 +17,7 @@ export const blankState = () => ({
   activeProjectId: null as string | null,
   backendEvents: [] as ContractEvent[],
   eventChannelStatus: 'disconnected' as EventChannelStatus,
+  liveRun: null as LiveRunState | null,
   agentFileWrites: {} as Record<string, AgentFileWriteResult>,
   openedFile: null as { projectId: string; path: string } | null,
   ...emptyTaskFields(),

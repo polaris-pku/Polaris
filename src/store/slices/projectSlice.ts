@@ -10,6 +10,22 @@ import {
   syncTasks,
 } from '@/store/lib/taskSync';
 
+/**
+ * 把 BCD 的 agent 工作区绑到某个项目。
+ *
+ * 后端只在启动时读一次 ACP_WORKSPACE，所以换项目 = 重启后端子进程。
+ * 浏览器里没有桌面桥（mock 模式），静默跳过。
+ */
+async function bindBackendWorkspace(project: Project): Promise<void> {
+  const backend = window.desktop?.backend;
+  if (!backend) return;
+  try {
+    await backend.configure({ projectName: project.name, rootPath: project.rootPath });
+  } catch (err) {
+    console.warn('[backend] 绑定 agent 工作区失败：', err);
+  }
+}
+
 /** 项目域：项目生命周期（建/开/关/删/导出/导入）与项目文件树。 */
 export const createProjectSlice: SliceCreator<ProjectSlice> = (set, get) => ({
   createProject: (name, description, rootPath) => {
@@ -114,6 +130,9 @@ export const createProjectSlice: SliceCreator<ProjectSlice> = (set, get) => ({
       activeTaskId,
       ...taskState,
     });
+    // 把 agent 的工作区绑到这个项目：BCD 只在启动时读 ACP_WORKSPACE，所以要重启后端。
+    // 落点解析复用主进程 fsBridge 的那一套 —— agent 写进哪里 = E 观测面板读哪里。
+    void bindBackendWorkspace(project);
   },
 
   closeProject: () => {

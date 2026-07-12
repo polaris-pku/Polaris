@@ -9,7 +9,27 @@ import type {
 } from '@/types';
 import type { EventChannelStatus } from '@/api/events';
 import type { Event as ContractEvent, FilePermissionOutcome } from '@/api/types';
+import type { RunEvent, RunSnapshot } from '@/api/types/rpc';
 import type { AgentFileWriteResult } from '@/lib/agentFs';
+
+/**
+ * 真实后端 run 的实时观测态。
+ *
+ * 与 mock 剧本并存：mock 剧本仍驱动泳道图的演示推进，`liveRun` 是**后端事实**——
+ * 两者不互相覆盖，UI 上分开呈现，避免把「后端真发生了什么」和「演示脚本演到哪」混为一谈。
+ */
+export type LiveRunState = {
+  runId: string;
+  taskId: string;
+  /** 后端权威状态。running → 终态由 run.completed / run.failed / run.cancelled 事件带出 */
+  status: 'running' | 'completed' | 'failed' | 'cancelled';
+  /** 按 sequence 升序的事件时间线（已在 events.ts 去重） */
+  timeline: RunEvent[];
+  /** 终态后拉取的完整快照（含 flow.node_statuses / delivery_report / errors） */
+  snapshot: RunSnapshot | null;
+  /** 拉快照或提交失败时的错误消息 */
+  error: string | null;
+};
 
 /** 单个任务的执行 trace（agent 执行过程的审计快照，只读；不支持导回应用）。 */
 export type TaskTrace = Pick<
@@ -157,8 +177,10 @@ export type DemoState = PartialExecState &
     activeProjectId: string | null;
     /** 后端事件通道推来的流程事件（新在前，封顶保留 EVENT_LOG_CAP 条） */
     backendEvents: ContractEvent[];
-    /** WS 事件通道连接态（mock 模式恒为 disconnected，事件走本地喂入） */
+    /** 后端通道连接态（mock 模式恒为 disconnected，事件走本地喂入） */
     eventChannelStatus: EventChannelStatus;
+    /** 真实后端 run 的实时状态；null = 当前没有在跑真实 run（纯 mock 剧本） */
+    liveRun: LiveRunState | null;
     /** Agent 生成文件的落盘结果（keyed by tool_event_id；会话级观测，不随任务持久化） */
     agentFileWrites: Record<string, AgentFileWriteResult>;
     /** 文件查看页当前打开的文件（会话级导航态） */

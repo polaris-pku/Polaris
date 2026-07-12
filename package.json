@@ -10,9 +10,9 @@
   },
   "type": "module",
   "main": "electron/main.cjs",
-  "packageManager": "pnpm@9.12.0",
+  "packageManager": "pnpm@11.12.0",
   "engines": {
-    "node": ">=20",
+    "node": ">=22.22.1",
     "pnpm": ">=9"
   },
   "scripts": {
@@ -121,13 +121,6 @@
     ],
     "*.{ts,tsx}": [
       "eslint --fix"
-    ]
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "electron",
-      "electron-builder",
-      "esbuild"
     ]
   }
 }

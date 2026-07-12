@@ -6,7 +6,9 @@ import prettier from 'eslint-config-prettier';
 import globals from 'globals';
 
 export default ts.config(
-  { ignores: ['dist/', 'node_modules/', 'coverage/'] },
+  // packages/ 下的 A、BCD 各自带 eslint 配置与 lint 命令（前端这套规则不适用于它们）。
+  // 全量 lint 用 pnpm -r lint。
+  { ignores: ['dist/', 'node_modules/', 'coverage/', 'packages/', 'release/'] },
   js.configs.recommended,
   ...ts.configs.recommended,
   {

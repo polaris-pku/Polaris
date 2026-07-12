@@ -87,6 +87,9 @@ export type DemoTask = {
   assignedAgentIds: string[];
   /** 后端（C）受理后回填的权威 task_id；缺失表示尚未受理或提交失败 */
   contractTaskId?: string;
+  /** 后端受理后回填的 run_id（run.create 一次性建 Task + Run 并立刻开跑）；
+   *  缺失 = 未接后端或提交失败。真实 run 的事件/快照都按它索引。 */
+  contractRunId?: string;
   /** 用户在 N0 自报的验收标准（随 TaskCreateRequest.completion_criteria 上送） */
   completionCriteria?: string[];
   /** 文件写入权限确认结果（tool_event_id → 人选的 outcome），随任务持久化。

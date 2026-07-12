@@ -43,6 +43,17 @@ declare global {
     | { ok: true; tree: Array<{ name: string; children?: unknown[] }>; truncated: boolean }
     | { ok: false; error: string };
 
+  /** backend:call 的结果信封（主进程已兜底 try/catch，错误不抛到渲染层） */
+  type DesktopBackendCallResult =
+    | { ok: true; result: unknown }
+    | { ok: false; error: string; code?: number };
+
+  /** BCD 后端子进程的运行状态 */
+  type DesktopBackendStatus = {
+    state: 'stopped' | 'starting' | 'ready' | 'error';
+    message: string;
+  };
+
   interface DesktopBridge {
     isDesktop: true;
     platform: NodeJS.Platform;
@@ -62,6 +73,28 @@ declare global {
       readDirectoryTree: (rootPath: string) => Promise<DesktopDirectoryTreeResult>;
       /** 在系统文件管理器中定位已写入的文件（仅工作区/已授权目录内路径生效） */
       reveal: (absPath: string) => Promise<void>;
+    };
+    /** BCD 后端桥（electron/backendBridge.cjs）：JSON-RPC over stdio 的 IPC 转发 */
+    backend: {
+      /** 调用 BCD 的 RPC 方法（主进程侧有方法白名单） */
+      call: (method: string, params?: unknown) => Promise<DesktopBackendCallResult>;
+      /** 拉取后端进程状态（挂载时补齐早于订阅发生的状态） */
+      getStatus: () => Promise<DesktopBackendStatus>;
+      /**
+       * 把 agent 工作区绑到某个项目并重启后端（BCD 只在启动时读 ACP_WORKSPACE）。
+       * 落点解析复用主进程 fsBridge：自定义 rootPath 须已授权，否则回落 默认工作区/<项目名>。
+       */
+      configure: (options: {
+        projectName?: string;
+        rootPath?: string;
+        agentId?: string;
+      }) => Promise<DesktopBackendStatus>;
+      /** 重启后端进程 */
+      restart: () => Promise<DesktopBackendStatus>;
+      /** 订阅 BCD 推来的 run.event；返回取消订阅函数 */
+      onEvent: (cb: (payload: { run_id: string; event: unknown }) => void) => () => void;
+      /** 订阅后端进程状态变化；返回取消订阅函数 */
+      onStatus: (cb: (status: DesktopBackendStatus) => void) => () => void;
     };
     updates: {
       /** 订阅更新事件；返回取消订阅函数 */

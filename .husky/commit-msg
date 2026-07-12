@@ -1,1 +1,3 @@
+. "$(dirname "$0")/common.sh"
+
 pnpm exec commitlint --edit "$1"

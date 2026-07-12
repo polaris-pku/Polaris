@@ -1,7 +1,8 @@
 import type { Project } from '@/types';
 import { createRequirementTask } from '@/data/tasks';
 import { createSampleRunTask, sampleRunProjectMeta, sampleRunSnapshot } from '@/data/sampleRun';
-import { createTask as apiCreateTask } from '@/api/client';
+import { createRun as apiCreateRun } from '@/api/client';
+import { watchRun } from '@/api/events';
 import { toTaskCreateRequest } from '@/api/map';
 import type { SliceCreator, TaskSlice } from '@/store/types';
 import { uid } from '@/store/lib/ids';
@@ -47,18 +48,27 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
       ...taskToState(newTask),
       isAutoRunning: false,
     });
-    // N2 创建 Task：本地乐观创建后异步提交协调器（C），受理成功回填权威 task_id。
-    // 提交失败不回滚本地任务（E 侧演示流仍可走），仅留日志待重试机制补上。
-    void apiCreateTask(toTaskCreateRequest(text, completionCriteria))
-      .then((contractTask) => {
+    // N2/N3：本地乐观创建后异步提交协调器（C）。后端没有「只建 Task 不建 Run」的入口——
+    // run.create 一次性建 Task + Run 并立刻开跑，所以受理成功即回填 task_id + run_id，
+    // 并把事件通道切到这个 run（订阅后后端会重放它已发生的全部事件，去重在 events.ts 里做）。
+    // 提交失败不回滚本地任务（mock 演示流仍可走），仅留日志。
+    void apiCreateRun(toTaskCreateRequest(text, completionCriteria), {
+      projectId: state.activeProjectId,
+      clientTaskId: newTask.id,
+      title: newTask.title,
+    })
+      .then((created) => {
         set((s) => ({
           tasks: s.tasks.map((t) =>
-            t.id === newTask.id ? { ...t, contractTaskId: contractTask.task_id } : t,
+            t.id === newTask.id
+              ? { ...t, contractTaskId: created.task_id, contractRunId: created.run_id }
+              : t,
           ),
         }));
+        return watchRun(created.run_id);
       })
       .catch((err: unknown) => {
-        console.warn('[api] createTask 提交失败，任务仅存在于本地：', err);
+        console.warn('[api] run.create 提交失败，任务仅存在于本地：', err);
       });
   },
 

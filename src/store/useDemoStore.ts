@@ -1,5 +1,6 @@
 import { create } from 'zustand';
-import { onEvent, onEventChannelStatus } from '@/api/events';
+import { getRunSnapshot } from '@/api/client';
+import { onEvent, onEventChannelStatus, onRunEvent } from '@/api/events';
 import type { DemoState } from '@/store/types';
 import { blankState } from '@/store/lib/blankState';
 import { createProjectSlice } from '@/store/slices/projectSlice';
@@ -41,6 +42,11 @@ export const useDemoStore = create<DemoState>()((...a) => ({
   ...createCouncilSlice(...a),
 }));
 
+// dev 下把 store 挂到 window，便于在 DevTools 里直接观察真实 run 的状态与后端事件。
+if (import.meta.env.DEV && typeof window !== 'undefined') {
+  (window as unknown as { __demoStore?: unknown }).__demoStore = useDemoStore;
+}
+
 /** 事件日志封顶条数：只做近期观测窗口，完整审计流由 C 持久化（E 不重放）。 */
 const EVENT_LOG_CAP = 200;
 
@@ -54,4 +60,51 @@ onEvent((event) => {
 });
 onEventChannelStatus((eventChannelStatus) => {
   useDemoStore.setState({ eventChannelStatus });
+});
+
+// ── 真实 run 接线（模块级常驻订阅）──
+// mock 模式下传输层不推 RunEvent，这条链路自然静默；有真实后端时它是唯一的事实来源。
+// 注意：与 mock 剧本并存 —— 剧本继续驱动泳道图演示，liveRun 记录后端真发生了什么。
+
+/** run 的终态事件：拿到后去拉一次完整快照（含 flow/delivery_report/errors）。 */
+const TERMINAL_EVENTS: Record<string, 'completed' | 'failed' | 'cancelled'> = {
+  'run.completed': 'completed',
+  'run.failed': 'failed',
+  'run.cancelled': 'cancelled',
+};
+
+onRunEvent((event) => {
+  useDemoStore.setState((s) => {
+    const prev =
+      s.liveRun?.runId === event.run_id
+        ? s.liveRun
+        : {
+            runId: event.run_id,
+            taskId: event.task_id,
+            status: 'running' as const,
+            timeline: [],
+            snapshot: null,
+            error: null,
+          };
+    // 后端事件带单调递增的 sequence —— 排序以它为准，不依赖到达顺序。
+    const timeline = [...prev.timeline, event].sort((a, b) => a.sequence - b.sequence);
+    const terminal = TERMINAL_EVENTS[event.type];
+    return { liveRun: { ...prev, timeline, status: terminal ?? prev.status } };
+  });
+
+  if (!TERMINAL_EVENTS[event.type]) return;
+
+  // 终态：拉完整快照。失败不影响已收到的事件时间线。
+  void getRunSnapshot(event.run_id)
+    .then((snapshot) => {
+      useDemoStore.setState((s) =>
+        s.liveRun?.runId === event.run_id ? { liveRun: { ...s.liveRun, snapshot } } : {},
+      );
+    })
+    .catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      useDemoStore.setState((s) =>
+        s.liveRun?.runId === event.run_id ? { liveRun: { ...s.liveRun, error: message } } : {},
+      );
+    });
 });

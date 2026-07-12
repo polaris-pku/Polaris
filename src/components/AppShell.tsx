@@ -9,7 +9,7 @@ import {
   Settings,
 } from 'lucide-react';
 import { useDemoStore } from '@/store/useDemoStore';
-import { apiConfig } from '@/api/config';
+import { isMockMode } from '@/api/config';
 import type { DemoStage } from '@/types';
 import { cn } from '@/lib/utils';
 import { useResizablePane } from '@/lib/useResizablePane';
@@ -54,8 +54,8 @@ export function AppShell({ children }: { children: ReactNode }) {
   const backendEvents = useDemoStore((s) => s.backendEvents);
   const eventChannelStatus = useDemoStore((s) => s.eventChannelStatus);
 
-  // 事件链路遥测：mock 走本地喂入（LOCAL），真连接显示 WS 通道状态
-  const eventLink = apiConfig.useMock
+  // 事件链路遥测：mock 走本地喂入（LOCAL），真后端显示 BCD 进程通道状态
+  const eventLink = isMockMode()
     ? { label: 'LOCAL', className: 'text-slate-400', dot: 'bg-slate-500' }
     : eventChannelStatus === 'connected'
       ? { label: 'LIVE', className: 'text-emerald-300', dot: 'bg-emerald-400' }

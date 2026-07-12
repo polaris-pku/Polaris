@@ -162,4 +162,18 @@ function setupFsBridge(getWindow) {
   });
 }
 
-module.exports = { setupFsBridge };
+/**
+ * 项目根目录（agent 的工作区）：自定义目录须已授权；否则回落 默认工作区/<项目名>。
+ * 与 resolveTargetPath 同一套落点语义 —— 后端桥（backendBridge）用它给 BCD 设 ACP_WORKSPACE，
+ * 保证「agent 写进哪里」和「E 观测面板读哪里」是同一个目录。
+ */
+function resolveProjectRoot({ projectName, rootPath }) {
+  if (rootPath != null && rootPath !== "") {
+    const root = path.resolve(String(rootPath));
+    if (!authorizedRoots.has(root)) return { error: "目录未经用户授权" };
+    return { root };
+  }
+  return { root: path.join(workspaceRoot(), safeSegment(projectName)) };
+}
+
+module.exports = { setupFsBridge, resolveProjectRoot };
