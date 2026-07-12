@@ -25,6 +25,7 @@ import { NodeInspector } from '@/components/NodeInspector';
 import { InterveneDialog } from '@/components/InterveneDialog';
 import { NewRequirementDialog } from '@/components/NewRequirementDialog';
 import { DeliveryReport } from '@/components/DeliveryReport';
+import { LiveRunPanel } from '@/components/LiveRunPanel';
 import { SidePanel } from '@/components/SidePanel';
 import { cn } from '@/lib/utils';
 import { deriveScenario } from '@/data/scenario';
@@ -116,13 +117,21 @@ function TaskBoardInner() {
               {activeTask?.title ?? 'Task Board'}
             </h1>
             <Badge variant={stageBadge[stage].variant}>{stageBadge[stage].label}</Badge>
-            {/* N2 受理遥测：后端（C）回填权威 task_id 前显示本地态 */}
-            {activeTask?.contractTaskId ? (
-              <span className="callsign text-[9px] text-emerald-300/80">
+            {/* 这条任务到底有没有真跑在后端上 —— 一眼可辨，别让人把演示当成真实执行。
+                LIVE = 后端已受理并起了 run；DEMO = 只有本地 mock 剧本。 */}
+            {activeTask?.contractRunId ? (
+              <Badge variant="green" title={`run_id: ${activeTask.contractRunId}`}>
+                LIVE · 后端真实执行
+              </Badge>
+            ) : (
+              <Badge variant="slate" title="未接后端，或提交失败；仅本地演示剧本">
+                DEMO · 演示剧本
+              </Badge>
+            )}
+            {activeTask?.contractTaskId && (
+              <span className="callsign text-[9px] text-slate-600">
                 COORD · {activeTask.contractTaskId}
               </span>
-            ) : (
-              <span className="callsign text-[9px] text-slate-500">COORD · 本地 · 未受理</span>
             )}
             {/* 回放任务按真实 run 的 mode 组队（single_agent=1 人），不提示人数 */}
             {!replay && assignedAgentIds.length < 3 && (
@@ -227,6 +236,9 @@ function TaskBoardInner() {
         maxWidth={620}
         storageKey="task-inspector"
       >
+        {/* 后端真实 run 常驻置顶：它是独立于 mock 剧本的另一条事实线，
+            不能随演示 stage 切换而消失，否则用户又分不清哪个是真的。 */}
+        <LiveRunPanel />
         {stage === 'delivery' ? (
           <DeliveryPanel tab={deliveryTab} onTab={setDeliveryTab} />
         ) : stage === 'analyzing' || stage === 'workflow_recommended' ? (

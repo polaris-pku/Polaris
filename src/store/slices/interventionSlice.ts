@@ -82,7 +82,9 @@ export const createInterventionSlice: SliceCreator<InterventionSlice> = (set, ge
     set((state) => {
       const agentFileWrites = { ...state.agentFileWrites, [toolEventId]: result };
       if (result.status !== 'written' || !state.activeProjectId) return { agentFileWrites };
-      // 写成功：把文件挂进当前项目的文件树，让 IDE 侧栏同步看到 agent 产出
+      // 写成功：把文件挂进当前项目的文件树，让 IDE 侧栏同步看到 agent 产出。
+      // 标 origin='demo'：这条链路走的是 mock 剧本（桌面壳代 A 落盘），
+      // 与后端真实 run 的产物落在同一个工作区里，不标就分不清谁写的。
       const op = findFileOp(toolEventId)?.op;
       const parts = op?.path.split('/').filter(Boolean) ?? [];
       if (parts.length === 0) return { agentFileWrites };
@@ -90,7 +92,7 @@ export const createInterventionSlice: SliceCreator<InterventionSlice> = (set, ge
         agentFileWrites,
         projects: state.projects.map((p) =>
           p.id === state.activeProjectId
-            ? { ...p, files: insertFileNode(p.files, parts, false) }
+            ? { ...p, files: insertFileNode(p.files, parts, false, 'demo') }
             : p,
         ),
       };

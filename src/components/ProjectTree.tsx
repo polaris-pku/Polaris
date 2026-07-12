@@ -590,6 +590,16 @@ function FileTree({
                   )}
                 />
                 <span className="min-w-0 flex-1 truncate font-mono">{node.name}</span>
+                {/* 演示剧本写出的文件 —— 与后端真实 run 的产物落在同一个工作区，
+                    不标就分不清是谁写的。真实产物不标（后端未给出工作区内的路径，不猜）。 */}
+                {node.origin === 'demo' && (
+                  <span
+                    title="由演示剧本写入（非后端真实 agent 产出）"
+                    className="callsign shrink-0 rounded border border-line-bright bg-ink-800 px-1 text-[8px] text-slate-500"
+                  >
+                    DEMO
+                  </span>
+                )}
               </button>
               <button
                 onClick={(e) => {

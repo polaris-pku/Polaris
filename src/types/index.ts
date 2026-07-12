@@ -22,6 +22,16 @@ export type PageKey = 'agents' | 'tasks' | 'council' | 'file';
 export type FileNode = {
   name: string;
   children?: FileNode[];
+  /**
+   * 文件的来源。真实后端 run 与 mock 演示剧本会写进**同一个工作区**，
+   * 产物混在一起、肉眼无法分辨 —— 所以能确知来源的必须标出来。
+   *
+   * 'demo' = 由 mock 演示剧本写入（桌面壳代 A 落盘）。
+   * 缺省 = 来源未知（从磁盘扫描来的文件，可能是真实 agent 写的，也可能本来就有）。
+   * 注意：**没有 'live' 这一档** —— 后端只给出 worktree 内的产物引用，
+   * 不给工作区里最终文件的路径，前端无从判定，不猜。
+   */
+  origin?: 'demo';
 };
 
 /** 一个工作项目（IDE 启动页选择/新建的单位） */
