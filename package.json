@@ -29,9 +29,12 @@
     "format": "prettier --check .",
     "format:fix": "prettier --write .",
     "test": "vitest run --passWithNoTests",
-    "verify": "pnpm lint && pnpm typecheck && pnpm test",
+    "verify": "pnpm lint && pnpm typecheck && pnpm test && pnpm design-guard",
     "prepare": "husky",
-    "build:backend": "node scripts/build-backend.mjs"
+    "build:backend": "node scripts/build-backend.mjs",
+    "design-guard": "node scripts/design-guard.mjs",
+    "smoke:python": "node scripts/smoke-python.mjs",
+    "refresh:python-catalog": "node scripts/refresh-python-catalog.mjs"
   },
   "build": {
     "appId": "com.polaris.app",
@@ -79,6 +82,8 @@
     "asarUnpack": []
   },
   "dependencies": {
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
     "@xyflow/react": "^12.3.5",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
@@ -87,6 +92,7 @@
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "tailwind-merge": "^2.5.4",
+    "tar": "^7.5.1",
     "zustand": "^5.0.1"
   },
   "devDependencies": {

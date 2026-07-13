@@ -29,9 +29,16 @@ export type EventGroup = {
 
 // ── 语义步骤定义 ──
 
-type StepKey = 'intake' | 'prepare' | 'execute' | 'produce' | 'review' | 'council' | 'deliver';
+export type StepKey =
+  | 'intake'
+  | 'prepare'
+  | 'execute'
+  | 'produce'
+  | 'review'
+  | 'council'
+  | 'deliver';
 
-type StepDef = {
+export type StepDef = {
   labelCn: string;
   label: string;
   tier: NodeTier;
@@ -42,7 +49,11 @@ type StepDef = {
   lane: Lane;
 };
 
-const STEPS: Record<StepKey, StepDef> = {
+/**
+ * 语义步骤表。**它是「协议参考」文档与步骤轨的同一个真值源** ——
+ * `src/docs/docs.test.ts` 会强制：改了 STEPS 却忘了改文档 → 测试红。
+ */
+export const STEPS: Record<StepKey, StepDef> = {
   intake: {
     labelCn: '需求受理',
     label: 'Intake',

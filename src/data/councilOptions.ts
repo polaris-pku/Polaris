@@ -5,41 +5,49 @@ import { UI_TO_CONTRACT_COUNCIL_VERDICT } from '@/api/map';
 // 按需求文本动态推导，见 src/data/scenario.ts。本文件仅保留与场景无关的
 // verdict 元数据（裁决类型 → 落点 + 收敛到后端契约的 verdict）。
 
-/** N14 verdict 四种取值 → C 侧状态落点（字段清单 §2 决策映射） */
+/**
+ * 裁决类型 → 人话标签 + 落点。
+ *
+ * 原来这里的 `label` 是 `select · 采纳方案` 这类双语枚举，`landing` 是 `→ reviewing →
+ * MergeAuthorization` 这类协议原文 —— 两者都在主层说协议话（F2）。协议枚举本身仍然在
+ * `id` 上（它要经 `src/api/map.ts` 收敛到后端契约），只是不再直接渲染给人看。
+ *
+ * `variant` 绑的是新的 4 个强调色：合议 = 「轮到人裁决」→ 并入 human（原来的紫色色相已删除）。
+ */
 const verdictBase: {
   id: CouncilVerdict;
   label: string;
   desc: string;
   landing: string;
-  variant: 'amber' | 'violet' | 'red' | 'slate';
+  variant: 'default' | 'command' | 'human' | 'danger';
 }[] = [
   {
     id: 'select',
-    label: 'select · 采纳方案',
-    desc: '采纳选中方案；delegated 模式下生成 MergeAuthorization 继续主流程。',
-    landing: '→ reviewing → MergeAuthorization',
-    variant: 'violet',
+    label: '采纳方案',
+    desc: '采纳选中方案；后续自动生成合并授权，主流程继续。',
+    landing: '继续到合并授权',
+    variant: 'command',
   },
   {
     id: 'needs_human',
-    label: 'needs_human · 需人工',
+    label: '需要人工',
     desc: '证据不足以自动决策，升级人工补充输入。',
-    landing: '→ waiting_input',
-    variant: 'amber',
+    landing: '等待你补充输入',
+    variant: 'human',
   },
   {
     id: 'request_revision',
-    label: 'request_revision · 打回修订',
+    label: '打回修订',
     desc: '方案需返工，任务回到阻断态等待重新执行。',
-    landing: '→ blocked',
-    variant: 'red',
+    landing: '任务阻断，等待重做',
+    variant: 'danger',
   },
   {
     id: 'reject',
-    label: 'reject · 拒绝',
+    label: '拒绝',
     desc: '拒绝全部方案，本轮不进入合并。',
-    landing: '→ blocked / reject',
-    variant: 'red',
+    landing: '任务阻断，本轮不合并',
+    variant: 'danger',
   },
 ];
 

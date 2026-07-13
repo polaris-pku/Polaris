@@ -1,8 +1,8 @@
-import type { Project } from '@/types';
+import type { DemoTask, Project } from '@/types';
 import { createRequirementTask } from '@/data/tasks';
 
 import { createRun as apiCreateRun } from '@/api/client';
-import { watchRun } from '@/api/events';
+import { unwatchRun, watchRun } from '@/api/events';
 import { toTaskCreateRequest } from '@/api/map';
 import { bindBackendWorkspace } from '@/lib/backendWorkspace';
 import { buildLiveProgressReplay, buildLiveRunReplay, liveProducedFiles } from '@/lib/liveReplay';
@@ -11,6 +11,7 @@ import { resetTimelineSeq } from '@/lib/snapshot';
 import { isFrontendWorkflowV01 } from '@/api/types/rpc';
 import type { PartialExecState, SliceCreator, TaskSlice } from '@/store/types';
 import { uid } from '@/store/lib/ids';
+import { canBindWorkspace, dropRun } from '@/store/lib/liveRuns';
 import { insertFileNode } from '@/store/lib/fileTree';
 import { buildTimelineEvent, getNodeLog } from '@/store/lib/timeline';
 import { extractTaskFields, pickProjectTask, syncTasks, taskToState } from '@/store/lib/taskSync';
@@ -21,6 +22,23 @@ function relativeParts(absPath: string, project: Project | undefined): string[] 
   const rootName = project?.rootPath?.split('/').filter(Boolean).pop() ?? project?.name;
   const at = rootName ? parts.lastIndexOf(rootName) : -1;
   return at >= 0 ? parts.slice(at + 1) : parts.slice(-1);
+}
+
+/**
+ * 工作区被**别的项目**的 run 占着时的拒绝理由。
+ *
+ * createTask 与 retrySubmit 共用同一句话 —— 两处提交走的是同一条后端路径（bindWorkspace →
+ * run.create），拒绝的理由当然也只能有一份。
+ */
+function workspaceBlockedMessage(projects: Project[], blocker: DemoTask): string {
+  const blockerProject = projects.find((p) => p.id === blocker.projectId);
+  return (
+    `「${blockerProject?.name ?? '另一个项目'}」里的需求「${blocker.title}」还在执行中。\n` +
+    'agent 的工作区是后端的全局状态，换项目要重启后端 —— 那会把正在跑的 agent 一起杀掉。\n' +
+    // 不许写「或先取消它」：驱动没实现中断，全应用没有取消按钮（cancelRun 零调用）。
+    // 指一条用户按不到的路，比不指更糟。
+    '请等它跑完，或退出应用（会杀掉正在干活的 agent），再在本项目提交。'
+  );
 }
 
 /** 任务域：任务生命周期（新建/开始/切换/删除）与页面导航。 */
@@ -38,9 +56,18 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
 
   createTask: (rawText, title, completionCriteria) => {
     const text = rawText.trim();
-    if (!text) return;
+    if (!text) return { ok: false, error: '需求内容不能为空。' };
     const state = get();
-    if (!state.activeProjectId) return;
+    if (!state.activeProjectId) return { ok: false, error: '请先打开一个项目。' };
+
+    // 提交前必然要把后端工作区绑到当前项目，而绑定会重启 BCD、连带杀死正在干活的 agent。
+    // 所以别的项目还有 run 在跑时，这次提交必须被拦下 —— 否则就是拿一次静默的数据损坏
+    // 去换一次提交。（同项目内并发提交是安全的：工作区没变，后端不会重启。）
+    const bindable = canBindWorkspace(state, state.activeProjectId);
+    if (!bindable.ok) {
+      return { ok: false, error: workspaceBlockedMessage(state.projects, bindable.blockingTask) };
+    }
+
     get().stopAutoRun();
     // 先把当前活动任务的实时状态回写，避免切走时丢进度
     const persisted = state.activeTaskId
@@ -86,15 +113,123 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
         set((s) => ({
           tasks: s.tasks.map((t) =>
             t.id === newTask.id
-              ? { ...t, contractTaskId: created.task_id, contractRunId: created.run_id }
+              ? {
+                  ...t,
+                  contractTaskId: created.task_id,
+                  contractRunId: created.run_id,
+                  submitError: undefined,
+                }
               : t,
           ),
         }));
         return watchRun(created.run_id);
       })
       .catch((err: unknown) => {
+        // 提交失败不回滚本地任务（mock 演示流仍可走），但**必须让用户看见**。
+        // 从前这里只有一句 console.warn —— 用户以为自己提交了需求，实际拿到的是一个
+        // 没有后端 run 的本地演示任务，界面上没有任何迹象。
+        const message = err instanceof Error ? err.message : String(err);
         console.warn('[api] run.create 提交失败，任务仅存在于本地：', err);
+        set((s) => ({
+          tasks: s.tasks.map((t) => (t.id === newTask.id ? { ...t, submitError: message } : t)),
+        }));
       });
+
+    return { ok: true };
+  },
+
+  /**
+   * 把一个**已存在**的本地任务重新提交给后端 —— `未提交到后端 · 点击重试` 的唯一出路。
+   *
+   * 走的是和 createTask **完全相同**的后端路径（绑工作区 → run.create → watchRun），
+   * 只是不再新建本地任务：这次提交失败的那条需求，用户不该被迫重新打一遍字。
+   *
+   * 拒绝条件也与 createTask 完全一致：别的项目还有 run 在跑时**必须拒绝** ——
+   * 绑定工作区会重启 BCD，把正在干活的 agent 一起杀掉。调用方必须把 error 显示出来。
+   *
+   * 失败的 run 重试时会拿到一个新的 run_id：老的那次 run 已经是历史，退订它并丢掉它的
+   * 实时状态，否则 liveRuns 里会堆着一堆再也不会有事件的死条目。
+   */
+  retrySubmit: async (taskId) => {
+    const state = get();
+    const task = state.tasks.find((t) => t.id === taskId);
+    if (!task) return { ok: false, error: '任务不存在。' };
+
+    const text = task.taskText.trim();
+    if (!text) return { ok: false, error: '需求内容不能为空。' };
+
+    const bindable = canBindWorkspace(state, task.projectId);
+    if (!bindable.ok) {
+      return { ok: false, error: workspaceBlockedMessage(state.projects, bindable.blockingTask) };
+    }
+
+    const staleRunId = task.contractRunId;
+    const project = state.projects.find((p) => p.id === task.projectId);
+
+    try {
+      await bindBackendWorkspace(project);
+      const created = await apiCreateRun(toTaskCreateRequest(text, task.completionCriteria), {
+        projectId: task.projectId,
+        clientTaskId: task.id,
+        title: task.title,
+      });
+
+      if (staleRunId && staleRunId !== created.run_id) {
+        void unwatchRun(staleRunId);
+        set((s) => ({ liveRuns: dropRun(s.liveRuns, staleRunId) }));
+      }
+
+      set((s) => ({
+        tasks: s.tasks.map((t) =>
+          t.id === task.id
+            ? {
+                ...t,
+                contractTaskId: created.task_id,
+                contractRunId: created.run_id,
+                submitError: undefined,
+              }
+            : t,
+        ),
+      }));
+
+      await watchRun(created.run_id);
+      return { ok: true };
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn('[api] run.create 重试仍失败，任务仍只存在于本地：', err);
+      set((s) => ({
+        tasks: s.tasks.map((t) => (t.id === task.id ? { ...t, submitError: message } : t)),
+      }));
+      return { ok: false, error: message };
+    }
+  },
+
+  /**
+   * 后端进程没了 → 把所有还挂着 running 的 run 如实标成失败。
+   *
+   * BCD 的 run registry 只活在它自己的进程内存里。进程一死（崩溃、被杀、切工作区重启），
+   * 那些 run 就再也不会有任何事件到达了 —— 而且新起的 BCD 对它们一无所知，重新订阅只会得到
+   * RUN_NOT_FOUND。此时界面若还显示「执行中」，就是在撒谎：它会一直转圈到用户放弃。
+   *
+   * 所以：宁可如实说「后端中断了，这次 run 没了」，也不要让一个永远不会到来的事件吊着用户。
+   */
+  failLiveRuns: (reason) => {
+    const state = get();
+    const stalled = Object.values(state.liveRuns).filter((r) => r.status === 'running');
+    if (stalled.length === 0) return;
+
+    const liveRuns = { ...state.liveRuns };
+    for (const run of stalled) {
+      liveRuns[run.runId] = { ...run, status: 'failed', error: reason };
+      void unwatchRun(run.runId);
+    }
+    set({ liveRuns });
+
+    // 把每个受影响的任务推到终态 —— 走的是和 run.failed 事件完全相同的投影路径，
+    // 所以泳道图/时间线/交付页的表现与「后端明确报失败」一致，没有第二套特例逻辑。
+    for (const run of stalled) {
+      get().applyLiveProgress(run.runId, run.timeline, 'failed');
+    }
   },
 
   /**
@@ -312,19 +447,27 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
       ? syncTasks(state.tasks, state.activeTaskId, extractTaskFields(state))
       : state.tasks;
     const remaining = synced.filter((t) => t.id !== taskId);
+
+    // 任务没了，它那次 run 的订阅与实时状态也要一并撤掉 —— 否则后端订阅和 liveRuns 条目
+    // 会随着建了又删的任务一直堆积。（run 本身仍在后端跑；这里只是不再关注它。）
+    const dropped = target.contractRunId;
+    const liveRuns = dropRun(state.liveRuns, dropped);
+    if (dropped) void unwatchRun(dropped);
+
     if (taskId === state.activeTaskId) {
       // 删掉的是当前任务：切到同项目下另一个任务，或空态。
       get().stopAutoRun();
       const { activeTaskId, taskState } = pickProjectTask(remaining, target.projectId);
       set({
         tasks: remaining,
+        liveRuns,
         activeTaskId,
         currentPage: 'tasks',
         isAutoRunning: false,
         ...taskState,
       });
     } else {
-      set({ tasks: remaining });
+      set({ tasks: remaining, liveRuns });
     }
   },
 });

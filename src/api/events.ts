@@ -35,7 +35,14 @@ const statusHandlers = new Set<(status: EventChannelStatus) => void>();
 
 /** 已投递过的 event_id —— 吸收 run.subscribe 的历史重放。 */
 const seen = new Set<string>();
-let subscribedRunId: string | null = null;
+/**
+ * 当前已订阅的所有 run。
+ *
+ * **必须是集合，不能是单槽。** 用户可以同时提交多个需求，它们在后端是并发执行的独立 run，
+ * 每一个都要各自保持订阅。事件靠 payload 里的 `run_id` 分流（消费方按 run_id 寻址），
+ * 而不是靠「同一时刻只订阅一个」来防串台。
+ */
+const subscribedRunIds = new Set<string>();
 let attached = false;
 
 /** 后端进程状态 → 前端通道词表。 */
@@ -116,33 +123,45 @@ export function onBackendStatus(handler: (status: BackendStatus) => void): () =>
 }
 
 /**
- * 把事件通道切到某个 run（先退订上一个，避免事件串台）。
- * 订阅成功后后端会立刻重放该 run 的历史事件 —— 去重由本模块负责。
+ * 关注一个 run 的事件流。**不会退订其他 run。**
+ *
+ * 订阅成功后后端会立刻重放该 run 的历史事件 —— 去重由本模块负责（按 event_id）。
+ *
+ * ── 为什么强调「不退订其他 run」──
+ * 这里曾经只维护一个 `subscribedRunId`，`watchRun` 会先把上一个 run 退订掉。
+ * 于是并发提交第二个需求时，第一个 run 在后端照常跑到底（文件也照常落盘），
+ * 前端却再也收不到它的任何事件 —— 界面上表现为**第一个任务永远卡在某个节点**，
+ * 既不前进也不报错。后端的 `run.subscribe` 本就是按 run_id 多路复用的
+ * （newide-bcd `RunRpcMethods` 内部是 `Map<run_id, unsubscribe>`），完全支持并发订阅。
  */
 export async function watchRun(runId: string): Promise<void> {
-  const transport = getTransport();
-  if (subscribedRunId === runId) return;
-  if (subscribedRunId) {
-    // 后端可能已丢弃该 run，退订失败无害
-    await transport.unsubscribe(subscribedRunId).catch(() => {});
-  }
+  if (subscribedRunIds.has(runId)) return;
   attach();
-  subscribedRunId = runId;
-  await transport.subscribe(runId);
+  subscribedRunIds.add(runId);
+  try {
+    await getTransport().subscribe(runId);
+  } catch (err) {
+    // 订阅失败不能把它留在集合里 —— 否则后续重试会被当成「已订阅」直接跳过，永远收不到事件。
+    subscribedRunIds.delete(runId);
+    throw err;
+  }
 }
 
-/** 停止关注当前 run。 */
-export async function unwatchRun(): Promise<void> {
-  if (!subscribedRunId) return;
-  const runId = subscribedRunId;
-  subscribedRunId = null;
-  await getTransport()
-    .unsubscribe(runId)
-    .catch(() => {});
+/**
+ * 停止关注某个 run（任务被删除 / 项目关闭时调用）。不传 runId = 全部退订。
+ * 后端可能已丢弃该 run，退订失败无害。
+ */
+export async function unwatchRun(runId?: string): Promise<void> {
+  const targets = runId ? (subscribedRunIds.has(runId) ? [runId] : []) : [...subscribedRunIds];
+  if (targets.length === 0) return;
+  const transport = getTransport();
+  for (const id of targets) subscribedRunIds.delete(id);
+  await Promise.all(targets.map((id) => transport.unsubscribe(id).catch(() => {})));
 }
 
-export function getWatchedRunId(): string | null {
-  return subscribedRunId;
+/** 当前正在关注的所有 run。 */
+export function getWatchedRunIds(): string[] {
+  return [...subscribedRunIds];
 }
 
 /**
@@ -151,4 +170,11 @@ export function getWatchedRunId(): string | null {
  */
 export function emitLocalEvent(event: Event) {
   legacyHandlers.forEach((h) => h(event));
+}
+
+/** 测试用：清空通道的模块级状态（去重表 / 订阅集 / 传输层挂载标记）。 */
+export function resetEventChannel(): void {
+  seen.clear();
+  subscribedRunIds.clear();
+  attached = false;
 }

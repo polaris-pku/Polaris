@@ -50,7 +50,7 @@ export function SidePanel({
   return (
     <aside
       className={cn(
-        'relative min-h-0 shrink-0 border-slate-800/80 bg-ink-900/40',
+        'relative min-h-0 shrink-0 border-edge bg-surface-deck',
         side === 'right' ? 'border-l' : 'border-r',
         !dragging.current && 'transition-[width] duration-150',
         className,
@@ -63,7 +63,7 @@ export function SidePanel({
         onClick={() => setCollapsed((v) => !v)}
         title={collapsed ? '展开面板' : '收起面板'}
         className={cn(
-          'absolute top-1/2 z-30 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-full border border-slate-700 bg-ink-850 text-slate-400 shadow-md transition-colors hover:border-slate-500 hover:text-slate-200',
+          'absolute top-1/2 z-30 flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-full border border-edge-strong bg-surface-panel text-fg-muted transition-colors hover:border-edge-strong hover:text-fg-primary',
           side === 'right' ? '-left-3' : '-right-3',
         )}
       >
@@ -74,11 +74,10 @@ export function SidePanel({
         <button
           type="button"
           onClick={() => setCollapsed(false)}
-          className="flex h-full w-full items-start justify-center pt-6 text-slate-600 transition-colors hover:text-slate-400"
+          className="flex h-full w-full items-start justify-center pt-6 text-fg-faint transition-colors hover:text-fg-secondary"
         >
-          <span className="[writing-mode:vertical-rl] text-[10px] uppercase tracking-widest">
-            {title}
-          </span>
+          {/* 竖排标题是中文 —— 不 uppercase、不 tracking（CJK 契约 C3），字号也不低于 13px（C1） */}
+          <span className="[writing-mode:vertical-rl] text-body">{title}</span>
         </button>
       ) : (
         <>
