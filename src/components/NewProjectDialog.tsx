@@ -49,29 +49,27 @@ export function NewProjectDialog({ open, onClose }: { open: boolean; onClose: ()
   return (
     <Dialog open={open} onClose={handleClose} className="max-w-md">
       <div className="p-6">
-        <div className="flex items-center gap-2.5">
-          <div className="flex h-9 w-9 items-center justify-center rounded-md bg-command/15 text-command-soft shadow-glow">
+        <div className="flex items-center gap-2">
+          <div className="flex h-9 w-9 items-center justify-center rounded-panel bg-command/15 text-command-soft">
             <FolderPlus className="h-5 w-5" />
           </div>
-          <div>
-            <h2 className="font-display text-base font-semibold text-white">新建项目</h2>
-          </div>
+          <h2 className="text-title text-fg-primary">新建项目</h2>
         </div>
 
-        <div className="mt-5">
-          <label className="callsign mb-1.5 block text-[9px] text-slate-400">项目名称</label>
+        <div className="mt-4">
+          <label className="mb-1 block text-body text-fg-secondary">项目名称</label>
           <input
             value={name}
             onChange={(e) => setName(e.target.value)}
             onKeyDown={onNameKeyDown}
             autoFocus
             placeholder="例如：order-service"
-            className="w-full rounded-md border border-line-bright bg-ink-900 px-3 py-2 font-mono text-[13px] text-slate-100 placeholder:text-slate-600 focus:border-command focus:outline-none focus:ring-1 focus:ring-command/40"
+            className="w-full rounded-panel border border-edge-strong bg-surface-void px-3 py-2 text-body text-fg-primary placeholder:text-fg-faint focus:border-command focus:outline-none focus:ring-1 focus:ring-command/40"
           />
         </div>
 
         <div className="mt-4">
-          <label className="callsign mb-1.5 block text-[9px] text-slate-400">描述 · 可选</label>
+          <label className="mb-1 block text-body text-fg-secondary">描述（可选）</label>
           <Textarea
             value={description}
             onChange={(e) => setDescription(e.target.value)}
@@ -82,38 +80,36 @@ export function NewProjectDialog({ open, onClose }: { open: boolean; onClose: ()
 
         {isDesktop && (
           <div className="mt-4">
-            <label className="callsign mb-1.5 block text-[9px] text-slate-400">保存位置</label>
+            <label className="mb-1 block text-body text-fg-secondary">保存位置</label>
             <div className="flex items-center gap-2">
               <button
                 type="button"
-                onClick={handlePickDirectory}
-                className="flex shrink-0 items-center gap-1.5 rounded-md border border-line-bright bg-ink-900 px-2.5 py-2 text-xs text-slate-300 transition-colors hover:border-slate-500 hover:text-slate-100"
+                onClick={() => void handlePickDirectory()}
+                className="flex shrink-0 items-center gap-1.5 rounded-panel border border-edge-strong bg-surface-void px-3 py-2 text-body text-fg-secondary transition-colors hover:border-command/40 hover:text-fg-primary"
               >
-                <FolderSearch className="h-3.5 w-3.5" /> 选择文件夹
+                <FolderSearch className="h-4 w-4" /> 选择文件夹
               </button>
               {rootPath ? (
-                <div className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md border border-line-bright bg-ink-900 px-2.5 py-2">
-                  <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-slate-300">
+                <div className="flex min-w-0 flex-1 items-center gap-1.5 rounded-panel border border-edge-strong bg-surface-void px-3 py-2">
+                  <span className="min-w-0 flex-1 truncate font-mono text-code text-fg-secondary">
                     {rootPath}
                   </span>
                   <button
                     type="button"
                     title="恢复默认位置"
                     onClick={() => setRootPath(null)}
-                    className="shrink-0 text-slate-500 transition-colors hover:text-slate-300"
+                    className="shrink-0 text-fg-muted transition-colors hover:text-fg-primary"
                   >
-                    <X className="h-3.5 w-3.5" />
+                    <X className="h-4 w-4" />
                   </button>
                 </div>
               ) : (
-                <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-slate-600">
+                <span className="min-w-0 flex-1 truncate text-body text-fg-muted">
                   默认：文档/polaris-workspace/&lt;项目名&gt;/
                 </span>
               )}
             </div>
-            <p className="mt-1.5 text-[10px] leading-relaxed text-slate-600">
-              Agent 生成的文件将写入该目录。
-            </p>
+            <p className="mt-1 text-body text-fg-muted">Agent 生成的文件将写入该目录。</p>
           </div>
         )}
 

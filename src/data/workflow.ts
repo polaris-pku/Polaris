@@ -3,13 +3,20 @@ import type { Lane, WorkflowNodeData } from '@/types';
 /** 泳道顺序（自上而下）= 执行角色分区 */
 export const lanes: Lane[] = ['User', 'System', 'Backend', 'Test', 'Security', 'Council'];
 
+// 纵轴说的是**执行者**，不是仓库模块。A/B/C/D 是仓库结构（acp-client / newide-bcd）泄漏到
+// 产品界面的字母，双语注音同理 —— 两者都已移出主层（去「帮助 › 架构说明」找它们）。
 export const laneLabels: Record<Lane, string> = {
-  User: 'User · 用户 / 前端',
-  System: 'System · 调度 / 协调',
-  Backend: 'Backend · 后端 Agent',
-  Test: 'Test · 测试 Agent',
-  Security: 'Security · 安全 / Gate',
-  Council: 'Council · 议会',
+  User: '用户',
+  System: '调度',
+  Backend: '后端 Agent',
+  Test: '测试 Agent',
+  Security: '安全检查',
+  Council: '合议',
+  // 事件驱动图的泳道（= event.source）。agent 泳道以后端给的 role_id 为名，
+  // 后端派几个角色就有几条，前端不预设。
+  Memory: '角色记忆',
+  Driver: '执行运行时',
+  Agent: 'Agent 执行',
 };
 
 /**
@@ -640,6 +647,64 @@ export const EXEC_BASE_IDS = [
 /** 剥去执行子链后缀还原基础 id（-be / -te / 任意 agent 后缀均可），非执行段原样返回 */
 export function stripExecSuffix(id: string): string {
   return EXEC_BASE_IDS.find((base) => id.startsWith(`${base}-`)) ?? id;
+}
+
+// ── 阶段分组（泳道图的折叠单元）──
+
+/**
+ * N0–N18 主链路的四个阶段。
+ *
+ * 18 个节点一次性铺开信息量过载 —— 尤其真实 run 里节点是后端一次性推出来的，
+ * 用户眼前会「突然涌现一大堆」。所以按阶段收纳：任何时刻只展开 agent 正在做的那个阶段，
+ * 其余折叠成一张带进度的阶段卡（渐进披露）。
+ *
+ * 阶段边界与 N 编号严格对齐，是流程的自然分段，不是为了折叠硬凑的：
+ *   受理 N0–N3 · 执行 N4–N9（每个 agent 一条子链）· 评审 N10–N14 · 交付 N15–N18
+ */
+export type PhaseKey = 'intake' | 'execution' | 'review' | 'delivery';
+
+export const PHASES: { key: PhaseKey; label: string; labelCn: string }[] = [
+  { key: 'intake', label: 'INTAKE', labelCn: '受理' },
+  { key: 'execution', label: 'EXECUTION', labelCn: '执行' },
+  // 「审查」不是「评审」：这一步是 Gate + hook 的自动检查，不是人做的 code review。
+  // （eventGraph.STEPS.review.labelCn 一直是「审查」—— 是这里在漂移。）
+  { key: 'review', label: 'REVIEW', labelCn: '审查' },
+  { key: 'delivery', label: 'DELIVERY', labelCn: '交付' },
+];
+
+/** 基础节点 id → 阶段（执行子链的分身先 stripExecSuffix 还原） */
+const PHASE_BY_BASE_ID: Record<string, PhaseKey> = {
+  'n0-intake': 'intake',
+  'n1-triage': 'intake',
+  'n2-create-task': 'intake',
+  'n3-create-run': 'intake',
+  'n4-claim': 'execution',
+  'n5-contextpack': 'execution',
+  'n6-start-driver': 'execution',
+  'n7-executing': 'execution',
+  'n8-driver-result': 'execution',
+  'n9-artifact': 'execution',
+  'n10-task-completed': 'review',
+  'n11-hook-gate': 'review',
+  'n13-gate': 'review',
+  'n14-council': 'review',
+  'n15-merge-auth': 'delivery',
+  'n16-checkpoint': 'delivery',
+  'n17-merge-boundary': 'delivery',
+  'n18-run-complete': 'delivery',
+};
+
+/** 节点属于哪个阶段。未登记的节点返回 undefined —— 调用方按「不可折叠」处理，不猜。 */
+export function phaseOf(nodeId: string): PhaseKey | undefined {
+  return PHASE_BY_BASE_ID[stripExecSuffix(nodeId)];
+}
+
+/**
+ * 节点的阶段：事件驱动生成的节点自带 `phase`；mock 模板节点按 id 反查。
+ * 泳道图的折叠一律走这个入口。
+ */
+export function phaseOfNode(node: { id: string; phase?: PhaseKey }): PhaseKey | undefined {
+  return node.phase ?? phaseOf(node.id);
 }
 
 /** 一条执行子链的参与者规格：后端派单的一个 agent（lane 即该 agent 的泳道） */

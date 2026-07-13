@@ -14,7 +14,9 @@ jobs:
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # 版本只认 .nvmrc 一个源 —— 这里曾写死 20，而仓库升到 pnpm 11（要求 Node >= 22.13）后
+          # 忘了同步，CI 在 setup-node 阶段就挂（node:sqlite 不存在）。写死一次就会漂一次。
+          node-version-file: .nvmrc
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm verify

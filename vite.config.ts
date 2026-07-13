@@ -15,6 +15,11 @@ export default defineConfig(({ command }) => ({
     port: 5173,
     strictPort: true,
   },
+  // 根仓只测前端（src/）。packages/ 下的 A、BCD 各有自己的测试命令，且它们的
+  // fixture 路径是 cwd 相对的 —— 从根仓跑必然找不到文件。用 pnpm -r test 跑全量。
+  test: {
+    include: ['src/**/*.{test,spec}.{ts,tsx}'],
+  },
   build: {
     rollupOptions: {
       output: {

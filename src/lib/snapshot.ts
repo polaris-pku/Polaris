@@ -1,10 +1,4 @@
-import type {
-  DemoSnapshot,
-  InterventionRule,
-  PageKey,
-  DemoStage,
-  WorkflowNodeData,
-} from "@/types";
+import type { DemoSnapshot, InterventionRule, PageKey, DemoStage, WorkflowNodeData } from '@/types';
 
 type SnapshotSource = {
   stage: DemoStage;

@@ -2,7 +2,9 @@
 
 一个**可演示的 Web 交互原型**：把「与单个 AI 聊天」升级为「像管理一支 AI 工程团队一样完成开发任务」。
 
-本项目是 **Scripted IDE Simulator**（假 IDE + 真实交互 + 预设 Agent 剧情）：不接真实 LLM / Agent / Git / 代码执行，演示流程稳定、可重复、可一键重置。
+项目起点是 **Scripted IDE Simulator**（假 IDE + 真实交互 + 预设 Agent 剧情），演示流程稳定、可重复、可一键重置。
+
+**桌面版现已接通真实后端**：需求会真正交给 coding agent 执行，产出真实文件 —— 见「[真实后端（A + BCD）](#真实后端a--bcd)」。mock 剧本保留为无后端时的兜底通路。
 
 > 界面已对齐后端协作链路规范：Task Board 完整建模 **N0–N18 端到端主链路**与 **11 态协调器状态机**，字段、状态、Gate 决策、事件均取自 `api/` 下的规范文档。
 
@@ -12,13 +14,28 @@
 
 Polaris 提供 Windows / macOS 桌面安装包，**无需任何开发环境**：
 
-1. 打开 [Releases](https://github.com/ExtraZhangYC/hci-ide-mvp/releases) 页面
+1. 打开 [Releases](https://github.com/ExtraZhangYC/Polaris/releases) 页面
 2. 下载对应平台的安装包：
    - **Windows** → `Polaris-<版本>-win-x64.exe`
    - **macOS**（Apple Silicon）→ `Polaris-<版本>-mac-arm64.dmg`
 3. 双击安装并启动
+4. **在设置里填一个 API key** —— 然后就能用了
 
-> macOS 当前为**未签名**构建。首次打开若提示「无法验证开发者」，在 `系统设置 → 隐私与安全性` 点「仍要打开」，或右键应用图标选「打开」即可。
+**coding agent 随包分发**：Claude Code 的本体（平台专属原生二进制）已经打进安装包里，
+你**不需要**另外安装 Claude Code、Node.js、npm/npx，也不需要联网现拉任何东西。
+安装包因此比较大（Windows ≈ 178 MB，其中 agent 本体就占 226 MB 未压缩）。
+
+装完只差一个凭据：设置 → 填入对应 agent 的 API key（`claude` → Anthropic API key）。
+key 存在本机 userData 下（权限 0600），只进主进程、不回传渲染层、不进日志。
+
+> **未签名构建**。Windows 首次运行 SmartScreen 会拦，点「更多信息 → 仍要运行」；
+> macOS 提示「无法验证开发者」时，在 `系统设置 → 隐私与安全性` 点「仍要打开」，或右键图标选「打开」。
+>
+> macOS 只提供 **Apple Silicon (arm64)** 版本：随包的 agent 是平台专属原生二进制，
+> universal 壳配单架构后端会在另一半机器上直接起不来，所以不再出 universal 包。
+>
+> 打包版只支持走 stdio 的 **ACP 协议 agent**（claude / gemini / codex 等）。
+> 需要 PTY 的 agent（如 aider）未随包提供 —— 见 `scripts/stub-node-pty.cjs` 里的说明。
 
 ## 规范对齐（Single Source of Truth）
 
@@ -90,6 +107,64 @@ Web 版全程 mock；桌面版（Electron）在同一份 UI 之上接通了真�
 
 普通任务不受影响（无 `replay` 时走原 mock 剧本）。集成测试见 `src/store/sampleRun.test.ts`。
 
+## 真实后端（A + BCD）
+
+三个仓库已并成一个 pnpm workspace（`git subtree`，保留上游历史，可 `git subtree pull` 拉更新）：
+
+| 包                    | 上游                           | 方向      | 职责                                       |
+| --------------------- | ------------------------------ | --------- | ------------------------------------------ |
+| `packages/acp-client` | `DWangSE/acp-client-prototype` | **A**     | ACP 客户端 / Driver：真正拉起 coding agent |
+| `packages/newide-bcd` | `Neighhhbor/newide-scaffold`   | **B/C/D** | 记忆 · 协调编排/Council · Hook/Gate        |
+| 根仓（`src/`)         | 本仓                           | **E**     | 前端：观测、渲染、人机交互                 |
+
+### 进程链
+
+```
+Electron renderer (React = E)
+   │  window.desktop.backend.*        ← IPC（electron/backendBridge.cjs）
+Electron main
+   │  行分隔 JSON-RPC over stdio
+BCD 后端（coordinator / council / gate / memory）
+   │  每个 prompt 拉起一次子进程：DriverPrompt → DriverRunResult
+A（ACP runner）
+   │  spawn
+真实 agent CLI（claude / gemini / codex …）
+```
+
+**A ↔ BCD 的集成来自上游，我们没有改动**：BCD 通过 `ACP_DRIVER_RUNNER_DIR` 把 A 当外部 driver 拉起。
+前端只需要接 BCD 一个入口，全部能力面就是 5 个 RPC：`run.create` / `run.getSnapshot` / `run.subscribe` / `run.unsubscribe` / `run.cancel`，外加一个 `run.event` 推送通知。
+
+契约镜像见 `src/api/types/rpc.ts`（对齐 BCD 的 `frontend-workflow.v0.1`），传输选路见 `src/api/transport.ts`。
+
+### 跑起来
+
+桌面壳启动时会自动拉起 BCD（主进程负责，无需手动启后端）。打开项目时，agent 的工作区自动绑到该项目根目录 —— **agent 写进哪里 = 文件树读哪里**。
+
+```bash
+pnpm install
+pnpm electron:dev      # 后端随桌面壳自动启动
+```
+
+顶栏事件指示灯：`LIVE` = 后端已就绪；`LOCAL` = 无后端（mock 兜底）；`OFFLINE` = 后端挂了。
+
+**选 agent**（默认 `claude`）与**配密钥**：
+
+```bash
+export ACP_AGENT_ID=claude            # 或 gemini / codex / opencode …
+# 密钥写进 A 的 .env，BCD 会读取并注入 driver 子进程：
+#   packages/acp-client/.env  →  ANTHROPIC_API_KEY=... / GEMINI_API_KEY=... 等
+```
+
+> agent CLI 由 A 通过 `npx` 拉起。**这也意味着打包分发还不可行**（打包后的 Electron 里没有 `npx`/`node`）—— 当前真实后端仅在开发环境可用。
+
+### 当前能力边界（诚实说明）
+
+- **可以**：真实提交需求 → agent 真实写代码 → 前端实时收到 22 个流程事件（N0–N18 节点态、Gate 结果、Council 决策、交付报告）。
+- **不可以**：**人类无法真正挡住 agent**。BCD 目前只暴露「创建」和「取消」，Council 由 `proposer/reviewer/synthesis` 几个 agent 角色自己裁决（`can_create_merge_authorization` 恒为 `false`），A 那边权限请求也是自动批准的。
+  前端的 Intervene / Council 裁决按钮仍可用，但**只改前端本地状态、不回写后端**。
+  扩展位已留好：待 BCD 补上 `gate.submitDecision` / `council.submitVerdict` 之类的方法，只需在 `src/api/transport.ts` + `client.ts` 各加一个薄封装，**UI 层一行都不用改**（`map.ts` 里 UI→契约的裁决映射已经写好）。
+- **拿不到 token 级流式输出**：A 的 `contract-runner` 把 agent 的流式事件收集在进程内，只汇总成统计与 tool_events 摘要返回。但 BCD 的 `run.event` 是实时的，**节点级进度推进是真实且实时的**。
+
 ## 技术栈
 
 - Vite + React + TypeScript
@@ -102,14 +177,15 @@ Web 版全程 mock；桌面版（Electron）在同一份 UI 之上接通了真�
 
 ## 启动方式
 
-需要 Node 20+ 与 pnpm 9+：
+需要 **Node 22.22.1+ 与 pnpm 11+**（由 `packages/acp-client` 与 `packages/newide-bcd` 的 engines 约束；仓库带 `.nvmrc`，可直接 `nvm use`）：
 
 ```bash
-pnpm install       # 首次运行
-pnpm dev           # http://localhost:5173/（Web 版，文件能力自动降级为 mock）
+pnpm install       # 首次运行（workspace，会一并装 A / BCD 的依赖）
+pnpm dev           # http://localhost:5173/（Web 版：无桌面桥 → 后端与文件能力均降级为 mock）
 ```
 
-构建生产版本：`pnpm build`，预览：`pnpm preview`；提交前自检：`pnpm verify`（lint + typecheck + vitest）。
+构建生产版本：`pnpm build`，预览：`pnpm preview`；提交前自检：`pnpm verify`（lint + typecheck + vitest，只覆盖前端）。
+全量自检（含 A / BCD）：`pnpm -r verify`。
 
 > 若本机未全局安装 Node，项目可能内置一份本地运行时（`.node/`）。此时可运行 `./start.sh`，或先 `export PATH="$PWD/.node/bin:$PATH"` 再执行上面的命令。
 
@@ -172,15 +248,25 @@ git push --follow-tags     # 推送提交 + 标签，触发 Release 工作流
 
 ```text
 api/                          # 后端协作链路规范（字段清单 + 流程图/状态机）— UI 的对齐基准
+packages/
+├── acp-client/               # 方向 A（subtree ← DWangSE/acp-client-prototype）：ACP 客户端 / Driver
+└── newide-bcd/               # 方向 B/C/D（subtree ← Neighhhbor/newide-scaffold）：记忆 / 协调 / Hook·Gate
 electron/                     # 桌面壳
 ├── main.cjs                  #   主进程（窗口 + 各桥注册）
-├── preload.cjs               #   contextBridge：window.desktop（fs / updates）
+├── preload.cjs               #   contextBridge：window.desktop（fs / backend / updates）
 ├── fsBridge.cjs              #   文件系统 IPC（写入/读取/目录选择/扫描/定位 + 授权模型）
+├── backendBridge.cjs         #   BCD 后端桥：拉起子进程 + JSON-RPC/stdio 客户端 + IPC 转发
 └── updater.cjs               #   自动更新（electron-updater + GitHub Releases）
 src/
 ├── App.tsx / main.tsx / index.css
 ├── types/                    # 全局 UI 类型（index.ts）+ 桌面桥类型（desktop.d.ts）
-├── api/                      # 后端契约的前端镜像（types/*）+ 词表桥接（map.ts）+ 事件通道（events.ts）
+├── api/                      # 后端接入层
+│   ├── types/rpc.ts          #   BCD 最新 RPC 契约镜像（frontend-workflow.v0.1）
+│   ├── types/*               #   其余契约镜像（A/B/C/D 实体形状）
+│   ├── transport.ts          #   传输选路（Electron IPC / mock）+ 未来人类回写的扩展位
+│   ├── client.ts             #   run.create / getSnapshot / cancel
+│   ├── events.ts             #   run.event 订阅（按 event_id 去重，吸收订阅时的历史重放）
+│   └── map.ts                #   UI 词表 ↔ 契约枚举 的防腐层
 ├── store/
 │   ├── useDemoStore.ts       # Zustand store 组装 + 事件通道接线
 │   ├── slices/               # 六个领域切片：project / team / task / execution / intervention / council

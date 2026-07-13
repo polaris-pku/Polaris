@@ -1,89 +1,112 @@
 /**
- * 方向 E · API client —— 前端到后端的第一条真实调用链（N2 创建 Task）。
+ * 方向 E · API client —— 前端到 BCD 后端的真实调用链。
  *
- * 契约锚点：`TaskCreateRequest` → `Task`（api/需求到处理-全流程图与状态机.md
- * N2 行，🟢 frozen；实体形状见 ./types/coord.ts，对齐 BCD core/task.ts）。
+ * 传输见 ./transport.ts（桌面壳 = Electron IPC → BCD 的 stdio JSON-RPC；浏览器 = mock）。
  *
- * 路由说明：后端契约冻结的是**实体形状**，HTTP 路由路径尚未发布。
- * `POST /tasks` 是 E 侧暂定约定，集中在本文件（TASKS_PATH），后端定稿后一处改。
+ * ── 契约错位（重要）──
+ * 前端的 `TaskCreateRequest` 有 spec / completion_criteria / role_id / risk_level /
+ * budget / affected_paths；而后端 `run.create` **只收 `{prompt, mode?}`**
+ * （project_id / client_task_id / title 虽然通过校验，但当前 runner 直接忽略）。
+ * 收敛发生在 ./map.ts 的 `toRunCreateParams()` —— 那里是**唯一**的收敛点：
+ * 后端将来接受更丰富的入参时只改那一个函数。前端未被接受的字段仍保留在本地状态里。
  *
- * Mock 边界：`apiConfig.useMock`（默认 true）时不发网络请求，本地伪造一个
- * 与后端受理行为同形的 `Task`（status='created'）走完同一条代码路径 ——
- * 调用方无需感知 mock 与否。
+ * ── 一个语义差异 ──
+ * 后端没有「只建 Task 不建 Run」的入口：`run.create` 一次性建 Task + Run 并**立刻开跑**。
+ * 所以前端的 N2「创建 Task」在真实链路上等价于「创建 Task 并启动 Run」。
  */
-import { apiConfig } from './config';
-import { emitLocalEvent } from './events';
+import { toRunCreateParams } from './map';
+import { getTransport } from './transport';
 import { SCHEMA_VERSION } from './types';
 import type { Task, TaskCreateRequest } from './types';
-
-const TASKS_PATH = '/tasks';
+import type { RunCreateResult, RunMode, RunSnapshot } from './types/rpc';
 
 export class ApiError extends Error {
   constructor(
     message: string,
-    readonly status?: number,
+    readonly code?: number,
   ) {
     super(message);
     this.name = 'ApiError';
   }
 }
 
-async function postJson<TReq, TRes>(path: string, body: TReq): Promise<TRes> {
-  let res: Response;
-  try {
-    res = await fetch(`${apiConfig.baseUrl}${path}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-  } catch (err) {
-    throw new ApiError(
-      `POST ${path} 网络失败: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-  if (!res.ok) {
-    throw new ApiError(`POST ${path} 返回 ${res.status}`, res.status);
-  }
-  return (await res.json()) as TRes;
+/** 后端受理结果 + 前端本地补全的展示字段。 */
+export interface CreatedRun {
+  run_id: string;
+  task_id: string;
+  /** 后端权威 task_id + 前端提交的内容拼出的 Task（后端未接受的字段保留本地值）。 */
+  task: Task;
 }
 
-let mockSeq = 0;
+export interface CreateRunOptions {
+  mode?: RunMode;
+  projectId?: string;
+  clientTaskId?: string;
+  title?: string;
+}
 
-/** 伪造后端受理结果：与 C 端 N2 行为同形（status='created'，回填服务端字段）。 */
-function mockCreatedTask(req: TaskCreateRequest): Task {
+/**
+ * N2/N3 创建 Task 并启动 Run。
+ *
+ * 后端只接受 `prompt`；其余字段（验收标准 / 风险 / 预算…）当前后端不收，
+ * 前端原样保留在返回的 `task` 里，等后端契约放开后自然生效。
+ */
+export async function createRun(
+  req: TaskCreateRequest,
+  options: CreateRunOptions = {},
+): Promise<CreatedRun> {
+  let created: RunCreateResult;
+  try {
+    created = await getTransport().createRun(toRunCreateParams(req, options));
+  } catch (err) {
+    throw new ApiError(`run.create 失败: ${errText(err)}`, codeOf(err));
+  }
+
   const now = new Date().toISOString();
   return {
-    task_id: `task-${Date.now().toString(36)}-${(mockSeq++).toString(36)}`,
-    parent_id: req.parent_task_id,
-    status: 'created',
-    role_id: req.role_id,
-    risk_level: req.risk_level ?? 'medium',
-    spec: req.spec,
-    completion_criteria: req.completion_criteria,
-    affected_paths: req.affected_paths,
-    budget: req.budget,
-    created_at: now,
-    updated_at: now,
-    schema_version: SCHEMA_VERSION,
+    run_id: created.run_id,
+    task_id: created.task_id,
+    task: {
+      task_id: created.task_id,
+      parent_id: req.parent_task_id,
+      status: 'created',
+      role_id: req.role_id,
+      risk_level: req.risk_level ?? 'medium',
+      spec: req.spec,
+      completion_criteria: req.completion_criteria,
+      affected_paths: req.affected_paths,
+      budget: req.budget,
+      created_at: now,
+      updated_at: now,
+      schema_version: SCHEMA_VERSION,
+    },
   };
 }
 
-/** N2 创建 Task：把需求提交给协调器（C），返回权威 `Task`。 */
-export async function createTask(req: TaskCreateRequest): Promise<Task> {
-  if (apiConfig.useMock) {
-    const task = mockCreatedTask(req);
-    // 后端 N2 受理即 emit task.created（全流程图 N2 行）；mock 同形复现，
-    // 让事件通道的消费链路在无后端时也真实走通。
-    emitLocalEvent({
-      event_id: `evt-${task.task_id}`,
-      event_type: 'task.created',
-      subject_id: task.task_id,
-      task_id: task.task_id,
-      payload: { status: task.status },
-      created_at: task.created_at,
-      schema_version: SCHEMA_VERSION,
-    });
-    return task;
+/** 拉取 run 完整快照。形状是双态的 —— 消费前用 `isFrontendWorkflowV01` 守卫。 */
+export async function getRunSnapshot(runId: string): Promise<RunSnapshot> {
+  try {
+    return await getTransport().getSnapshot(runId);
+  } catch (err) {
+    throw new ApiError(`run.getSnapshot 失败: ${errText(err)}`, codeOf(err));
   }
-  return postJson<TaskCreateRequest, Task>(TASKS_PATH, req);
+}
+
+/** 取消 run。注意：对已终态的 run，后端抛的是通用 -32603 而非有类型的错误。 */
+export async function cancelRun(runId: string): Promise<void> {
+  try {
+    await getTransport().cancel(runId);
+  } catch (err) {
+    throw new ApiError(`run.cancel 失败: ${errText(err)}`, codeOf(err));
+  }
+}
+
+function errText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function codeOf(err: unknown): number | undefined {
+  return err && typeof err === 'object' && 'code' in err
+    ? (err as { code?: number }).code
+    : undefined;
 }

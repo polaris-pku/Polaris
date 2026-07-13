@@ -55,11 +55,19 @@ export function UpdateDialog() {
   if (phase === 'idle') return null;
 
   const label = version ? `v${version}` : '新版本';
+  // macOS 未签名构建无法自动安装更新，只做「发现新版本 → 引导手动下载」；
+  // Windows(NSIS) 仍走后台下载 + 重启自动安装。
+  const isMac = window.desktop?.platform === 'darwin';
 
   const startDownload = () => {
     setPhase('downloading');
     setPercent(0);
     window.desktop?.updates.download();
+  };
+
+  const openDownloadPage = () => {
+    window.desktop?.updates.openDownloadPage();
+    setOpen(false);
   };
 
   return (
@@ -69,46 +77,49 @@ export function UpdateDialog() {
       )}
       <Dialog open={open} onClose={() => setOpen(false)} className="max-w-md">
         <div className="p-6">
-          <div className="flex items-center gap-2.5">
-            <div className="flex h-9 w-9 items-center justify-center rounded-md bg-command/15 text-command-soft shadow-glow">
+          <div className="flex items-center gap-2">
+            <div className="flex h-9 w-9 items-center justify-center rounded-panel bg-command/15 text-command-soft">
               {phase === 'downloaded' ? (
                 <RotateCw className="h-5 w-5" />
               ) : (
                 <Sparkles className="h-5 w-5" />
               )}
             </div>
-            <div>
-              <h2 className="font-display text-base font-semibold text-white">
-                {phase === 'downloaded' ? '更新已就绪' : '发现新版本'}
-              </h2>
-            </div>
+            <h2 className="text-title text-fg-primary">
+              {phase === 'downloaded' ? '更新已就绪' : '发现新版本'}
+            </h2>
           </div>
 
           {phase === 'available' && (
-            <p className="mt-4 text-sm leading-relaxed text-slate-300">
-              检测到新版本 <span className="font-mono text-command-soft">{label}</span>
-              ，是否现在下载？下载在后台进行，完成后可选择重启更新。
+            <p className="mt-4 text-body text-fg-secondary">
+              检测到新版本 <span className="font-mono text-code text-command-soft">{label}</span>
+              {isMac
+                ? '，前往下载页获取安装包（dmg），下载后拖入 Applications 覆盖即可。'
+                : '，是否现在下载？下载在后台进行，完成后可选择重启更新。'}
             </p>
           )}
 
           {phase === 'downloading' && (
             <div className="mt-4">
-              <p className="text-sm text-slate-300">
-                正在下载 <span className="font-mono text-command-soft">{label}</span>…
+              <p className="text-body text-fg-secondary">
+                正在下载 <span className="font-mono text-code text-command-soft">{label}</span>…
               </p>
-              <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-ink-700">
+              {/* 2px 进度条压在文案下沿 —— 不是居中的大 spinner */}
+              <div className="mt-2 h-0.5 w-full overflow-hidden rounded-full bg-surface-raised">
                 <div
                   className="h-full rounded-full bg-command transition-all"
-                  style={{ width: `${percent}%` }}
+                  style={{ width: `${String(percent)}%` }}
                 />
               </div>
-              <div className="mt-1 text-right font-mono text-[10px] text-slate-500">{percent}%</div>
+              <div className="tabular mt-1 text-right font-mono text-code text-fg-muted">
+                {percent}%
+              </div>
             </div>
           )}
 
           {phase === 'downloaded' && (
-            <p className="mt-4 text-sm leading-relaxed text-slate-300">
-              <span className="font-mono text-command-soft">{label}</span>{' '}
+            <p className="mt-4 text-body text-fg-secondary">
+              <span className="font-mono text-code text-command-soft">{label}</span>{' '}
               已下载完成，重启应用即可完成更新。
             </p>
           )}
@@ -119,9 +130,15 @@ export function UpdateDialog() {
                 <Button variant="ghost" onClick={() => setOpen(false)}>
                   稍后
                 </Button>
-                <Button variant="primary" onClick={startDownload}>
-                  <Download className="h-4 w-4" /> 下载更新
-                </Button>
+                {isMac ? (
+                  <Button variant="primary" onClick={openDownloadPage}>
+                    <Download className="h-4 w-4" /> 打开下载页
+                  </Button>
+                ) : (
+                  <Button variant="primary" onClick={startDownload}>
+                    <Download className="h-4 w-4" /> 下载更新
+                  </Button>
+                )}
               </>
             )}
             {phase === 'downloading' && (
@@ -162,23 +179,23 @@ function UpdatePill({
     <button
       onClick={onClick}
       title="查看更新"
-      className="fixed bottom-4 right-4 z-[100] flex animate-fade-in items-center gap-2 rounded-full border border-line-bright bg-ink-850 px-3.5 py-2 text-xs shadow-lg shadow-black/40 transition-colors hover:border-command/60"
+      className="fixed bottom-4 right-4 z-[100] flex animate-fade-in items-center gap-2 rounded-full border border-edge-strong bg-surface-panel px-3 py-1.5 text-body transition-colors hover:border-command/60"
     >
       {phase === 'downloading' ? (
         <>
-          <RefreshCw className="h-3.5 w-3.5 animate-spin text-command-soft" />
-          <span className="text-slate-200">下载中</span>
-          <span className="font-mono text-command-soft">{percent}%</span>
+          <RefreshCw className="h-4 w-4 animate-spin text-command-soft" />
+          <span className="text-fg-primary">下载中</span>
+          <span className="tabular font-mono text-code text-command-soft">{percent}%</span>
         </>
       ) : phase === 'downloaded' ? (
         <>
-          <RotateCw className="h-3.5 w-3.5 text-emerald-400" />
-          <span className="text-emerald-300">更新就绪</span>
+          <RotateCw className="h-4 w-4 text-ok" />
+          <span className="text-ok">更新就绪</span>
         </>
       ) : (
         <>
-          <Download className="h-3.5 w-3.5 text-command-soft" />
-          <span className="text-slate-200">有新版本 {label}</span>
+          <Download className="h-4 w-4 text-command-soft" />
+          <span className="text-fg-primary">有新版本 {label}</span>
         </>
       )}
     </button>

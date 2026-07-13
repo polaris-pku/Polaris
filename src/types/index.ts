@@ -14,6 +14,8 @@ import type {
   SkillView,
 } from '@/api/types';
 // 仅类型引用（编译期擦除），不构成运行时循环依赖
+import type { RunSnapshot as RpcRunSnapshot } from '@/api/types/rpc';
+import type { PhaseKey } from '@/data/workflow';
 import type { Scenario } from '@/data/scenario';
 
 export type PageKey = 'agents' | 'tasks' | 'council' | 'file';
@@ -22,6 +24,15 @@ export type PageKey = 'agents' | 'tasks' | 'council' | 'file';
 export type FileNode = {
   name: string;
   children?: FileNode[];
+  /**
+   * 文件的来源。真实后端 run 与 mock 演示剧本会写进**同一个工作区**，
+   * 产物混在一起、肉眼无法分辨 —— 所以能确知来源的必须标出来。
+   *
+   * 'live' = 本次真实 run 的 agent 写出（后端快照 `artifacts[].source_path` 给的绝对路径）。
+   * 'demo' = 由 mock 演示剧本写入（桌面壳代 A 落盘）。
+   * 缺省   = 来源未知（从磁盘扫描来的既有文件）。
+   */
+  origin?: 'live' | 'demo';
 };
 
 /** 一个工作项目（IDE 启动页选择/新建的单位） */
@@ -58,8 +69,26 @@ export type RunNodeFact = { key: string; value: string; time?: string };
  * 「本次 run 未提供」。key 一律用去掉执行子链后缀的节点 id。
  */
 export type RunReplay = {
-  /** 后端落盘的快照原件（frontend-snapshot.json），审计与展示的真相源 */
-  snapshot: FrontendRunSnapshot;
+  /**
+   * 数据来自哪次 run：
+   *  - 'live'   本次真实后端 run（RPC 快照 frontend-workflow.v0.1，见 lib/liveReplay.ts）
+   *  - 'sample' 仓库自带的样例落盘快照（coordinator.frontend_run_snapshot.v0，见 lib/runReplay.ts）
+   * 两种来源产出同一个 RunReplay 形状，界面消费方无需区分。
+   */
+  source: 'live' | 'sample';
+  /** 展示用的 run 元信息（两种来源都能给出） */
+  meta: {
+    runId: string;
+    taskId: string;
+    mode: string;
+    status: string;
+    /** 后端未必给（样例快照有，RPC 快照要从 driver.session_started 事件里取） */
+    driverId?: string;
+  };
+  /** 样例回放的落盘快照原件；live 回放没有这个（它的原件是 liveSnapshot） */
+  snapshot?: FrontendRunSnapshot;
+  /** 本次真实 run 的 RPC 快照原件；sample 回放没有 */
+  liveSnapshot?: RpcRunSnapshot;
   /** 节点 id → 执行时间轴日志（替换 data/logs.ts 的 mock 文案） */
   nodeLogs: Record<string, LogEntry & { checkpoint?: TimelineCheckpoint }>;
   /** 节点 id → Node Inspector 执行日志明细 */
@@ -87,6 +116,12 @@ export type DemoTask = {
   assignedAgentIds: string[];
   /** 后端（C）受理后回填的权威 task_id；缺失表示尚未受理或提交失败 */
   contractTaskId?: string;
+  /** 后端受理后回填的 run_id（run.create 一次性建 Task + Run 并立刻开跑）；
+   *  缺失 = 未接后端或提交失败。真实 run 的事件/快照都按它索引。 */
+  contractRunId?: string;
+  /** 提交给后端失败的原因（后端没受理这个需求 → 它只是个本地任务）。
+   *  必须显示出来：否则用户以为自己提了需求，实际什么都没发生。 */
+  submitError?: string;
   /** 用户在 N0 自报的验收标准（随 TaskCreateRequest.completion_criteria 上送） */
   completionCriteria?: string[];
   /** 文件写入权限确认结果（tool_event_id → 人选的 outcome），随任务持久化。
@@ -210,6 +245,17 @@ export type WorkflowNodeData = {
   taskStatus: TaskStatusCore | null;
   /** 状态补充说明（如 N13 的分支落点、N17 的 reserved 提示） */
   statusNote?: string;
+  /**
+   * 所属阶段（泳道图的折叠单元）。事件驱动生成的节点自带；
+   * mock 模板节点不带，由 phaseOf(id) 按 id 反查。
+   */
+  phase?: PhaseKey;
+  /**
+   * 跨度节点尚未闭合时的开始时刻（ISO）。
+   * agent 执行那十几秒里后端一个事件都不发 —— 有它，节点卡才能显示实时计时，
+   * 界面不至于看起来是死的。
+   */
+  spanStartedAt?: string;
   frozen: FrozenLevel;
   summary: string;
   input: string[];

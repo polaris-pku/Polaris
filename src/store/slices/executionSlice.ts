@@ -1,5 +1,5 @@
 import type { DemoStage, DemoTask, RunReplay } from '@/types';
-import { emitLocalEvent } from '@/api/events';
+import { emitLocalEvent, unwatchRun } from '@/api/events';
 import {
   MAX_COLUMN,
   NODE_IDS,
@@ -213,6 +213,9 @@ export const createExecutionSlice: SliceCreator<ExecutionSlice> = (set, get) => 
       autoRunTimer = null;
     }
     resetTimelineSeq();
+    // 任务全清了，订阅也要一并撤掉（不传参 = 退订全部）。否则那些 run 会继续推事件进来，
+    // 在一个已经没有对应任务的 store 里凭空重建 liveRuns 条目，并触发无意义的快照拉取。
+    void unwatchRun();
     // 回到空白启动态：清空项目与任务，返回启动页。
     set(blankState());
   },

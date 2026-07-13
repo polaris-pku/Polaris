@@ -10,6 +10,7 @@ import {
   Users,
   ListTodo,
   FolderGit2,
+  Play,
   Plus,
   CircleDot,
   Trash2,
@@ -21,8 +22,11 @@ import { NewProjectDialog } from '@/components/NewProjectDialog';
 import { NewRequirementDialog } from '@/components/NewRequirementDialog';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 import { saveProjectTrace } from '@/lib/projectFile';
+import { RUN_STATE_LABEL, RUN_STATE_TONE, runStateOf, type RunState } from '@/lib/runState';
+import { writeTargetOf } from '@/store/lib/agentWrites';
 import { cn } from '@/lib/utils';
-import type { AgentStatus, DemoStage, FileNode, Project } from '@/types';
+import type { LiveRunState } from '@/store/types';
+import type { AgentStatus, DemoTask, FileNode, Project } from '@/types';
 
 const GROUPS = ['files', 'tasks'] as const;
 
@@ -31,35 +35,33 @@ function defaultOpenKeys(projectId: string | null): string[] {
   return [`p:${projectId}`, ...GROUPS.map((g) => `g:${projectId}:${g}`), `d:${projectId}:src`];
 }
 
+/** Agent 在线状态的点色：只编码「在动 / 需要注意 / 无」，不新增色相。 */
 const agentDotColor: Record<AgentStatus, string> = {
-  created: 'text-slate-500',
-  active: 'text-emerald-400',
-  idle: 'text-slate-500',
-  draining: 'text-amber-300',
-  retired: 'text-violet-300',
+  created: 'text-fg-muted',
+  active: 'text-ok',
+  idle: 'text-fg-muted',
+  draining: 'text-human',
+  retired: 'text-fg-faint',
 };
 
-const stageDotColor: Record<DemoStage, string> = {
-  idle: 'bg-slate-600',
-  team_configured: 'bg-command-soft',
-  analyzing: 'bg-command-soft',
-  workflow_recommended: 'bg-command-soft',
-  executing: 'bg-blue-400',
-  intervention: 'bg-human',
-  council: 'bg-violet-400',
-  delivery: 'bg-emerald-400',
+/** run 状态的点色。词表与色调都来自 runState.ts —— 这里不允许出现第二份。 */
+const TONE_DOT: Record<(typeof RUN_STATE_TONE)[RunState], string> = {
+  muted: 'bg-fg-faint',
+  command: 'bg-command',
+  human: 'bg-human',
+  ok: 'bg-ok',
+  danger: 'bg-danger',
 };
 
-const stageShort: Record<DemoStage, string> = {
-  idle: '待开始',
-  team_configured: '就绪',
-  analyzing: '分析中',
-  workflow_recommended: '已推荐',
-  executing: '执行中',
-  intervention: '介入',
-  council: '议会',
-  delivery: '已交付',
+const TONE_TEXT: Record<(typeof RUN_STATE_TONE)[RunState], string> = {
+  muted: 'text-fg-muted',
+  command: 'text-command-soft',
+  human: 'text-human-soft',
+  ok: 'text-ok-soft',
+  danger: 'text-danger-soft',
 };
+
+const isPython = (name: string) => /\.py$/i.test(name);
 
 function fileIcon(name: string) {
   if (/\.(ts|tsx|js|jsx|go|py)$/.test(name)) return FileCode2;
@@ -72,8 +74,8 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
   const projects = useDemoStore((s) => s.projects);
   const activeProjectId = useDemoStore((s) => s.activeProjectId);
   const activeTaskId = useDemoStore((s) => s.activeTaskId);
-  const stage = useDemoStore((s) => s.stage);
   const tasks = useDemoStore((s) => s.tasks);
+  const liveRuns = useDemoStore((s) => s.liveRuns);
   const openProject = useDemoStore((s) => s.openProject);
   const selectTask = useDemoStore((s) => s.selectTask);
   const selectAgent = useDemoStore((s) => s.selectAgent);
@@ -85,6 +87,7 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
   const openFile = useDemoStore((s) => s.openFile);
   const openedFile = useDemoStore((s) => s.openedFile);
   const buildProjectTrace = useDemoStore((s) => s.buildProjectTrace);
+  const startTerminalRun = useDemoStore((s) => s.startTerminalRun);
 
   const [open, setOpen] = useState<Set<string>>(() => new Set(defaultOpenKeys(activeProjectId)));
   // 选中态派生自查看页正打开的文件（点文件 = 打开文件查看页）
@@ -100,6 +103,14 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
     danger?: boolean;
     onConfirm: () => void;
   } | null>(null);
+
+  /**
+   * 每一行任务只看**自己那次 run**：按该任务的 contractRunId 直接键控取数。
+   * 绝不能退化成「取某个当前 run 的状态，安到所有任务头上」—— 并发跑多个需求时，
+   * 那会让第二个 run 的状态覆盖第一个（liveRuns 从单槽改成表，就是为了修这个）。
+   */
+  const liveOf = (task: DemoTask): LiveRunState | undefined =>
+    task.contractRunId ? liveRuns[task.contractRunId] : undefined;
 
   // 切换聚焦项目时，自动展开该项目的分组
   useEffect(() => {
@@ -135,10 +146,10 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
             onClick={() => openProject(p.id)}
             title={p.name}
             className={cn(
-              'flex w-full items-center justify-center rounded-lg py-2 transition-colors',
+              'flex w-full items-center justify-center rounded-panel py-2 transition-colors',
               p.id === activeProjectId
-                ? 'bg-command/15 text-command-soft ring-1 ring-command/30'
-                : 'text-slate-400 hover:bg-ink-700 hover:text-slate-100',
+                ? 'bg-command/10 text-command-soft ring-1 ring-command/30'
+                : 'text-fg-secondary hover:bg-surface-raised hover:text-fg-primary',
             )}
           >
             <FolderGit2 className="h-4 w-4" />
@@ -165,13 +176,13 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
     setAddingFileFor(null);
   };
 
-  // 保存 agent 执行 trace：桌面版写入项目根目录 .polaris/，浏览器回退为下载
+  // 导出运行记录：桌面版写入项目根目录 .polaris/，浏览器回退为下载
   const exportTrace = async (project: Project) => {
     const trace = buildProjectTrace(project.id);
     if (!trace) return;
     const result = await saveProjectTrace(trace);
     setConfirm({
-      title: result.ok ? '执行 Trace 已保存' : 'Trace 保存失败',
+      title: result.ok ? '运行记录已导出' : '导出失败',
       description: result.ok
         ? result.where === 'disk'
           ? result.absPath
@@ -181,6 +192,15 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
       danger: !result.ok,
       onConfirm: () => {},
     });
+  };
+
+  /**
+   * 【R3 / I5 —— 用户手势】点击文件行尾的 ▶ 才会走到这里。
+   * 运行目标恒为「项目根 + 相对路径」，与 agent 的写入根（writeTargetOf）同源：
+   * agent 写哪 = 面板读哪 = 终端跑哪，三者必须同根，否则相对路径的读写会落到两个地方。
+   */
+  const runPythonFile = (project: Project, relPath: string) => {
+    void startTerminalRun({ ...writeTargetOf(project), relPath });
   };
 
   // Agent Board 已从侧栏收起：通过点任务的团队跳转过去（并切到该任务，展示其团队）。
@@ -199,11 +219,11 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
     <div>
       {/* 工作台标题 + 新建项目 */}
       <div className="mb-1 flex items-center justify-between px-2">
-        <span className="callsign text-[9px] text-slate-600">工作台</span>
+        <span className="text-meta text-fg-faint">工作台</span>
         <button
           onClick={() => setNewProjectOpen(true)}
           title="新建项目"
-          className="rounded-md p-1 text-slate-500 transition-colors hover:bg-command/10 hover:text-command-soft"
+          className="rounded-chip p-1 text-fg-muted transition-colors hover:bg-command/10 hover:text-command-soft"
         >
           <Plus className="h-3.5 w-3.5" />
         </button>
@@ -220,13 +240,13 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
               {/* 项目行 */}
               <div
                 className={cn(
-                  'group/proj flex items-center rounded-md pr-1 transition-colors',
-                  isActive ? 'bg-command/10' : 'hover:bg-ink-700/70',
+                  'group/proj flex items-center rounded-chip pr-1 transition-colors',
+                  isActive ? 'bg-command/10' : 'hover:bg-surface-raised/70',
                 )}
               >
                 <button
                   onClick={() => toggle(`p:${project.id}`)}
-                  className="p-1 text-slate-500 hover:text-slate-300"
+                  className="p-1 text-fg-muted hover:text-fg-secondary"
                   aria-label={projectOpen ? '收起' : '展开'}
                 >
                   <ChevronRight
@@ -240,13 +260,13 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
                   <FolderGit2
                     className={cn(
                       'h-4 w-4 shrink-0',
-                      isActive ? 'text-command-soft' : 'text-slate-400',
+                      isActive ? 'text-command-soft' : 'text-fg-secondary',
                     )}
                   />
                   <span
                     className={cn(
-                      'min-w-0 flex-1 truncate font-mono text-[13px]',
-                      isActive ? 'text-command-soft' : 'text-slate-200',
+                      'min-w-0 flex-1 truncate font-mono text-body',
+                      isActive ? 'text-command-soft' : 'text-fg-primary',
                     )}
                   >
                     {project.name}
@@ -258,8 +278,8 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
                     e.stopPropagation();
                     void exportTrace(project);
                   }}
-                  title="保存执行 Trace（agent 执行审计流水）"
-                  className="p-1 text-slate-600 opacity-0 transition-opacity hover:text-command-soft group-hover/proj:opacity-100"
+                  title="导出运行记录"
+                  className="p-1 text-fg-faint opacity-0 transition-opacity hover:text-command-soft group-hover/proj:opacity-100"
                 >
                   <ScrollText className="h-3.5 w-3.5" />
                 </button>
@@ -273,7 +293,7 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
                     });
                   }}
                   title="删除项目"
-                  className="p-1 text-slate-600 opacity-0 transition-opacity hover:text-rose-400 group-hover/proj:opacity-100"
+                  className="p-1 text-fg-faint opacity-0 transition-opacity hover:text-danger group-hover/proj:opacity-100"
                 >
                   <Trash2 className="h-3.5 w-3.5" />
                 </button>
@@ -281,7 +301,7 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
 
               {/* 项目子树 */}
               {projectOpen && (
-                <div className="ml-3 border-l border-line pl-1.5">
+                <div className="ml-3 border-l border-edge pl-1.5">
                   {/* 文件 */}
                   <TreeGroup
                     icon={Folder}
@@ -296,7 +316,7 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
                           requestAddFile(project.id);
                         }}
                         title="添加文件"
-                        className="rounded p-0.5 text-slate-500 hover:bg-command/10 hover:text-command-soft"
+                        className="rounded-chip p-0.5 text-fg-muted hover:bg-command/10 hover:text-command-soft"
                       >
                         <Plus className="h-3 w-3" />
                       </button>
@@ -304,7 +324,7 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
                   >
                     {addingFileFor === project.id && (
                       <div className="flex items-center gap-1 px-1 py-1">
-                        <FileCode2 className="h-3.5 w-3.5 shrink-0 text-slate-500" />
+                        <FileCode2 className="h-3.5 w-3.5 shrink-0 text-fg-muted" />
                         <input
                           autoFocus
                           value={newFileName}
@@ -321,7 +341,7 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
                             setAddingFileFor(null);
                           }}
                           placeholder="如 index.ts、src/util.ts；结尾加 / 建文件夹"
-                          className="min-w-0 flex-1 rounded border border-line-bright bg-ink-900 px-1.5 py-0.5 font-mono text-[11px] text-slate-100 placeholder:text-slate-600 focus:border-command focus:outline-none"
+                          className="min-w-0 flex-1 rounded-chip border border-edge-strong bg-surface-deck px-1.5 py-0.5 font-mono text-meta text-fg-primary placeholder:text-fg-faint focus:border-command focus:outline-none"
                         />
                       </div>
                     )}
@@ -334,6 +354,7 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
                       toggle={toggle}
                       selectedFile={selectedFile}
                       onSelectFile={(path) => openFile(project.id, path)}
+                      onRunFile={(path) => runPythonFile(project, path)}
                       onDelete={(path) => deleteFile(project.id, path)}
                     />
                     {project.files.length === 0 && addingFileFor !== project.id && (
@@ -355,14 +376,15 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
                           requestNewRequirement(project.id);
                         }}
                         title="新建需求"
-                        className="rounded p-0.5 text-slate-500 hover:bg-command/10 hover:text-command-soft"
+                        className="rounded-chip p-0.5 text-fg-muted hover:bg-command/10 hover:text-command-soft"
                       >
                         <Plus className="h-3 w-3" />
                       </button>
                     }
                   >
                     {projTasks.map((t) => {
-                      const liveStage = t.id === activeTaskId ? stage : t.stage;
+                      const runState = runStateOf(t, liveOf(t));
+                      const tone = RUN_STATE_TONE[runState];
                       const selected = t.id === activeTaskId;
                       const taskKey = `t:${t.id}`;
                       const taskOpen = isOpen(taskKey);
@@ -372,13 +394,13 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
                           {/* 任务行：左箭头展开团队，标题点击选中任务 */}
                           <div
                             className={cn(
-                              'group/task flex items-center rounded pr-1 transition-colors',
-                              selected ? 'bg-blue-600/20' : 'hover:bg-ink-700',
+                              'group/task flex items-center rounded-chip pr-1 transition-colors',
+                              selected ? 'bg-command/10' : 'hover:bg-surface-raised',
                             )}
                           >
                             <button
                               onClick={() => toggle(taskKey)}
-                              className="p-0.5 text-slate-500 hover:text-slate-300"
+                              className="p-0.5 text-fg-muted hover:text-fg-secondary"
                               aria-label={taskOpen ? '收起' : '展开'}
                             >
                               <ChevronRight
@@ -391,19 +413,22 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
                             <button
                               onClick={() => selectTask(t.id)}
                               className={cn(
-                                'flex min-w-0 flex-1 items-center gap-1.5 py-1 pr-1 text-left text-xs transition-colors',
-                                selected ? 'text-blue-100' : 'text-slate-400 hover:text-slate-200',
+                                'flex min-w-0 flex-1 items-center gap-1.5 py-1 pr-1 text-left text-body transition-colors',
+                                selected
+                                  ? 'text-command-soft'
+                                  : 'text-fg-secondary hover:text-fg-primary',
                               )}
                             >
                               <span
                                 className={cn(
                                   'h-1.5 w-1.5 shrink-0 rounded-full',
-                                  stageDotColor[liveStage],
+                                  TONE_DOT[tone],
+                                  runState === 'running' && 'animate-pulse-ring',
                                 )}
                               />
                               <span className="min-w-0 flex-1 truncate">{t.title}</span>
-                              <span className="shrink-0 text-[10px] text-slate-500">
-                                {stageShort[liveStage]}
+                              <span className={cn('shrink-0 text-meta', TONE_TEXT[tone])}>
+                                {RUN_STATE_LABEL[runState]}
                               </span>
                             </button>
                             <button
@@ -416,26 +441,25 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
                                 });
                               }}
                               title="删除任务"
-                              className="p-0.5 text-slate-600 opacity-0 transition-opacity hover:text-rose-400 group-hover/task:opacity-100"
+                              className="p-0.5 text-fg-faint opacity-0 transition-opacity hover:text-danger group-hover/task:opacity-100"
                             >
                               <Trash2 className="h-3 w-3" />
                             </button>
                           </div>
 
-                          {/* 该任务绑定的 Agent 团队（点标题跳 Agent Board 查看/自定义） */}
+                          {/* 该任务绑定的 Agent 团队（点标题跳团队页查看 / 自定义） */}
                           {taskOpen && (
-                            <div className="ml-4 border-l border-line pl-1.5">
+                            <div className="ml-4 border-l border-edge pl-1.5">
                               <button
                                 onClick={() => openTaskTeam(t.id)}
-                                title="打开 Agent Board · 查看 / 自定义该任务团队"
-                                className="group/at flex w-full items-center gap-1 rounded px-1 py-0.5 text-left transition-colors hover:bg-ink-700/60"
+                                title="打开团队页 · 查看 / 自定义该任务团队"
+                                className="group/at flex w-full items-center gap-1 rounded-chip px-1 py-0.5 text-left transition-colors hover:bg-surface-raised/60"
                               >
-                                <Users className="h-3 w-3 shrink-0 text-slate-500" />
-                                <span className="callsign text-[9px] text-slate-500">Agents</span>
-                                <span className="text-[9px] text-slate-600">
-                                  {taskAgents.length}
-                                </span>
-                                <ChevronRight className="ml-auto h-2.5 w-2.5 text-slate-600 opacity-0 transition-opacity group-hover/at:opacity-100" />
+                                <Users className="h-3 w-3 shrink-0 text-fg-muted" />
+                                {/* 纯 ASCII，合法的 callsign 眉标（CJK 契约 C2） */}
+                                <span className="callsign text-micro text-fg-muted">Agents</span>
+                                <span className="text-meta text-fg-faint">{taskAgents.length}</span>
+                                <ChevronRight className="ml-auto h-3 w-3 text-fg-faint opacity-0 transition-opacity group-hover/at:opacity-100" />
                               </button>
                               {taskAgents.map((id) => {
                                 const a = getAgentById(id);
@@ -444,7 +468,7 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
                                   <button
                                     key={id}
                                     onClick={() => openTaskAgent(t.id, id)}
-                                    className="flex w-full items-center gap-1.5 rounded px-1.5 py-1 text-left text-xs text-slate-400 transition-colors hover:bg-ink-700 hover:text-slate-200"
+                                    className="flex w-full items-center gap-1.5 rounded-chip px-1.5 py-1 text-left text-body text-fg-secondary transition-colors hover:bg-surface-raised hover:text-fg-primary"
                                   >
                                     <CircleDot
                                       className={cn('h-3 w-3 shrink-0', agentDotColor[a.status])}
@@ -502,20 +526,20 @@ function TreeGroup({
 }) {
   return (
     <div>
-      <div className="group/g flex items-center rounded pr-1 hover:bg-ink-700/50">
+      <div className="group/g flex items-center rounded-chip pr-1 hover:bg-surface-raised/50">
         <button
           onClick={onToggle}
           className="flex min-w-0 flex-1 items-center gap-1 py-1 pl-0.5 text-left"
         >
           <ChevronRight
             className={cn(
-              'h-3 w-3 shrink-0 text-slate-600 transition-transform',
+              'h-3 w-3 shrink-0 text-fg-faint transition-transform',
               open && 'rotate-90',
             )}
           />
-          <Icon className="h-3.5 w-3.5 shrink-0 text-slate-500" />
-          <span className="callsign text-[9px] text-slate-500">{label}</span>
-          <span className="text-[9px] text-slate-600">{count}</span>
+          <Icon className="h-3.5 w-3.5 shrink-0 text-fg-muted" />
+          <span className="text-meta text-fg-muted">{label}</span>
+          <span className="text-meta text-fg-faint tabular">{count}</span>
         </button>
         {action && (
           <span className="opacity-0 transition-opacity group-hover/g:opacity-100">{action}</span>
@@ -535,6 +559,7 @@ function FileTree({
   toggle,
   selectedFile,
   onSelectFile,
+  onRunFile,
   onDelete,
 }: {
   nodes: FileNode[];
@@ -545,6 +570,7 @@ function FileTree({
   toggle: (key: string) => void;
   selectedFile: string | null;
   onSelectFile: (path: string) => void;
+  onRunFile: (path: string) => void;
   onDelete: (path: string) => void;
 }) {
   return (
@@ -556,27 +582,28 @@ function FileTree({
         const dirOpen = isOpen(dirKey);
         const Icon = isDir ? (dirOpen ? FolderOpen : Folder) : fileIcon(node.name);
         const selected = !isDir && selectedFile === `${projectId}:${nodePath}`;
+        const runnable = !isDir && isPython(node.name);
         return (
           <div key={nodePath}>
             <div
               className={cn(
-                'group/file flex items-center rounded pr-1 transition-colors',
-                selected ? 'bg-blue-600/20' : 'hover:bg-ink-700/50',
+                'group/file flex items-center rounded-chip pr-1 transition-colors',
+                selected ? 'bg-command/10' : 'hover:bg-surface-raised/50',
               )}
             >
               <button
                 onClick={() => (isDir ? toggle(dirKey) : onSelectFile(nodePath))}
                 title={isDir ? undefined : '打开文件'}
                 className={cn(
-                  'flex min-w-0 flex-1 items-center gap-1 py-0.5 text-left text-xs transition-colors',
-                  selected ? 'text-blue-100' : 'text-slate-400 hover:text-slate-200',
+                  'flex min-w-0 flex-1 items-center gap-1 py-0.5 text-left text-body transition-colors',
+                  selected ? 'text-command-soft' : 'text-fg-secondary hover:text-fg-primary',
                 )}
                 style={{ paddingLeft: `${depth * 12 + 4}px` }}
               >
                 {isDir ? (
                   <ChevronRight
                     className={cn(
-                      'h-3 w-3 shrink-0 text-slate-600 transition-transform',
+                      'h-3 w-3 shrink-0 text-fg-faint transition-transform',
                       dirOpen && 'rotate-90',
                     )}
                   />
@@ -586,18 +613,31 @@ function FileTree({
                 <Icon
                   className={cn(
                     'h-3.5 w-3.5 shrink-0',
-                    isDir ? 'text-command-soft/70' : 'text-slate-500',
+                    isDir ? 'text-command-soft/70' : 'text-fg-muted',
                   )}
                 />
                 <span className="min-w-0 flex-1 truncate font-mono">{node.name}</span>
               </button>
+              {/* 【R3 / I5】运行只由这一次点击触发 —— 没有任何事件驱动的自动执行。 */}
+              {runnable && (
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onRunFile(nodePath);
+                  }}
+                  title="在终端里运行"
+                  className="p-0.5 text-fg-faint opacity-0 transition-opacity hover:text-command-soft group-hover/file:opacity-100"
+                >
+                  <Play className="h-3 w-3" />
+                </button>
+              )}
               <button
                 onClick={(e) => {
                   e.stopPropagation();
                   onDelete(nodePath);
                 }}
                 title={isDir ? '删除文件夹（含内容）' : '删除文件'}
-                className="p-0.5 text-slate-600 opacity-0 transition-opacity hover:text-rose-400 group-hover/file:opacity-100"
+                className="p-0.5 text-fg-faint opacity-0 transition-opacity hover:text-danger group-hover/file:opacity-100"
               >
                 <Trash2 className="h-3 w-3" />
               </button>
@@ -612,6 +652,7 @@ function FileTree({
                 toggle={toggle}
                 selectedFile={selectedFile}
                 onSelectFile={onSelectFile}
+                onRunFile={onRunFile}
                 onDelete={onDelete}
               />
             )}
@@ -623,7 +664,7 @@ function FileTree({
 }
 
 function EmptyHint({ text }: { text: string }) {
-  return <div className="px-2 py-1 text-[11px] text-slate-600">{text}</div>;
+  return <div className="px-2 py-1 text-meta text-fg-faint">{text}</div>;
 }
 
 function countFiles(nodes: FileNode[]): number {

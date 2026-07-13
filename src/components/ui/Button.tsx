@@ -1,53 +1,45 @@
-import { cva, type VariantProps } from "class-variance-authority";
-import { forwardRef, type ButtonHTMLAttributes } from "react";
-import { cn } from "@/lib/utils";
+import { cva, type VariantProps } from 'class-variance-authority';
+import { forwardRef, type ButtonHTMLAttributes } from 'react';
+import { cn } from '@/lib/utils';
 
+/**
+ * 按钮：**4 个 variant，没有第 5 个。**
+ *
+ * 删掉的 `council` / `success` / `warning` / `outline` 各自带着一个色相和一次性阴影 ——
+ * `council`(violet) 已并入 `human`（议会本质上就是「轮到人裁决」）；元素级 box-shadow 全灭
+ * （纵深只由表面色阶 + 边框表达）。字重只有 400 / 700：base 里的 `font-medium` 删除。
+ */
 const buttonVariants = cva(
-  "inline-flex items-center justify-center gap-2 rounded-md font-medium transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-command/50 focus-visible:ring-offset-2 focus-visible:ring-offset-ink-950 disabled:pointer-events-none disabled:opacity-40 select-none whitespace-nowrap",
+  'inline-flex select-none items-center justify-center gap-2 whitespace-nowrap rounded-panel transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-command/40 focus-visible:ring-offset-2 focus-visible:ring-offset-surface-void disabled:pointer-events-none disabled:opacity-40',
   {
     variants: {
       variant: {
-        // routine machine command
-        primary:
-          "bg-command text-white hover:bg-command-soft shadow-glow",
-        secondary:
-          "bg-ink-700/70 text-slate-100 hover:bg-ink-600 border border-line-bright",
-        ghost: "text-slate-300 hover:bg-ink-700 hover:text-white",
-        outline:
-          "border border-line-bright text-slate-200 hover:bg-ink-700 hover:border-slate-500",
-        success: "bg-emerald-600 text-white hover:bg-emerald-500",
-        // human-authority act — the warm thread
-        warning:
-          "bg-human text-ink-950 hover:bg-human-soft font-semibold shadow-glow-human",
-        danger: "bg-rose-600 text-white hover:bg-rose-500",
-        council:
-          "bg-violet-600 text-white hover:bg-violet-500 shadow-lg shadow-violet-900/30",
+        /** 机器在动：此刻唯一的主行动 */
+        primary: 'bg-command text-white hover:bg-command-soft',
+        secondary: 'border border-edge-strong text-fg-primary hover:bg-surface-raised',
+        ghost: 'text-fg-secondary hover:bg-surface-raised hover:text-fg-primary',
+        danger: 'bg-danger text-surface-void hover:bg-danger-soft',
       },
       size: {
-        sm: "h-8 px-3 text-xs",
-        md: "h-9 px-4 text-sm",
-        lg: "h-11 px-6 text-base",
-        icon: "h-9 w-9",
+        sm: 'h-8 px-3 text-body',
+        md: 'h-9 px-4 text-body',
+        lg: 'h-11 px-6 text-title',
+        icon: 'h-9 w-9',
       },
     },
     defaultVariants: {
-      variant: "secondary",
-      size: "md",
+      variant: 'secondary',
+      size: 'md',
     },
-  }
+  },
 );
 
 export interface ButtonProps
-  extends ButtonHTMLAttributes<HTMLButtonElement>,
-    VariantProps<typeof buttonVariants> {}
+  extends ButtonHTMLAttributes<HTMLButtonElement>, VariantProps<typeof buttonVariants> {}
 
 export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
   ({ className, variant, size, ...props }, ref) => (
-    <button
-      ref={ref}
-      className={cn(buttonVariants({ variant, size }), className)}
-      {...props}
-    />
-  )
+    <button ref={ref} className={cn(buttonVariants({ variant, size }), className)} {...props} />
+  ),
 );
-Button.displayName = "Button";
+Button.displayName = 'Button';

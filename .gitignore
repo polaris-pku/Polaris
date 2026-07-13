@@ -7,6 +7,9 @@ coverage/
 .vite/
 .node
 
+# BCD 后端的运行时产物（审计日志 / worktree / agent 工作区）
+.newide/
+
 # electron 打包产物
 release/
 
@@ -33,4 +36,11 @@ my-session.json
 .claude
 design-comparison
 /api/
-hci_ide_mvp_plan.md
+
+# 规划类文档：本地参考，不进仓
+polaris_plan.md
+merge_plan.md
+*_plan.md
+
+# 打包后端产物（scripts/build-backend.mjs 生成）
+backend/

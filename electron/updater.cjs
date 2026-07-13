@@ -1,7 +1,11 @@
 // 应用内自动更新：electron-updater + GitHub Releases（发布时生成的 latest.yml 为更新源）。
 // 运行中定时轮询（无需重启即可发现新版），检测到后由渲染层弹窗，用户自行决定是否下载。
-const { app, ipcMain } = require("electron");
+const { app, ipcMain, shell } = require("electron");
 const { autoUpdater } = require("electron-updater");
+
+// macOS 未签名构建无法用 Squirrel 自动安装更新，改为引导用户到 Releases 页手动下载 dmg。
+// 该页始终指向最新发布，无需拼版本号。
+const RELEASES_LATEST_URL = "https://github.com/ExtraZhangYC/Polaris/releases/latest";
 
 // 运行中轮询间隔（10 分钟）。GitHub 未认证请求限流 60 次/时，此频率很安全。
 const CHECK_INTERVAL = 10 * 60 * 1000;
@@ -51,6 +55,8 @@ function setupAutoUpdater(getWindow) {
   ipcMain.handle("update:download", () => autoUpdater.downloadUpdate().catch(() => {}));
   ipcMain.handle("update:restart", () => autoUpdater.quitAndInstall());
   ipcMain.handle("update:check", () => autoUpdater.checkForUpdates().catch(() => {}));
+  // macOS 走手动下载：打开 Releases 最新页，用户下载 dmg 后自行拖入 Applications
+  ipcMain.handle("update:openDownload", () => shell.openExternal(RELEASES_LATEST_URL));
 
   // 启动 3s 后检查一次（避开首屏渲染），之后每 10 分钟轮询一次
   setTimeout(() => autoUpdater.checkForUpdates().catch(() => {}), 3000);
