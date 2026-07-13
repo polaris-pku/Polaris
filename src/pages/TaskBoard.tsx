@@ -1,49 +1,39 @@
-import { useEffect, useRef, useState } from 'react';
-import {
-  Play,
-  Workflow,
-  StepForward,
-  FastForward,
-  Hand,
-  Scale,
-  FileCheck2,
-  Square,
-  Target,
-  FolderTree,
-  FlaskConical,
-  ShieldAlert,
-  Sparkles,
-  FilePlus2,
-  Loader2,
-} from 'lucide-react';
-import { selectActiveReplay, useDemoStore } from '@/store/useDemoStore';
+/**
+ * 运行屏 —— **这一屏只回答四个问题：谁 / 在做什么 / 多久了 / 成没成。**
+ *
+ * 验收判据：陌生人站两米外看 3 秒，能说出这四件事。所以主句是全屏唯一的 24px，
+ * 而它上面/下面的一切都必须让路：
+ *
+ *   面包屑（定位，20px）→ 主句带 → 进度缎带 → 步骤轨（或画布）→ 主行动（仅 idle / 失败时存在）
+ *
+ * 对照重设计前的这一屏，**已经删掉的东西**：两枚状态徽章（其中一枚在 mock 移除后已经零区分度）、
+ * 半截 uuid 的协调器铭牌、模式 / 执行器 的机器铭牌、常驻的任务描述输入框、5 个英文按钮的控制栏、
+ * 「根据流程进度自动显示可用操作」、空状态里背协议规格的那句话、
+ * 「后端执行中 · 泳道图随 agent 实时推进（已收到 N 个事件）」、需求分析面板、
+ * 那三个只改本地状态的手动推进按钮、以及整条执行时间轴。
+ * **新出现的**：一句话。
+ */
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { FilePlus2, MoreHorizontal, Workflow } from 'lucide-react';
+import { selectActiveLiveRun, useDemoStore } from '@/store/useDemoStore';
+import { onBackendStatus } from '@/api/events';
 import { Button } from '@/components/ui/Button';
-import { Textarea } from '@/components/ui/Textarea';
-import { Badge } from '@/components/ui/Badge';
+import { EmptyState } from '@/components/ui/EmptyState';
 import { WorkflowCanvas } from '@/components/WorkflowCanvas';
-import { ExecutionTimeline } from '@/components/ExecutionTimeline';
-import { NodeInspector } from '@/components/NodeInspector';
-import { InterveneDialog } from '@/components/InterveneDialog';
 import { NewRequirementDialog } from '@/components/NewRequirementDialog';
-import { DeliveryReport } from '@/components/DeliveryReport';
-import { LiveRunPanel } from '@/components/LiveRunPanel';
-import { SidePanel } from '@/components/SidePanel';
+import { Breadcrumb } from '@/components/run/Breadcrumb';
+import { MissionLine } from '@/components/run/MissionLine';
+import { ProgressRibbon } from '@/components/run/ProgressRibbon';
+import { StepRail } from '@/components/run/StepRail';
+import { OutputStage } from '@/components/run/OutputStage';
+import { PrimaryAction } from '@/components/run/PrimaryAction';
+import { RunFoldColumn } from '@/components/run/RunFoldColumn';
+import { missionLineOf, phaseSegments } from '@/lib/missionLine';
+import { artifactFactsOf } from '@/lib/runFacts';
+import { runStateOf } from '@/lib/runState';
+import { useNow } from '@/lib/elapsed';
+import { revealAgentFile } from '@/lib/agentFs';
 import { cn } from '@/lib/utils';
-import type { DemoStage } from '@/types';
-
-const stageBadge: Record<
-  DemoStage,
-  { label: string; variant: 'slate' | 'blue' | 'amber' | 'violet' | 'green' }
-> = {
-  idle: { label: '待组队', variant: 'slate' },
-  team_configured: { label: '团队就绪', variant: 'blue' },
-  analyzing: { label: '需求分析中', variant: 'blue' },
-  workflow_recommended: { label: '已推荐流程', variant: 'blue' },
-  executing: { label: '执行中', variant: 'blue' },
-  intervention: { label: '用户介入', variant: 'amber' },
-  council: { label: '议会裁决中', variant: 'violet' },
-  delivery: { label: '已交付', variant: 'green' },
-};
 
 export function TaskBoard() {
   const activeTaskId = useDemoStore((s) => s.activeTaskId);
@@ -52,278 +42,238 @@ export function TaskBoard() {
 }
 
 function TaskBoardInner() {
-  const stage = useDemoStore((s) => s.stage);
-  const taskText = useDemoStore((s) => s.taskText);
-  const setTaskText = useDemoStore((s) => s.setTaskText);
+  const tasks = useDemoStore((s) => s.tasks);
+  const activeTaskId = useDemoStore((s) => s.activeTaskId);
+  const activeTask = tasks.find((t) => t.id === activeTaskId);
+  const liveRun = useDemoStore(selectActiveLiveRun);
+  const nodes = useDemoStore((s) => s.nodes);
+  const selectedNodeId = useDemoStore((s) => s.selectedNodeId);
+  const selectNode = useDemoStore((s) => s.selectNode);
+  const eventChannelStatus = useDemoStore((s) => s.eventChannelStatus);
+  const projects = useDemoStore((s) => s.projects);
+  const activeProjectId = useDemoStore((s) => s.activeProjectId);
   const startTask = useDemoStore((s) => s.startTask);
   const useRecommendedWorkflow = useDemoStore((s) => s.useRecommendedWorkflow);
-  const nextStep = useDemoStore((s) => s.nextStep);
-  const autoRun = useDemoStore((s) => s.autoRun);
-  const stopAutoRun = useDemoStore((s) => s.stopAutoRun);
-  const goToCouncil = useDemoStore((s) => s.goToCouncil);
-  const showDelivery = useDemoStore((s) => s.showDelivery);
-  const isAutoRunning = useDemoStore((s) => s.isAutoRunning);
-  const nodes = useDemoStore((s) => s.nodes);
-  const activeStepIndex = useDemoStore((s) => s.activeStepIndex);
-  const assignedAgentIds = useDemoStore((s) => s.assignedAgentIds);
-  const activeTaskId = useDemoStore((s) => s.activeTaskId);
-  const tasks = useDemoStore((s) => s.tasks);
-  const activeTask = tasks.find((t) => t.id === activeTaskId);
-  const liveRun = useDemoStore((s) => s.liveRun);
-  const replay = useDemoStore(selectActiveReplay);
-  const selectedNodeId = useDemoStore((s) => s.selectedNodeId);
+  const retrySubmit = useDemoStore((s) => s.retrySubmit);
 
-  const [interveneOpen, setInterveneOpen] = useState(false);
+  const activeProject = projects.find((p) => p.id === activeProjectId);
+  const state = runStateOf(activeTask, liveRun);
 
-  // 交付阶段右侧面板视图：交付报告 / 节点详情。进入交付默认看报告，
-  // 点画布上「非入口」节点时自动切到节点详情（仍可用分段控件切回）。
-  const [deliveryTab, setDeliveryTab] = useState<'report' | 'node'>('report');
-  const deliveryEntryNode = useRef<string | null>(null);
-  useEffect(() => {
-    if (stage === 'delivery') {
-      deliveryEntryNode.current = useDemoStore.getState().selectedNodeId;
-      setDeliveryTab('report');
-    } else {
-      deliveryEntryNode.current = null;
-    }
-  }, [stage]);
-  useEffect(() => {
-    if (stage === 'delivery' && selectedNodeId && selectedNodeId !== deliveryEntryNode.current) {
-      setDeliveryTab('node');
-    }
-  }, [selectedNodeId, stage]);
+  // 秒表只在 run 还活着时走 —— 终态之后每秒重渲染整块运行屏是白烧电。
+  const now = useNow(1000, state === 'running' || state === 'blocked');
+  const mission = missionLineOf({ task: activeTask, live: liveRun, now });
 
-  const activeNode = stage === 'executing' && activeStepIndex >= 0 ? nodes[activeStepIndex] : null;
+  // agent 的工作区（文件真正写到哪）。它是后端的**全局状态** —— 界面上看不见的话，
+  // 文件写进别的项目也毫无察觉：run 照样显示已交付，产物却不在你的目录里。
+  const [workspace, setWorkspace] = useState('');
+  useEffect(() => onBackendStatus((s) => setWorkspace(s.workspace)), []);
 
-  // 真实后端 run：泳道图由后端事件实时驱动，人不需要（也不应该）手动推进。
-  // 这些按钮只属于 mock 演示剧本那条路。
-  const isLiveRun = !!activeTask?.contractRunId;
-  const showStart = !isLiveRun && (stage === 'idle' || stage === 'team_configured');
-  const showRecommend = !isLiveRun && (stage === 'analyzing' || stage === 'workflow_recommended');
-  const showExecuteControls = !isLiveRun && stage === 'executing';
-  // 用 code 判断（并行执行段节点 id 带 -be/-te 后缀，code 仍为 N7）
-  const showIntervene = activeNode?.code === 'N7';
-  // 回放任务 Gate=allow：本次 run 未触发 Council，不提供入口
-  const showCouncil =
-    (activeNode?.code === 'N13' || activeNode?.code === 'N14') && replay?.gateDecision !== 'allow';
-  const showDelivered = stage === 'delivery';
+  // 两个视图开关都是**本地状态**，不进 store：它们是这一屏的看法，不是这次 run 的事实。
+  const [view, setView] = useState<'rail' | 'canvas' | null>(null);
+  const [showMachineSteps, setShowMachineSteps] = useState(false);
 
-  const hasWorkflow = stage !== 'idle' && stage !== 'team_configured' && stage !== 'analyzing';
+  const [retrying, setRetrying] = useState(false);
+  const [retryError, setRetryError] = useState<string | undefined>(undefined);
+
+  const onRetry = useCallback(() => {
+    if (!activeTask || retrying) return;
+    setRetrying(true);
+    setRetryError(undefined);
+    void retrySubmit(activeTask.id).then((result) => {
+      setRetrying(false);
+      if (!result.ok) setRetryError(result.error);
+    });
+  }, [activeTask, retrying, retrySubmit]);
+
+  // 多 agent 扇出时，图才真的是图 —— 只有那时它才自动成为默认视图。
+  //
+  // ⚠️ 这里必须数**执行者泳道**，不能数全部泳道。
+  // 全部泳道包括 System / Memory / Driver 这些责任方分区 —— 任何一个单 agent 的 run
+  // 只要跑到交付，泳道数就必然超过 2，于是**每一个跑完的 run 都会翻回画布**，
+  // 「步骤轨是默认视图」这个决定就形同虚设。而单 agent 的事件图是一条直线，
+  // 用图渲染器画直线、还占掉整个舞台，正是这次重排要解决的问题。
+  //
+  // 执行者的判定与 liveBoard.projectLiveBoard 里的 `agents` 同源：direction='A' 且不是 Driver 泳道。
+  const agentLaneCount = new Set(
+    nodes.filter((n) => n.direction === 'A' && n.lane !== 'Driver').map((n) => n.lane),
+  ).size;
+  const effectiveView = view ?? (agentLaneCount > 1 ? 'canvas' : 'rail');
+
+  const railNodes = nodes.filter((n) => showMachineSteps || n.tier !== 'machine');
+  const activeNodeId = selectedNodeId ?? nodes.find((n) => n.status === 'active')?.id ?? null;
+
+  // 产出（agent 真写出来的文件）—— 舞台的主角。右栏不再重复渲染它（一个事实只有一个宿主）。
+  const artifacts = artifactFactsOf(liveRun);
 
   return (
     <div className="flex h-full overflow-hidden">
-      {/* Left column */}
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
-        {/* Command Bar */}
-        <div className="border-b border-line px-5 py-4">
-          <div className="mb-2 flex items-center gap-3">
-            <h1 className="font-display text-lg font-semibold tracking-tight text-white">
-              {activeTask?.title ?? 'Task Board'}
-            </h1>
-            <Badge variant={stageBadge[stage].variant}>{stageBadge[stage].label}</Badge>
-            {/* 这条任务到底有没有真跑在后端上 —— 一眼可辨，别让人把演示当成真实执行。
-                LIVE = 后端已受理并起了 run；DEMO = 只有本地 mock 剧本。 */}
-            {activeTask?.contractRunId ? (
-              <Badge variant="green" title={`run_id: ${activeTask.contractRunId}`}>
-                LIVE · 后端真实执行
-              </Badge>
+        <div className="flex flex-col gap-3 border-b border-edge px-5 py-4">
+          <Breadcrumb
+            projectName={activeProject?.name ?? '当前项目'}
+            taskTitle={activeTask?.title ?? '未命名需求'}
+          />
+
+          <MissionLine
+            state={state}
+            headline={mission.headline}
+            sub={mission.sub}
+            workspacePath={liveRun ? workspace || undefined : undefined}
+            channel={eventChannelStatus}
+            onRetry={mission.retry ? onRetry : undefined}
+            onRevealWorkspace={() => {
+              if (workspace) revealAgentFile(workspace);
+            }}
+          />
+
+          <ProgressRibbon phases={phaseSegments(nodes, activeNodeId ?? undefined)} />
+        </div>
+
+        <div className="flex min-h-0 flex-1 flex-col">
+          <div className="flex shrink-0 items-center justify-end px-5 pt-2">
+            <ViewMenu
+              canvas={effectiveView === 'canvas'}
+              showMachineSteps={showMachineSteps}
+              onToggleCanvas={() => {
+                setView(effectiveView === 'canvas' ? 'rail' : 'canvas');
+              }}
+              onToggleMachineSteps={() => {
+                setShowMachineSteps((v) => !v);
+              }}
+            />
+          </div>
+
+          {/*
+            舞台 = 步骤轨（贴顶，内容多高就多高）+ 产出面（占满剩下的空间）。
+            步骤轨本身只有 ~120px；此前它独占一个 flex-1 容器，底下是 500px 真空。
+            那不是「没填满」，是舞台失去了职责 —— 顶部管状态、右栏管详情、Dock 管原始文本，
+            舞台没活干了。现在它接手整个产品最重要的那个事实：agent 到底写出了什么。
+            选了「图」视图时舞台整个让给画布 —— 那是用户明确要看结构。
+          */}
+          <div className="relative flex min-h-0 flex-1 flex-col px-5 pb-2">
+            {nodes.length === 0 ? (
+              <div className="flex h-full items-center justify-center">
+                <EmptyState
+                  icon={Workflow}
+                  title="尚未执行"
+                  hint="开始后，Agent 的每一步会在这里出现。"
+                />
+              </div>
+            ) : effectiveView === 'canvas' ? (
+              <div className="h-full">
+                <WorkflowCanvas showMachineSteps={showMachineSteps} />
+              </div>
             ) : (
-              <Badge variant="slate" title="未接后端，或提交失败；仅本地演示剧本">
-                DEMO · 演示剧本
-              </Badge>
-            )}
-            {activeTask?.contractTaskId && (
-              <span className="callsign text-[9px] text-slate-600">
-                COORD · {activeTask.contractTaskId}
-              </span>
-            )}
-            {/* 回放任务按真实 run 的 mode 组队（single_agent=1 人），不提示人数 */}
-            {!replay && assignedAgentIds.length < 3 && (
-              <span className="text-xs text-human/80">
-                当前团队人数不足（建议至少 3 名）。可前往 Agent Board → 自定义团队
-              </span>
-            )}
-            {replay && (
-              <span className="callsign text-[9px] text-slate-500">
-                MODE · {replay.meta.mode}
-                {replay.meta.driverId ? ` · driver=${replay.meta.driverId}` : ''}
-              </span>
+              <>
+                <div className="shrink-0">
+                  <StepRail nodes={railNodes} activeId={activeNodeId} onSelect={selectNode} />
+                </div>
+                <div className="min-h-0 flex-1">
+                  <OutputStage facts={artifacts} state={state} />
+                </div>
+              </>
             )}
           </div>
-          <div className="flex items-end gap-3">
-            <div className="flex-1">
-              <label className="callsign mb-1 block text-[9px] text-slate-500">任务描述</label>
-              <Textarea
-                value={taskText}
-                onChange={(e) => setTaskText(e.target.value)}
-                rows={2}
-                disabled={stage !== 'idle' && stage !== 'team_configured'}
-                className="disabled:opacity-70"
-              />
-            </div>
-            <div className="flex flex-col gap-2 pb-0.5">
-              {showStart && (
-                <Button variant="primary" onClick={startTask}>
-                  <Play className="h-4 w-4" /> Start Task
-                </Button>
-              )}
-              {showRecommend && (
-                <Button variant="primary" onClick={useRecommendedWorkflow}>
-                  <Workflow className="h-4 w-4" /> Use Recommended Workflow
-                </Button>
-              )}
-            </div>
-          </div>
         </div>
 
-        {/* Canvas / placeholder */}
-        <div className="relative min-h-0 flex-1">
-          {hasWorkflow ? <WorkflowCanvas /> : <EmptyCanvas stage={stage} />}
-        </div>
-
-        {/* Execution timeline */}
-        <ExecutionTimeline />
-
-        {/* Demo Controls */}
-        <div className="flex flex-wrap items-center gap-2 border-t border-line bg-ink-900/60 px-5 py-3">
-          {showExecuteControls && (
-            <>
-              <Button variant="secondary" size="sm" onClick={nextStep}>
-                <StepForward className="h-4 w-4" /> Next Step
-              </Button>
-              {isAutoRunning ? (
-                <Button variant="warning" size="sm" onClick={stopAutoRun}>
-                  <Square className="h-4 w-4" /> 暂停
-                </Button>
-              ) : (
-                <Button variant="secondary" size="sm" onClick={autoRun}>
-                  <FastForward className="h-4 w-4" /> Auto Run
-                </Button>
-              )}
-            </>
-          )}
-
-          {showIntervene && (
-            <Button variant="warning" size="sm" onClick={() => setInterveneOpen(true)}>
-              <Hand className="h-4 w-4" /> Intervene
-            </Button>
-          )}
-
-          {showCouncil && (
-            <Button variant="council" size="sm" onClick={goToCouncil}>
-              <Scale className="h-4 w-4" /> Go to Council
-            </Button>
-          )}
-
-          {showDelivered && (
-            <Button variant="success" size="sm" onClick={showDelivery}>
-              <FileCheck2 className="h-4 w-4" /> View Delivery Report
-            </Button>
-          )}
-
-          {/* 真实 run：进度由后端事件驱动，没有可点的推进按钮 —— 说清楚为什么。
-              liveRun 是全局单槽，必须限定到当前任务自己那次 run，否则并发跑第二个任务时
-              这里会用另一次 run 的事件数谎报当前任务的进度。 */}
-          {isLiveRun &&
-            liveRun &&
-            liveRun.runId === activeTask?.contractRunId &&
-            liveRun.status === 'running' && (
-              <span className="flex items-center gap-1.5 text-xs text-command-soft">
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                后端执行中 · 泳道图随 agent 实时推进（已收到 {liveRun.timeline.length} 个事件）
-              </span>
-            )}
-
-          {!isLiveRun &&
-            !showExecuteControls &&
-            !showIntervene &&
-            !showCouncil &&
-            !showDelivered &&
-            !showStart &&
-            !showRecommend && (
-              <span className="text-xs text-slate-600">根据流程进度自动显示可用操作</span>
-            )}
-        </div>
+        <PrimaryAction
+          state={state}
+          retrying={retrying}
+          error={retryError}
+          onStart={startTask}
+          onUseRecommended={useRecommendedWorkflow}
+          onRetry={onRetry}
+        />
       </div>
 
-      {/* Right column */}
-      <SidePanel
-        side="right"
-        title="节点详情"
-        defaultWidth={400}
-        minWidth={300}
-        maxWidth={620}
-        storageKey="task-inspector"
-      >
-        {/* 后端真实 run 常驻置顶：它是独立于 mock 剧本的另一条事实线，
-            不能随演示 stage 切换而消失，否则用户又分不清哪个是真的。 */}
-        <LiveRunPanel />
-        {stage === 'delivery' ? (
-          <DeliveryPanel tab={deliveryTab} onTab={setDeliveryTab} />
-        ) : stage === 'analyzing' || stage === 'workflow_recommended' ? (
-          <TaskUnderstandingPanel />
-        ) : stage === 'idle' || stage === 'team_configured' ? (
-          <IdleRightPanel />
-        ) : (
-          <NodeInspector />
-        )}
-      </SidePanel>
-
-      <InterveneDialog open={interveneOpen} onClose={() => setInterveneOpen(false)} />
+      <RunFoldColumn />
     </div>
   );
 }
 
-/** 交付阶段右侧面板：交付报告 / 节点详情 分段切换（都可访问，互不遮挡）。 */
-function DeliveryPanel({
-  tab,
-  onTab,
+/** 步骤轨右上角的 `⋯ 视图`：两个开关，都只影响这一屏怎么看，不影响这次 run 是什么。 */
+function ViewMenu({
+  canvas,
+  showMachineSteps,
+  onToggleCanvas,
+  onToggleMachineSteps,
 }: {
-  tab: 'report' | 'node';
-  onTab: (t: 'report' | 'node') => void;
+  canvas: boolean;
+  showMachineSteps: boolean;
+  onToggleCanvas: () => void;
+  onToggleMachineSteps: () => void;
 }) {
+  const [open, setOpen] = useState(false);
+  const root = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (!root.current?.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', onDown);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+    };
+  }, [open]);
+
   return (
-    <div className="flex h-full min-h-0 flex-col">
-      <div className="flex shrink-0 gap-1 border-b border-line p-2">
-        <DeliveryTab active={tab === 'report'} onClick={() => onTab('report')}>
-          交付报告
-        </DeliveryTab>
-        <DeliveryTab active={tab === 'node'} onClick={() => onTab('node')}>
-          节点详情
-        </DeliveryTab>
-      </div>
-      <div className="min-h-0 flex-1">
-        {tab === 'report' ? <DeliveryReport /> : <NodeInspector />}
-      </div>
+    <div ref={root} className="relative">
+      <Button
+        variant="ghost"
+        size="sm"
+        aria-expanded={open}
+        onClick={() => {
+          setOpen((v) => !v);
+        }}
+      >
+        <MoreHorizontal className="h-4 w-4" aria-hidden /> 视图
+      </Button>
+
+      {open && (
+        <div className="absolute right-0 top-9 z-10 w-56 rounded-panel border border-edge-strong bg-surface-panel py-1">
+          <MenuToggle checked={canvas} onClick={onToggleCanvas}>
+            图
+          </MenuToggle>
+          <MenuToggle checked={showMachineSteps} onClick={onToggleMachineSteps}>
+            显示机器握手步骤
+          </MenuToggle>
+        </div>
+      )}
     </div>
   );
 }
 
-function DeliveryTab({
-  active,
+function MenuToggle({
+  checked,
   onClick,
   children,
 }: {
-  active: boolean;
+  checked: boolean;
   onClick: () => void;
-  children: React.ReactNode;
+  children: string;
 }) {
   return (
     <button
       type="button"
+      role="menuitemcheckbox"
+      aria-checked={checked}
       onClick={onClick}
-      className={cn(
-        'flex-1 rounded-md px-3 py-1.5 text-xs font-medium transition-colors',
-        active
-          ? 'bg-ink-800 text-slate-100'
-          : 'text-slate-500 hover:bg-ink-800/50 hover:text-slate-300',
-      )}
+      className="flex w-full items-center gap-2 px-3 py-1.5 text-left text-body text-fg-secondary transition-colors hover:bg-surface-raised hover:text-fg-primary"
     >
+      <span
+        aria-hidden
+        className={cn(
+          'h-1.5 w-1.5 shrink-0 rounded-full',
+          checked ? 'bg-command' : 'border border-fg-faint',
+        )}
+      />
       {children}
     </button>
   );
 }
 
+/** 项目里还一条需求都没有 —— 这一屏只该有一个动作。 */
 function NoTaskBoard() {
   const [reqOpen, setReqOpen] = useState(false);
   const projects = useDemoStore((s) => s.projects);
@@ -331,139 +281,28 @@ function NoTaskBoard() {
   const activeProject = projects.find((p) => p.id === activeProjectId);
 
   return (
-    <div className="flex h-full flex-col items-center justify-center gap-4 text-center">
-      <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-ink-800 text-slate-500">
-        <FilePlus2 className="h-8 w-8" />
-      </div>
-      <div>
-        <div className="font-display text-lg font-semibold text-white">
-          {activeProject?.name ?? '当前项目'} · 还没有任务
-        </div>
-        <p className="mt-1 max-w-sm text-sm text-slate-500">
-          输入一条需求，Agent 会分析并推荐执行 Workflow。
-        </p>
-      </div>
-      <Button variant="primary" onClick={() => setReqOpen(true)}>
-        <FilePlus2 className="h-4 w-4" /> 新建需求
-      </Button>
-      <NewRequirementDialog open={reqOpen} onClose={() => setReqOpen(false)} />
-    </div>
-  );
-}
-
-function EmptyCanvas({ stage }: { stage: DemoStage }) {
-  return (
-    <div className="flex h-full flex-col items-center justify-center gap-3 text-center">
-      <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-ink-800 text-slate-500">
-        <Workflow className="h-7 w-7" />
-      </div>
-      <div className="text-sm text-slate-400">
-        {stage === 'analyzing'
-          ? '需求分析完成，点击 “Use Recommended Workflow” 开始执行并逐步生成泳道图'
-          : '输入任务并点击 “Start Task” 开始'}
-      </div>
-      <div className="text-xs text-slate-600">
-        执行过程将沿 7 条责任方 Lane 动态生成 N0–N18 全链路节点
-      </div>
-    </div>
-  );
-}
-
-function TaskUnderstandingPanel() {
-  const useRecommendedWorkflow = useDemoStore((s) => s.useRecommendedWorkflow);
-  const stage = useDemoStore((s) => s.stage);
-  const replay = useDemoStore(selectActiveReplay);
-
-  // 需求分析只来自真实 run 的快照；没有 run 就不编造分析结果。
-  if (!replay) {
-    return (
-      <div className="flex h-full flex-col items-center justify-center gap-2 p-8 text-center">
-        <Sparkles className="h-8 w-8 text-slate-600" />
-        <p className="text-sm text-slate-400">等待后端 run 的需求分析结果。</p>
-        <p className="text-xs text-slate-600">提交需求后，agent 的结构化分析会显示在这里。</p>
-      </div>
-    );
-  }
-  const understanding = replay.scenario.understanding;
-
-  const rows = [
-    {
-      icon: Target,
-      title: '需求目标',
-      tone: 'text-blue-300',
-      content: understanding.goal,
-    },
-    {
-      icon: FolderTree,
-      title: '涉及模块',
-      tone: 'text-cyan-300',
-      content: understanding.modules.join('、'),
-    },
-    {
-      icon: FlaskConical,
-      title: '测试目录',
-      tone: 'text-emerald-300',
-      content: understanding.testDir,
-    },
-    {
-      icon: ShieldAlert,
-      title: '潜在风险',
-      tone: 'text-rose-300',
-      content: understanding.risks.join('、'),
-    },
-    {
-      icon: Sparkles,
-      title: '推荐 Workflow',
-      tone: 'text-violet-300',
-      content: understanding.workflow,
-    },
-  ];
-
-  return (
-    <div className="flex h-full flex-col">
-      <div className="border-b border-slate-800/80 p-5">
-        <div className="flex items-center gap-2">
-          <Sparkles className="h-4 w-4 text-blue-400" />
-          <h2 className="text-base font-semibold text-white">Task Understanding</h2>
-        </div>
-        <p className="mt-1 text-xs text-slate-500">agent 对需求的结构化分析</p>
-      </div>
-
-      <div className="flex-1 space-y-3 overflow-y-auto p-5">
-        {rows.map((r) => {
-          const Icon = r.icon;
-          return (
-            <div
-              key={r.title}
-              className="rounded-lg border border-slate-800 bg-ink-900/60 p-3 animate-fade-in"
-            >
-              <div className={`mb-1 flex items-center gap-1.5 text-[11px] font-semibold ${r.tone}`}>
-                <Icon className="h-3.5 w-3.5" />
-                {r.title}
-              </div>
-              <p className="text-xs leading-relaxed text-slate-300">{r.content}</p>
-            </div>
-          );
-        })}
-      </div>
-
-      {stage === 'analyzing' && (
-        <div className="border-t border-slate-800/80 p-4">
-          <Button variant="primary" className="w-full" onClick={useRecommendedWorkflow}>
-            <Workflow className="h-4 w-4" /> Use Recommended Workflow
+    <div className="flex h-full items-center justify-center">
+      <EmptyState
+        icon={FilePlus2}
+        title={`${activeProject?.name ?? '当前项目'} · 还没有需求`}
+        hint="写一条需求，Agent 会接手并把文件写进这个项目。"
+        action={
+          <Button
+            variant="primary"
+            onClick={() => {
+              setReqOpen(true);
+            }}
+          >
+            <FilePlus2 className="h-4 w-4" aria-hidden /> 新建需求
           </Button>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function IdleRightPanel() {
-  return (
-    <div className="flex h-full flex-col items-center justify-center px-6 text-center text-slate-500">
-      <Play className="mb-3 h-10 w-10 text-slate-700" />
-      <p className="text-sm">输入任务并点击 Start Task</p>
-      <p className="text-xs text-slate-600">系统会先分析需求，再推荐多 Agent 执行流程</p>
+        }
+      />
+      <NewRequirementDialog
+        open={reqOpen}
+        onClose={() => {
+          setReqOpen(false);
+        }}
+      />
     </div>
   );
 }

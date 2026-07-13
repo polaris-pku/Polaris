@@ -1,8 +1,10 @@
 import type { Project } from '@/types';
 import { PROJECT_TRACE_FORMAT, type SliceCreator, type ProjectSlice } from '@/store/types';
+import { unwatchRun } from '@/api/events';
 import { uid } from '@/store/lib/ids';
 import { pickProjectDirectory, readProjectFolder } from '@/lib/agentFs';
 import { bindBackendWorkspace } from '@/lib/backendWorkspace';
+import { canBindWorkspace, dropRun } from '@/store/lib/liveRuns';
 import { insertFileNode, removeFileNode } from '@/store/lib/fileTree';
 import {
   emptyTaskFields,
@@ -44,9 +46,10 @@ export const createProjectSlice: SliceCreator<ProjectSlice> = (set, get) => ({
       activeTaskId: null,
       ...emptyTaskFields(),
     });
-    // 新建即进入该项目 —— 工作区必须跟着绑过去。漏了这一步的话，从启动页新建项目后
-    // 直接提需求，agent 会把文件写进**上一个项目**的目录里（提交时还会再对齐一次兜底）。
-    void bindBackendWorkspace(project);
+    // 工作区跟着新项目走 —— 但**只在没有别的项目的 run 在跑时**才敢绑：
+    // 绑定会重启 BCD，而重启会连带杀掉正在干活的 agent（见 canBindWorkspace）。
+    // 跳过也无妨：提交需求时 createTask 一定会再对齐一次，那才是权威的绑定时机。
+    if (canBindWorkspace(get(), project.id).ok) void bindBackendWorkspace(project);
   },
 
   openProjectFromFolder: async () => {
@@ -119,8 +122,12 @@ export const createProjectSlice: SliceCreator<ProjectSlice> = (set, get) => ({
       ...taskState,
     });
     // 把 agent 的工作区绑到这个项目：BCD 只在启动时读 ACP_WORKSPACE，所以要重启后端。
-    // 落点解析复用主进程 fsBridge 的那一套 —— agent 写进哪里 = E 观测面板读哪里。
-    void bindBackendWorkspace(project);
+    //
+    // ⚠️ 只在没有别的项目的 run 在跑时才绑。重启 BCD = 杀掉整个进程组，**包括正在写文件的 agent**。
+    // 从前这里是无条件绑定的 —— 于是「点一下侧栏切到另一个项目」就足以静默杀死一次正在跑的需求，
+    // 而那个任务会永远停在「执行中」。浏览项目不该有这种副作用。
+    // 跳过绑定不会写错目录：提交需求时 createTask 会再对齐一次，那才是权威时机。
+    if (canBindWorkspace(get(), project.id).ok) void bindBackendWorkspace(project);
   },
 
   closeProject: () => {
@@ -135,13 +142,23 @@ export const createProjectSlice: SliceCreator<ProjectSlice> = (set, get) => ({
   deleteProject: (projectId) => {
     const state = get();
     const projects = state.projects.filter((p) => p.id !== projectId);
+    const removed = state.tasks.filter((t) => t.projectId === projectId);
     const tasks = state.tasks.filter((t) => t.projectId !== projectId);
+
+    // 项目下所有任务的 run 一并退订并清出 liveRuns —— 否则订阅与实时状态会随删掉的项目泄漏。
+    const removedRunIds = removed.map((t) => t.contractRunId);
+    const liveRuns = dropRun(state.liveRuns, ...removedRunIds);
+    for (const runId of removedRunIds) {
+      if (runId) void unwatchRun(runId);
+    }
+
     if (projectId === state.activeProjectId) {
       // 删除的是当前项目：回到空白启动页（其余项目仍在）。
       get().stopAutoRun();
       set({
         projects,
         tasks,
+        liveRuns,
         activeProjectId: null,
         activeTaskId: null,
         selectedAgentId: null,
@@ -150,7 +167,7 @@ export const createProjectSlice: SliceCreator<ProjectSlice> = (set, get) => ({
         ...emptyTaskFields(),
       });
     } else {
-      set({ projects, tasks });
+      set({ projects, tasks, liveRuns });
     }
   },
 
@@ -162,6 +179,13 @@ export const createProjectSlice: SliceCreator<ProjectSlice> = (set, get) => ({
     const tasks = state.activeTaskId
       ? syncTasks(state.tasks, state.activeTaskId, extractTaskFields(state))
       : state.tasks;
+    // 本项目各任务对应的 run —— 用来把全局事件窗口过滤成「只属于本项目」的证据。
+    const projectRunIds = new Set(
+      tasks
+        .filter((t) => t.projectId === projectId)
+        .map((t) => t.contractRunId)
+        .filter((id): id is string => !!id),
+    );
     return {
       format: PROJECT_TRACE_FORMAT,
       version: 1,
@@ -183,7 +207,9 @@ export const createProjectSlice: SliceCreator<ProjectSlice> = (set, get) => ({
           timeline: t.timeline,
         })),
       agentFileWrites: state.agentFileWrites,
-      backendEvents: state.backendEvents,
+      // 事件观测窗口是**全局**的（所有 run 的事件混在一起）。项目级 trace 是审计材料，
+      // 塞进别的项目的 run 事件就是在污染证据 —— 按本项目任务的 run_id 过一遍。
+      backendEvents: state.backendEvents.filter((e) => !!e.run_id && projectRunIds.has(e.run_id)),
     };
   },
 

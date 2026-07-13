@@ -3,18 +3,20 @@ import type { Lane, WorkflowNodeData } from '@/types';
 /** 泳道顺序（自上而下）= 执行角色分区 */
 export const lanes: Lane[] = ['User', 'System', 'Backend', 'Test', 'Security', 'Council'];
 
+// 纵轴说的是**执行者**，不是仓库模块。A/B/C/D 是仓库结构（acp-client / newide-bcd）泄漏到
+// 产品界面的字母，双语注音同理 —— 两者都已移出主层（去「帮助 › 架构说明」找它们）。
 export const laneLabels: Record<Lane, string> = {
-  User: 'User · 用户 / 前端',
-  System: 'System · 调度 / 协调',
-  Backend: 'Backend · 后端 Agent',
-  Test: 'Test · 测试 Agent',
-  Security: 'Security · 安全 / Gate',
-  Council: 'Council · 议会',
+  User: '用户',
+  System: '调度',
+  Backend: '后端 Agent',
+  Test: '测试 Agent',
+  Security: '安全检查',
+  Council: '合议',
   // 事件驱动图的泳道（= event.source）。agent 泳道以后端给的 role_id 为名，
   // 后端派几个角色就有几条，前端不预设。
-  Memory: 'Memory · B · 角色记忆',
-  Driver: 'Driver · A · 执行运行时',
-  Agent: 'Agent · 执行',
+  Memory: '角色记忆',
+  Driver: '执行运行时',
+  Agent: 'Agent 执行',
 };
 
 /**
@@ -664,7 +666,9 @@ export type PhaseKey = 'intake' | 'execution' | 'review' | 'delivery';
 export const PHASES: { key: PhaseKey; label: string; labelCn: string }[] = [
   { key: 'intake', label: 'INTAKE', labelCn: '受理' },
   { key: 'execution', label: 'EXECUTION', labelCn: '执行' },
-  { key: 'review', label: 'REVIEW', labelCn: '评审' },
+  // 「审查」不是「评审」：这一步是 Gate + hook 的自动检查，不是人做的 code review。
+  // （eventGraph.STEPS.review.labelCn 一直是「审查」—— 是这里在漂移。）
+  { key: 'review', label: 'REVIEW', labelCn: '审查' },
   { key: 'delivery', label: 'DELIVERY', labelCn: '交付' },
 ];
 

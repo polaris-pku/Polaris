@@ -119,6 +119,9 @@ export type DemoTask = {
   /** 后端受理后回填的 run_id（run.create 一次性建 Task + Run 并立刻开跑）；
    *  缺失 = 未接后端或提交失败。真实 run 的事件/快照都按它索引。 */
   contractRunId?: string;
+  /** 提交给后端失败的原因（后端没受理这个需求 → 它只是个本地任务）。
+   *  必须显示出来：否则用户以为自己提了需求，实际什么都没发生。 */
+  submitError?: string;
   /** 用户在 N0 自报的验收标准（随 TaskCreateRequest.completion_criteria 上送） */
   completionCriteria?: string[];
   /** 文件写入权限确认结果（tool_event_id → 人选的 outcome），随任务持久化。

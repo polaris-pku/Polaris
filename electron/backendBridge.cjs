@@ -11,6 +11,8 @@ const { createInterface } = require('readline');
 const path = require('path');
 const fs = require('fs');
 const { resolveProjectRoot } = require('./fsBridge.cjs');
+// settings.json 的读写只有这一个入口（串行 + 原子写）。见 electron/settings.cjs 顶部注释。
+const { readSettings, writeSettings } = require('./settings.cjs');
 
 const isDev = !app.isPackaged;
 
@@ -190,18 +192,6 @@ const PROVIDERS = [
  */
 const AGENTS = [{ id: 'claude', name: 'Claude Code' }];
 
-function settingsPath() {
-  return path.join(app.getPath('userData'), 'settings.json');
-}
-
-function readSettings() {
-  try {
-    return JSON.parse(fs.readFileSync(settingsPath(), 'utf8'));
-  } catch {
-    return {};
-  }
-}
-
 /** 当前服务商 + 它的配置（key / baseUrl / model）。 */
 function currentProvider() {
   const s = readSettings();
@@ -326,7 +316,10 @@ function start({ workspace, agentId } = {}, { force = false } = {}) {
   // 只认随包分发的 agent。A 的其余 adapter（gemini/codex/…）默认命令是 `npx -y …`，
   // 而打包后的机器上没有 npx —— 放进去只会换来一个 ENOENT。宁可在这里就说清楚。
   if (!AGENTS.some((a) => a.id === resolvedAgentId)) {
-    setStatus('error', `未知的 agent「${resolvedAgentId}」；本版本只随包分发：${AGENTS.map((a) => a.id).join('、')}`);
+    setStatus(
+      'error',
+      `未知的 agent「${resolvedAgentId}」；本版本只随包分发：${AGENTS.map((a) => a.id).join('、')}`,
+    );
     return;
   }
 
@@ -470,10 +463,30 @@ function stop() {
   const dying = child;
   child = null;
   currentConfig = null;
-  // 按进程组杀：pnpm 底下还挂着真正跑 BCD 的 node 进程，只杀 pnpm 会留下孤儿。
+
+  // 未响应的调用必须当场拒绝。
+  //
+  // 不能指望子进程的 exit handler 来做这件事：那个 handler 一开头就是 `if (!isCurrent()) return`，
+  // 而 stop() 已经把 child 置空、start() 随后又同步把 child 指向新进程 —— 等旧进程的 exit
+  // 真正到达时 isCurrent() 早就是 false 了，拒绝逻辑被整段跳过。
+  // 结果是调用方挂满 60 秒，最后拿到一句驴唇不对马嘴的「RPC 超时」，而真相是「后端被重启了」。
+  for (const { reject } of pending.values()) {
+    reject(new Error('BCD 后端已重启或退出，本次调用未完成'));
+  }
+  pending.clear();
+
+  // 杀掉整棵进程树：BCD 底下还挂着 A（ACP runner）和真实 agent CLI，只杀 BCD 会留下孤儿 ——
+  // 孤儿 agent 会继续往**旧工作区**写文件，而用户已经切到别的项目了。
   try {
-    if (process.platform !== 'win32' && dying.pid) {
-      process.kill(-dying.pid, 'SIGTERM');
+    if (process.platform === 'win32' && dying.pid) {
+      // Windows 没有进程组信号。dying.kill() 只结束 BCD 自己，claude.exe 会活下来继续写盘。
+      // taskkill /T 才是杀整棵树（A 自己的 terminal-handler 也是这么干的）。
+      spawn('taskkill', ['/T', '/F', '/PID', String(dying.pid)], { stdio: 'ignore' }).on(
+        'error',
+        () => dying.kill(),
+      );
+    } else if (dying.pid) {
+      process.kill(-dying.pid, 'SIGTERM'); // 按进程组杀（spawn 时 detached，BCD 即组长）
     } else {
       dying.kill();
     }
@@ -549,7 +562,7 @@ function setupBackendBridge(windowGetter) {
    * key 传空串 = 删除该服务商的 key；不传 key = 保留原值（切服务商 / 改模型时不必重填 key）。
    * 存完必须重启后端 —— 子进程的环境变量只在启动时读一次。
    */
-  ipcMain.handle('backend:saveSettings', (_event, next = {}) => {
+  ipcMain.handle('backend:saveSettings', async (_event, next = {}) => {
     const current = readSettings();
     const providers = { ...(current.providers ?? {}) };
 
@@ -566,13 +579,12 @@ function setupBackendBridge(windowGetter) {
       providers[id] = cfg;
     }
 
-    const merged = {
-      ...current,
+    // 只提交本模块负责的两个顶层键：settings.cjs 的合并语义会保留 python 等其它顶层块，
+    // 且写入是串行的 —— 与 Python 安装器的并发回写不会互相吃掉对方（这正是原实现的 bug）。
+    await writeSettings({
       providers,
       provider: next.provider ?? current.provider ?? 'anthropic',
-    };
-    fs.mkdirSync(path.dirname(settingsPath()), { recursive: true });
-    fs.writeFileSync(settingsPath(), JSON.stringify(merged, null, 2), { mode: 0o600 });
+    });
 
     start(currentConfig ?? {}, { force: true });
     return status;
