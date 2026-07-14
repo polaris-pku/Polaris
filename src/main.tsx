@@ -4,10 +4,16 @@ import App from './App';
 import { UpdateDialog } from '@/components/UpdateDialog';
 import './index.css';
 import '@xyflow/react/dist/style.css';
+import { installLocalWebBridge } from '@/api/webBridge';
 
-createRoot(document.getElementById('root')!).render(
-  <StrictMode>
-    <App />
-    <UpdateDialog />
-  </StrictMode>,
-);
+async function bootstrap() {
+  await installLocalWebBridge();
+  createRoot(document.getElementById('root')!).render(
+    <StrictMode>
+      <App />
+      <UpdateDialog />
+    </StrictMode>,
+  );
+}
+
+void bootstrap();

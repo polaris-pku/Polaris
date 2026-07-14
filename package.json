@@ -17,9 +17,11 @@
   },
   "scripts": {
     "dev": "vite",
+    "web:backend:build": "node scripts/build-web-backend.mjs",
+    "web:dev": "pnpm web:backend:build && concurrently -k -n bridge,vite -c yellow,cyan \"node scripts/local-web-bridge.mjs\" \"vite --host 127.0.0.1\"",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "electron:dev": "concurrently -k -n vite,electron -c cyan,magenta \"vite\" \"wait-on tcp:127.0.0.1:5173 && electron .\"",
+    "electron:dev": "concurrently -k -n vite,electron -c cyan,magenta \"vite --host 127.0.0.1\" \"wait-on tcp:127.0.0.1:5173 && electron .\"",
     "electron:build": "pnpm build:backend && vite build && electron-builder",
     "electron:build:win": "pnpm build:backend --target-os=win32 --target-cpu=x64 && vite build && electron-builder --win",
     "electron:build:mac": "vite build && electron-builder --mac",

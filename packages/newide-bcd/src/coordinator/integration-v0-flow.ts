@@ -56,6 +56,7 @@ import {
   type IntegrationRunResultManifest,
 } from './run-result';
 import { buildFrontendRunSnapshot, type FrontendRunSnapshot } from './frontend-run-snapshot';
+import { diffWorkspaceFiles, snapshotWorkspaceFiles } from './workspace-change-detector';
 
 export interface IntegrationV0TimelineItem {
   name: string;
@@ -126,6 +127,7 @@ export interface IntegrationV0Options {
   hookEngine?: IntegrationV0HookEngine;
   materializer?: IntegrationV0Materializer;
   worktreePath?: string;
+  workspacePath?: string;
   runsRoot?: string;
   telemetry?: TelemetrySink;
   signal?: AbortSignal;
@@ -331,6 +333,10 @@ export async function runIntegrationV0Flow(
     uri: `artifact://context/${task.task_id}/${contextPack.context_pack_id}`,
     schema_version: SCHEMA_VERSION,
   };
+  const workspacePath = options?.workspacePath ?? process.env.ACP_WORKSPACE;
+  const workspaceSnapshotBefore = workspacePath
+    ? await snapshotWorkspaceFiles(workspacePath)
+    : undefined;
   let agentExecutionResult: AgentExecutionResult | undefined;
   let driverResult: DriverRunResult;
   if (options?.agentExecutionFacade) {
@@ -380,7 +386,29 @@ export async function runIntegrationV0Flow(
       options?.signal,
     );
   }
+  const workspaceChangedFiles =
+    workspacePath && workspaceSnapshotBefore
+      ? diffWorkspaceFiles(workspaceSnapshotBefore, await snapshotWorkspaceFiles(workspacePath))
+      : [];
+  const workspaceFilesWritten = workspacePath
+    ? workspaceChangedFiles.map((file) => path.join(workspacePath, file))
+    : [];
   options?.signal?.throwIfAborted();
+
+  if (workspacePath) {
+    const workspaceChangedEvent = orchestrator.appendEvent({
+      event_type: 'workspace.changed',
+      subject_id: run.run_id,
+      run_id: run.run_id,
+      task_id: task.task_id,
+      payload: {
+        workspace_path: workspacePath,
+        changed_files: workspaceChangedFiles,
+        changed_file_count: workspaceChangedFiles.length,
+      },
+    });
+    timeline.push({ name: 'WorkspaceChanged', id: workspaceChangedEvent.event_id });
+  }
 
   if (agentExecutionResult) {
     const agentExecutionEvent = orchestrator.appendEvent({
@@ -777,13 +805,24 @@ export async function runIntegrationV0Flow(
   const hasSelectedArtifact = selectionResult.selected_artifacts.length > 0;
   const materialized =
     materializationResult.status === 'completed' && materializationResult.files_written.length > 0;
-  const flowCompleted = driverSucceeded && gatesPassed && hasSelectedArtifact && materialized;
+  const hasWorkspaceChanges = workspaceChangedFiles.length > 0;
+  const deliveryFiles = hasWorkspaceChanges
+    ? workspaceFilesWritten
+    : materializationResult.files_written;
+  const deliveryChangedFiles = hasWorkspaceChanges
+    ? workspaceChangedFiles
+    : materializationResult.changed_files;
+  const flowCompleted =
+    driverSucceeded &&
+    gatesPassed &&
+    (hasWorkspaceChanges || (hasSelectedArtifact && materialized));
   const failure = buildIntegrationFailure({
     driverResult,
     preGateResults,
     postCouncilGateResults,
     postCouncilGatesRequired,
     hasSelectedArtifact,
+    hasWorkspaceChanges,
     materializationResult,
   });
 
@@ -798,7 +837,7 @@ export async function runIntegrationV0Flow(
     snapshot_commit: 'demo-head',
     worktree_path: materializationResult.worktree_path,
     branch: 'integration-v0-demo',
-    modified_files: materializationResult.files_written,
+    modified_files: deliveryFiles,
   };
   if (diffArtifactId) {
     mechanicalSnapshot.diff_artifact_id = diffArtifactId;
@@ -809,12 +848,13 @@ export async function runIntegrationV0Flow(
   if (gatesPassed) doneSteps.push('gates passed');
   if (hasSelectedArtifact) doneSteps.push('artifacts selected');
   if (materialized) doneSteps.push('worktree materialized');
+  if (hasWorkspaceChanges) doneSteps.push('workspace changes captured');
 
   const blockedOn: string[] = [];
   if (!driverSucceeded) blockedOn.push('driver execution failed');
   if (!gatesPassed) blockedOn.push('gates blocked or not evaluated');
-  if (!hasSelectedArtifact) blockedOn.push('no artifacts selected');
-  if (!materialized) blockedOn.push('worktree materialization failed');
+  if (!hasSelectedArtifact && !hasWorkspaceChanges) blockedOn.push('no artifacts selected');
+  if (!materialized && !hasWorkspaceChanges) blockedOn.push('worktree materialization failed');
 
   const checkpoint: Checkpoint = {
     checkpoint_id: createId('checkpoint'),
@@ -909,8 +949,8 @@ export async function runIntegrationV0Flow(
     ...(failure ? { failure } : {}),
     worktree_path: materializationResult.worktree_path,
     artifacts_materialized: materializationResult.materialized_artifacts.length,
-    files_written: materializationResult.files_written,
-    changed_files: materializationResult.changed_files,
+    files_written: deliveryFiles,
+    changed_files: deliveryChangedFiles,
     materialization_status: materializationResult.status,
     materialization_failures: materializationResult.failures,
     artifact_outputs: artifactOutputs,
@@ -975,7 +1015,7 @@ export async function runIntegrationV0Flow(
     mode: selectionResult.mode,
     driver_id: driverResult.diagnostics.driver_id,
     artifact_outputs: artifactOutputs,
-    changed_files: materializationResult.changed_files,
+    changed_files: deliveryChangedFiles,
     materialization_status: materializationResult.status,
     materialization_failures: materializationResult.failures,
     result_path: outputPaths.result_path,
@@ -1035,6 +1075,7 @@ function buildIntegrationFailure(input: {
   postCouncilGateResults: GateResult[];
   postCouncilGatesRequired: boolean;
   hasSelectedArtifact: boolean;
+  hasWorkspaceChanges: boolean;
   materializationResult: MaterializationResult;
 }): IntegrationV0Failure | undefined {
   if (input.driverResult.status !== 'succeeded') {
@@ -1107,7 +1148,7 @@ function buildIntegrationFailure(input: {
       },
     };
   }
-  if (!input.hasSelectedArtifact) {
+  if (!input.hasSelectedArtifact && !input.hasWorkspaceChanges) {
     return {
       code: 'ARTIFACT_NOT_SELECTED',
       message: 'No artifact was selected',
@@ -1122,21 +1163,21 @@ function buildIntegrationFailure(input: {
     changed_files: input.materializationResult.changed_files,
     failures: input.materializationResult.failures,
   };
-  if (input.materializationResult.status === 'failed') {
+  if (!input.hasWorkspaceChanges && input.materializationResult.status === 'failed') {
     return {
       code: 'MATERIALIZATION_FAILED',
       message: 'Worktree materialization failed',
       details: materializationDetails,
     };
   }
-  if (input.materializationResult.status === 'partial') {
+  if (!input.hasWorkspaceChanges && input.materializationResult.status === 'partial') {
     return {
       code: 'MATERIALIZATION_PARTIAL',
       message: 'Worktree materialization completed partially',
       details: materializationDetails,
     };
   }
-  if (input.materializationResult.files_written.length === 0) {
+  if (!input.hasWorkspaceChanges && input.materializationResult.files_written.length === 0) {
     return {
       code: 'MATERIALIZATION_FAILED',
       message: 'Worktree materialization wrote no files',

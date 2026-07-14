@@ -5,6 +5,7 @@ import { createRun as apiCreateRun } from '@/api/client';
 import { unwatchRun, watchRun } from '@/api/events';
 import { toTaskCreateRequest } from '@/api/map';
 import { bindBackendWorkspace } from '@/lib/backendWorkspace';
+import { readProjectFolder } from '@/lib/agentFs';
 import { buildLiveProgressReplay, buildLiveRunReplay, liveProducedFiles } from '@/lib/liveReplay';
 import { projectLiveBoard } from '@/lib/liveBoard';
 import { resetTimelineSeq } from '@/lib/snapshot';
@@ -389,6 +390,19 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
       // 切的是当前任务 → 同步把实时态也换过去，界面立刻变成真实 run
       ...(state.activeTaskId === task.id ? taskToState(nextTask) : {}),
     });
+
+    // 真实磁盘是项目文件树的权威来源。ACP 的 artifact 事件可能只覆盖部分写操作，
+    // run 终态后重新扫描一次，确保多文件产物全部立刻出现在侧栏。
+    if (project?.rootPath) {
+      void readProjectFolder(project.rootPath).then((scanned) => {
+        if ('error' in scanned) return;
+        set((latest) => ({
+          projects: latest.projects.map((candidate) =>
+            candidate.id === project.id ? { ...candidate, files: scanned.tree } : candidate,
+          ),
+        }));
+      });
+    }
   },
 
   startTask: () =>

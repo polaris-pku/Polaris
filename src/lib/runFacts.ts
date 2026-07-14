@@ -143,7 +143,9 @@ export function artifactFactsOf(live: LiveRunState | undefined): ArtifactFacts {
         count: written.length,
         files: written.map((path) => ({
           label: path,
-          absPath: abs.find((a) => a === path || baseName(a) === baseName(path)),
+          absPath:
+            (/^(?:\/|[A-Za-z]:[\\/])/.test(path) ? path : undefined) ??
+            abs.find((a) => a === path || baseName(a) === baseName(path)),
         })),
       };
     }

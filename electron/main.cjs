@@ -10,7 +10,7 @@ const { setupTerminalBridge } = require('./terminalBridge.cjs');
 const { buildAppMenu } = require('./appMenu.cjs');
 
 const isDev = !app.isPackaged;
-const DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL || 'http://localhost:5173';
+const DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL || 'http://127.0.0.1:5173';
 
 /** @type {BrowserWindow | null} */
 let mainWindow = null;
