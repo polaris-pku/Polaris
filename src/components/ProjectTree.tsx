@@ -47,7 +47,7 @@ const agentDotColor: Record<AgentStatus, string> = {
 /** run 状态的点色。词表与色调都来自 runState.ts —— 这里不允许出现第二份。 */
 const TONE_DOT: Record<(typeof RUN_STATE_TONE)[RunState], string> = {
   muted: 'bg-fg-faint',
-  command: 'bg-command',
+  command: 'bg-brand-purple',
   human: 'bg-human',
   ok: 'bg-ok',
   danger: 'bg-danger',
@@ -55,7 +55,7 @@ const TONE_DOT: Record<(typeof RUN_STATE_TONE)[RunState], string> = {
 
 const TONE_TEXT: Record<(typeof RUN_STATE_TONE)[RunState], string> = {
   muted: 'text-fg-muted',
-  command: 'text-command-soft',
+  command: 'text-brand-purple',
   human: 'text-human-soft',
   ok: 'text-ok-soft',
   danger: 'text-danger-soft',
@@ -241,7 +241,7 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
               <div
                 className={cn(
                   'group/proj flex items-center rounded-chip pr-1 transition-colors',
-                  isActive ? 'bg-command/10' : 'hover:bg-surface-raised/70',
+                  isActive ? 'bg-command/10 ring-1 ring-command/20' : 'hover:bg-[#182238]/75',
                 )}
               >
                 <button
@@ -395,7 +395,9 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
                           <div
                             className={cn(
                               'group/task flex items-center rounded-chip pr-1 transition-colors',
-                              selected ? 'bg-command/10' : 'hover:bg-surface-raised',
+                              selected
+                                ? 'bg-command/10 ring-1 ring-command/20'
+                                : 'hover:bg-[#182238]',
                             )}
                           >
                             <button
@@ -526,7 +528,7 @@ function TreeGroup({
 }) {
   return (
     <div>
-      <div className="group/g flex items-center rounded-chip pr-1 hover:bg-surface-raised/50">
+      <div className="group/g flex items-center rounded-chip pr-1 hover:bg-[#182238]/55">
         <button
           onClick={onToggle}
           className="flex min-w-0 flex-1 items-center gap-1 py-1 pl-0.5 text-left"
@@ -588,7 +590,7 @@ function FileTree({
             <div
               className={cn(
                 'group/file flex items-center rounded-chip pr-1 transition-colors',
-                selected ? 'bg-command/10' : 'hover:bg-surface-raised/50',
+                selected ? 'bg-command/10 ring-1 ring-command/20' : 'hover:bg-[#182238]/60',
               )}
             >
               <button

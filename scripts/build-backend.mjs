@@ -111,7 +111,7 @@ writeFileSync(
   JSON.stringify({ name: 'polaris-agent-runtime', private: true, version: '0.0.0' }, null, 2),
 );
 execFileSync(
-  'npm',
+  'npm.cmd',
   [
     'install',
     '--omit=dev',
@@ -121,7 +121,7 @@ execFileSync(
     `--cpu=${targetCpu}`,
     `@agentclientprotocol/claude-agent-acp@${agentVersion}`,
   ],
-  { cwd: agentDir, stdio: 'inherit' },
+  { cwd: agentDir, stdio: 'inherit', shell: true },
 );
 
 // 校验：Claude Code 的原生二进制必须真的躺在那里，否则打出来的包是个空壳

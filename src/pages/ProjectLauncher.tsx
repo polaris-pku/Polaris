@@ -1,16 +1,10 @@
 import { useState } from 'react';
-import {
-  Boxes,
-  FolderPlus,
-  FolderOpen,
-  FolderGit2,
-  FolderSearch,
-  Clock,
-  ArrowRight,
-} from 'lucide-react';
+import { FolderPlus, FolderOpen, FolderGit2, FolderSearch, Clock, ArrowRight } from 'lucide-react';
 import { useDemoStore } from '@/store/useDemoStore';
 import { Dialog } from '@/components/ui/Dialog';
 import { NewProjectDialog } from '@/components/NewProjectDialog';
+import { Logo } from '@/components/Logo';
+import { Title } from '@/components/Title';
 import { cn } from '@/lib/utils';
 import type { Project } from '@/types';
 
@@ -21,7 +15,7 @@ import type { Project } from '@/types';
  * 页脚那个「帮助」是**首次运行的用户唯一能看到的入口** —— 他还没进工作区，
  * 侧栏和状态栏都不存在，所以帮助抽屉必须挂在 App 级（它在每一屏都能开）。
  *
- * 背景的网格 + 背光由 body 提供（index.css），这里不再叠第二层：
+ * 背景的网格 + 背光在 `.launcher-bg`（index.css）里做轻微漂移动画；
  * 死的是元素级辉光，不是房间的背光。
  */
 export function ProjectLauncher() {
@@ -35,16 +29,15 @@ export function ProjectLauncher() {
 
   return (
     // h-full（不是 min-h-screen）：外层 App 已占满视口，顶部可能有认证提示条
-    <div className="relative flex h-full w-full items-center justify-center overflow-y-auto text-fg-secondary">
+    <div className="relative flex h-full w-full items-center justify-center overflow-y-auto bg-black text-white">
+      <div className="launcher-bg" aria-hidden />
       <div className="relative z-10 w-full max-w-2xl px-6 py-12">
         {/* 品牌 */}
-        <div className="flex flex-col items-center text-center">
-          <div className="flex h-14 w-14 items-center justify-center rounded-panel bg-command">
-            <Boxes className="h-8 w-8 text-white" />
-          </div>
-          <h1 className="mt-4 text-title text-fg-primary">Polaris</h1>
-          <p className="mt-2 max-w-sm text-body text-fg-muted">
-            多 Agent 协作开发工作台。先新建或打开一个项目开始。
+        <div className="flex -translate-y-4 flex-col items-center text-center sm:-translate-y-6">
+          <Logo className="h-20 w-20" />
+          <Title className="mt-3 h-5 w-auto text-white" />
+          <p className="mt-2 max-w-sm text-body text-white/80">
+            多 Agent 协作开发，从新建或打开一个项目开始
           </p>
         </div>
 
@@ -54,7 +47,7 @@ export function ProjectLauncher() {
             icon={FolderPlus}
             title="新建项目"
             desc="创建一个新的协作项目"
-            accent="command"
+            accent="neutral"
             onClick={() => setNewOpen(true)}
           />
           <LauncherCard
@@ -113,24 +106,24 @@ function LauncherCard({
     <button
       onClick={onClick}
       className={cn(
-        'group flex flex-col items-start gap-3 rounded-panel border p-4 text-left transition-colors',
+        'group relative flex flex-col items-start gap-3 rounded-panel p-4 text-left transition-colors',
         accent === 'command'
-          ? 'border-command/40 bg-command/10 hover:border-command/70 hover:bg-command/15'
-          : 'border-edge-strong bg-surface-panel hover:border-command/40 hover:bg-surface-raised',
+          ? 'border border-brand-purple/30 bg-white/[0.04] hover:border-brand-purple/60 hover:bg-brand-purple/10'
+          : 'border border-white/[0.08] bg-white/[0.03] hover:border-white/20 hover:bg-white/[0.06]',
       )}
     >
       <div
         className={cn(
-          'flex h-10 w-10 items-center justify-center rounded-panel',
+          'flex h-10 w-10 items-center justify-center rounded-panel backdrop-blur-sm',
           accent === 'command'
-            ? 'bg-command/20 text-command-soft'
-            : 'bg-surface-raised text-fg-secondary',
+            ? 'bg-brand-purple/20 text-brand-purple'
+            : 'bg-white/[0.08] text-brand-silver',
         )}
       >
         <Icon className="h-5 w-5" />
       </div>
       <div>
-        <div className="flex items-center gap-1.5 text-title text-fg-primary">
+        <div className="flex items-center gap-1.5 text-title text-brand-silver">
           {title}
           <ArrowRight className="h-4 w-4 -translate-x-1 opacity-0 transition-all group-hover:translate-x-0 group-hover:opacity-100" />
         </div>

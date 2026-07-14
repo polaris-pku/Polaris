@@ -21,30 +21,32 @@ export default {
         code: ['12px', { lineHeight: '20px' }],
       },
       colors: {
+        brand: {
+          void: '#000000',
+          deep: '#0A1B3F',
+          purple: '#7717FF',
+          silver: '#C0C0C3',
+          panel: '#1A1A1C',
+          border: '#2a2a2e',
+        },
         surface: {
-          void: '#090b10',
-          deck: '#0e121a',
-          panel: '#121724',
-          raised: '#19202e',
+          void: '#000000',
+          deck: '#0A1B3F',
+          panel: '#1A1A1C',
+          raised: '#222226',
         },
-        edge: { DEFAULT: '#1e2636', strong: '#2a3346' },
+        edge: { DEFAULT: '#1f1f23', strong: '#2a2a2e' },
         fg: {
-          primary: '#e2e8f0',
-          secondary: '#94a3b8',
-          muted: '#64748b',
-          faint: '#475569',
+          primary: '#C0C0C3',
+          secondary: '#9a9aa0',
+          muted: '#6b6b72',
+          faint: '#4a4a52',
         },
-        // 强调色只有 4 个，且只编码状态：机器在动 / 需要你 / 成功 / 失败
-        command: { DEFAULT: '#4d8df0', soft: '#6fa3f4', deep: '#2f6fd6' },
-        human: { DEFAULT: '#ffb454', soft: '#ffc880', deep: '#e8932c' },
+        // 强调色改为品牌主色紫 + 保留语义色
+        command: { DEFAULT: '#7717FF', soft: '#9a5dff', deep: '#5c11c4' },
+        accent: { DEFAULT: '#4f6ef6', soft: '#7a93f8', deep: '#3b54c4' },
         ok: { DEFAULT: '#34d399', soft: '#6ee7b7', deep: '#059669' },
         danger: { DEFAULT: '#fb7185', soft: '#fda4af', deep: '#e11d48' },
-        // ink / line 迁移垫片已删除（迁移完成，全仓零引用）。
-        //
-        // 它们是没法靠 typecheck 兜住的一类东西：Tailwind 遇到不认识的类名不会报错，
-        // 只是**不生成那条 CSS** —— 留着垫片，一个漏改的 bg-ink-900 会一直正常显示，
-        // 删掉垫片，它会安静地变成「没有背景色」。所以这一刀必须在迁移真正清零之后砍，
-        // 而不是靠「以后记得删」。
       },
       borderRadius: { chip: '4px', panel: '8px', modal: '12px' },
       // 元素级 box-shadow 全灭。唯一还会发光的东西是 .led 的 filter 光晕（index.css）。

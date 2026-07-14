@@ -39,7 +39,7 @@ type Tone = (typeof RUN_STATE_TONE)[RunState];
 /** 颜色只编码状态。 */
 const TONE_DOT: Record<Tone, string> = {
   muted: 'bg-fg-faint',
-  command: 'bg-command',
+  command: 'bg-brand-purple',
   human: 'bg-human',
   ok: 'bg-ok',
   danger: 'bg-danger',
@@ -47,7 +47,7 @@ const TONE_DOT: Record<Tone, string> = {
 
 const TONE_TEXT: Record<Tone, string> = {
   muted: 'text-fg-muted',
-  command: 'text-command',
+  command: 'text-brand-purple',
   human: 'text-human',
   ok: 'text-ok',
   danger: 'text-danger',
@@ -55,7 +55,7 @@ const TONE_TEXT: Record<Tone, string> = {
 
 /** 事件通道健康度。它回答的是那个没人问出口、却每次都想问的问题：界面不动，是没事发生，还是断了？ */
 const CHANNEL: Record<EventChannelStatus, { dot: string; text: string }> = {
-  connected: { dot: 'bg-command', text: '事件通道已连接' },
+  connected: { dot: 'bg-brand-purple', text: '事件通道已连接' },
   connecting: { dot: 'bg-human', text: '正在连接事件通道' },
   disconnected: { dot: 'bg-danger', text: '事件通道已断开（界面收不到新事件）' },
 };

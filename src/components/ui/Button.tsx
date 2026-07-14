@@ -10,14 +10,15 @@ import { cn } from '@/lib/utils';
  * （纵深只由表面色阶 + 边框表达）。字重只有 400 / 700：base 里的 `font-medium` 删除。
  */
 const buttonVariants = cva(
-  'inline-flex select-none items-center justify-center gap-2 whitespace-nowrap rounded-panel transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-command/40 focus-visible:ring-offset-2 focus-visible:ring-offset-surface-void disabled:pointer-events-none disabled:opacity-40',
+  'inline-flex select-none items-center justify-center gap-2 whitespace-nowrap rounded-panel transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-purple/40 focus-visible:ring-offset-2 focus-visible:ring-offset-surface-void disabled:pointer-events-none disabled:opacity-40',
   {
     variants: {
       variant: {
-        /** 机器在动：此刻唯一的主行动 */
-        primary: 'bg-command text-white hover:bg-command-soft',
-        secondary: 'border border-edge-strong text-fg-primary hover:bg-surface-raised',
-        ghost: 'text-fg-secondary hover:bg-surface-raised hover:text-fg-primary',
+        /** 主行动 */
+        primary: 'bg-brand-purple text-white hover:bg-brand-purple',
+        secondary:
+          'border border-[#33405c] bg-[#11182a] text-fg-primary hover:border-[#46557a] hover:bg-[#182238]',
+        ghost: 'text-fg-secondary hover:bg-[#182238] hover:text-fg-primary',
         danger: 'bg-danger text-surface-void hover:bg-danger-soft',
       },
       size: {

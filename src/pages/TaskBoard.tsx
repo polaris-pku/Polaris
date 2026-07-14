@@ -108,7 +108,7 @@ function TaskBoardInner() {
   return (
     <div className="flex h-full overflow-hidden">
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
-        <div className="flex flex-col gap-3 border-b border-edge px-5 py-4">
+        <div className="flex flex-col gap-3 border-b border-[#2a3142] px-5 py-4">
           <Breadcrumb
             projectName={activeProject?.name ?? '当前项目'}
             taskTitle={activeTask?.title ?? '未命名需求'}
@@ -231,7 +231,7 @@ function ViewMenu({
       </Button>
 
       {open && (
-        <div className="absolute right-0 top-9 z-10 w-56 rounded-panel border border-edge-strong bg-surface-panel py-1">
+        <div className="absolute right-0 top-9 z-10 w-56 rounded-panel border border-[#2a3142] bg-surface-panel py-1">
           <MenuToggle checked={canvas} onClick={onToggleCanvas}>
             图
           </MenuToggle>
