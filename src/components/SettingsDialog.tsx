@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import {
   Settings,
-  Boxes,
   KeyRound,
   ExternalLink,
   CheckCircle2,
@@ -12,6 +11,7 @@ import {
 } from 'lucide-react';
 import { Dialog } from '@/components/ui/Dialog';
 import { Button } from '@/components/ui/Button';
+import { Logo } from '@/components/Logo';
 import { APP_VERSION } from '@/lib/version';
 import { onBackendStatus } from '@/api/events';
 import type { BackendStatus } from '@/api/transport';
@@ -124,17 +124,17 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
     <Dialog open={open} onClose={onClose} className="max-w-lg">
       <div className="max-h-[85vh] overflow-y-auto p-6">
         <div className="flex items-center gap-2">
-          <div className="flex h-9 w-9 items-center justify-center rounded-panel bg-command/15 text-command-soft">
+          <div className="flex h-9 w-9 items-center justify-center rounded-panel bg-brand-purple/15 text-brand-purple">
             <Settings className="h-5 w-5" />
           </div>
-          <h2 className="text-title text-fg-primary">设置</h2>
+          <h2 className="text-title text-brand-silver">设置</h2>
         </div>
 
         {backend && provider && auth ? (
-          <section className="mt-4 rounded-panel border border-edge bg-surface-void p-4">
+          <section className="mt-4 rounded-panel border border-[#2d3955] bg-gradient-to-b from-[#101827] to-[#0b1020] p-4">
             <div className="flex items-center gap-2">
-              <KeyRound className="h-4 w-4 text-command-soft" />
-              <h3 className="text-title text-fg-primary">模型与认证</h3>
+              <KeyRound className="h-4 w-4 text-brand-purple" />
+              <h3 className="text-title text-brand-silver">模型与认证</h3>
               {auth.ready ? (
                 <span className="ml-auto flex items-center gap-1 rounded-full border border-ok/30 bg-ok/10 px-2 text-body text-ok">
                   <CheckCircle2 className="h-3 w-3" /> 已就绪
@@ -150,7 +150,7 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
             <p className="mt-2 text-body text-fg-secondary">
               Coding agent（Claude Code）已随应用一起安装，你不需要另外安装任何东西。 它只会说
               Anthropic 的 Messages API —— 但任何提供
-              <span className="text-fg-primary"> Anthropic 兼容端点 </span>
+              <span className="text-brand-silver"> Anthropic 兼容端点 </span>
               的服务都能接（DeepSeek 官方就有一个）。
             </p>
 
@@ -166,8 +166,8 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
                     className={cn(
                       'rounded-panel border px-2 py-1 text-body transition-colors',
                       p.id === providerId
-                        ? 'border-command bg-command/15 text-command-soft'
-                        : 'border-edge-strong bg-surface-panel text-fg-secondary hover:text-fg-primary',
+                        ? 'border-brand-purple bg-brand-purple/15 text-brand-purple'
+                        : 'border-[#33405c] bg-[#101827] text-fg-secondary hover:border-[#46557a] hover:text-brand-silver',
                     )}
                   >
                     {p.name}
@@ -183,7 +183,7 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
 
             {/* 本机登录态（开发机常见）：如实说明，别让人以为一定要填 key */}
             {auth.hasLocalCredentials && !hasSavedKey && providerId === 'anthropic' && (
-              <p className="mt-3 rounded-panel border border-edge bg-surface-panel px-3 py-1.5 text-body text-fg-secondary">
+              <p className="mt-3 rounded-panel border border-edge bg-brand-panel px-3 py-1.5 text-body text-fg-secondary">
                 检测到本机已有 Claude Code 登录态，走 Anthropic 官方端点时可直接使用。 填入 key
                 会优先用 key（分发给别人时必须填）。
               </p>
@@ -199,7 +199,9 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
               {hasSavedKey && !editingKey ? (
                 <div className="flex items-center gap-2 rounded-panel border border-ok/30 bg-ok/5 px-3 py-2">
                   <CheckCircle2 className="h-4 w-4 shrink-0 text-ok" />
-                  <span className="text-body text-fg-primary">已保存（存在本机，不回传界面）</span>
+                  <span className="text-body text-brand-silver">
+                    已保存（存在本机，不回传界面）
+                  </span>
                   <button
                     type="button"
                     onClick={() => {
@@ -228,14 +230,14 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
                     placeholder={provider.keyHint || 'API Key'}
                     spellCheck={false}
                     autoComplete="off"
-                    className="w-full rounded-panel border border-edge-strong bg-surface-panel px-3 py-2 pr-16 font-mono text-code text-fg-primary outline-none placeholder:text-fg-faint focus:border-command"
+                    className="w-full rounded-panel border border-edge-strong bg-brand-panel px-3 py-2 pr-16 font-mono text-code text-brand-silver outline-none placeholder:text-fg-faint focus:border-brand-purple"
                   />
                   <div className="absolute right-2 top-1/2 flex -translate-y-1/2 items-center gap-1.5">
                     <button
                       type="button"
                       onClick={() => setReveal((v) => !v)}
                       title={reveal ? '隐藏' : '显示'}
-                      className="text-fg-muted hover:text-fg-primary"
+                      className="text-fg-muted hover:text-brand-silver"
                     >
                       {reveal ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                     </button>
@@ -246,7 +248,7 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
                           setEditingKey(false);
                           setKey('');
                         }}
-                        className="text-body text-fg-muted hover:text-fg-primary"
+                        className="text-body text-fg-muted hover:text-brand-silver"
                       >
                         取消
                       </button>
@@ -268,8 +270,8 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
                     placeholder="https://…/anthropic"
                     spellCheck={false}
                     className={cn(
-                      'w-full rounded-panel border border-edge-strong bg-surface-panel px-3 py-2 font-mono text-code outline-none placeholder:text-fg-faint focus:border-command',
-                      provider.editableBaseUrl ? 'text-fg-primary' : 'text-fg-muted',
+                      'w-full rounded-panel border border-edge-strong bg-brand-panel px-3 py-2 font-mono text-code outline-none placeholder:text-fg-faint focus:border-brand-purple',
+                      provider.editableBaseUrl ? 'text-brand-silver' : 'text-fg-muted',
                     )}
                   />
                 </div>
@@ -281,7 +283,7 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
                       onChange={(e) => setModel(e.target.value)}
                       placeholder={provider.defaultModel || 'model-id'}
                       spellCheck={false}
-                      className="w-full rounded-panel border border-edge-strong bg-surface-panel px-3 py-2 font-mono text-code text-fg-primary outline-none placeholder:text-fg-faint focus:border-command"
+                      className="w-full rounded-panel border border-edge-strong bg-brand-panel px-3 py-2 font-mono text-code text-brand-silver outline-none placeholder:text-fg-faint focus:border-brand-purple"
                     />
                   </div>
                   <div>
@@ -291,7 +293,7 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
                       onChange={(e) => setFastModel(e.target.value)}
                       placeholder={provider.defaultFastModel || 'model-id'}
                       spellCheck={false}
-                      className="w-full rounded-panel border border-edge-strong bg-surface-panel px-3 py-2 font-mono text-code text-fg-primary outline-none placeholder:text-fg-faint focus:border-command"
+                      className="w-full rounded-panel border border-edge-strong bg-brand-panel px-3 py-2 font-mono text-code text-brand-silver outline-none placeholder:text-fg-faint focus:border-brand-purple"
                     />
                   </div>
                 </div>
@@ -316,7 +318,7 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
                   href={provider.consoleUrl}
                   target="_blank"
                   rel="noreferrer"
-                  className="inline-flex items-center gap-1 text-body text-command-soft hover:underline"
+                  className="inline-flex items-center gap-1 text-body text-brand-purple hover:underline"
                 >
                   去 {provider.consoleName} 申请 key <ExternalLink className="h-3 w-3" />
                 </a>
@@ -325,7 +327,7 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
 
             <p className="mt-3 text-body text-fg-muted">
               key 存在本机（
-              <code className="rounded-chip bg-surface-raised px-1 font-mono text-code">
+              <code className="rounded-chip bg-brand-raised px-1 font-mono text-code">
                 userData/settings.json
               </code>
               ，权限 0600）， 只注入 agent 子进程，不会回传界面、不进日志。
@@ -333,25 +335,23 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
           </section>
         ) : (
           !backend && (
-            <p className="mt-4 rounded-panel border border-edge bg-surface-void p-4 text-body text-fg-secondary">
+            <p className="mt-4 rounded-panel border border-edge bg-brand-void p-4 text-body text-fg-secondary">
               浏览器环境不接后端，模型与认证仅在桌面版可用。
             </p>
           )
         )}
 
         {/* ── 关于 ── */}
-        <div className="mt-4 flex items-center gap-3 rounded-panel border border-edge bg-surface-void p-3">
-          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-panel bg-command">
-            <Boxes className="h-5 w-5 text-white" />
-          </div>
+        <div className="mt-4 flex items-center gap-3 rounded-panel border border-edge bg-brand-void p-3">
+          <Logo className="h-10 w-10" />
           <div className="min-w-0">
-            <div className="text-title text-fg-primary">Polaris</div>
+            <div className="text-title text-brand-silver">Polaris</div>
             <div className="truncate font-mono text-code text-fg-muted">
               {navigator.userAgent.includes('Electron') ? 'Electron 桌面端' : '浏览器'}
               {status?.workspace && ` · ${status.workspace}`}
             </div>
           </div>
-          <span className="ml-auto shrink-0 rounded-chip border border-command/30 bg-command/10 px-2 py-1 font-mono text-code text-command-soft">
+          <span className="ml-auto shrink-0 rounded-chip border border-brand-purple/30 bg-brand-purple/10 px-2 py-1 font-mono text-code text-brand-purple">
             v{APP_VERSION}
           </span>
         </div>

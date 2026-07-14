@@ -27,14 +27,14 @@ export function Dialog({ open, onClose, children, className }: DialogProps) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div
-        className="absolute inset-0 animate-fade-in bg-surface-void/80 backdrop-blur-sm"
+        className="absolute inset-0 animate-fade-in bg-[#040814]/86 backdrop-blur-[10px]"
         onClick={onClose}
       />
       <div
         role="dialog"
         aria-modal="true"
         className={cn(
-          'relative z-10 w-full max-w-lg animate-fade-in rounded-modal border border-edge-strong bg-surface-panel shadow-modal',
+          'relative z-10 w-full max-w-lg animate-fade-in rounded-modal border border-[#2b3550] bg-[#0f1524]/96 shadow-modal backdrop-blur-xl',
           className,
         )}
       >

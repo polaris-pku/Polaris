@@ -41,14 +41,16 @@ body,
 
 body {
   margin: 0;
-  background: #090b10;
-  color: #cbd4e1;
-  /* faint console grid + top glow — the room is backlit, not flat */
+  background: #000000;
+  color: #C0C0C3;
+  /* brand-tinted backlight: black base with purple/blue accents */
   background-image:
-    radial-gradient(900px 500px at 75% -10%, rgba(77, 141, 240, 0.06), transparent 70%),
-    linear-gradient(rgba(255, 255, 255, 0.014) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.014) 1px, transparent 1px);
+    radial-gradient(900px 500px at 75% -10%, rgba(119, 23, 255, 0.08), transparent 60%),
+    radial-gradient(600px 400px at 20% 90%, rgba(10, 27, 63, 0.45), transparent 55%),
+    linear-gradient(rgba(255, 255, 255, 0.012) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.012) 1px, transparent 1px);
   background-size:
+    100% 100%,
     100% 100%,
     44px 44px,
     44px 44px;
@@ -124,6 +126,73 @@ body {
 }
 .react-flow__controls button {
   border-radius: var(--radius-chip, 4px);
+}
+
+/* 启动页背景：紫/蓝辉光缓慢漂移 + 网格极慢平移 */
+.launcher-bg {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.012) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.012) 1px, transparent 1px);
+  background-size: 44px 44px;
+  animation: launcher-grid-drift 90s linear infinite;
+}
+.launcher-bg::before,
+.launcher-bg::after {
+  content: '';
+  position: absolute;
+  border-radius: 50%;
+}
+.launcher-bg::before {
+  top: -8%;
+  right: 8%;
+  width: 58%;
+  height: 52%;
+  background: radial-gradient(circle, rgba(168, 85, 247, 0.18) 0%, transparent 68%);
+  animation: launcher-orb-drift-a 26s ease-in-out infinite;
+}
+.launcher-bg::after {
+  bottom: 0;
+  left: 2%;
+  width: 54%;
+  height: 50%;
+  background: radial-gradient(circle, rgba(59, 130, 246, 0.18) 0%, transparent 68%);
+  animation: launcher-orb-drift-b 32s ease-in-out infinite;
+}
+
+@keyframes launcher-orb-drift-a {
+  0%,
+  100% {
+    transform: translate(0, 0) scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: translate(-2.5%, 2%) scale(1.05);
+    opacity: 0.82;
+  }
+}
+@keyframes launcher-orb-drift-b {
+  0%,
+  100% {
+    transform: translate(0, 0) scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: translate(2.5%, -2%) scale(1.06);
+    opacity: 0.85;
+  }
+}
+@keyframes launcher-grid-drift {
+  0% {
+    background-position: 0 0;
+  }
+  100% {
+    background-position: 44px 44px;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {

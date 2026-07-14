@@ -15,8 +15,9 @@
  * 在全屏唯一还活着的答案。
  */
 import { type ReactNode, useState } from 'react';
-import { Boxes, ChevronLeft, ChevronRight, CircleHelp, LayoutGrid, Settings } from 'lucide-react';
+import { ChevronLeft, ChevronRight, CircleHelp, LayoutGrid, Settings } from 'lucide-react';
 import { Dock } from '@/components/dock/Dock';
+import { Logo } from '@/components/Logo';
 import { ProjectTree } from '@/components/ProjectTree';
 import { SettingsDialog } from '@/components/SettingsDialog';
 import { StatusBar } from '@/components/StatusBar';
@@ -48,12 +49,12 @@ export function AppShell({ children }: { children: ReactNode }) {
 
   return (
     // h-full（不是 h-screen）：外层 App 已经占满视口，且顶部可能有认证提示条
-    <div className="flex h-full w-full flex-col overflow-hidden bg-surface-void text-fg-secondary">
+    <div className="flex h-full w-full flex-col overflow-hidden bg-brand-void text-fg-secondary">
       <div className="flex min-h-0 flex-1">
         {/* 侧栏 */}
         <aside
           className={cn(
-            'relative flex shrink-0 flex-col border-r border-edge bg-surface-deck',
+            'relative flex shrink-0 flex-col border-r border-edge bg-brand-deep',
             !navDragging.current && 'transition-[width] duration-150',
           )}
           style={{ width: navCollapsed ? 56 : navWidth }}
@@ -65,7 +66,7 @@ export function AppShell({ children }: { children: ReactNode }) {
               setNavCollapsed((v) => !v);
             }}
             title={navCollapsed ? '展开工作台' : '收起工作台'}
-            className="absolute -right-3 top-7 z-30 flex h-6 w-6 items-center justify-center rounded-full border border-edge-strong bg-surface-panel text-fg-muted transition-colors hover:border-command hover:text-fg-primary"
+            className="absolute -right-3 top-7 z-30 flex h-6 w-6 items-center justify-center rounded-full border border-brand-border bg-brand-panel text-fg-muted transition-colors hover:border-brand-purple hover:text-brand-silver"
           >
             {navCollapsed ? (
               <ChevronRight className="h-3 w-3" aria-hidden />
@@ -80,10 +81,10 @@ export function AppShell({ children }: { children: ReactNode }) {
               navCollapsed ? 'justify-center px-0' : 'px-4',
             )}
           >
-            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-panel bg-command">
-              <Boxes className="h-4 w-4 text-white" aria-hidden />
+            <div className="flex shrink-0 items-center justify-center">
+              <Logo className="h-8 w-8" />
             </div>
-            {!navCollapsed && <div className="text-title text-fg-primary">Polaris</div>}
+            {!navCollapsed && <div className="text-title text-brand-silver">Polaris</div>}
           </div>
 
           <nav
@@ -137,7 +138,7 @@ export function AppShell({ children }: { children: ReactNode }) {
               title="拖拽调整宽度"
               className="group absolute inset-y-0 right-0 z-20 w-1 cursor-col-resize"
             >
-              <div className="h-full w-full transition-colors group-hover:bg-command/40" />
+              <div className="h-full w-full transition-colors group-hover:bg-brand-purple/40" />
             </div>
           )}
         </aside>
@@ -183,7 +184,7 @@ function SideAction({
       onClick={onClick}
       title={title ?? (collapsed ? label : undefined)}
       className={cn(
-        'flex w-full items-center gap-3 rounded-panel py-2 text-body text-fg-secondary transition-colors hover:bg-surface-raised hover:text-fg-primary',
+        'flex w-full items-center gap-3 rounded-panel py-2 text-body text-fg-secondary transition-colors hover:bg-brand-raised hover:text-brand-silver',
         collapsed ? 'justify-center px-0' : 'px-3',
       )}
     >

@@ -50,7 +50,7 @@ export function NewProjectDialog({ open, onClose }: { open: boolean; onClose: ()
     <Dialog open={open} onClose={handleClose} className="max-w-md">
       <div className="p-6">
         <div className="flex items-center gap-2">
-          <div className="flex h-9 w-9 items-center justify-center rounded-panel bg-command/15 text-command-soft">
+          <div className="flex h-9 w-9 items-center justify-center rounded-panel border border-command/20 bg-gradient-to-br from-command/20 to-command/10 text-command-soft">
             <FolderPlus className="h-5 w-5" />
           </div>
           <h2 className="text-title text-fg-primary">新建项目</h2>
@@ -64,7 +64,7 @@ export function NewProjectDialog({ open, onClose }: { open: boolean; onClose: ()
             onKeyDown={onNameKeyDown}
             autoFocus
             placeholder="例如：order-service"
-            className="w-full rounded-panel border border-edge-strong bg-surface-void px-3 py-2 text-body text-fg-primary placeholder:text-fg-faint focus:border-command focus:outline-none focus:ring-1 focus:ring-command/40"
+            className="w-full rounded-panel border border-[#33405c] bg-[#0d1320] px-3 py-2 text-body text-fg-primary placeholder:text-fg-faint focus:border-command focus:outline-none focus:ring-1 focus:ring-command/40"
           />
         </div>
 
