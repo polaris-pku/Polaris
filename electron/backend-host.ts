@@ -14,7 +14,11 @@
  */
 import path from 'node:path';
 import { CommandDriverTransport, ExternalDriverRuntime } from '../packages/newide-bcd/src/driver';
-import { InMemoryBufferRepository, InMemoryRepository } from '../packages/newide-bcd/src/memory';
+import {
+  InMemoryBufferRepository,
+  InMemoryRepository,
+  type ToolCallingClient,
+} from '../packages/newide-bcd/src/memory';
 import { IntegrationV0CoordinatorRunner } from '../packages/newide-bcd/src/coordinator/coordinator-runner';
 import { SynthesisAgentCouncilProvider } from '../packages/newide-bcd/src/council';
 import { DriverRuntimeAgentExecutionFacade } from '../packages/newide-bcd/src/app/driver-runtime-agent-execution-facade';
@@ -101,10 +105,50 @@ const driver = new ExternalDriverRuntime({
   }),
 });
 
+/**
+ * B 角色的「LLM」：确定性直通，不是真模型。
+ *
+ * 上游把 B 的调度改成了 LLM tool-calling 循环（facade 的 llm 从此必填），默认实现
+ * LiteLLMToolCallingClient 要 OpenAI 兼容的 key（DEEPSEEK_API_KEY 等），而打包环境只随
+ * agent 发 Anthropic 凭据；它的 YAML 配置还靠 import.meta.url 找仓库相对路径，进了
+ * esbuild 的 CJS 单文件就失效。所以这里按上游 scripts/rpc-smoke.ts 的 invokeDriverLlm
+ * 模式给一个直通实现：首轮固定发一次 invoke_driver（instruction 剥掉 agent.ts 加的
+ * `Task: ` 前缀，还原成原始指令，driver 拿到的内容与旧版逐字相同），收到 tool 结果后
+ * 回 "[done]" 结束循环。等价于旧版「指令 → driver，恰好一次」的确定性语义。
+ */
+function passthroughLlm(): ToolCallingClient {
+  let sequence = 0;
+  return {
+    async completeWithTools(input) {
+      if (input.messages.at(-1)?.role === 'tool') {
+        return { content: 'Task completed. [done]', tool_calls: undefined };
+      }
+      const userMessage = [...input.messages].reverse().find((message) => message.role === 'user');
+      sequence += 1;
+      return {
+        content: null,
+        tool_calls: [
+          {
+            id: `polaris_tool_call_${String(sequence)}`,
+            type: 'function',
+            function: {
+              name: 'invoke_driver',
+              arguments: JSON.stringify({
+                instruction: userMessage?.content?.replace(/^Task:\s*/, '') ?? 'Execute task.',
+              }),
+            },
+          },
+        ],
+      };
+    },
+  };
+}
+
 const agentExecutionFacade = new DriverRuntimeAgentExecutionFacade({
   driver,
   repository: new InMemoryRepository(),
   bufferRepository: new InMemoryBufferRepository(),
+  llm: passthroughLlm(),
 });
 
 const runner = new IntegrationV0CoordinatorRunner({
