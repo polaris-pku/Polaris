@@ -111,7 +111,7 @@ writeFileSync(
   JSON.stringify({ name: 'polaris-agent-runtime', private: true, version: '0.0.0' }, null, 2),
 );
 execFileSync(
-  'npm.cmd',
+  'npm',
   [
     'install',
     '--omit=dev',
