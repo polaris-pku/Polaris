@@ -50,7 +50,7 @@ export function NewProjectDialog({ open, onClose }: { open: boolean; onClose: ()
     <Dialog open={open} onClose={handleClose} className="max-w-md">
       <div className="p-6">
         <div className="flex items-center gap-2">
-          <div className="flex h-9 w-9 items-center justify-center rounded-panel border border-command/20 bg-gradient-to-br from-command/20 to-accent/10 text-command-soft">
+          <div className="flex h-9 w-9 items-center justify-center rounded-panel border border-command/20 bg-gradient-to-br from-command/20 to-command/10 text-command-soft">
             <FolderPlus className="h-5 w-5" />
           </div>
           <h2 className="text-title text-fg-primary">新建项目</h2>

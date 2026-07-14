@@ -42,9 +42,9 @@ export default {
           muted: '#6b6b72',
           faint: '#4a4a52',
         },
-        // 强调色改为品牌主色紫 + 保留语义色
+        // command 取值改为品牌紫；human 仍是「需要你」语义色，全仓状态机仍依赖它。
         command: { DEFAULT: '#7717FF', soft: '#9a5dff', deep: '#5c11c4' },
-        accent: { DEFAULT: '#4f6ef6', soft: '#7a93f8', deep: '#3b54c4' },
+        human: { DEFAULT: '#ffb454', soft: '#ffc880', deep: '#e8932c' },
         ok: { DEFAULT: '#34d399', soft: '#6ee7b7', deep: '#059669' },
         danger: { DEFAULT: '#fb7185', soft: '#fda4af', deep: '#e11d48' },
       },

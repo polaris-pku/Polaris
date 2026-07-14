@@ -137,8 +137,17 @@ describe('脚本的盲区：css / tailwind 配置 / html', () => {
     const colors = directKeys(stripComments(tailwindConfig), 'colors');
     expect(colors).not.toContain('ink');
     expect(colors).not.toContain('line');
-    // 四个强调色 + 四个表面 / 边框 / 文本组，一个不多。
-    expect(colors.sort()).toEqual(['command', 'danger', 'edge', 'fg', 'human', 'ok', 'surface']);
+    // 品牌组 brand + 四个强调色 + 三个表面 / 边框 / 文本组。
+    expect(colors.sort()).toEqual([
+      'brand',
+      'command',
+      'danger',
+      'edge',
+      'fg',
+      'human',
+      'ok',
+      'surface',
+    ]);
   });
 });
 
