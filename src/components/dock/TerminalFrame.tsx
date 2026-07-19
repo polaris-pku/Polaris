@@ -64,6 +64,8 @@ export function TerminalFrame({
     if (replayRef.current) term.write(replayRef.current);
 
     const dispose = term.onData((data) => {
+      // 先本地回显，再发给后端 stdin：管道式终端没有 PTY 的自动 echo。
+      term.write(data);
       void writeTerminal(sessionId, data);
     });
 
