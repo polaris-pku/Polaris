@@ -1,4 +1,4 @@
-import { recommendAgents } from '@/data/scenario';
+import { recommendAgents } from '@/data/agentRecommendation';
 import type { SliceCreator, TeamSlice } from '@/store/types';
 import { extractTaskFields, syncTasks } from '@/store/lib/taskSync';
 
