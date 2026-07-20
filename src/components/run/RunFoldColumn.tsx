@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { ChevronLeft, ChevronRight, Inbox } from 'lucide-react';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { NewRequirementDialog } from '@/components/NewRequirementDialog';
+import { CouncilFold } from '@/components/run/folds/CouncilFold';
 import { DeliveryFold } from '@/components/run/folds/DeliveryFold';
 import { MachineHandshakeFold } from '@/components/run/folds/MachineHandshakeFold';
 import { NeedsYouFold } from '@/components/run/folds/NeedsYouFold';
@@ -12,6 +13,7 @@ import { isFrontendWorkflowV01 } from '@/api/types/rpc';
 import {
   artifactFactsOf,
   blockingGateOf,
+  councilFactsOf,
   eventsByNode,
   focusStepOf,
   machineSteps,
@@ -30,7 +32,8 @@ const NARROW = '(max-width: 1119px)';
 
 /**
  * 右栏 —— **没有标题、没有 tab，就是一列 Fold**，顺序固定：
- * 步骤 / 产出文件 / 需要你 / 交付 / 机器握手 / 需求 / 运行信息。
+ * 步骤 / 产出文件 / 需要你 / 议会 / 交付 / 机器握手 / 需求 / 运行信息。
+ * （议会只在 council 事件真的发生过时出现 —— 单 agent run 没有这一条。）
  *
  * 它取代的是：`LiveRunPanel`（把 L1 的工作区路径和 L3 的 22 条事件焊在一起）、
  * `NodeInspector`（标题写死「节点详情」，里面却四选一渲染 —— 标题在说谎）、
@@ -98,6 +101,7 @@ export function RunFoldColumn() {
   const machine = machineSteps(nodes);
   const gate = blockingGateOf(timeline);
   const artifacts = artifactFactsOf(live);
+  const council = councilFactsOf(live);
 
   const snapshot = live?.snapshot;
   const report = snapshot && isFrontendWorkflowV01(snapshot) ? snapshot.delivery_report : undefined;
@@ -163,6 +167,14 @@ export function RunFoldColumn() {
                 gate={gate}
                 eventCount={countOf(idOfStep('review'))}
                 onOpenEvidence={openStepOrAll('review')}
+              />
+            )}
+
+            {council && (
+              <CouncilFold
+                facts={council}
+                eventCount={countOf(idOfStep('council'))}
+                onOpenEvidence={openStepOrAll('council')}
               />
             )}
 

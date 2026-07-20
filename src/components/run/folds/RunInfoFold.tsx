@@ -27,12 +27,19 @@ export function RunInfoFold({
           mode: meta.mode,
           driver_id: meta.driverId,
           events: meta.eventCount,
+          events_by_source: Object.fromEntries(meta.sourceCounts),
+          ...(meta.selection ? { artifact_selection: meta.selection } : {}),
         },
         null,
         2,
       ),
     );
   };
+
+  /** `coordinator 12 · agent 4 · driver 3` —— 报 bug 时一眼看出哪条链路没动静。 */
+  const sourceLine = meta.sourceCounts
+    .map(([source, count]) => `${source} ${String(count)}`)
+    .join(' · ');
 
   return (
     <Fold
@@ -49,6 +56,14 @@ export function RunInfoFold({
           <KeyValue k="执行器" v={`${driverLabel(meta.driverId)}（${meta.driverId}）`} />
         )}
         <KeyValue k="事件数" v={String(meta.eventCount)} />
+        {sourceLine && <KeyValue k="事件分布" v={sourceLine} mono />}
+        {meta.selection && (
+          <KeyValue
+            k="产物选择"
+            v={`${meta.selection.mode} · 选中 ${String(meta.selection.selectedCount)} 个`}
+            mono
+          />
+        )}
       </KeyValueList>
     </Fold>
   );

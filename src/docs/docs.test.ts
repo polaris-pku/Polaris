@@ -203,8 +203,6 @@ describe('总览如实写出了每一条能力边界', () => {
     ['文件树只补挂一个文件', '文件树只补挂一个文件'],
     // Gate 出厂只挂一条空检查
     ['Gate 放行一切', '放行一切'],
-    // eventGraph.statusOf 靠 .failed 后缀判断，后端发的是 agent.execution_completed + failed
-    ['执行失败时步骤卡仍显示完成', '仍然显示成完成'],
     ['ContextPack 是占位', 'ContextPack 是占位'],
     ['团队页是演示数据', '「团队」页是演示数据'],
     ['验收标准不会发给 agent', '「验收标准」不会发给 agent'],

@@ -29,6 +29,10 @@ export type GateFact = {
   decision: string;
   reason: string;
   requiredActions: string[];
+  /** 后端原文（pre / post_council…）；没给就是空串。仅作 D2 注解。 */
+  phase: string;
+  gateId: string;
+  targetState: string;
 };
 
 /** 四个分支里，只有这两个意味着「停下来，需要人」。与 runState.ts 的判定同源。 */
@@ -45,6 +49,9 @@ export function gateFactOf(timeline: RunEvent[]): GateFact | null {
       decision: str(payload.decision),
       reason: str(payload.reason),
       requiredActions: Array.isArray(actions) ? actions.map((a) => str(a)).filter(Boolean) : [],
+      phase: str(payload.phase),
+      gateId: str(payload.gate_id),
+      targetState: str(payload.target_state),
     };
   }
   return null;
@@ -59,6 +66,121 @@ export function gateFactOf(timeline: RunEvent[]): GateFact | null {
 export function blockingGateOf(timeline: RunEvent[]): GateFact | null {
   const gate = gateFactOf(timeline);
   return gate && BLOCKING_DECISIONS.has(gate.decision) ? gate : null;
+}
+
+// ── Council ────────────────────────────────────────────────────────────────
+
+/** 议会里的一次角色产出（提案 / 评审 / 综合），全部来自事件 payload 原文。 */
+export type CouncilRoleFact = {
+  kind: '提案' | '评审' | '综合';
+  roleId: string;
+  /** proposal_id / review_ids / synthesis_id —— 报 bug 用的机器 ID，仅作 D2 注解 */
+  refId: string;
+};
+
+export type CouncilFacts = {
+  /** 后端原文：running / completed / failed（由事件推导，快照到达后以快照为准） */
+  status: string;
+  verdict: string;
+  decisionMode: string;
+  selectedProposalId: string;
+  proposalCount: number;
+  reviewCount: number;
+  synthesisDone: boolean;
+  /** council.failed 的 code；没失败就是空串 */
+  failedCode: string;
+  requiredNextActions: string[];
+  blockedBy: string[];
+  roles: CouncilRoleFact[];
+};
+
+const COUNCIL_ROLE_KINDS: Record<string, { kind: CouncilRoleFact['kind']; refKey: string }> = {
+  'council.proposal.completed': { kind: '提案', refKey: 'proposal_id' },
+  'council.review.completed': { kind: '评审', refKey: 'review_ids' },
+  'council.synthesis.completed': { kind: '综合', refKey: 'synthesis_id' },
+};
+
+/**
+ * 议会事实：**事件流先行，快照补齐**。
+ * run 进行中只有事件（proposal/review/synthesis 逐个到达）；快照到了再用
+ * `snapshot.council` 的终态字段（status / verdict / required_next_actions…）覆盖。
+ * 本次 run 没有任何 council 事件也没有快照 council 数据 → null（这一 Fold 压根不出现）。
+ */
+export function councilFactsOf(live: LiveRunState | undefined): CouncilFacts | null {
+  if (!live) return null;
+  const snapshot = live.snapshot;
+  const council =
+    snapshot && isFrontendWorkflowV01(snapshot) ? (snapshot.council ?? undefined) : undefined;
+  return councilFactsFrom(live.timeline, council);
+}
+
+/** 同上，但输入是裸时间线（+ 可选快照 council 段）—— liveReplay 的实时路径没有 LiveRunState。 */
+export function councilFactsFrom(
+  timeline: RunEvent[],
+  council?: NonNullable<RunSnapshot['council']>,
+): CouncilFacts | null {
+  const events = timeline.filter((e) => e.type.startsWith('council.'));
+  if (events.length === 0 && !council) return null;
+
+  const payloadOf = (type: string): Record<string, unknown> => {
+    const event = events.find((e) => e.type === type);
+    return event ? asRecord(event.payload) : {};
+  };
+
+  const roles: CouncilRoleFact[] = events.flatMap((e) => {
+    const spec = COUNCIL_ROLE_KINDS[e.type];
+    if (!spec) return [];
+    const payload = asRecord(e.payload);
+    const ref = payload[spec.refKey];
+    return [
+      {
+        kind: spec.kind,
+        roleId: str(payload.role_id),
+        refId: Array.isArray(ref)
+          ? ref
+              .map((v) => str(v))
+              .filter(Boolean)
+              .join(', ')
+          : str(ref),
+      },
+    ];
+  });
+
+  const statusFromEvents = events.some((e) => e.type === 'council.failed')
+    ? 'failed'
+    : events.some((e) => e.type === 'council.completed')
+      ? 'completed'
+      : 'running';
+
+  const decision = payloadOf('council.decision');
+  const nextActions = council?.required_next_actions ?? [];
+  const blockedBy = council?.blocked_by ?? [];
+
+  return {
+    status: council?.status ?? statusFromEvents,
+    verdict: council?.verdict ?? str(decision.verdict),
+    decisionMode:
+      council?.decision_mode ??
+      ([str(decision.decision_mode), str(payloadOf('council.started').decision_mode)].find(
+        Boolean,
+      ) ||
+        ''),
+    selectedProposalId: council?.selected_proposal_id ?? str(decision.selected_proposal_id),
+    proposalCount: Math.max(
+      council?.proposals?.length ?? 0,
+      events.filter((e) => e.type === 'council.proposal.completed').length,
+    ),
+    reviewCount: Math.max(
+      council?.reviews?.length ?? 0,
+      events.filter((e) => e.type === 'council.review.completed').length,
+    ),
+    synthesisDone:
+      Boolean(council?.synthesis) || events.some((e) => e.type === 'council.synthesis.completed'),
+    failedCode: str(payloadOf('council.failed').code),
+    requiredNextActions: nextActions.map((a) => str(a)).filter(Boolean),
+    blockedBy: blockedBy.map((b) => str(b)).filter(Boolean),
+    roles,
+  };
 }
 
 // ── 产出文件 ───────────────────────────────────────────────────────────────
@@ -246,6 +368,10 @@ export type RunMeta = {
   /** 后端原文（acp-external）；显示名过 driverLabel()。拿不到就是空串 —— 不猜 */
   driverId: string;
   eventCount: number;
+  /** 事件按 source 的分布（coordinator / agent / driver…），顺序 = 首次出现顺序 */
+  sourceCounts: [string, number][];
+  /** `artifact.selected` 的产物选择结论；这条事件没发生就是 null */
+  selection: { mode: string; selectedCount: number } | null;
 };
 
 export function runMetaOf(live: LiveRunState): RunMeta {
@@ -255,11 +381,27 @@ export function runMetaOf(live: LiveRunState): RunMeta {
       .map((e) => str(asRecord(e.payload).driver_id))
       .find(Boolean) ?? '';
 
+  const sourceCounts = new Map<string, number>();
+  for (const event of live.timeline) {
+    sourceCounts.set(event.source, (sourceCounts.get(event.source) ?? 0) + 1);
+  }
+
+  const selected = live.timeline.find((e) => e.type === 'artifact.selected');
+  const selectedPayload = selected ? asRecord(selected.payload) : undefined;
+  const selectedCount = selectedPayload?.selected_count;
+
   return {
     runId: live.runId,
     taskId: live.taskId,
     mode: live.snapshot?.mode ?? '',
     driverId,
     eventCount: live.timeline.length,
+    sourceCounts: [...sourceCounts.entries()],
+    selection: selectedPayload
+      ? {
+          mode: str(selectedPayload.mode),
+          selectedCount: typeof selectedCount === 'number' ? selectedCount : 0,
+        }
+      : null,
   };
 }

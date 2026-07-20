@@ -152,8 +152,12 @@ function stepOf(event: RunEvent): StepKey | undefined {
       return 'review';
 
     case 'council.started':
+    case 'council.proposal.completed':
+    case 'council.review.completed':
+    case 'council.synthesis.completed':
     case 'council.decision':
     case 'council.completed':
+    case 'council.failed':
       return 'council';
 
     case 'artifact.selected':
@@ -177,6 +181,8 @@ const SPAN_ENDS = new Set([
   'agent.execution_completed',
   'agent.execution_failed',
   'council.completed',
+  // 议会失败也要闭合跨度 —— 否则失败的议会永远显示「进行中」
+  'council.failed',
 ]);
 
 // ── 角色归属 ──
@@ -280,7 +286,21 @@ function summaryOf(step: StepKey, events: RunEvent[]): string {
     }
     case 'council': {
       const verdict = pick(events, 'council.decision', 'verdict');
-      return verdict ? `裁决 ${verdict}` : '议会进行中';
+      const proposals = events.filter((e) => e.type === 'council.proposal.completed').length;
+      const reviews = events.filter((e) => e.type === 'council.review.completed').length;
+      const synthesis = events.some((e) => e.type === 'council.synthesis.completed');
+      const failedCode = pick(events, 'council.failed', 'code');
+      return (
+        [
+          verdict && `裁决 ${verdict}`,
+          proposals > 0 && `提案 ${String(proposals)}`,
+          reviews > 0 && `评审 ${String(reviews)}`,
+          synthesis && '综合完成',
+          failedCode && `失败 ${failedCode}`,
+        ]
+          .filter(Boolean)
+          .join(' · ') || '议会进行中'
+      );
     }
     case 'deliver': {
       const files = pick(events, 'worktree.materialized', 'files_written');
@@ -359,6 +379,9 @@ function roleKeyOf(group: EventGroup): string {
 function statusOf(group: EventGroup, runStatus: LiveRunStatus): WorkflowNodeStatus {
   if (group.open) return runStatus === 'running' ? 'active' : 'blocked';
   if (group.events.some((e) => e.type.endsWith('.failed'))) return 'blocked';
+  // 后端失败不总用 `.failed` 事件表达：agent 失败发的是 `agent.execution_completed` +
+  // payload.status='failed'。只看类型后缀会把失败的步骤画成「完成」。
+  if (group.events.some((e) => text(asRecord(e.payload).status) === 'failed')) return 'blocked';
   return 'done';
 }
 
