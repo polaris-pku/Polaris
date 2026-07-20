@@ -3,7 +3,7 @@ import { freshWorkflowNodes } from '@/data/tasks';
 import type { TaskFields } from '@/store/types';
 
 /** 深拷贝一个任务（数组/嵌套对象全部断开引用，防止跨任务串改）。 */
-export function cloneTask(task: DemoTask): DemoTask {
+function cloneTask(task: DemoTask): DemoTask {
   return {
     ...task,
     assignedAgentIds: [...(task.assignedAgentIds ?? [])],

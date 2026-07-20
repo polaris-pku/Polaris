@@ -1,22 +1,10 @@
-import type { DemoStage, DemoTask, RunReplay } from '@/types';
-import { emitLocalEvent, unwatchRun } from '@/api/events';
-import {
-  MAX_COLUMN,
-  NODE_IDS,
-  indicesInColumn,
-  primaryIndexInColumn,
-  revealedCountThroughColumn,
-  stripExecSuffix,
-} from '@/data/workflow';
+import type { DemoTask, RunReplay } from '@/types';
+import { unwatchRun } from '@/api/events';
 import { resetTimelineSeq } from '@/lib/snapshot';
 import type { ExecutionSlice, PartialExecState, SliceCreator } from '@/store/types';
-import { flushAgentWritesForNode, writeTargetOf } from '@/store/lib/agentWrites';
 import { blankState } from '@/store/lib/blankState';
 import { extractTaskFields, syncTasks } from '@/store/lib/taskSync';
 import { buildTimelineEvent, getNodeLog } from '@/store/lib/timeline';
-
-/** Auto Run 的调度句柄（模块级单例，与 store 生命周期一致）。 */
-let autoRunTimer: ReturnType<typeof setTimeout> | null = null;
 
 /** 活动任务挂载的真实 run 回放数据源（普通 mock 任务为 undefined）。 */
 const activeReplay = (s: {
@@ -24,8 +12,17 @@ const activeReplay = (s: {
   activeTaskId: string | null;
 }): RunReplay | undefined => s.tasks.find((t) => t.id === s.activeTaskId)?.replay;
 
-/** 执行域：工作流推进引擎（单步/自动/回退 Checkpoint/交付）。 */
-export const createExecutionSlice: SliceCreator<ExecutionSlice> = (set, get) => ({
+/**
+ * 执行域。
+ *
+ * 曾经这里是一整套 mock 推进引擎（单步 / 自动跑 / 交付 / 回退 Checkpoint）。它们连同
+ * `介入` / `Next Step` / `Auto Run` 三个按钮在信息架构重排时就被删了（见 PrimaryAction 的
+ * 【R4】：真实 run 全自动且没有人类回写通道，这类按钮只能改本地状态），此后一直是无调用者的
+ * 死代码 —— 现已移除。真实 run 的推进由后端事件驱动（taskSlice.applyLiveProgress）。
+ *
+ * `isAutoRunning` 因此恒为 false：字段仍在（多处读取并写进导出的运行记录），但再没有人能把它置真。
+ */
+export const createExecutionSlice: SliceCreator<ExecutionSlice> = (set) => ({
   useRecommendedWorkflow: () =>
     set((state) => {
       const nodes = state.nodes.map((n, i) => (i === 0 ? { ...n, status: 'active' as const } : n));
@@ -60,158 +57,15 @@ export const createExecutionSlice: SliceCreator<ExecutionSlice> = (set, get) => 
       };
     }),
 
-  nextStep: () => {
-    const state = get();
-    if (state.stage !== 'executing') return;
-    const cur = state.activeStepIndex;
-    if (cur < 0) return;
-    const curCol = state.nodes[cur].column;
-    const replay = activeReplay(state);
-    // 真实 run 回放且 Gate=allow：Council 未触发，N14 直通不拦截
-    const councilBypassed = replay?.gateDecision === 'allow';
-
-    // 活跃列为 Council 且尚未裁决 → 进入议会
-    if (
-      state.nodes[cur].id === NODE_IDS.council &&
-      !state.confirmedCouncilOptionId &&
-      !councilBypassed
-    ) {
-      get().goToCouncil();
-      return;
-    }
-
-    const nodes = state.nodes.map((n) => ({ ...n }));
-    // 当前列整列置 done（并行列两节点一起完成）
-    indicesInColumn(nodes, curCol).forEach((i) => {
-      nodes[i] = { ...nodes[i], status: 'done' };
-    });
-
-    // 末列：进入交付
-    if (curCol >= MAX_COLUMN) {
-      const exec: PartialExecState = {
-        stage: 'delivery',
-        currentPage: state.currentPage,
-        nodes,
-        revealedNodeCount: nodes.length,
-        activeStepIndex: cur,
-        selectedNodeId: nodes[cur].id,
-        interventionRules: state.interventionRules,
-        confirmedCouncilOptionId: state.confirmedCouncilOptionId,
-        interventionFeedback: state.interventionFeedback,
-      };
-      const taskFields = extractTaskFields({ ...state, ...exec });
-      set({
-        ...exec,
-        tasks: syncTasks(state.tasks, state.activeTaskId, taskFields),
-      });
-      get().stopAutoRun();
-      return;
-    }
-
-    // 推进到下一列：整列置 active（并行列两节点一起点亮）
-    const nextCol = curCol + 1;
-    indicesInColumn(nodes, nextCol).forEach((i) => {
-      nodes[i] = { ...nodes[i], status: 'active' };
-    });
-    const primaryIndex = primaryIndexInColumn(nodes, nextCol);
-    const primaryNode = nodes[primaryIndex];
-    const nodeLog = getNodeLog(primaryNode.id, replay);
-
-    let stage: DemoStage = 'executing';
-    let currentPage = state.currentPage;
-    if (primaryNode.id === NODE_IDS.council && !councilBypassed) {
-      stage = 'council';
-      currentPage = 'council';
-      get().stopAutoRun();
-    }
-
-    const exec: PartialExecState = {
-      stage,
-      currentPage,
-      nodes,
-      revealedNodeCount: revealedCountThroughColumn(nodes, nextCol),
-      activeStepIndex: primaryIndex,
-      selectedNodeId: primaryNode.id,
-      interventionRules: state.interventionRules,
-      confirmedCouncilOptionId: state.confirmedCouncilOptionId,
-      interventionFeedback: state.interventionFeedback,
-    };
-
-    const timeline = nodeLog
-      ? [
-          ...state.timeline,
-          buildTimelineEvent(
-            {
-              time: nodeLog.time,
-              source: nodeLog.source,
-              text: nodeLog.text,
-              level: nodeLog.level,
-            },
-            exec,
-            nodeLog.checkpoint,
-          ),
-        ]
-      : state.timeline;
-
-    const taskFields = extractTaskFields({ ...state, ...exec, timeline });
-    set({
-      ...exec,
-      timeline,
-      tasks: syncTasks(state.tasks, state.activeTaskId, taskFields),
-    });
-
-    // 新点亮的节点若带文件操作剧本（N7 执行段），把无需人机确认的写操作落盘
-    const after = get();
-    const target = writeTargetOf(after.projects.find((p) => p.id === after.activeProjectId));
-    indicesInColumn(nodes, nextCol).forEach((i) => {
-      flushAgentWritesForNode(
-        nodes[i].id,
-        after.filePermissionOutcomes ?? {},
-        after.agentFileWrites,
-        target,
-        after.recordAgentFileWrite,
-        replay?.nodeFileOps,
-      );
-    });
-
-    // 回放任务：该列点亮时，把真实 run 的契约事件喂入事件通道（按主节点整列只喂一次）
-    replay?.nodeEvents[stripExecSuffix(primaryNode.id)]?.forEach(emitLocalEvent);
-  },
-
-  autoRun: () => {
-    const tick = () => {
-      const state = get();
-      if (state.stage !== 'executing') {
-        set({ isAutoRunning: false });
-        autoRunTimer = null;
-        return;
-      }
-      state.nextStep();
-      const after = get();
-      if (after.stage === 'executing' && after.isAutoRunning) {
-        autoRunTimer = setTimeout(tick, 950);
-      } else {
-        set({ isAutoRunning: false });
-        autoRunTimer = null;
-      }
-    };
-    set({ isAutoRunning: true });
-    autoRunTimer = setTimeout(tick, 400);
-  },
-
+  /**
+   * 保留为空动作：13 处调用点（切项目 / 切任务 / 建任务…）把它当作「停下正在跑的东西」的
+   * 统一收口。自动跑已删除，所以它现在只把标志位归位。
+   */
   stopAutoRun: () => {
-    if (autoRunTimer) {
-      clearTimeout(autoRunTimer);
-      autoRunTimer = null;
-    }
     set({ isAutoRunning: false });
   },
 
   resetDemo: () => {
-    if (autoRunTimer) {
-      clearTimeout(autoRunTimer);
-      autoRunTimer = null;
-    }
     resetTimelineSeq();
     // 任务全清了，订阅也要一并撤掉（不传参 = 退订全部）。否则那些 run 会继续推事件进来，
     // 在一个已经没有对应任务的 store 里凭空重建 liveRuns 条目，并触发无意义的快照拉取。
@@ -228,93 +82,4 @@ export const createExecutionSlice: SliceCreator<ExecutionSlice> = (set, get) => 
         tasks: syncTasks(state.tasks, state.activeTaskId, taskFields),
       };
     }),
-
-  showDelivery: () =>
-    set((state) => {
-      const completeIdx = state.nodes.findIndex((n) => n.id === NODE_IDS.complete);
-      const nodes = state.nodes.map((n) =>
-        n.column === MAX_COLUMN ? { ...n, status: 'done' as const } : n,
-      );
-      const nodeLog = getNodeLog(NODE_IDS.complete, activeReplay(state));
-      const alreadyHasComplete = state.timeline.some(
-        (e) => e.source === 'Orchestrator' && e.text.includes('Delivery Report'),
-      );
-      const exec: PartialExecState = {
-        stage: 'delivery',
-        currentPage: 'tasks',
-        nodes,
-        activeStepIndex: completeIdx,
-        selectedNodeId: nodes[completeIdx].id,
-        revealedNodeCount: nodes.length,
-        interventionRules: state.interventionRules,
-        confirmedCouncilOptionId: state.confirmedCouncilOptionId,
-        interventionFeedback: state.interventionFeedback,
-      };
-      const timeline =
-        alreadyHasComplete || !nodeLog
-          ? state.timeline
-          : [
-              ...state.timeline,
-              buildTimelineEvent(
-                {
-                  time: nodeLog.time,
-                  source: nodeLog.source,
-                  text: nodeLog.text,
-                  level: nodeLog.level,
-                },
-                exec,
-                nodeLog.checkpoint,
-              ),
-            ];
-      const taskFields = extractTaskFields({ ...state, ...exec, timeline });
-      return {
-        ...exec,
-        timeline,
-        tasks: syncTasks(state.tasks, state.activeTaskId, taskFields),
-      };
-    }),
-
-  restoreCheckpoint: (eventId) => {
-    const state = get();
-    const idx = state.timeline.findIndex((e) => e.id === eventId);
-    if (idx < 0) return;
-    const event = state.timeline[idx];
-    if (!event.checkpoint) return;
-
-    get().stopAutoRun();
-    const snap = event.snapshot;
-    const taskFields = extractTaskFields({
-      ...state,
-      stage: snap.stage,
-      nodes: snap.nodes.map((n) => ({
-        ...n,
-        input: [...n.input],
-        output: [...n.output],
-      })),
-      revealedNodeCount: snap.revealedNodeCount,
-      activeStepIndex: snap.activeStepIndex,
-      selectedNodeId: snap.selectedNodeId,
-      interventionRules: snap.interventionRules.map((r) => ({
-        ...r,
-        affectedAgents: [...r.affectedAgents],
-      })),
-      confirmedCouncilOptionId: snap.confirmedCouncilOptionId,
-      interventionFeedback: snap.interventionFeedback,
-      timeline: state.timeline.slice(0, idx + 1),
-    });
-    set({
-      stage: snap.stage,
-      currentPage: snap.currentPage,
-      nodes: taskFields.nodes,
-      revealedNodeCount: taskFields.revealedNodeCount,
-      activeStepIndex: taskFields.activeStepIndex,
-      selectedNodeId: taskFields.selectedNodeId,
-      interventionRules: taskFields.interventionRules,
-      confirmedCouncilOptionId: taskFields.confirmedCouncilOptionId,
-      interventionFeedback: taskFields.interventionFeedback,
-      timeline: taskFields.timeline,
-      tasks: syncTasks(state.tasks, state.activeTaskId, taskFields),
-      isAutoRunning: false,
-    });
-  },
 });

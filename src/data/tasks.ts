@@ -12,12 +12,6 @@ const cloneNodes = (): WorkflowNodeData[] =>
 /** 一份全新的、全部 pending 的工作流节点（供空任务/空项目占位使用） */
 export const freshWorkflowNodes = (): WorkflowNodeData[] => cloneNodes();
 
-/**
- * 种子任务。
- * 现从空白开始：没有任何预置任务，任务由用户在项目内新建需求时产生。
- */
-export const initialTasks: DemoTask[] = [];
-
 /** 从原始需求文本派生一个简短的任务标题（首行截断，超长加省略号） */
 function deriveTitle(text: string, explicit?: string): string {
   const t = explicit?.trim();

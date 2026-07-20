@@ -207,31 +207,20 @@ export type TerminalSlice = {
   signalSession: (sessionId: string, signal: 'interrupt' | 'kill') => Promise<void>;
 };
 
-/** 执行域：工作流推进引擎（单步/自动/回退/交付）。 */
+/** 执行域：节点选中与整体复位（mock 推进引擎已删除，真实 run 由后端事件驱动）。 */
 export type ExecutionSlice = {
   useRecommendedWorkflow: () => void;
-  nextStep: () => void;
-  autoRun: () => void;
   stopAutoRun: () => void;
   resetDemo: () => void;
   selectNode: (nodeId: string | null) => void;
-  showDelivery: () => void;
-  restoreCheckpoint: (eventId: string) => void;
 };
 
-/** 介入域：人对流程的干预（业务规则注入、文件写权限确认）。 */
+/** 介入域：文件写权限确认（业务规则注入已随 mock 推进引擎删除）。 */
 export type InterventionSlice = {
-  addInterventionRule: (rule: InterventionRule) => void;
   /** 文件写入权限确认（N7 · lifecycle.human_gate 的文件层落点）：记录人选结果，获准则落盘 */
   resolveFilePermission: (toolEventId: string, outcome: FilePermissionOutcome) => void;
   /** 回写一次落盘结果（keyed by tool_event_id）；写成功时同步把文件挂进项目文件树 */
   recordAgentFileWrite: (toolEventId: string, result: AgentFileWriteResult) => void;
-};
-
-/** 议会域：进入议会与裁决收束。 */
-export type CouncilSlice = {
-  goToCouncil: () => void;
-  confirmCouncilOption: (optionId: string) => void;
 };
 
 /** 全量 store 形状 = 数据字段 + 各领域切片的动作。 */
@@ -284,7 +273,6 @@ export type DemoState = PartialExecState &
   TaskSlice &
   ExecutionSlice &
   InterventionSlice &
-  CouncilSlice &
   TerminalSlice;
 
 /** 各 slice 的统一签名：可读写全量 state，返回自己负责的那部分动作。 */

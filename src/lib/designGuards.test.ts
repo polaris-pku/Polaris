@@ -173,6 +173,14 @@ describe('删掉的东西必须留在坟里', () => {
     //   data/deliveryReport.ts 唯一消费者是 InterveneDialog（按 R4 删除）。
     'src/api/config.ts',
     'src/data/deliveryReport.ts',
+    // mock 推进引擎的残骸：`介入` / `Next Step` / `Auto Run` 三个按钮在信息架构重排时就删了，
+    // 这些模块从那以后一直是无调用者的死代码（真实 run 由后端事件驱动 taskSlice.applyLiveProgress）。
+    //   slices/councilSlice.ts  goToCouncil / confirmCouncilOption —— 裁决由后端自主完成，没有回写通道；
+    //   data/councilOptions.ts  verdictDefs —— 旧 CouncilBoard「你的裁决」面板的词表；
+    //   lib/runReplay.ts        buildRunReplay —— 启动页「样例 · Run 回放」入口已在 daaa45d 删除。
+    'src/store/slices/councilSlice.ts',
+    'src/data/councilOptions.ts',
+    'src/lib/runReplay.ts',
   ];
 
   it.each(buried)('%s 已删除', (rel) => {

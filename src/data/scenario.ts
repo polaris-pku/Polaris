@@ -75,13 +75,6 @@ function extractSubject(taskText: string): string {
   return cleaned || '该需求';
 }
 
-/** 稳定 4 位散列，用于派生 council_id（避免随机、保证可复现）。 */
-function hash4(s: string): string {
-  let h = 0;
-  for (let i = 0; i < s.length; i += 1) h = (h * 31 + s.charCodeAt(i)) >>> 0;
-  return ((h % 9000) + 1000).toString();
-}
-
 // ══════════════════════════════════════════════════
 //  领域包
 // ══════════════════════════════════════════════════
@@ -461,55 +454,6 @@ function pickPack(taskText: string, subject: string): DomainPack {
     p.keywords.some((k) => taskText.includes(k) || t.includes(k)),
   );
   return hit ?? genericPack(subject);
-}
-
-function withIds(specs: DomainPack['options']): CouncilOption[] {
-  const ids = ['option-a', 'option-b', 'option-c'];
-  return specs.map((spec, i) => ({ id: ids[i], ...spec }));
-}
-
-/** 需求文本 → 完整演示场景（纯函数，可复现）。 */
-export function deriveScenario(taskText: string): Scenario {
-  const subject = extractSubject(taskText);
-  const pack = pickPack(taskText, subject);
-  const options = withIds(pack.options);
-
-  return {
-    subject,
-    domain: pack.tag,
-    understanding: {
-      goal: `围绕"${subject}"完成实现并补充对应测试；主要落在 ${pack.modules.join('、')}。`,
-      modules: pack.modules,
-      testDir: pack.testDir,
-      risks: pack.risks,
-      workflow: pack.workflow,
-    },
-    council: {
-      context: {
-        title: `${pack.conflict}`,
-        description: `处理"${subject}"时，${pack.conflict}，需要你裁决。`,
-        decisionMode: 'delegated_decision',
-        councilId: `COUNCIL-${hash4(taskText)}`,
-      },
-      discussion: pack.discussion,
-      options,
-      evidenceRefs: pack.evidenceRefs,
-      riskSignals: pack.riskSignals,
-      recommendedReason: pack.recommendedReason,
-    },
-    delivery: {
-      summary: `已完成"${subject}"，采用 ${options[0].title.replace(/^Option A · /, '')}，并补充相关测试与安全审查。`,
-      changedFiles: pack.changedFiles,
-      testResult: { passed: pack.passed, failed: 0, coverageDelta: pack.coverageDelta },
-      riskNotes: pack.riskNotes,
-    },
-  };
-}
-
-/** 在场景内按 id 取议会方案（替代原 getCouncilOption）。 */
-export function findOption(scenario: Scenario, id: string | null): CouncilOption | undefined {
-  if (!id) return undefined;
-  return scenario.council.options.find((o) => o.id === id);
 }
 
 // ══════════════════════════════════════════════════

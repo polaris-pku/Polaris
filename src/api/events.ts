@@ -164,14 +164,6 @@ export function getWatchedRunIds(): string[] {
   return [...subscribedRunIds];
 }
 
-/**
- * Mock 专用：本地喂入一条同形事件（mock 剧本回放调用），
- * 让订阅方在无后端时走完全相同的消费链路。真实后端事件永远以传输层为准。
- */
-export function emitLocalEvent(event: Event) {
-  legacyHandlers.forEach((h) => h(event));
-}
-
 /** 测试用：清空通道的模块级状态（去重表 / 订阅集 / 传输层挂载标记）。 */
 export function resetEventChannel(): void {
   seen.clear();

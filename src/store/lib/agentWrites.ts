@@ -6,10 +6,9 @@ import { writeAgentFile, type AgentFileWriteResult, type AgentWriteTarget } from
 /**
  * Agent 写操作的落盘调度（store/lib 共享）。
  *
- * 两个触发点共用同一入口：
- *   - executionSlice.nextStep —— N7 节点整列点亮时，落盘该节点上 gate:allow 的写操作；
- *   - interventionSlice.resolveFilePermission —— 人确认"允许"后，落盘被挂起的那条。
- * 先同步记 pending 占位（防两个触发点重复写），异步完成后回写真实结果。
+ * 触发点：`interventionSlice.resolveFilePermission` —— 人确认"允许"后，落盘被挂起的那条。
+ * （另一个触发点 `executionSlice.nextStep` 随 mock 推进引擎一起删除。）
+ * 先同步记 pending 占位（防重复写），异步完成后回写真实结果。
  */
 
 /** 一条观测是否已获准落盘：写方法 + 带内容 + （无权限请求，或人已选择非拒绝项）。 */

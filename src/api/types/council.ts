@@ -51,7 +51,12 @@ export interface CouncilDecision {
   run_id: RunId;
   task_id: TaskId;
   selected_proposal_id?: string;
-  verdict: 'accept' | 'reject' | 'defer';
+  /**
+   * 与 `packages/newide-bcd/src/council/contract.ts` 的 CouncilDecision 逐字对齐。
+   * 曾经写作 `'accept' | 'reject' | 'defer'` —— 后端从来没发过这三个值中的任何一个；
+   * 2026-07-20 实跑一条 council run 抓到的真实取值是 `select`，压根不在旧联合里。
+   */
+  verdict: 'select' | 'needs_human' | 'request_revision' | 'reject';
   reason: string;
   evidence_refs: string[];
   created_at: Timestamp;

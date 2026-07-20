@@ -15,6 +15,7 @@ import { Badge, type BadgeProps } from '@/components/ui/Badge';
 import { IdChip } from '@/components/ui/IdChip';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { isFrontendWorkflowV01 } from '@/api/types/rpc';
+import type { CouncilDecision, Review } from '@/api/types/council';
 import { buildCouncilBoard, type CouncilProposalCard } from '@/lib/councilBoard';
 import { roleName } from '@/lib/roleNames';
 import { cn } from '@/lib/utils';
@@ -177,9 +178,12 @@ export function CouncilBoard() {
                   <div className="rounded-panel border border-edge bg-surface-panel p-3">
                     <div className="flex items-center gap-2">
                       <Badge
-                        variant={(VERDICT_BADGE[model.decision.verdict] ?? DEFAULT_VERDICT).variant}
+                        variant={
+                          (badgeOf(VERDICT_BADGE, model.decision.verdict) ?? DEFAULT_VERDICT)
+                            .variant
+                        }
                       >
-                        {(VERDICT_BADGE[model.decision.verdict] ?? DEFAULT_VERDICT).label}
+                        {(badgeOf(VERDICT_BADGE, model.decision.verdict) ?? DEFAULT_VERDICT).label}
                       </Badge>
                       {/* 协议原文只作灰色注解 */}
                       <span className="font-mono text-code text-fg-faint">
@@ -284,19 +288,32 @@ const STATUS_BADGE: Record<string, { label: string; variant: BadgeProps['variant
   failed: { label: '合议失败', variant: 'danger' },
 };
 
-const DEFAULT_VERDICT = { label: '裁决', variant: 'default' as BadgeProps['variant'] };
-const VERDICT_BADGE: Record<string, { label: string; variant: BadgeProps['variant'] }> = {
+type VerdictBadge = { label: string; variant: BadgeProps['variant'] };
+
+const DEFAULT_VERDICT: VerdictBadge = { label: '裁决', variant: 'default' };
+
+/**
+ * 裁决词表。**键类型锚在契约的 verdict 联合上** —— 后端加一个取值，这里就编译不过，
+ * 而不是在界面上静默显示成一个没人认识的英文原文。
+ * （曾经这个哨兵是 api/map.ts 的 `UI_TO_CONTRACT_COUNCIL_VERDICT`，但它锚在一个写错的
+ * 契约类型上，后端从没发过那三个值，所以它从来没响过。）
+ */
+const VERDICT_BADGE: Record<CouncilDecision['verdict'], VerdictBadge> = {
   select: { label: '采纳方案', variant: 'ok' },
   needs_human: { label: '需要人工', variant: 'human' },
   request_revision: { label: '要求修改', variant: 'human' },
   reject: { label: '拒绝', variant: 'danger' },
 };
 
-const REVIEW_BADGE: Record<string, { label: string; variant: BadgeProps['variant'] }> = {
+const REVIEW_BADGE: Record<Review['verdict'], VerdictBadge> = {
   approve: { label: '通过', variant: 'ok' },
   needs_revision: { label: '需修改', variant: 'human' },
   reject: { label: '拒绝', variant: 'danger' },
 };
+
+/** 后端原文可能是词表外的新取值 —— 运行时兜底，不让界面崩在一个陌生字符串上。 */
+const badgeOf = (table: Record<string, VerdictBadge>, verdict: string): VerdictBadge | undefined =>
+  table[verdict];
 
 const EVENT_LABEL: Record<string, string> = {
   'council.started': '合议开始',
@@ -334,7 +351,7 @@ function ProposalCard({ proposal }: { proposal: CouncilProposalCard }) {
         <div className="mt-3 space-y-1.5">
           <div className="text-body text-fg-muted">评审</div>
           {proposal.reviews.map((review) => {
-            const badge = REVIEW_BADGE[review.verdict];
+            const badge = badgeOf(REVIEW_BADGE, review.verdict);
             return (
               <div key={review.reviewId} className="rounded-panel border border-edge p-2">
                 <div className="flex items-center gap-2">

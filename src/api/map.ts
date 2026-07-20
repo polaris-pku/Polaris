@@ -2,7 +2,7 @@
  * UI 展示词表 ↔ 后端契约枚举 的桥接层（防腐层）。
  *
  * 前端有些状态机刻意用了自己的展示词表（如 `TaskStatusCore` 的 pending_gate/
- * pending_council、`CouncilVerdict` 的 select/needs_human），与后端契约枚举并不逐一对应。
+ * pending_council），与后端契约枚举并不逐一对应。
  * 这里用 `Record<UI枚举, 契约枚举>` 显式映射：
  *   - UI 侧新增/删改成员 → 缺键或多键，编译报错；
  *   - 后端契约枚举漂移（改名/删值）→ 映射目标非法，编译报错。
@@ -10,14 +10,8 @@
  *
  * 映射方向恒为 UI → 契约（有损收敛）：UI 词表更细，向后端较粗的 v0 枚举收拢。
  */
-import type { CouncilVerdict, TaskStatusCore } from '@/types';
-import type {
-  AcpFsMethod,
-  CouncilDecision,
-  FileOpIntent,
-  TaskCreateRequest,
-  TaskStatus,
-} from '@/api/types';
+import type { TaskStatusCore } from '@/types';
+import type { AcpFsMethod, FileOpIntent, TaskCreateRequest, TaskStatus } from '@/api/types';
 import type { RunCreateParams, RunMode } from '@/api/types/rpc';
 
 /**
@@ -36,22 +30,6 @@ export const UI_TO_CONTRACT_TASK_STATUS: Record<TaskStatusCore, TaskStatus> = {
   completed: 'completed',
   failed: 'failed',
   cancelled: 'cancelled',
-};
-
-/** 契约 v0 的 Council 决策取值：'accept' | 'reject' | 'defer'。 */
-export type ContractCouncilVerdict = CouncilDecision['verdict'];
-
-/**
- * Council 决策：UI 四态 verdict → 契约 v0 三态。
- * needs_human 收敛为 defer（挂起转人工），request_revision 收敛为 reject（本轮不合入）。
- * 说明：这是有损映射；若后端未来把 CouncilDecision.verdict 扩成更细的取值，
- * 应回到这里放开对应分支，而不是在 UI 侧硬编码。
- */
-export const UI_TO_CONTRACT_COUNCIL_VERDICT: Record<CouncilVerdict, ContractCouncilVerdict> = {
-  select: 'accept',
-  needs_human: 'defer',
-  request_revision: 'reject',
-  reject: 'reject',
 };
 
 /**

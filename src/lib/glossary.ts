@@ -20,7 +20,7 @@ export const PHASE_ORDER: readonly PhaseKey[] = ['intake', 'execution', 'review'
 
 /**
  * `review` 是「审查」不是「评审」：这一步实际是 Gate + hook 的**自动**检查，
- * 不是人做的 code review。（`eventGraph.STEPS.review.labelCn` 一直是「审查」，是 PHASES 在漂移。）
+ * 不是人做的 code review。（与 `eventGraph.STEPS.review.labelCn` 保持一致。）
  */
 export const PHASE_LABEL: Record<PhaseKey, string> = {
   intake: '受理',

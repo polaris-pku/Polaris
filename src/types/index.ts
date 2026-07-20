@@ -1,6 +1,6 @@
 // 与后端契约镜像对齐：UI 直接复用契约里"完全一致"的枚举，
-// 让后端契约漂移在编译期咬住前端。刻意换了词表的状态机（TaskStatusCore /
-// CouncilVerdict）不在此直接替换，改由 src/api/map.ts 的 Record 桥接映射兜住。
+// 让后端契约漂移在编译期咬住前端。刻意换了词表的状态机（TaskStatusCore）
+// 不在此直接替换，改由 src/api/map.ts 的 Record 桥接映射兜住。
 import type {
   AgentLifecycle,
   AgentMetrics,
@@ -8,7 +8,6 @@ import type {
   ExperienceView,
   FileOpObservation,
   FilePermissionOutcome,
-  FrontendRunSnapshot,
   GateDecision as ContractGateDecision,
   PersonaDef,
   SkillView,
@@ -62,32 +61,27 @@ export type Project = {
 export type RunNodeFact = { key: string; value: string; time?: string };
 
 /**
- * 真实后端 run 的回放数据源（样例任务用），全部内容由 `buildRunReplay(snapshot)`
- * 从后端快照程序化派生——后端给什么展示什么，E 不补写、不预设。
- * 挂在任务上后，泳道图推进的各内容查找点（时间线日志 / 节点执行日志 /
- * 后端事实 / 场景 / 文件操作流 / 事件通道）只取这里的数据，缺失即为
+ * 真实后端 run 的回放数据源，全部内容由 `lib/liveReplay.ts` 从后端事件与快照程序化派生
+ * ——后端给什么展示什么，不补写、不预设。挂在任务上后，各内容查找点（时间线日志 /
+ * 节点执行日志 / 后端事实 / 场景 / 文件操作流 / 事件通道）只取这里的数据，缺失即为
  * 「本次 run 未提供」。key 一律用去掉执行子链后缀的节点 id。
  */
 export type RunReplay = {
   /**
-   * 数据来自哪次 run：
-   *  - 'live'   本次真实后端 run（RPC 快照 frontend-workflow.v0.1，见 lib/liveReplay.ts）
-   *  - 'sample' 仓库自带的样例落盘快照（coordinator.frontend_run_snapshot.v0，见 lib/runReplay.ts）
-   * 两种来源产出同一个 RunReplay 形状，界面消费方无需区分。
+   * 数据来自哪次 run。曾经还有一个 'sample'（仓库自带的落盘样例快照），随启动页的
+   * 「样例 · Run 回放」入口一起删除 —— 现在只有真实 run 一种来源。
    */
-  source: 'live' | 'sample';
-  /** 展示用的 run 元信息（两种来源都能给出） */
+  source: 'live';
+  /** 展示用的 run 元信息 */
   meta: {
     runId: string;
     taskId: string;
     mode: string;
     status: string;
-    /** 后端未必给（样例快照有，RPC 快照要从 driver.session_started 事件里取） */
+    /** 后端未必给（要从 driver.session_started 事件里取） */
     driverId?: string;
   };
-  /** 样例回放的落盘快照原件；live 回放没有这个（它的原件是 liveSnapshot） */
-  snapshot?: FrontendRunSnapshot;
-  /** 本次真实 run 的 RPC 快照原件；sample 回放没有 */
+  /** 本次真实 run 的 RPC 快照原件 */
   liveSnapshot?: RpcRunSnapshot;
   /** 节点 id → 执行时间轴日志（替换 data/logs.ts 的 mock 文案） */
   nodeLogs: Record<string, LogEntry & { checkpoint?: TimelineCheckpoint }>;
@@ -99,7 +93,7 @@ export type RunReplay = {
   nodeEvents: Record<string, ContractEvent[]>;
   /** 节点 id → 文件操作观测流（替换 data/fileops.ts 的 mock 剧本；含后缀 id） */
   nodeFileOps: Record<string, FileOpObservation[]>;
-  /** 场景内容（需求分析/议会/交付报告），替代按需求文本推导的 deriveScenario */
+  /** 场景内容（需求分析/议会/交付报告），全部由后端事件与快照派生（见 lib/liveReplay.ts） */
   scenario: Scenario;
   /** 本次 run 的 Gate 实际走向；allow = 未升级 Council，推进时直通 N14 */
   gateDecision: GateDecision;
@@ -249,8 +243,8 @@ export type WorkflowNodeData = {
   /** 状态补充说明（如 N13 的分支落点、N17 的 reserved 提示） */
   statusNote?: string;
   /**
-   * 所属阶段（泳道图的折叠单元）。事件驱动生成的节点自带；
-   * mock 模板节点不带，由 phaseOf(id) 按 id 反查。
+   * 所属阶段（进度缎带的分段单元）。事件驱动生成的节点自带（见 lib/eventGraph.ts 的 STEPS）；
+   * mock 模板节点不带 —— 按 id 反查阶段的那套映射已随折叠视图一起删除。
    */
   phase?: PhaseKey;
   /**
@@ -274,9 +268,6 @@ export type WorkflowNodeData = {
   risk: string;
   nextAction: string;
 };
-
-/** N14 CouncilDecision.verdict（字段清单 N14） */
-export type CouncilVerdict = 'select' | 'needs_human' | 'request_revision' | 'reject';
 
 export type CouncilOption = {
   id: string;
