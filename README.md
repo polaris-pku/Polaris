@@ -93,19 +93,21 @@ Web 版全程 mock；桌面版（Electron）在同一份 UI 之上接通了真�
 
 > 边界立场不变：真实后端下文件读写由 **A（Driver/ACP 客户端）** 执行，前端（E）只观测、渲染、接住人机确认；mock 演示里由桌面壳代 A 落盘，不构成对后端的新契约诉求（`FileOpObservation.content` 镜像的是 A 本就有的 `content` 入参）。
 
-## 样例 · 后端真实 Run 回放
+## 真实 Run 的投影
 
-启动页的 **「样例 · Run 回放」** 入口加载 BCD 一次真实 Integration v0 run 的落盘产物（`api/run_be712da2….zip` 里的 `frontend-snapshot.json`，契约镜像见 `src/api/types/snapshot.ts`）：prompt「贪吃蛇游戏」→ driver=claude 执行 45.5s → 产出 `snake.html`（diff 产物）→ **Gate 放行（未升级 Council）** → 物化 worktree → Checkpoint → completed。
+界面上与运行有关的一切**只来自后端**：`run.event` 事件流（实时）与 `run.getSnapshot` 快照（终态），
+由 `src/lib/liveReplay.ts` 与 `src/lib/eventGraph.ts` 程序化派生——后端给什么展示什么，前端不补写叙事：
 
-回放机制：样例任务挂一个 `RunReplay` 数据源，**全部内容由 `buildRunReplay(snapshot)`（`src/lib/runReplay.ts`）从快照程序化派生**——后端给什么展示什么，前端不补写叙事、不反向要求后端：
+- **步骤由事件生成**：泳道图/步骤轨的节点是「事件 → 语义步骤」的投影（`eventGraph.STEPS`），
+  没触发的步骤压根不出现，不预设条数、不画灰色待办；
+- **协议节点由事件点亮**：N0–N18 的状态由时间线纯函数重建（`src/lib/protocolFlow.ts`）——
+  快照里的 `flow.active_node_code` 是硬编码占位，不读它；
+- **文案取事件 payload 原文**，时间戳只在后端给了的地方显示，不插值；
+- **契约有但本次 run 没给的不虚构**：无 tool_events → 不显示文件操作流；无 Council 数据 → 合议页空态。
 
-- **执行泳道按后端派单生成**：执行子链条数是后端 agent 自主决策的既成事实——图由快照里被派单的 agent 正向组合（`composeRunWorkflowNodes`），本次 run 只派了 `acp-external`（driver=claude，Agent 池里有其档案）一个 agent，图上就只有它一条执行泳道；多 agent 的 run 快照进来会自然长出多条。E 只投影，不预设条数；
-- **文案全部取快照原文**：执行时间轴 / 节点执行日志显示 timeline 事件、mailbox 消息、checkpoint 清单的原文；Node Inspector 新增「本次 Run · 后端数据」区块，逐字段展示该节点后端给出的全部事实（含 `runtime_state`、`artifact_refs` 等），没给的节点如实显示「本次 run 未提供」；
-- **时间戳只在后端给了的地方显示**：timeline 事件本身无时间戳 → 显示序号 `#k`；mailbox 消息带 `created_at` → 显示真实时刻。不插值、不编造；
-- **契约有但 run 没给的不虚构**：无 tool_events → 不显示文件操作流；GateResult 未附 decision → 节点只陈述事件本身（Council 未触发是流程事实，仅用于推进控制）；无 Council 数据 → Council 页显示空态而非 mock 议程；无测试数据 → 交付报告如实说明；
-- **事件通道**：节点点亮时把该 run 的事件（真实 event_id/run_id，映射到冻结事件词表）喂入观测窗口。
-
-普通任务不受影响（无 `replay` 时走原 mock 剧本）。集成测试见 `src/store/sampleRun.test.ts`。
+> 启动页曾有一个「样例 · Run 回放」入口，加载仓库自带的落盘快照（`api/run_be712da2….zip`）。
+> 它连同其余面向用户的 mock 数据在 `daaa45d` 一并删除——提交后端失败时亮出一整套假的交付报告，
+> 用户会当成真发生过。契约镜像类型 `src/api/types/snapshot.ts` 保留作文档。
 
 ## 真实后端（A + BCD）
 
@@ -269,7 +271,7 @@ src/
 │   └── map.ts                #   UI 词表 ↔ 契约枚举 的防腐层
 ├── store/
 │   ├── useDemoStore.ts       # Zustand store 组装 + 事件通道接线
-│   ├── slices/               # 六个领域切片：project / team / task / execution / intervention / council
+│   ├── slices/               # 六个领域切片：project / team / task / execution / intervention / terminal
 │   ├── lib/                  # 跨切片纯函数（taskSync / agentWrites 落盘调度 / fileTree / timeline …）
 │   └── agentWrites.test.ts   # 落盘链路集成测试（vitest）
 ├── data/                     # 全部 mock data（workflow.ts = N0–N18 节点定义；fileops.ts = N7 文件操作剧本）

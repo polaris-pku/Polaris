@@ -8,7 +8,6 @@ import { createTeamSlice } from '@/store/slices/teamSlice';
 import { createTaskSlice } from '@/store/slices/taskSlice';
 import { createExecutionSlice } from '@/store/slices/executionSlice';
 import { createInterventionSlice } from '@/store/slices/interventionSlice';
-import { createCouncilSlice } from '@/store/slices/councilSlice';
 import { createTerminalSlice, reduceTermEvent } from '@/store/slices/terminalSlice';
 import { onTerminalEvent } from '@/api/terminal';
 
@@ -38,11 +37,10 @@ export const selectActiveLiveRun = (s: DemoState) => {
  *
  *   项目域  slices/projectSlice.ts      项目生命周期 + 文件树
  *   团队域  slices/teamSlice.ts         Agent 选择与组队定制
- *   任务域  slices/taskSlice.ts         任务生命周期 + 页面导航
- *   执行域  slices/executionSlice.ts    工作流推进引擎（单步/自动/回退/交付）
- *   介入域  slices/interventionSlice.ts 业务规则注入 + 文件写权限确认
- *   议会域  slices/councilSlice.ts      进入议会 + 裁决收束
- *   终端域  slices/terminalSlice.ts    Dock 三频道 + Python 终端会话 + 帮助抽屉
+ *   任务域  slices/taskSlice.ts         任务生命周期 + 页面导航 + 真实 run 投影
+ *   执行域  slices/executionSlice.ts    节点选中 + 整体复位
+ *   介入域  slices/interventionSlice.ts 文件写权限确认
+ *   终端域  slices/terminalSlice.ts     Dock 三频道 + Python 终端会话 + 帮助抽屉
  *
  * 跨域共享的纯函数在 store/lib/（任务回写、时间线快照、文件树、id）。
  */
@@ -53,7 +51,6 @@ export const useDemoStore = create<DemoState>()((...a) => ({
   ...createTaskSlice(...a),
   ...createExecutionSlice(...a),
   ...createInterventionSlice(...a),
-  ...createCouncilSlice(...a),
   ...createTerminalSlice(...a),
 }));
 

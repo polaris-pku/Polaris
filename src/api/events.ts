@@ -12,9 +12,9 @@
  *
  * ── 两套消费者 ──
  * - `onRunEvent`：拿后端原样的 `RunEvent`（带 sequence/source），真实 run 的驱动源。
- * - `onEvent`：拿收敛成前端既有 `Event` 形状的同一批事件，喂给观测窗口
- *   （backendEvents）。mock 剧本用 `emitLocalEvent` 走同一条消费链路 ——
- *   订阅方无需感知 mock 与否。
+ * - `onEvent`：拿收敛成前端既有 `Event` 形状的同一批事件，喂给观测窗口（backendEvents）。
+ *   （曾经还有一个 `emitLocalEvent` 让 mock 剧本走同一条消费链路，已随 mock 推进引擎删除；
+ *   现在这条链路上的每一条事件都来自后端。）
  *
  * E 的职责边界：只接收与呈现，不确认、不重放、不参与事件持久化（C 负责 persist）。
  */
@@ -162,14 +162,6 @@ export async function unwatchRun(runId?: string): Promise<void> {
 /** 当前正在关注的所有 run。 */
 export function getWatchedRunIds(): string[] {
   return [...subscribedRunIds];
-}
-
-/**
- * Mock 专用：本地喂入一条同形事件（mock 剧本回放调用），
- * 让订阅方在无后端时走完全相同的消费链路。真实后端事件永远以传输层为准。
- */
-export function emitLocalEvent(event: Event) {
-  legacyHandlers.forEach((h) => h(event));
 }
 
 /** 测试用：清空通道的模块级状态（去重表 / 订阅集 / 传输层挂载标记）。 */

@@ -2,7 +2,7 @@
  * Python 运行时的渲染层视图 —— **模块级缓存 + useSyncExternalStore，不进 zustand。**
  *
  * ── 为什么不进 store ──
- * `resetDemo()` 是 `set(blankState())`（executionSlice.ts:217）。一个天真的实现会把
+ * `resetDemo()` 是 `set(blankState())`（见 store/slices/executionSlice.ts）。一个天真的实现会把
  * 「已安装的 Python 清单」和「用户选中的解释器」一起放进 store，于是用户点一下「重来一次」，
  * 他刚装好的 260 MB Python 就从界面上消失了 —— 而它明明还在磁盘上。
  *

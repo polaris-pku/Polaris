@@ -15,6 +15,7 @@ import { Badge, type BadgeProps } from '@/components/ui/Badge';
 import { IdChip } from '@/components/ui/IdChip';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { isFrontendWorkflowV01 } from '@/api/types/rpc';
+import type { CouncilVerdict, ReviewVerdict } from '@/api/types/council';
 import { buildCouncilBoard, type CouncilProposalCard } from '@/lib/councilBoard';
 import { roleName } from '@/lib/roleNames';
 import { cn } from '@/lib/utils';
@@ -177,9 +178,12 @@ export function CouncilBoard() {
                   <div className="rounded-panel border border-edge bg-surface-panel p-3">
                     <div className="flex items-center gap-2">
                       <Badge
-                        variant={(VERDICT_BADGE[model.decision.verdict] ?? DEFAULT_VERDICT).variant}
+                        variant={
+                          (badgeOf(VERDICT_BADGE, model.decision.verdict) ?? DEFAULT_VERDICT)
+                            .variant
+                        }
                       >
-                        {(VERDICT_BADGE[model.decision.verdict] ?? DEFAULT_VERDICT).label}
+                        {(badgeOf(VERDICT_BADGE, model.decision.verdict) ?? DEFAULT_VERDICT).label}
                       </Badge>
                       {/* 协议原文只作灰色注解 */}
                       <span className="font-mono text-code text-fg-faint">
@@ -284,19 +288,44 @@ const STATUS_BADGE: Record<string, { label: string; variant: BadgeProps['variant
   failed: { label: '合议失败', variant: 'danger' },
 };
 
-const DEFAULT_VERDICT = { label: '裁决', variant: 'default' as BadgeProps['variant'] };
-const VERDICT_BADGE: Record<string, { label: string; variant: BadgeProps['variant'] }> = {
-  select: { label: '采纳方案', variant: 'ok' },
+type VerdictBadge = { label: string; variant: BadgeProps['variant'] };
+
+const DEFAULT_VERDICT: VerdictBadge = { label: '裁决', variant: 'default' };
+
+/**
+ * 裁决词表。键类型锚在契约的 `CouncilVerdict` 上 —— 后端改词表，这里编译不过。
+ *
+ * **它保证的是「词表覆盖」，不是「数据合法」**：`RunSnapshot.council.verdict` 已同步收紧到
+ * 同一个类型（见 api/types/rpc.ts），所以两端一起动；但 RPC 边界是不可信 JSON，
+ * 类型只是「后端声称会发什么」。真发来词表外的值时走下面的运行时兜底。
+ *
+ * （曾经这个哨兵是 api/map.ts 的 `UI_TO_CONTRACT_COUNCIL_VERDICT`，锚在一个写错的契约类型上，
+ * 后端从没发过那三个值，所以它从来没响过。）
+ *
+ * `select` 不叫「采纳方案」：实测后端在 synthesis 流程里发 `select` 时**不带**
+ * `selected_proposal_id` —— 采纳的是综合产出的最终候选，不是某一份原始提案。
+ */
+const VERDICT_BADGE: Record<CouncilVerdict, VerdictBadge> = {
+  select: { label: '采纳候选', variant: 'ok' },
   needs_human: { label: '需要人工', variant: 'human' },
   request_revision: { label: '要求修改', variant: 'human' },
   reject: { label: '拒绝', variant: 'danger' },
 };
 
-const REVIEW_BADGE: Record<string, { label: string; variant: BadgeProps['variant'] }> = {
+/**
+ * 评审词表。同样是**词表覆盖**保证：快照里的 `reviews` 整体是 `Record<string, unknown>`
+ * （嵌套记录形状未定，由 buildCouncilBoard 逐字段防御性取值），所以这里拿到的是裸 string，
+ * 编译期约束不到它 —— 兜底同下。
+ */
+const REVIEW_BADGE: Record<ReviewVerdict, VerdictBadge> = {
   approve: { label: '通过', variant: 'ok' },
   needs_revision: { label: '需修改', variant: 'human' },
   reject: { label: '拒绝', variant: 'danger' },
 };
+
+/** 后端原文可能是词表外的新取值 —— 运行时兜底，不让界面崩在一个陌生字符串上。 */
+const badgeOf = (table: Record<string, VerdictBadge>, verdict: string): VerdictBadge | undefined =>
+  table[verdict];
 
 const EVENT_LABEL: Record<string, string> = {
   'council.started': '合议开始',
@@ -334,7 +363,7 @@ function ProposalCard({ proposal }: { proposal: CouncilProposalCard }) {
         <div className="mt-3 space-y-1.5">
           <div className="text-body text-fg-muted">评审</div>
           {proposal.reviews.map((review) => {
-            const badge = REVIEW_BADGE[review.verdict];
+            const badge = badgeOf(REVIEW_BADGE, review.verdict);
             return (
               <div key={review.reviewId} className="rounded-panel border border-edge p-2">
                 <div className="flex items-center gap-2">
