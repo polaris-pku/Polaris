@@ -39,6 +39,9 @@ export function NeedsYouFold({
         ))}
         {/* 协议原文只作 D2 的灰色注解（F2） */}
         <KeyValue k="Gate" v={gate.decision} mono />
+        {gate.gateId && <KeyValue k="检查项" v={gate.gateId} mono />}
+        {gate.phase && <KeyValue k="阶段" v={gate.phase} mono />}
+        {gate.targetState && <KeyValue k="目标态" v={gate.targetState} mono />}
       </KeyValueList>
       <p className="mt-1 text-body text-fg-muted">
         这一步只能在后端侧放行，Polaris 里没有能把你的决定送回去的通道 —— 所以这里不给按钮。

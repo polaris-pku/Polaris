@@ -167,7 +167,7 @@ describe('总览如实写出了每一条能力边界', () => {
       .find((s) => s.title === '一次需求会经历什么')!
       .blocks.filter((b) => b.kind === 'h3')
       .map((b) => (b.kind === 'h3' ? b.text : ''));
-    // 「议会」不单列小节（真实运行不触发），但必须在正文里交代 —— 其余六步逐字对上
+    // 「议会」不单列小节（仅合议模式出现），但必须在正文里交代 —— 其余六步逐字对上
     expect(h3).toEqual(['需求受理', '分派与上下文', 'Agent 执行', '产出', '审查', '交付']);
     expect(overviewDoc).toContain(STEPS.council.labelCn);
   });
@@ -203,13 +203,12 @@ describe('总览如实写出了每一条能力边界', () => {
     ['文件树只补挂一个文件', '文件树只补挂一个文件'],
     // Gate 出厂只挂一条空检查
     ['Gate 放行一切', '放行一切'],
-    // eventGraph.statusOf 靠 .failed 后缀判断，后端发的是 agent.execution_completed + failed
-    ['执行失败时步骤卡仍显示完成', '仍然显示成完成'],
     ['ContextPack 是占位', 'ContextPack 是占位'],
     ['团队页是演示数据', '「团队」页是演示数据'],
     ['验收标准不会发给 agent', '「验收标准」不会发给 agent'],
     ['Checkpoint 不能回滚', 'Checkpoint 不能回滚'],
-    ['议会不触发', '不会触发'],
+    // 合议自主裁决：后端没有人工裁决回写通道，合议页只能观察
+    ['合议没有人工裁决通道', '没有人工裁决通道'],
     // backendBridge 的 PROVIDERS：需求正文与文件内容要发给模型服务商
     ['代码会出网', '你的代码会发给模型服务商'],
     // 全仓没有任何 usage/cost 上报

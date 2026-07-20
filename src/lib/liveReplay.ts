@@ -14,6 +14,7 @@ import type { RunEvent, RunSnapshot, FrontendWorkflowV01Snapshot } from '@/api/t
 import { isFrontendWorkflowV01 } from '@/api/types/rpc';
 import type { Event as ContractEvent } from '@/api/types';
 import { buildEventGraph, groupEvents, type LiveRunStatus } from '@/lib/eventGraph';
+import { councilFactsFrom } from '@/lib/runFacts';
 import type {
   GateDecision,
   LogEntry,
@@ -159,7 +160,27 @@ export function buildLiveProgressReplay(
     ? 'defer'
     : 'allow';
 
-  void groups;
+  // 实时握手：`coord.checkpoint_observed` 的 semantic_handoff（已完成 / 进行中 / 下一步 /
+  // 已知风险）是 agent 干活期间后端唯一的进度自述。终态路径把 checkpoint.saved 的同款数据
+  // 摊开成事实 —— 实时路径对齐同一处理，不再把它整段丢掉等快照。
+  const observed = [...events].reverse().find((e) => e.type === 'coord.checkpoint_observed');
+  const liveHandoff = observed ? asRecord(asRecord(observed.payload).semantic_handoff) : {};
+  const handoffNodeId = nodeIdForType(groups, 'coord.checkpoint_observed');
+  if (handoffNodeId && Object.keys(liveHandoff).length > 0) {
+    nodeFacts[handoffNodeId] = [
+      ...(nodeFacts[handoffNodeId] ?? []),
+      ...Object.entries(liveHandoff).map(([key, value]) => ({
+        key: `semantic_handoff.${key}`,
+        value: Array.isArray(value) ? value.join('\n') || '—' : str(value),
+      })),
+    ];
+  }
+  const liveRisks = Array.isArray(liveHandoff.known_risks)
+    ? liveHandoff.known_risks.map(String)
+    : [];
+
+  // 议会（事件先行）：council.* 事件到达即渲染，不等终态快照。
+  const council = councilFactsFrom(events);
 
   return {
     source: 'live',
@@ -182,27 +203,50 @@ export function buildLiveProgressReplay(
         goal: spec ?? '—',
         modules: [], // 产物路径要等快照，运行中还不知道 —— 留空而不是编造
         testDir: '—',
-        risks: [],
+        risks: liveRisks,
         workflow: meta.mode,
       },
-      council: {
-        context: {
-          title: '本次 run 未触发 Council',
-          description: '运行中；如触发 Council，事件到达后此处会更新。',
-          decisionMode: '—',
-          councilId: '—',
-        },
-        discussion: [],
-        options: [],
-        evidenceRefs: [],
-        riskSignals: [],
-        recommendedReason: '—',
-      },
+      council: council
+        ? {
+            context: {
+              title: `Council · ${council.status}`,
+              description:
+                [
+                  council.verdict && `verdict=${council.verdict}`,
+                  council.proposalCount > 0 && `提案 ${String(council.proposalCount)}`,
+                  council.reviewCount > 0 && `评审 ${String(council.reviewCount)}`,
+                  council.synthesisDone && '综合完成',
+                  council.failedCode && `失败 ${council.failedCode}`,
+                ]
+                  .filter(Boolean)
+                  .join(' · ') || '议会进行中',
+              decisionMode: council.decisionMode || '—',
+              councilId: council.selectedProposalId || '—',
+            },
+            discussion: [],
+            options: [],
+            evidenceRefs: [],
+            riskSignals: [],
+            recommendedReason: '—',
+          }
+        : {
+            context: {
+              title: '本次 run 未触发 Council',
+              description: '运行中；如触发 Council，事件到达后此处会更新。',
+              decisionMode: '—',
+              councilId: '—',
+            },
+            discussion: [],
+            options: [],
+            evidenceRefs: [],
+            riskSignals: [],
+            recommendedReason: '—',
+          },
       delivery: {
         summary: `run.status=${meta.status} · mode=${meta.mode}（执行中，交付数据待 run 结束）`,
         changedFiles: [],
         testResult: { passed: 0, failed: 0, coverageDelta: '—' },
-        riskNotes: [],
+        riskNotes: liveRisks,
       },
     },
     gateDecision,
@@ -271,6 +315,13 @@ export function buildLiveRunReplay(snapshot: RunSnapshot): RunReplay | null {
       value: str(value),
     })),
   ]);
+  // 议会终态：快照的 council 段（proposals / reviews / synthesis / 决议字段）摊开挂到
+  // 议会节点上 —— 与 gates / artifacts 的处理同款。completed / failed 只会有其一。
+  if (snapshot.council) {
+    const councilRows = payloadFacts(asRecord(snapshot.council));
+    if (nodeIdForType(groups, 'council.completed')) attach('council.completed', councilRows);
+    else attach('council.failed', councilRows);
+  }
 
   const producedFiles = liveProducedFiles(snapshot);
 
@@ -288,7 +339,16 @@ export function buildLiveRunReplay(snapshot: RunSnapshot): RunReplay | null {
       ? {
           context: {
             title: `Council · ${snapshot.council.status}`,
-            description: `verdict=${snapshot.council.verdict ?? '—'} · decision_mode=${snapshot.council.decision_mode ?? '—'}`,
+            description: [
+              `verdict=${snapshot.council.verdict ?? '—'}`,
+              `decision_mode=${snapshot.council.decision_mode ?? '—'}`,
+              snapshot.council.proposals?.length &&
+                `提案 ${String(snapshot.council.proposals.length)}`,
+              snapshot.council.reviews?.length && `评审 ${String(snapshot.council.reviews.length)}`,
+              snapshot.council.synthesis && '综合完成',
+            ]
+              .filter(Boolean)
+              .join(' · '),
             decisionMode: snapshot.council.decision_mode ?? '—',
             councilId: snapshot.council.decision_id ?? '—',
           },

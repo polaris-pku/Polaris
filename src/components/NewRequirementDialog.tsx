@@ -4,6 +4,19 @@ import { Dialog } from '@/components/ui/Dialog';
 import { Button } from '@/components/ui/Button';
 import { Textarea } from '@/components/ui/Textarea';
 import { useDemoStore } from '@/store/useDemoStore';
+import { cn } from '@/lib/utils';
+
+type RunModeChoice = 'single_agent' | 'council';
+
+/** 执行方式说人话（协议词 single_agent / council 不出现在这一屏）。 */
+const MODE_CHOICES: { id: RunModeChoice; label: string; desc: string }[] = [
+  { id: 'single_agent', label: '单 Agent', desc: '一个 Agent 直接完成需求。' },
+  {
+    id: 'council',
+    label: '多 Agent 合议',
+    desc: '两份提案 + 评审 + 综合，选优交付。约 5 次 Agent 调用，费用与时长相应增加。',
+  },
+];
 
 /**
  * 新建需求 —— **这是新用户的正门**。
@@ -15,6 +28,7 @@ export function NewRequirementDialog({ open, onClose }: { open: boolean; onClose
   const [text, setText] = useState('');
   const [title, setTitle] = useState('');
   const [criteria, setCriteria] = useState('');
+  const [mode, setMode] = useState<RunModeChoice>('single_agent');
   const [error, setError] = useState<string | null>(null);
 
   const canSubmit = text.trim().length > 0;
@@ -23,6 +37,7 @@ export function NewRequirementDialog({ open, onClose }: { open: boolean; onClose
     setText('');
     setTitle('');
     setCriteria('');
+    setMode('single_agent');
     setError(null);
   };
 
@@ -35,7 +50,7 @@ export function NewRequirementDialog({ open, onClose }: { open: boolean; onClose
     if (!canSubmit) return;
     // 提交可能被拒（别的项目还有 run 在跑 —— 绑定工作区会杀掉它）。
     // 被拒时**不要关对话框**：把原因摆在用户眼前，他输入的内容也原样留着。
-    const result = createTask(text, title, criteria.split('\n'));
+    const result = createTask(text, title, criteria.split('\n'), mode);
     if (!result.ok) {
       setError(result.error);
       return;
@@ -100,6 +115,37 @@ export function NewRequirementDialog({ open, onClose }: { open: boolean; onClose
             placeholder={'未授权访问返回 403\n已有单测全部通过'}
           />
           <p className="mt-1 text-body text-fg-muted">留空则由 Agent 起草一份，随任务一起提交。</p>
+        </div>
+
+        <div className="mt-4">
+          <label className="mb-1 block text-body text-fg-secondary">执行方式</label>
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+            {MODE_CHOICES.map((choice) => {
+              const active = mode === choice.id;
+              return (
+                <button
+                  key={choice.id}
+                  type="button"
+                  onClick={() => {
+                    setMode(choice.id);
+                  }}
+                  className={cn(
+                    'rounded-panel border bg-surface-panel p-3 text-left transition-colors',
+                    active
+                      ? 'border-command/60 ring-1 ring-command/40'
+                      : 'border-edge hover:border-edge-strong',
+                  )}
+                >
+                  <div
+                    className={cn('text-body', active ? 'text-command-soft' : 'text-fg-primary')}
+                  >
+                    {choice.label}
+                  </div>
+                  <p className="mt-0.5 text-body text-fg-muted">{choice.desc}</p>
+                </button>
+              );
+            })}
+          </div>
         </div>
 
         {/* 提交被拒（例如别的项目还有 run 在跑）：原因必须摆在用户眼前，且对话框不关 */}

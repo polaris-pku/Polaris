@@ -4,6 +4,7 @@ import { buildEventGraph } from '@/lib/eventGraph';
 import {
   artifactFactsOf,
   blockingGateOf,
+  councilFactsOf,
   eventsByNode,
   focusStepOf,
   gateFactOf,
@@ -98,7 +99,25 @@ describe('runFacts · Gate 提取', () => {
       decision: 'ask',
       reason: '需要人工确认写入范围',
       requiredActions: ['确认 src/user 下的改动'],
+      phase: '',
+      gateId: '',
+      targetState: '',
     });
+  });
+
+  it('gate_id / phase / target_state 一并带出（后端给了就不丢）', () => {
+    const fact = gateFactOf([
+      event('gate.result', {
+        decision: 'allow',
+        reason: '',
+        phase: 'pre_selection',
+        gate_id: 'allow-gate',
+        target_state: 'artifact_selection',
+      }),
+    ]);
+    expect(fact?.phase).toBe('pre_selection');
+    expect(fact?.gateId).toBe('allow-gate');
+    expect(fact?.targetState).toBe('artifact_selection');
   });
 
   it('只有 ask / defer 算「需要你」；allow / deny 不是', () => {
@@ -245,7 +264,104 @@ describe('runFacts · 运行信息', () => {
       mode: 'single_agent',
       driverId: 'acp-external',
       eventCount: 1,
+      sourceCounts: [['coordinator', 1]],
+      selection: null,
     });
     expect(runMetaOf(liveRun([])).driverId).toBe('');
+  });
+
+  it('事件分布按 source 计数；artifact.selected 的选择结论带出 mode + selected_count', () => {
+    const meta = runMetaOf(
+      liveRun([
+        event('task.created', {}),
+        event('run.started', {}),
+        event('artifact.selected', { mode: 'single_agent_artifacts', selected_count: 2 }),
+      ]),
+    );
+    expect(meta.sourceCounts).toEqual([['coordinator', 3]]);
+    expect(meta.selection).toEqual({ mode: 'single_agent_artifacts', selectedCount: 2 });
+  });
+});
+
+describe('runFacts · Council', () => {
+  it('没有 council 事件也没有快照 council 段 → null（Fold 压根不出现）', () => {
+    expect(councilFactsOf(liveRun([event('task.created', {})]))).toBeNull();
+    expect(councilFactsOf(undefined)).toBeNull();
+  });
+
+  it('实时：proposal / review / synthesis 事件逐个到达即计数，状态由事件推导', () => {
+    const facts = councilFactsOf(
+      liveRun([
+        event('council.started', { decision_mode: 'advisory' }),
+        event('council.proposal.completed', { role_id: 'role_proposer_a', proposal_id: 'prop-1' }),
+        event('council.proposal.completed', { role_id: 'role_proposer_b', proposal_id: 'prop-2' }),
+        event('council.review.completed', {
+          role_id: 'role_reviewer',
+          review_ids: ['rev-1', 'rev-2'],
+        }),
+      ]),
+    );
+    expect(facts?.status).toBe('running');
+    expect(facts?.proposalCount).toBe(2);
+    expect(facts?.reviewCount).toBe(1);
+    expect(facts?.synthesisDone).toBe(false);
+    expect(facts?.decisionMode).toBe('advisory');
+    expect(facts?.roles).toEqual([
+      { kind: '提案', roleId: 'role_proposer_a', refId: 'prop-1' },
+      { kind: '提案', roleId: 'role_proposer_b', refId: 'prop-2' },
+      { kind: '评审', roleId: 'role_reviewer', refId: 'rev-1, rev-2' },
+    ]);
+  });
+
+  it('council.failed → status=failed，code 带出', () => {
+    const facts = councilFactsOf(
+      liveRun([
+        event('council.started', {}),
+        event('council.failed', { code: 'PROPOSAL_ROLE_FAILED' }),
+      ]),
+    );
+    expect(facts?.status).toBe('failed');
+    expect(facts?.failedCode).toBe('PROPOSAL_ROLE_FAILED');
+  });
+
+  it('决议字段来自 council.decision；快照到达后以快照为准', () => {
+    const timeline = [
+      event('council.decision', {
+        verdict: 'approved',
+        decision_mode: 'advisory',
+        selected_proposal_id: 'prop-1',
+      }),
+      event('council.completed', {}),
+    ];
+    const eventsOnly = councilFactsOf(liveRun(timeline));
+    expect(eventsOnly?.status).toBe('completed');
+    expect(eventsOnly?.verdict).toBe('approved');
+    expect(eventsOnly?.selectedProposalId).toBe('prop-1');
+
+    const snapshot = {
+      ...snapshotWith([]),
+      council: {
+        enabled: true as const,
+        status: 'completed' as const,
+        verdict: 'needs_iteration',
+        decision_mode: 'binding',
+        selected_proposal_id: 'prop-2',
+        selected_artifact_refs: [],
+        required_next_actions: ['补充测试'],
+        blocked_by: ['gate-x'],
+        can_create_merge_authorization: false,
+        proposals: [{ proposal_id: 'prop-1' }, { proposal_id: 'prop-2' }],
+        reviews: [{ review_id: 'rev-1' }],
+        synthesis: { synthesis_id: 'syn-1' },
+      },
+    };
+    const withSnapshot = councilFactsOf(liveRun(timeline, snapshot));
+    expect(withSnapshot?.verdict).toBe('needs_iteration');
+    expect(withSnapshot?.decisionMode).toBe('binding');
+    expect(withSnapshot?.selectedProposalId).toBe('prop-2');
+    expect(withSnapshot?.proposalCount).toBe(2);
+    expect(withSnapshot?.synthesisDone).toBe(true);
+    expect(withSnapshot?.requiredNextActions).toEqual(['补充测试']);
+    expect(withSnapshot?.blockedBy).toEqual(['gate-x']);
   });
 });

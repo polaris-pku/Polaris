@@ -40,6 +40,7 @@ export type TaskTrace = Pick<
   | 'title'
   | 'taskText'
   | 'completionCriteria'
+  | 'mode'
   | 'assignedAgentIds'
   | 'stage'
   | 'interventionRules'
@@ -140,6 +141,7 @@ export type TaskSlice = {
     rawText: string,
     title?: string,
     completionCriteria?: string[],
+    mode?: 'single_agent' | 'council',
   ) => { ok: true } | { ok: false; error: string };
   /** 每条后端事件都重投影一次泳道图（幂等）——「泳道图实时跟着后端走」的落点 */
   applyLiveProgress: (

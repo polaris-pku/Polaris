@@ -1,60 +1,50 @@
-import { useState } from 'react';
 import {
-  MessagesSquare,
   Scale,
-  CheckCircle2,
   ArrowLeft,
-  Star,
-  ThumbsUp,
   AlertTriangle,
   FileCode2,
   Gavel,
   Link2,
-  ShieldAlert,
+  MessagesSquare,
+  Sparkles,
 } from 'lucide-react';
-import { selectActiveReplay, useDemoStore } from '@/store/useDemoStore';
+import { selectActiveLiveRun, useDemoStore } from '@/store/useDemoStore';
 import { SidePanel } from '@/components/SidePanel';
-import { verdictDefs } from '@/data/councilOptions';
-import { findOption } from '@/data/scenario';
 import { Button } from '@/components/ui/Button';
-import { Badge } from '@/components/ui/Badge';
+import { Badge, type BadgeProps } from '@/components/ui/Badge';
 import { IdChip } from '@/components/ui/IdChip';
 import { EmptyState } from '@/components/ui/EmptyState';
+import { isFrontendWorkflowV01 } from '@/api/types/rpc';
+import { buildCouncilBoard, type CouncilProposalCard } from '@/lib/councilBoard';
+import { roleName } from '@/lib/roleNames';
 import { cn } from '@/lib/utils';
-import type { CouncilVerdict } from '@/types';
 
 /**
- * 合议（原「议会」页）。
+ * 合议 —— proposer / reviewer / synthesizer 裁决过程的**观察面板**。
  *
- * 「Council / 议会」在同一句话里出现过两种语言 —— 统一为「合议」。
- * 紫色（council 色相）已删除：合议本质上就是「轮到人裁决」→ 并入 human；
- * 而「选中 / 推荐」是机器态 → command。发言人的 4 色左缘也删了：
- * 责任方不再靠颜色编码，只留一条不着色的左缘线（§4.3）。
+ * 数据完全来自真实 run：运行中由 council.* 事件逐步长出（谁提了案、谁在评审），
+ * 终态用快照的 `snapshot.council` 补全正文（提案 summary / 评审意见 / 综合结论）。
+ *
+ * 【R4】这里**没有任何裁决按钮**：合议由后端 agent 自主完成，Polaris 没有把人工
+ * 裁决送回后端的通道 —— 一个只改本地状态的「采纳」按钮会让用户以为自己影响了结果。
+ * 旧版的「你的裁决」面板正是这样一个谎言，已删除。
  */
 export function CouncilBoard() {
-  const confirmCouncilOption = useDemoStore((s) => s.confirmCouncilOption);
-  const confirmedId = useDemoStore((s) => s.confirmedCouncilOptionId);
   const setPage = useDemoStore((s) => s.setPage);
-  const replay = useDemoStore(selectActiveReplay);
+  const live = useDemoStore(selectActiveLiveRun);
 
-  // Council 数据只来自真实 run 的快照（后端给什么展示什么），不用 mock 议程顶替
-  const scenario = replay?.scenario;
-  const council = scenario?.council;
-  const councilOptions = council?.options ?? [];
+  const snapshot = live?.snapshot;
+  const council =
+    snapshot && isFrontendWorkflowV01(snapshot) ? (snapshot.council ?? undefined) : undefined;
+  const model = live ? buildCouncilBoard(live.timeline, council) : null;
 
-  const [selectedId, setSelectedId] = useState(
-    councilOptions.find((o) => o.recommended)?.id ?? councilOptions[0]?.id ?? '',
-  );
-  const [verdict, setVerdict] = useState<CouncilVerdict>('select');
-
-  // 本次 run 没有合议数据（未触发合议 / Gate 直通 / 还没跑）→ 只呈现该事实
-  if (!scenario || !council || councilOptions.length === 0) {
+  if (!model) {
     return (
       <div className="flex h-full items-center justify-center">
         <EmptyState
           icon={Scale}
-          title={council?.context.title ?? '本次任务未触发合议裁决'}
-          hint={council?.context.description ?? '单 Agent 模式或 Gate 直通的 run 不产生合议议程。'}
+          title="本次任务未触发合议"
+          hint="新建需求时选择「多 Agent 合议」，两份提案、评审与综合的全过程会出现在这里。"
           action={
             <Button
               variant="secondary"
@@ -71,280 +61,204 @@ export function CouncilBoard() {
     );
   }
 
-  const {
-    context: councilContext,
-    discussion,
-    evidenceRefs,
-    riskSignals,
-    recommendedReason,
-  } = council;
-  const selectedOption = findOption(scenario, selectedId)!;
-  const verdictDef = verdictDefs.find((v) => v.id === verdict)!;
-  // 只有「采纳方案」会驱动主链路继续（采纳 + 委托决策 → 合并授权）
-  const canAdvance = verdict === 'select';
+  const statusBadge = STATUS_BADGE[model.status] ?? { label: model.status, variant: 'default' };
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
-      {/* 抬头 */}
+      {/* 抬头：状态 + 决议标识（机器 ID 收进 IdChip） */}
       <header className="border-b border-edge px-6 py-4">
         <div className="flex flex-wrap items-center gap-2">
-          <Scale className="h-5 w-5 text-human" />
+          <Scale className="h-5 w-5 text-command" />
           <h1 className="text-title text-fg-primary">合议</h1>
-          <Badge variant="human">等待裁决</Badge>
-          <IdChip value={councilContext.councilId} label="合议 ID" />
-          <span className="text-body text-fg-muted">
-            决策模式 <span className="font-mono text-code">{councilContext.decisionMode}</span>
-          </span>
+          <Badge variant={statusBadge.variant}>{statusBadge.label}</Badge>
+          {model.decision?.decisionId && (
+            <IdChip value={model.decision.decisionId} label="决议 ID" />
+          )}
+          {model.decisionMode && (
+            <span className="text-body text-fg-muted">
+              决策模式 <span className="font-mono text-code">{model.decisionMode}</span>
+            </span>
+          )}
+          {model.failedCode && (
+            <span className="font-mono text-code text-danger">{model.failedCode}</span>
+          )}
         </div>
-        <p className="mt-1 max-w-3xl text-body text-fg-secondary">{councilContext.description}</p>
+        <p className="mt-1 max-w-3xl text-body text-fg-secondary">
+          两位提案者各给出一份候选实现，评审员逐案评审，综合员产出最终候选 ——
+          裁决由后端自主完成，这里呈现全过程。
+        </p>
       </header>
 
       <div className="flex min-h-0 flex-1 overflow-hidden">
-        {/* 左：Agent 讨论 */}
+        {/* 左：过程（合议事件序，全部真实事件） */}
         <SidePanel
           side="left"
-          title="Agent 讨论"
-          defaultWidth={300}
-          minWidth={220}
-          maxWidth={460}
-          storageKey="council-discussion"
+          title="过程"
+          defaultWidth={260}
+          minWidth={200}
+          maxWidth={400}
+          storageKey="council-feed"
         >
           <div className="flex h-full min-h-0 flex-col">
-            <PanelTitle icon={MessagesSquare}>Agent 讨论</PanelTitle>
-            <div className="flex-1 space-y-3 overflow-y-auto p-4">
-              {discussion.map((d, i) => (
-                <div
-                  key={i}
-                  // 责任方不再着色：位置 + 一条不着色的左缘线就够了（6–9 色色板已删）
-                  className="rounded-panel border border-edge border-l-2 border-l-edge-strong bg-surface-panel p-3"
-                >
-                  <div className="text-title text-fg-primary">{d.agent}</div>
-                  <span className="text-body text-fg-muted">{d.role}</span>
-                  <p className="mt-1.5 text-body text-fg-secondary">{d.message}</p>
-                </div>
+            <PanelTitle icon={MessagesSquare}>过程</PanelTitle>
+            <ul className="flex-1 space-y-1 overflow-y-auto p-3">
+              {model.feed.map((item, i) => (
+                <li key={i} className="flex items-baseline gap-2 px-1 py-0.5">
+                  <span className="tabular shrink-0 text-meta text-fg-faint">{item.time}</span>
+                  <span className="min-w-0 flex-1 text-body text-fg-secondary">
+                    {EVENT_LABEL[item.type] ?? item.type}
+                    {item.roleId && (
+                      <span className="text-fg-muted"> · {roleName(item.roleId)}</span>
+                    )}
+                  </span>
+                </li>
               ))}
-            </div>
+            </ul>
           </div>
         </SidePanel>
 
-        {/* 中：方案对比 */}
+        {/* 中：提案（运行中是骨架，终态补全正文） */}
         <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-          <PanelTitle icon={Scale}>方案对比</PanelTitle>
-          <div className="grid flex-1 grid-cols-1 gap-4 overflow-y-auto p-4 xl:grid-cols-3">
-            {councilOptions.map((opt) => {
-              const active = selectedId === opt.id;
-              return (
-                <button
-                  key={opt.id}
-                  onClick={() => {
-                    setSelectedId(opt.id);
-                  }}
-                  className={cn(
-                    'flex flex-col rounded-panel border bg-surface-panel p-4 text-left transition-colors',
-                    active
-                      ? 'border-command/60 ring-1 ring-command/40'
-                      : 'border-edge hover:border-edge-strong',
-                  )}
-                >
-                  <div className="flex items-start justify-between gap-2">
-                    <span className="text-title text-fg-primary">{opt.title}</span>
-                    {opt.recommended && (
-                      <Badge variant="command" className="shrink-0">
-                        <Star className="h-3 w-3" /> 推荐
-                      </Badge>
-                    )}
-                  </div>
-                  <span className="mt-0.5 text-body text-fg-muted">提出者：{opt.proposedBy}</span>
-                  <p className="mt-2 text-body text-fg-secondary">{opt.summary}</p>
-
-                  <div className="mt-3 space-y-2">
-                    <div>
-                      <div className="mb-1 flex items-center gap-1 text-body text-ok">
-                        <ThumbsUp className="h-3 w-3" /> 优点
-                      </div>
-                      <ul className="space-y-0.5 text-body text-fg-secondary">
-                        {opt.pros.map((p) => (
-                          <li key={p}>· {p}</li>
-                        ))}
-                      </ul>
-                    </div>
-                    <div>
-                      <div className="mb-1 flex items-center gap-1 text-body text-danger">
-                        <AlertTriangle className="h-3 w-3" /> 风险
-                      </div>
-                      <ul className="space-y-0.5 text-body text-fg-secondary">
-                        {opt.risks.map((r) => (
-                          <li key={r}>· {r}</li>
-                        ))}
-                      </ul>
-                    </div>
-                  </div>
-
-                  <div className="mt-3">
-                    <div className="mb-1 flex items-center gap-1 text-body text-fg-muted">
-                      <FileCode2 className="h-3 w-3" /> 影响文件
-                    </div>
-                    <div className="flex flex-wrap gap-1">
-                      {opt.impactedFiles.map((f) => (
-                        <span
-                          key={f}
-                          className="rounded-chip bg-surface-raised px-1.5 font-mono text-code text-fg-secondary"
-                        >
-                          {f}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-
-                  <div className="mt-3 border-t border-edge pt-2">
-                    <div className="mb-1 text-body text-fg-muted">Agent 评分</div>
-                    <div className="space-y-1">
-                      {Object.entries(opt.scores).map(([k, v]) => (
-                        <ScoreBar key={k} label={k} value={v} />
-                      ))}
-                    </div>
-                  </div>
-                </button>
-              );
-            })}
+          <PanelTitle icon={Scale}>提案 · {model.proposals.length}</PanelTitle>
+          <div className="grid flex-1 grid-cols-1 content-start gap-4 overflow-y-auto p-4 xl:grid-cols-2">
+            {model.proposals.length === 0 && (
+              <p className="text-body text-fg-muted">提案者还在起草 —— 提案完成后会出现在这里。</p>
+            )}
+            {model.proposals.map((proposal) => (
+              <ProposalCard key={proposal.proposalId} proposal={proposal} />
+            ))}
           </div>
         </div>
 
-        {/* 右：你的裁决 */}
+        {/* 右：综合与裁决（只读） */}
         <SidePanel
           side="right"
-          title="你的裁决"
+          title="综合与裁决"
           defaultWidth={340}
           minWidth={280}
           maxWidth={520}
           storageKey="council-decision"
         >
           <div className="flex h-full min-h-0 flex-col">
-            <PanelTitle icon={Gavel}>你的裁决</PanelTitle>
+            <PanelTitle icon={Gavel}>综合与裁决</PanelTitle>
             <div className="flex-1 space-y-4 overflow-y-auto p-4">
-              {/* 裁决类型 */}
-              <div>
-                <div className="mb-1.5 text-body text-fg-muted">裁决类型</div>
-                <div className="space-y-1.5">
-                  {verdictDefs.map((v) => {
-                    const active = verdict === v.id;
-                    return (
-                      <button
-                        key={v.id}
-                        onClick={() => {
-                          setVerdict(v.id);
-                        }}
-                        disabled={!!confirmedId}
-                        className={cn(
-                          'w-full rounded-panel border bg-surface-panel p-2 text-left transition-colors disabled:opacity-60',
-                          active
-                            ? 'border-command/60 ring-1 ring-command/40'
-                            : 'border-edge hover:border-edge-strong',
-                        )}
-                      >
-                        <div className="flex items-center justify-between gap-2">
-                          <span
-                            className={cn(
-                              'text-body',
-                              active ? 'text-command-soft' : 'text-fg-primary',
-                            )}
-                          >
-                            {v.label}
-                          </span>
-                          <span className="text-body text-fg-muted">{v.landing}</span>
-                        </div>
-                        <p className="mt-1 text-body text-fg-muted">{v.desc}</p>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-
-              {/* 已选方案 —— 只有「采纳方案」时才有意义 */}
-              {verdict === 'select' && (
-                <div>
-                  <div className="mb-1 text-body text-fg-muted">已选方案</div>
-                  <div className="flex items-center gap-2 rounded-panel border border-command/30 bg-surface-panel p-2">
-                    <span className="text-body text-fg-primary">{selectedOption.title}</span>
-                    {selectedOption.recommended && (
-                      <Badge variant="command" className="ml-auto">
-                        <Star className="h-3 w-3" /> 推荐
-                      </Badge>
-                    )}
-                  </div>
-                  <p className="mt-1.5 text-body text-fg-muted">
-                    {selectedOption.recommended
-                      ? recommendedReason
-                      : '该方案非系统推荐，确认前请评估其风险与维护成本。'}
-                  </p>
-                </div>
-              )}
-
-              {/* 证据 */}
+              {/* 综合 */}
               <div>
                 <div className="mb-1.5 flex items-center gap-1 text-body text-fg-muted">
-                  <Link2 className="h-3 w-3" /> 证据 ·{' '}
-                  <span className="tabular">{evidenceRefs.length}</span>
+                  <Sparkles className="h-3 w-3" /> 综合
                 </div>
-                <div className="space-y-1">
-                  {evidenceRefs.map((ref) => (
-                    <div
-                      key={ref}
-                      className="truncate rounded-chip border border-edge bg-surface-raised px-2 font-mono text-code text-fg-secondary"
-                    >
-                      {ref}
+                {model.synthesis ? (
+                  <div className="rounded-panel border border-edge bg-surface-panel p-3">
+                    <div className="text-body text-fg-primary">
+                      {roleName(model.synthesis.roleId)}
                     </div>
-                  ))}
-                </div>
+                    {model.synthesis.summary ? (
+                      <p className="mt-1 text-body text-fg-secondary">{model.synthesis.summary}</p>
+                    ) : (
+                      <p className="mt-1 text-body text-fg-muted">正文随终态快照到达。</p>
+                    )}
+                    <div className="mt-2">
+                      <IdChip value={model.synthesis.synthesisId} label="综合 ID" />
+                    </div>
+                  </div>
+                ) : (
+                  <p className="text-body text-fg-muted">
+                    {model.status === 'running' ? '综合还未开始。' : '本次合议没有综合产出。'}
+                  </p>
+                )}
               </div>
 
-              {/* 风险信号 */}
+              {/* 裁决 */}
               <div>
-                <div className="mb-1.5 flex items-center gap-1 text-body text-danger">
-                  <ShieldAlert className="h-3 w-3" /> 风险信号 ·{' '}
-                  <span className="tabular">{riskSignals.length}</span>
+                <div className="mb-1.5 flex items-center gap-1 text-body text-fg-muted">
+                  <Gavel className="h-3 w-3" /> 裁决
                 </div>
-                <ul className="space-y-1">
-                  {riskSignals.map((r) => (
-                    <li key={r} className="flex gap-1.5 text-body text-fg-secondary">
-                      <AlertTriangle className="mt-1 h-3 w-3 shrink-0 text-danger" />
-                      {r}
-                    </li>
-                  ))}
-                </ul>
+                {model.decision ? (
+                  <div className="rounded-panel border border-edge bg-surface-panel p-3">
+                    <div className="flex items-center gap-2">
+                      <Badge
+                        variant={(VERDICT_BADGE[model.decision.verdict] ?? DEFAULT_VERDICT).variant}
+                      >
+                        {(VERDICT_BADGE[model.decision.verdict] ?? DEFAULT_VERDICT).label}
+                      </Badge>
+                      {/* 协议原文只作灰色注解 */}
+                      <span className="font-mono text-code text-fg-faint">
+                        {model.decision.verdict}
+                      </span>
+                    </div>
+                    {model.decision.selectedProposalId && (
+                      <div className="mt-2 flex items-center gap-2 text-body text-fg-secondary">
+                        选中提案
+                        <IdChip value={model.decision.selectedProposalId} />
+                      </div>
+                    )}
+                    {model.decision.terminationReason && (
+                      <p className="mt-1 text-body text-fg-muted">
+                        终止原因：{model.decision.terminationReason}
+                      </p>
+                    )}
+                    {model.decision.selectedArtifactRefs.length > 0 && (
+                      <div className="mt-2">
+                        <div className="mb-1 flex items-center gap-1 text-body text-fg-muted">
+                          <Link2 className="h-3 w-3" /> 选中产物 ·{' '}
+                          <span className="tabular">
+                            {model.decision.selectedArtifactRefs.length}
+                          </span>
+                        </div>
+                        <div className="space-y-1">
+                          {model.decision.selectedArtifactRefs.map((ref) => (
+                            <div
+                              key={ref}
+                              className="truncate rounded-chip border border-edge bg-surface-raised px-2 font-mono text-code text-fg-secondary"
+                            >
+                              {ref}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <p className="text-body text-fg-muted">
+                    {model.status === 'running' ? '裁决还未产生。' : '本次合议没有产生裁决。'}
+                  </p>
+                )}
               </div>
 
-              {confirmedId && (
-                <div className="flex items-center gap-2 rounded-panel border border-ok/30 bg-surface-panel p-3 text-body text-ok-soft">
-                  <CheckCircle2 className="h-4 w-4 shrink-0" />
-                  已采纳「{findOption(scenario, confirmedId)?.title}」，任务流已继续。
+              {/* 后续动作 / 阻塞项（后端要求的，只告知） */}
+              {model.requiredNextActions.length > 0 && (
+                <div>
+                  <div className="mb-1.5 text-body text-fg-muted">后续动作</div>
+                  <ul className="space-y-1">
+                    {model.requiredNextActions.map((action) => (
+                      <li key={action} className="text-body text-fg-secondary">
+                        · {action}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {model.blockedBy.length > 0 && (
+                <div>
+                  <div className="mb-1.5 flex items-center gap-1 text-body text-danger">
+                    <AlertTriangle className="h-3 w-3" /> 阻塞项
+                  </div>
+                  <ul className="space-y-1">
+                    {model.blockedBy.map((item) => (
+                      <li key={item} className="font-mono text-code text-fg-secondary">
+                        {item}
+                      </li>
+                    ))}
+                  </ul>
                 </div>
               )}
             </div>
 
             <div className="space-y-2 border-t border-edge p-4">
-              <div className="flex items-center gap-2 text-body text-fg-muted">
-                最终裁决权属于你 · 落点
-                <Badge variant={verdictDef.variant}>{verdictDef.landing}</Badge>
-              </div>
-              {canAdvance ? (
-                <Button
-                  variant="primary"
-                  className="w-full"
-                  disabled={!!confirmedId}
-                  onClick={() => {
-                    confirmCouncilOption(selectedId);
-                  }}
-                >
-                  <Gavel className="h-4 w-4" />
-                  采纳「{selectedOption.title}」
-                </Button>
-              ) : (
-                <div className="rounded-panel border border-human/30 bg-surface-panel p-2 text-body text-human-soft">
-                  该裁决会让任务{verdictDef.landing}
-                  ，主链路在此暂停（只有「采纳方案」会继续到合并授权）。
-                </div>
-              )}
+              <p className="text-body text-fg-muted">
+                合议由后端 agent 自主完成，Polaris 没有把人工裁决送回后端的通道 ——
+                所以这里不给按钮。
+              </p>
               <Button
                 variant="secondary"
                 className="w-full"
@@ -362,23 +276,144 @@ export function CouncilBoard() {
   );
 }
 
+// ── 词表（主层说人话，协议原文只作灰色注解）──
+
+const STATUS_BADGE: Record<string, { label: string; variant: BadgeProps['variant'] }> = {
+  running: { label: '合议进行中', variant: 'command' },
+  completed: { label: '合议完成', variant: 'ok' },
+  failed: { label: '合议失败', variant: 'danger' },
+};
+
+const DEFAULT_VERDICT = { label: '裁决', variant: 'default' as BadgeProps['variant'] };
+const VERDICT_BADGE: Record<string, { label: string; variant: BadgeProps['variant'] }> = {
+  select: { label: '采纳方案', variant: 'ok' },
+  needs_human: { label: '需要人工', variant: 'human' },
+  request_revision: { label: '要求修改', variant: 'human' },
+  reject: { label: '拒绝', variant: 'danger' },
+};
+
+const REVIEW_BADGE: Record<string, { label: string; variant: BadgeProps['variant'] }> = {
+  approve: { label: '通过', variant: 'ok' },
+  needs_revision: { label: '需修改', variant: 'human' },
+  reject: { label: '拒绝', variant: 'danger' },
+};
+
+const EVENT_LABEL: Record<string, string> = {
+  'council.started': '合议开始',
+  'council.proposal.completed': '提案完成',
+  'council.review.completed': '评审完成',
+  'council.synthesis.completed': '综合完成',
+  'council.decision': '裁决产生',
+  'council.completed': '合议结束',
+  'council.failed': '合议失败',
+};
+
+function ProposalCard({ proposal }: { proposal: CouncilProposalCard }) {
+  return (
+    <div
+      className={cn(
+        'flex flex-col rounded-panel border bg-surface-panel p-4',
+        proposal.selected ? 'border-ok/60 ring-1 ring-ok/40' : 'border-edge',
+      )}
+    >
+      <div className="flex items-start justify-between gap-2">
+        <span className="text-title text-fg-primary">{roleName(proposal.roleId)}</span>
+        {proposal.selected && <Badge variant="ok">已选中</Badge>}
+      </div>
+      <div className="mt-1">
+        <IdChip value={proposal.proposalId} label="提案 ID" />
+      </div>
+
+      {proposal.summary ? (
+        <p className="mt-2 text-body text-fg-secondary">{proposal.summary}</p>
+      ) : (
+        <p className="mt-2 text-body text-fg-muted">提案正文随终态快照到达。</p>
+      )}
+
+      {proposal.reviews.length > 0 && (
+        <div className="mt-3 space-y-1.5">
+          <div className="text-body text-fg-muted">评审</div>
+          {proposal.reviews.map((review) => {
+            const badge = REVIEW_BADGE[review.verdict];
+            return (
+              <div key={review.reviewId} className="rounded-panel border border-edge p-2">
+                <div className="flex items-center gap-2">
+                  {badge ? (
+                    <Badge variant={badge.variant}>{badge.label}</Badge>
+                  ) : (
+                    <Badge>评审中</Badge>
+                  )}
+                  {review.verdict && (
+                    <span className="font-mono text-code text-fg-faint">{review.verdict}</span>
+                  )}
+                </div>
+                {review.reason && (
+                  <p className="mt-1 text-body text-fg-secondary">{review.reason}</p>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {proposal.knownRisks.length > 0 && (
+        <div className="mt-3">
+          <div className="mb-1 flex items-center gap-1 text-body text-danger">
+            <AlertTriangle className="h-3 w-3" /> 已知风险
+          </div>
+          <ul className="space-y-0.5 text-body text-fg-secondary">
+            {proposal.knownRisks.map((risk) => (
+              <li key={risk}>· {risk}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {proposal.affectedPaths.length > 0 && (
+        <div className="mt-3">
+          <div className="mb-1 flex items-center gap-1 text-body text-fg-muted">
+            <FileCode2 className="h-3 w-3" /> 影响文件
+          </div>
+          <div className="flex flex-wrap gap-1">
+            {proposal.affectedPaths.map((path) => (
+              <span
+                key={path}
+                className="rounded-chip bg-surface-raised px-1.5 font-mono text-code text-fg-secondary"
+              >
+                {path}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {proposal.artifactRefs.length > 0 && (
+        <div className="mt-3">
+          <div className="mb-1 flex items-center gap-1 text-body text-fg-muted">
+            <Link2 className="h-3 w-3" /> 产物 ·{' '}
+            <span className="tabular">{proposal.artifactRefs.length}</span>
+          </div>
+          <div className="space-y-1">
+            {proposal.artifactRefs.map((ref) => (
+              <div
+                key={ref}
+                className="truncate rounded-chip border border-edge bg-surface-raised px-2 font-mono text-code text-fg-secondary"
+              >
+                {ref}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PanelTitle({ icon: Icon, children }: { icon: typeof Scale; children: React.ReactNode }) {
   return (
     <div className="flex items-center gap-2 border-b border-edge px-4 py-2 text-title text-fg-secondary">
       <Icon className="h-3.5 w-3.5" />
       {children}
-    </div>
-  );
-}
-
-function ScoreBar({ label, value }: { label: string; value: number }) {
-  return (
-    <div className="flex items-center gap-2">
-      <span className="w-16 shrink-0 text-body text-fg-muted">{label}</span>
-      <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-surface-raised">
-        <div className="h-full rounded-full bg-command" style={{ width: `${value * 10}%` }} />
-      </div>
-      <span className="tabular w-5 shrink-0 text-right text-body text-fg-secondary">{value}</span>
     </div>
   );
 }
