@@ -124,6 +124,9 @@ export type DemoTask = {
   submitError?: string;
   /** 用户在 N0 自报的验收标准（随 TaskCreateRequest.completion_criteria 上送） */
   completionCriteria?: string[];
+  /** 执行方式（run.create 的 mode）。缺失 = single_agent。
+   *  必须存在任务上：retrySubmit 从任务重建提交参数，不存就会掉回单 agent。 */
+  mode?: 'single_agent' | 'council';
   /** 文件写入权限确认结果（tool_event_id → 人选的 outcome），随任务持久化。
    *  可选：兼容旧版存盘文件（缺失按空记录处理） */
   filePermissionOutcomes?: Record<string, FilePermissionOutcome>;

@@ -21,10 +21,13 @@ export function CouncilFold({
   facts,
   eventCount,
   onOpenEvidence,
+  onOpenBoard,
 }: {
   facts: CouncilFacts;
   eventCount: number;
   onOpenEvidence: () => void;
+  /** 打开合议观察面板（提案正文 / 评审意见 / 裁决全景） */
+  onOpenBoard: () => void;
 }) {
   const copyAll = () => {
     void navigator.clipboard?.writeText(JSON.stringify(facts, null, 2));
@@ -69,6 +72,13 @@ export function CouncilFold({
           <KeyValue key={action} k={i === 0 ? '后续动作' : ''} v={action} />
         ))}
       </KeyValueList>
+      <button
+        type="button"
+        onClick={onOpenBoard}
+        className="mt-1 rounded-chip px-1 py-0.5 text-body text-command-soft transition-colors hover:bg-surface-raised"
+      >
+        打开合议面板 →
+      </button>
     </Fold>
   );
 }

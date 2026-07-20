@@ -54,7 +54,7 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
       };
     }),
 
-  createTask: (rawText, title, completionCriteria) => {
+  createTask: (rawText, title, completionCriteria, mode) => {
     const text = rawText.trim();
     if (!text) return { ok: false, error: '需求内容不能为空。' };
     const state = get();
@@ -75,13 +75,11 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
       : state.tasks;
     // N1 Triage：读需求 → 建议角色/组队（C 的职责）。团队随任务创建（createRequirementTask
     // 内部按需求推荐），由 taskToState 带入实时状态；输入需求后直接进 Task Board 看分析。
-    const newTask = createRequirementTask(
-      uid('task'),
-      state.activeProjectId,
-      text,
-      title,
-      completionCriteria,
-    );
+    const newTask = {
+      ...createRequirementTask(uid('task'), state.activeProjectId, text, title, completionCriteria),
+      // 执行方式存在任务上：retrySubmit 要靠它重建提交参数
+      ...(mode ? { mode } : {}),
+    };
     set({
       tasks: [...persisted, newTask],
       activeTaskId: newTask.id,
@@ -104,6 +102,7 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
     void bindBackendWorkspace(project)
       .then(() =>
         apiCreateRun(toTaskCreateRequest(text, completionCriteria), {
+          ...(mode ? { mode } : {}),
           projectId: state.activeProjectId ?? undefined,
           clientTaskId: newTask.id,
           title: newTask.title,
@@ -169,6 +168,7 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
     try {
       await bindBackendWorkspace(project);
       const created = await apiCreateRun(toTaskCreateRequest(text, task.completionCriteria), {
+        ...(task.mode ? { mode: task.mode } : {}),
         projectId: task.projectId,
         clientTaskId: task.id,
         title: task.title,
@@ -253,7 +253,8 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
     const replay = buildLiveProgressReplay(events, {
       runId,
       taskId: first.task_id,
-      mode: task.replay?.meta.mode ?? 'single_agent',
+      // replay 是自引用（上一轮 progress replay），run 刚开始时它还没有 —— 先信任务上存的执行方式
+      mode: task.replay?.meta.mode ?? task.mode ?? 'single_agent',
       status: runStatus,
     });
 

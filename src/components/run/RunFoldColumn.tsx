@@ -6,6 +6,7 @@ import { CouncilFold } from '@/components/run/folds/CouncilFold';
 import { DeliveryFold } from '@/components/run/folds/DeliveryFold';
 import { MachineHandshakeFold } from '@/components/run/folds/MachineHandshakeFold';
 import { NeedsYouFold } from '@/components/run/folds/NeedsYouFold';
+import { ProtocolFlowFold } from '@/components/run/folds/ProtocolFlowFold';
 import { RequirementFold } from '@/components/run/folds/RequirementFold';
 import { RunInfoFold } from '@/components/run/folds/RunInfoFold';
 import { StepFold } from '@/components/run/folds/StepFold';
@@ -19,6 +20,7 @@ import {
   machineSteps,
   runMetaOf,
 } from '@/lib/runFacts';
+import { projectProtocolFlow } from '@/lib/protocolFlow';
 import { runStateOf } from '@/lib/runState';
 import { useResizablePane } from '@/lib/useResizablePane';
 import { selectActiveLiveRun, useDemoStore } from '@/store/useDemoStore';
@@ -32,8 +34,9 @@ const NARROW = '(max-width: 1119px)';
 
 /**
  * 右栏 —— **没有标题、没有 tab，就是一列 Fold**，顺序固定：
- * 步骤 / 产出文件 / 需要你 / 议会 / 交付 / 机器握手 / 需求 / 运行信息。
- * （议会只在 council 事件真的发生过时出现 —— 单 agent run 没有这一条。）
+ * 步骤 / 产出文件 / 需要你 / 议会 / 交付 / 机器握手 / 协议流程 / 需求 / 运行信息。
+ * （议会只在 council 事件真的发生过时出现 —— 单 agent run 没有这一条；
+ * 协议流程是 N0–N18 的事件点亮图，只在有真实 run 时出现。）
  *
  * 它取代的是：`LiveRunPanel`（把 L1 的工作区路径和 L3 的 22 条事件焊在一起）、
  * `NodeInspector`（标题写死「节点详情」，里面却四选一渲染 —— 标题在说谎）、
@@ -49,6 +52,7 @@ export function RunFoldColumn() {
   // 并发跑第二个需求时，会把另一次 run 的状态/事件数安在当前任务头上。
   const live = useDemoStore(selectActiveLiveRun);
   const openEvidence = useDemoStore((s) => s.openEvidence);
+  const setPage = useDemoStore((s) => s.setPage);
 
   const { size, collapsed, setCollapsed, onResizeStart } = useResizablePane({
     side: 'right',
@@ -175,6 +179,9 @@ export function RunFoldColumn() {
                 facts={council}
                 eventCount={countOf(idOfStep('council'))}
                 onOpenEvidence={openStepOrAll('council')}
+                onOpenBoard={() => {
+                  setPage('council');
+                }}
               />
             )}
 
@@ -199,6 +206,16 @@ export function RunFoldColumn() {
                 eventsByNodeId={byNode}
                 onOpenEvidence={openStep}
                 onOpenAllEvidence={() => {
+                  openEvidence(null);
+                }}
+              />
+            )}
+
+            {live && timeline.length > 0 && (
+              <ProtocolFlowFold
+                nodes={projectProtocolFlow(timeline, live.status)}
+                eventCount={timeline.length}
+                onOpenEvidence={() => {
                   openEvidence(null);
                 }}
               />

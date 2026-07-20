@@ -10,6 +10,11 @@ export const ROLE_NAMES: Record<string, string> = {
   test_engineer: '测试工程师',
   security_auditor: '安全审计',
   role_ts_engineer: 'TypeScript 工程师',
+  // 合议的三类角色（BCD synthesis-agent-provider 的 role_id 原文）
+  proposer_a: '提案者 A',
+  proposer_b: '提案者 B',
+  reviewer: '评审员',
+  synthesizer: '综合员',
 };
 
 /** 缺失 → 'Agent'（不回落到蛇形 id）。 */
