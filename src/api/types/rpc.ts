@@ -8,6 +8,7 @@
  * （`coordinator.frontend_run_snapshot.v0`，供 mock 剧本回放用）；本文件建模的是
  * `run.getSnapshot` 通过 RPC 实时返回的形状。两者不同，不要混用。
  */
+import type { CouncilVerdict } from './council';
 
 /** run.event 的来源方向（由 event.type 前缀推导，见后端 projectRunEventSource）。 */
 export type RunEventSource = 'coordinator' | 'agent' | 'driver' | 'memory' | 'gate' | 'council';
@@ -131,7 +132,16 @@ export interface RunSnapshot {
     enabled: true;
     status: RunStatus;
     decision_id?: string;
-    verdict?: string;
+    /**
+     * 与契约镜像锚在同一个类型上（见 ./council 的 `CouncilVerdict`）——
+     * 后端改裁决词表，这里和消费它的 UI 词表会**一起**编译不过。
+     *
+     * 边界仍然是不可信 JSON：类型是「后端声称会发什么」，不是运行时保证。
+     * 所以消费方（pages/CouncilBoard.tsx）对词表外的值保留运行时兜底，不崩在陌生字符串上。
+     * 同理，`proposals` / `reviews` / `synthesis` 这些**整体形状未定的嵌套记录**
+     * 保持 `Record<string, unknown>`，由消费方逐字段防御性取值 —— 只给标量枚举收紧。
+     */
+    verdict?: CouncilVerdict;
     decision_mode?: string;
     selected_proposal_id?: string;
     selected_artifact_refs: string[];

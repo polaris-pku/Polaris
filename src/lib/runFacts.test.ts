@@ -325,9 +325,11 @@ describe('runFacts · Council', () => {
   });
 
   it('决议字段来自 council.decision；快照到达后以快照为准', () => {
+    // verdict 取值一律用后端真实词表（select / needs_human / request_revision / reject）——
+    // 编过的值（'approved' / 'needs_iteration'）会让测试看起来通过，却证明不了任何真事。
     const timeline = [
       event('council.decision', {
-        verdict: 'approved',
+        verdict: 'select',
         decision_mode: 'advisory',
         selected_proposal_id: 'prop-1',
       }),
@@ -335,7 +337,7 @@ describe('runFacts · Council', () => {
     ];
     const eventsOnly = councilFactsOf(liveRun(timeline));
     expect(eventsOnly?.status).toBe('completed');
-    expect(eventsOnly?.verdict).toBe('approved');
+    expect(eventsOnly?.verdict).toBe('select');
     expect(eventsOnly?.selectedProposalId).toBe('prop-1');
 
     const snapshot = {
@@ -343,7 +345,7 @@ describe('runFacts · Council', () => {
       council: {
         enabled: true as const,
         status: 'completed' as const,
-        verdict: 'needs_iteration',
+        verdict: 'request_revision' as const,
         decision_mode: 'binding',
         selected_proposal_id: 'prop-2',
         selected_artifact_refs: [],
@@ -356,7 +358,7 @@ describe('runFacts · Council', () => {
       },
     };
     const withSnapshot = councilFactsOf(liveRun(timeline, snapshot));
-    expect(withSnapshot?.verdict).toBe('needs_iteration');
+    expect(withSnapshot?.verdict).toBe('request_revision');
     expect(withSnapshot?.decisionMode).toBe('binding');
     expect(withSnapshot?.selectedProposalId).toBe('prop-2');
     expect(withSnapshot?.proposalCount).toBe(2);

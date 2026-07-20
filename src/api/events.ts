@@ -12,9 +12,9 @@
  *
  * ── 两套消费者 ──
  * - `onRunEvent`：拿后端原样的 `RunEvent`（带 sequence/source），真实 run 的驱动源。
- * - `onEvent`：拿收敛成前端既有 `Event` 形状的同一批事件，喂给观测窗口
- *   （backendEvents）。mock 剧本用 `emitLocalEvent` 走同一条消费链路 ——
- *   订阅方无需感知 mock 与否。
+ * - `onEvent`：拿收敛成前端既有 `Event` 形状的同一批事件，喂给观测窗口（backendEvents）。
+ *   （曾经还有一个 `emitLocalEvent` 让 mock 剧本走同一条消费链路，已随 mock 推进引擎删除；
+ *   现在这条链路上的每一条事件都来自后端。）
  *
  * E 的职责边界：只接收与呈现，不确认、不重放、不参与事件持久化（C 负责 persist）。
  */

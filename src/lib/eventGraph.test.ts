@@ -27,7 +27,7 @@ describe('eventGraph · council 事件归桶', () => {
       event('council.proposal.completed', { proposal_id: 'prop-1' }),
       event('council.review.completed', { review_ids: ['rev-1'] }),
       event('council.synthesis.completed', { synthesis_id: 'syn-1' }),
-      event('council.decision', { verdict: 'approved' }),
+      event('council.decision', { verdict: 'select' }),
       event('council.completed', {}),
     ];
     const groups = groupEvents(timeline);
@@ -56,12 +56,12 @@ describe('eventGraph · council 事件归桶', () => {
       event('council.proposal.completed', { proposal_id: 'prop-2' }),
       event('council.review.completed', { review_ids: ['rev-1'] }),
       event('council.synthesis.completed', { synthesis_id: 'syn-1' }),
-      event('council.decision', { verdict: 'approved' }),
+      event('council.decision', { verdict: 'select' }),
       event('council.completed', {}),
     ];
     const { nodes } = buildEventGraph(timeline, 'completed');
     const council = nodes.find((n) => stepOfNode(n.id) === 'council');
-    expect(council?.summary).toBe('裁决 approved · 提案 2 · 评审 1 · 综合完成');
+    expect(council?.summary).toBe('裁决 select · 提案 2 · 评审 1 · 综合完成');
   });
 });
 

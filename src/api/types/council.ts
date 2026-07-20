@@ -26,11 +26,17 @@ export interface Proposal {
   schema_version: SchemaVersion;
 }
 
+/**
+ * 评审结论。与 `packages/newide-bcd/src/council/contract.ts` 的 Review 逐字对齐。
+ * 单独命名是为了让 UI 词表能锚在它上面 —— 后端改词表，前端编译期就红。
+ */
+export type ReviewVerdict = 'approve' | 'reject' | 'needs_revision';
+
 export interface Review {
   review_id: string;
   proposal_id: string;
   reviewer_id: string;
-  verdict: 'approve' | 'reject' | 'needs_revision';
+  verdict: ReviewVerdict;
   reason: string;
   created_at: Timestamp;
   schema_version: SchemaVersion;
@@ -45,18 +51,22 @@ export interface EvidencePack {
   schema_version: SchemaVersion;
 }
 
+/**
+ * 合议裁决取值。与 `packages/newide-bcd/src/council/contract.ts` 的 CouncilDecision 逐字对齐。
+ *
+ * 曾经写作 `'accept' | 'reject' | 'defer'` —— 后端从来没发过这三个值中的任何一个；
+ * 2026-07-20 实跑一条 council run 抓到的真实取值是 `select`，压根不在旧联合里。
+ * 单独命名是为了让 RPC 快照字段与 UI 词表锚在**同一个**类型上，两端一起动。
+ */
+export type CouncilVerdict = 'select' | 'needs_human' | 'request_revision' | 'reject';
+
 /** v0 权威决策形状（council/contract.ts）。前端前瞻的富形状见下方 `DecisionPacket`。 */
 export interface CouncilDecision {
   decision_id: string;
   run_id: RunId;
   task_id: TaskId;
   selected_proposal_id?: string;
-  /**
-   * 与 `packages/newide-bcd/src/council/contract.ts` 的 CouncilDecision 逐字对齐。
-   * 曾经写作 `'accept' | 'reject' | 'defer'` —— 后端从来没发过这三个值中的任何一个；
-   * 2026-07-20 实跑一条 council run 抓到的真实取值是 `select`，压根不在旧联合里。
-   */
-  verdict: 'select' | 'needs_human' | 'request_revision' | 'reject';
+  verdict: CouncilVerdict;
   reason: string;
   evidence_refs: string[];
   created_at: Timestamp;
