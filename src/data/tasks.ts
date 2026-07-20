@@ -1,6 +1,6 @@
 import type { DemoTask, WorkflowNodeData } from '@/types';
 import { workflowNodes as baseWorkflowNodes } from '@/data/workflow';
-import { recommendAgents } from '@/data/scenario';
+import { recommendAgents } from '@/data/agentRecommendation';
 
 const cloneNodes = (): WorkflowNodeData[] =>
   baseWorkflowNodes.map((n) => ({

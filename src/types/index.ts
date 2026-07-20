@@ -15,7 +15,6 @@ import type {
 // 仅类型引用（编译期擦除），不构成运行时循环依赖
 import type { RunSnapshot as RpcRunSnapshot } from '@/api/types/rpc';
 import type { PhaseKey } from '@/data/workflow';
-import type { Scenario } from '@/data/scenario';
 
 export type PageKey = 'agents' | 'tasks' | 'council' | 'file';
 
@@ -78,6 +77,8 @@ export type RunReplay = {
     taskId: string;
     mode: string;
     status: string;
+    /** 本次 run 的需求原文（实时取 task.created.spec，终态取 snapshot.task.spec） */
+    spec: string;
     /** 后端未必给（要从 driver.session_started 事件里取） */
     driverId?: string;
   };
@@ -93,8 +94,6 @@ export type RunReplay = {
   nodeEvents: Record<string, ContractEvent[]>;
   /** 节点 id → 文件操作观测流（替换 data/fileops.ts 的 mock 剧本；含后缀 id） */
   nodeFileOps: Record<string, FileOpObservation[]>;
-  /** 场景内容（需求分析/议会/交付报告），全部由后端事件与快照派生（见 lib/liveReplay.ts） */
-  scenario: Scenario;
   /** 本次 run 的 Gate 实际走向；allow = 未升级 Council，推进时直通 N14 */
   gateDecision: GateDecision;
 };
@@ -156,7 +155,7 @@ export type AgentStatus = AgentLifecycle;
  * 形状对齐 BCD `agent-board-query.ts` 的 `AgentBoardAgentView`（+ 懒加载的技能/经验列表）。
  * 运行态 session/worktree/lease 属 A/C，不在 Agent Board 展示。
  *
- * `id` 是 E 侧稳定句柄（store/scenario 用）；`role_id` 是 B 契约身份键。
+ * `id` 是 E 侧稳定句柄（store 与团队推荐用）；`role_id` 是 B 契约身份键。
  */
 export type Agent = {
   id: string;
@@ -269,18 +268,6 @@ export type WorkflowNodeData = {
   nextAction: string;
 };
 
-export type CouncilOption = {
-  id: string;
-  title: string;
-  proposedBy: string;
-  summary: string;
-  pros: string[];
-  risks: string[];
-  impactedFiles: string[];
-  scores: Record<string, number>;
-  recommended?: boolean;
-};
-
 export type InterventionScope =
   | 'current_step'
   | 'current_agent'
@@ -291,13 +278,6 @@ export type InterventionRule = {
   text: string;
   scope: InterventionScope;
   affectedAgents: string[];
-};
-
-export type DiscussionMessage = {
-  agent: string;
-  role: string;
-  message: string;
-  accent: 'backend' | 'test' | 'security' | 'system';
 };
 
 export type LogLevel = 'info' | 'success' | 'warning' | 'council';

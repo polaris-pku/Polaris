@@ -290,7 +290,7 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
 
     const nextTask = {
       ...task,
-      taskText: replay.scenario.subject,
+      taskText: replay.meta.spec,
       assignedAgentIds: projection.agents,
       stage: projection.stage,
       analysisReady: true,

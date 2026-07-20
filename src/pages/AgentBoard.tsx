@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { ArrowRight, Users2, CheckCircle2, Sparkles, FilePlus2 } from 'lucide-react';
 import { agents, getAgentById } from '@/data/agents';
-import { recommendAgents } from '@/data/scenario';
+import { recommendAgents } from '@/data/agentRecommendation';
 import { useDemoStore } from '@/store/useDemoStore';
 import { AgentCard } from '@/components/AgentCard';
 import { AgentDetailPanel } from '@/components/AgentDetailPanel';

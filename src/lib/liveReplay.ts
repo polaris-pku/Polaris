@@ -2,7 +2,7 @@
  * 用**本次真实后端 run** 的数据驱动整个界面。
  *
  * 图由事件生成（见 lib/eventGraph.ts）——触发了什么就展示什么。这里负责把同一批事件
- * 派生成界面各处要的东西：节点日志 / 执行日志 / Inspector 事实 / 事件通道 / 场景 / Gate 走向。
+ * 派生成界面各处要的东西：节点日志 / 执行日志 / Inspector 事实 / 事件通道 / Gate 走向。
  * 所有 per-node 数据都**按事件图的节点 id 键控**，与泳道图一一对应。
  *
  * 铁律：**后端给什么展示什么**。
@@ -14,7 +14,6 @@ import type { RunEvent, RunSnapshot, FrontendWorkflowV01Snapshot } from '@/api/t
 import { isFrontendWorkflowV01 } from '@/api/types/rpc';
 import type { Event as ContractEvent } from '@/api/types';
 import { buildEventGraph, groupEvents, type LiveRunStatus } from '@/lib/eventGraph';
-import { councilFactsFrom } from '@/lib/runFacts';
 import type {
   GateDecision,
   LogEntry,
@@ -25,7 +24,6 @@ import type {
   RunReplay,
   TimelineCheckpoint,
 } from '@/types';
-import type { Scenario } from '@/data/scenario';
 
 /** ISO → HH:MM:SS（事件都带 created_at，时间戳是后端给的真值） */
 const hms = (iso: string) => iso.slice(11, 19);
@@ -175,17 +173,12 @@ export function buildLiveProgressReplay(
       })),
     ];
   }
-  const liveRisks = Array.isArray(liveHandoff.known_risks)
-    ? liveHandoff.known_risks.map(String)
-    : [];
-
-  // 议会（事件先行）：council.* 事件到达即渲染，不等终态快照。
-  const council = councilFactsFrom(events);
-
   return {
     source: 'live',
     meta: {
       ...meta,
+      // task.created 还没到时退回 taskId —— 界面上宁可显示一个 id，也不显示空白标题
+      spec: spec ?? meta.taskId,
       driverId: events
         .filter((e) => e.type === 'driver.session_started')
         .map((e) => str(asRecord(e.payload).driver_id, ''))
@@ -196,59 +189,6 @@ export function buildLiveProgressReplay(
     nodeFacts,
     nodeEvents,
     nodeFileOps: {},
-    scenario: {
-      subject: spec ?? meta.taskId,
-      domain: `${meta.mode} · run=${meta.status}`,
-      understanding: {
-        goal: spec ?? '—',
-        modules: [], // 产物路径要等快照，运行中还不知道 —— 留空而不是编造
-        testDir: '—',
-        risks: liveRisks,
-        workflow: meta.mode,
-      },
-      council: council
-        ? {
-            context: {
-              title: `Council · ${council.status}`,
-              description:
-                [
-                  council.verdict && `verdict=${council.verdict}`,
-                  council.proposalCount > 0 && `提案 ${String(council.proposalCount)}`,
-                  council.reviewCount > 0 && `评审 ${String(council.reviewCount)}`,
-                  council.synthesisDone && '综合完成',
-                  council.failedCode && `失败 ${council.failedCode}`,
-                ]
-                  .filter(Boolean)
-                  .join(' · ') || '议会进行中',
-              decisionMode: council.decisionMode || '—',
-              councilId: council.selectedProposalId || '—',
-            },
-            discussion: [],
-            options: [],
-            evidenceRefs: [],
-            riskSignals: [],
-            recommendedReason: '—',
-          }
-        : {
-            context: {
-              title: '本次 run 未触发 Council',
-              description: '运行中；如触发 Council，事件到达后此处会更新。',
-              decisionMode: '—',
-              councilId: '—',
-            },
-            discussion: [],
-            options: [],
-            evidenceRefs: [],
-            riskSignals: [],
-            recommendedReason: '—',
-          },
-      delivery: {
-        summary: `run.status=${meta.status} · mode=${meta.mode}（执行中，交付数据待 run 结束）`,
-        changedFiles: [],
-        testResult: { passed: 0, failed: 0, coverageDelta: '—' },
-        riskNotes: liveRisks,
-      },
-    },
     gateDecision,
   };
 }
@@ -323,65 +263,6 @@ export function buildLiveRunReplay(snapshot: RunSnapshot): RunReplay | null {
     else attach('council.failed', councilRows);
   }
 
-  const producedFiles = liveProducedFiles(snapshot);
-
-  const scenario: Scenario = {
-    subject: snapshot.task.spec,
-    domain: `${snapshot.run.mode} · run=${snapshot.run.status}`,
-    understanding: {
-      goal: snapshot.task.spec,
-      modules: producedFiles.map((path) => path.split('/').pop() ?? path),
-      testDir: '—',
-      risks: Array.isArray(handoff.known_risks) ? handoff.known_risks.map(String) : [],
-      workflow: snapshot.run.mode,
-    },
-    council: snapshot.council
-      ? {
-          context: {
-            title: `Council · ${snapshot.council.status}`,
-            description: [
-              `verdict=${snapshot.council.verdict ?? '—'}`,
-              `decision_mode=${snapshot.council.decision_mode ?? '—'}`,
-              snapshot.council.proposals?.length &&
-                `提案 ${String(snapshot.council.proposals.length)}`,
-              snapshot.council.reviews?.length && `评审 ${String(snapshot.council.reviews.length)}`,
-              snapshot.council.synthesis && '综合完成',
-            ]
-              .filter(Boolean)
-              .join(' · '),
-            decisionMode: snapshot.council.decision_mode ?? '—',
-            councilId: snapshot.council.decision_id ?? '—',
-          },
-          discussion: [],
-          options: [],
-          evidenceRefs: snapshot.council.selected_artifact_refs,
-          riskSignals: snapshot.council.blocked_by,
-          recommendedReason: '—',
-        }
-      : {
-          context: {
-            title: '本次 run 未触发 Council',
-            description: '快照中无 Council 数据（Gate 后直接进入合并段）。',
-            decisionMode: '—',
-            councilId: '—',
-          },
-          discussion: [],
-          options: [],
-          evidenceRefs: [],
-          riskSignals: [],
-          recommendedReason: '—',
-        },
-    delivery: {
-      summary:
-        `run.status=${snapshot.status} · mode=${snapshot.run.mode} · ` +
-        `artifacts_materialized=${String(report.artifacts_materialized)}` +
-        (snapshot.errors.length ? ` · errors=${snapshot.errors.map((e) => e.code).join(',')}` : ''),
-      changedFiles: producedFiles,
-      testResult: { passed: 0, failed: 0, coverageDelta: '—' },
-      riskNotes: Array.isArray(handoff.known_risks) ? handoff.known_risks.map(String) : [],
-    },
-  };
-
   const gateDecision: GateDecision = snapshot.gates
     .map((gate) => str(asRecord(gate).decision, ''))
     .includes('defer')
@@ -395,6 +276,7 @@ export function buildLiveRunReplay(snapshot: RunSnapshot): RunReplay | null {
       taskId: snapshot.task_id,
       mode: snapshot.run.mode,
       status: snapshot.status,
+      spec: snapshot.task.spec,
       driverId: snapshot.timeline
         .filter((e) => e.type === 'driver.session_started')
         .map((e) => str(asRecord(e.payload).driver_id, ''))
@@ -407,7 +289,6 @@ export function buildLiveRunReplay(snapshot: RunSnapshot): RunReplay | null {
     nodeEvents,
     // 后端未提供 A 方向的工具事件流（fs/* 操作观测）→ 不虚构文件操作剧本
     nodeFileOps: {},
-    scenario,
     gateDecision,
   };
 }
