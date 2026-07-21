@@ -10,6 +10,7 @@
  * 所以重复调用不会引起无谓的重启。
  */
 import type { Project } from '@/types';
+import { getTransport } from '@/api/transport';
 
 /**
  * 把 agent 工作区绑到某个项目，并等后端就绪。
@@ -29,4 +30,19 @@ export async function bindBackendWorkspace(project: Project | undefined): Promis
     console.warn('[backend] 绑定 agent 工作区失败：', err);
     return false;
   }
+}
+
+/** 绑定并返回后端确认过的绝对工作区，供每次 run.create 持久化。 */
+export async function requireBackendWorkspace(project: Project | undefined): Promise<string> {
+  const transport = getTransport();
+  if (transport.kind === 'mock') return project?.rootPath ?? '/';
+
+  const bound = await bindBackendWorkspace(project);
+  if (!bound) throw new Error('后端工作区绑定失败');
+
+  const status = await transport.getStatus();
+  if (status.state !== 'ready' || !status.workspace) {
+    throw new Error(status.message || '后端没有返回有效的工作区路径');
+  }
+  return status.workspace;
 }

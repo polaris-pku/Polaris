@@ -171,6 +171,7 @@ export function isFrontendWorkflowV01(
 
 export interface RunCreateParams {
   prompt: string;
+  workspace_path: string;
   mode?: RunMode;
   project_id?: string;
   client_task_id?: string;

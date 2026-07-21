@@ -39,6 +39,7 @@ export interface CreatedRun {
 }
 
 export interface CreateRunOptions {
+  workspacePath: string;
   mode?: RunMode;
   projectId?: string;
   clientTaskId?: string;
@@ -53,7 +54,7 @@ export interface CreateRunOptions {
  */
 export async function createRun(
   req: TaskCreateRequest,
-  options: CreateRunOptions = {},
+  options: CreateRunOptions,
 ): Promise<CreatedRun> {
   let created: RunCreateResult;
   try {

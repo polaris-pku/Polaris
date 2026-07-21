@@ -85,7 +85,8 @@ export function toTaskCreateRequest(
 /**
  * `TaskCreateRequest` → 后端 `run.create` 入参（**有损收敛**）。
  *
- * 后端当前只吃 `{prompt, mode?}`：`project_id` / `client_task_id` / `title` 虽然能通过
+ * 后端当前要求 `{prompt, workspace_path, mode?}`：工作区必须来自刚完成的后端绑定；
+ * `project_id` / `client_task_id` / `title` 虽然能通过
  * zod 校验，但 coordinator runner 拿到后直接忽略；`completion_criteria` / `risk_level` /
  * `budget` / `affected_paths` / `role_id` 后端**根本不收**，只存在于前端本地状态。
  *
@@ -94,14 +95,16 @@ export function toTaskCreateRequest(
 export function toRunCreateParams(
   req: TaskCreateRequest,
   options: {
+    workspacePath: string;
     mode?: RunMode;
     projectId?: string;
     clientTaskId?: string;
     title?: string;
-  } = {},
+  },
 ): RunCreateParams {
   return {
     prompt: req.spec,
+    workspace_path: options.workspacePath,
     ...(options.mode ? { mode: options.mode } : {}),
     ...(options.projectId ? { project_id: options.projectId } : {}),
     ...(options.clientTaskId ? { client_task_id: options.clientTaskId } : {}),

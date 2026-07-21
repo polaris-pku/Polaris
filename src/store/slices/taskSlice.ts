@@ -4,7 +4,7 @@ import { createRequirementTask } from '@/data/tasks';
 import { createRun as apiCreateRun } from '@/api/client';
 import { unwatchRun, watchRun } from '@/api/events';
 import { toTaskCreateRequest } from '@/api/map';
-import { bindBackendWorkspace } from '@/lib/backendWorkspace';
+import { requireBackendWorkspace } from '@/lib/backendWorkspace';
 import { readProjectFolder } from '@/lib/agentFs';
 import { buildLiveProgressReplay, buildLiveRunReplay, liveProducedFiles } from '@/lib/liveReplay';
 import { projectLiveBoard } from '@/lib/liveBoard';
@@ -102,9 +102,10 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
     // 写进**别的项目目录** —— 而界面上完全看不出来：run 照样 completed，产物却不在你的项目里。
     // 曾实测到：用户在 A 项目提的需求，文件落到了 B 项目下。
     const project = state.projects.find((p) => p.id === state.activeProjectId);
-    void bindBackendWorkspace(project)
-      .then(() =>
+    void requireBackendWorkspace(project)
+      .then((workspacePath) =>
         apiCreateRun(toTaskCreateRequest(text, completionCriteria), {
+          workspacePath,
           mode,
           projectId: state.activeProjectId ?? undefined,
           clientTaskId: newTask.id,
@@ -169,8 +170,9 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
     const project = state.projects.find((p) => p.id === task.projectId);
 
     try {
-      await bindBackendWorkspace(project);
+      const workspacePath = await requireBackendWorkspace(project);
       const created = await apiCreateRun(toTaskCreateRequest(text, task.completionCriteria), {
+        workspacePath,
         projectId: task.projectId,
         clientTaskId: task.id,
         title: task.title,
