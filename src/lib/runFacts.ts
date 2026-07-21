@@ -69,8 +69,8 @@ export type ArtifactFacts = { count: number; files: ArtifactFile[] };
 
 const baseName = (p: string): string => p.split(/[\\/]/).filter(Boolean).pop() ?? p;
 
-/** 快照里 agent 真正写进工作区的文件（artifacts[type=diff].source_path，绝对路径）。 */
-function producedAbsPaths(snapshot: RunSnapshot): string[] {
+/** 快照里 agent 真正写进用户工作区的文件（可为相对 workspace 的路径）。 */
+function producedSourcePaths(snapshot: RunSnapshot): string[] {
   return snapshot.artifacts
     .map((artifact) => asRecord(artifact))
     .filter((artifact) => str(artifact.type) === 'diff')
@@ -128,7 +128,8 @@ function diffArtifactNames(timeline: RunEvent[]): string[] {
 }
 
 /**
- * 产出文件：**快照在 → `delivery_report.files_written`（string[]，路径）；
+ * 产出文件：**快照在 → 优先 `artifacts[type=diff].source_path`（用户 workspace 路径）；
+ * 没有 diff artifact 才回退 `delivery_report.files_written`（内部物化路径）；
  * 快照未到 → `worktree.materialized.payload.files_written`（number，直接当数字用）。**
  */
 export function artifactFactsOf(live: LiveRunState | undefined): ArtifactFacts {
@@ -136,21 +137,28 @@ export function artifactFactsOf(live: LiveRunState | undefined): ArtifactFacts {
 
   const snapshot = live.snapshot;
   if (snapshot && isFrontendWorkflowV01(snapshot)) {
-    const abs = producedAbsPaths(snapshot);
+    const sources = producedSourcePaths(snapshot);
+    if (sources.length > 0) {
+      return {
+        count: sources.length,
+        files: sources.map((sourcePath) => ({
+          label: sourcePath,
+          ...(/^(?:\/|[A-Za-z]:[\\/])/.test(sourcePath) ? { absPath: sourcePath } : {}),
+        })),
+      };
+    }
+
     const written = snapshot.delivery_report.files_written;
     if (written.length > 0) {
       return {
         count: written.length,
         files: written.map((path) => ({
           label: path,
-          absPath:
-            (/^(?:\/|[A-Za-z]:[\\/])/.test(path) ? path : undefined) ??
-            abs.find((a) => a === path || baseName(a) === baseName(path)),
+          ...(/^(?:\/|[A-Za-z]:[\\/])/.test(path) ? { absPath: path } : {}),
         })),
       };
     }
-    // files_written 为空但产物里有代码文件 —— 两者都来自同一份快照，取能点开的那个
-    return { count: abs.length, files: abs.map((a) => ({ label: baseName(a), absPath: a })) };
+    return { count: 0, files: [] };
   }
 
   // 快照未到：名字优先取 worktree.materialized 的 changed_files（真数组），
