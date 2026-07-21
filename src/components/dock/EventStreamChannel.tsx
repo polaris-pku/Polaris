@@ -35,7 +35,7 @@ export function EventStreamChannel() {
     : '';
 
   return (
-    <div className="flex h-full flex-col bg-surface-void">
+    <div className="flex h-full flex-col bg-black">
       <header className="flex shrink-0 items-center gap-2 border-b border-edge px-3 py-2">
         <span className="callsign text-micro text-fg-muted">EVENTS</span>
         <span className="text-body text-fg-secondary">

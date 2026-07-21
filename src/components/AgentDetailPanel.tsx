@@ -26,7 +26,7 @@ type Props = {
 export function AgentDetailPanel({ agent, assigned, onAssign, showAssign = true }: Props) {
   if (!agent) {
     return (
-      <div className="flex h-full items-center justify-center">
+      <div className="flex h-full items-center justify-center bg-black">
         <EmptyState
           icon={UserCircle2}
           title="选择左侧任意 Agent"
@@ -41,7 +41,7 @@ export function AgentDetailPanel({ agent, assigned, onAssign, showAssign = true 
 
   return (
     // key=agent.id：切换 Agent 时重置各折叠区开合
-    <div key={agent.id} className="flex h-full flex-col">
+    <div key={agent.id} className="flex h-full flex-col bg-black">
       {/* 头部：身份 + persona 摘要（常驻） */}
       <div className="border-b border-edge p-4">
         <div className="flex items-center gap-3">

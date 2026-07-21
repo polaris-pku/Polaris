@@ -57,7 +57,7 @@ export function TerminalChannel() {
 
   if (!terminalAvailable()) {
     return (
-      <div className="flex h-full items-center justify-center bg-surface-void">
+      <div className="flex h-full items-center justify-center bg-black">
         <p className="text-body text-fg-muted">终端仅在桌面版可用。</p>
       </div>
     );
@@ -66,8 +66,8 @@ export function TerminalChannel() {
   const active = sessions.find((s) => s.sessionId === activeSessionId) ?? null;
 
   return (
-    <div className="flex h-full flex-col bg-surface-void">
-      <div className="flex h-8 shrink-0 items-center gap-1 border-b border-edge bg-surface-deck px-2">
+    <div className="flex h-full flex-col bg-black">
+      <div className="flex h-8 shrink-0 items-center gap-1 border-b border-edge bg-black px-2">
         <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto">
           {sessions.map((s) => (
             <div

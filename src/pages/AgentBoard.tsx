@@ -176,6 +176,7 @@ export function AgentBoard() {
         minWidth={300}
         maxWidth={560}
         storageKey="agent-detail"
+        className="bg-black"
       >
         <AgentDetailPanel
           agent={selectedAgent}
