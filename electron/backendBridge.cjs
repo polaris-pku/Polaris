@@ -47,6 +47,12 @@ const RPC_METHODS = [
   'run.subscribe',
   'run.unsubscribe',
   'run.cancel',
+  'memory.listAgents',
+  'memory.getAgent',
+  'memory.listSkills',
+  'memory.listExperiences',
+  'memory.listMaintenance',
+  'memory.promoteSkills',
 ];
 
 /** @type {import('child_process').ChildProcess | null} */

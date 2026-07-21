@@ -4,6 +4,7 @@ import { Dialog } from '@/components/ui/Dialog';
 import { Button } from '@/components/ui/Button';
 import { Textarea } from '@/components/ui/Textarea';
 import { useDemoStore } from '@/store/useDemoStore';
+import type { RunMode } from '@/api/types/rpc';
 
 /**
  * 新建需求 —— **这是新用户的正门**。
@@ -15,6 +16,7 @@ export function NewRequirementDialog({ open, onClose }: { open: boolean; onClose
   const [text, setText] = useState('');
   const [title, setTitle] = useState('');
   const [criteria, setCriteria] = useState('');
+  const [mode, setMode] = useState<RunMode>('council');
   const [error, setError] = useState<string | null>(null);
 
   const canSubmit = text.trim().length > 0;
@@ -23,6 +25,7 @@ export function NewRequirementDialog({ open, onClose }: { open: boolean; onClose
     setText('');
     setTitle('');
     setCriteria('');
+    setMode('council');
     setError(null);
   };
 
@@ -35,7 +38,7 @@ export function NewRequirementDialog({ open, onClose }: { open: boolean; onClose
     if (!canSubmit) return;
     // 提交可能被拒（别的项目还有 run 在跑 —— 绑定工作区会杀掉它）。
     // 被拒时**不要关对话框**：把原因摆在用户眼前，他输入的内容也原样留着。
-    const result = createTask(text, title, criteria.split('\n'));
+    const result = createTask(text, title, criteria.split('\n'), mode);
     if (!result.ok) {
       setError(result.error);
       return;
@@ -75,6 +78,31 @@ export function NewRequirementDialog({ open, onClose }: { open: boolean; onClose
             placeholder="例如：权限校验功能"
             className="w-full rounded-panel border border-edge-strong bg-surface-void px-3 py-2 text-body text-fg-primary placeholder:text-fg-faint focus:border-command focus:outline-none focus:ring-1 focus:ring-command/40"
           />
+        </div>
+
+        <div className="mt-4">
+          <label className="mb-1 block text-body text-fg-secondary">执行模式</label>
+          <div className="grid grid-cols-2 rounded-panel border border-edge-strong bg-surface-void p-1">
+            {(
+              [
+                ['single_agent', '单 Agent'],
+                ['council', 'Council'],
+              ] as const
+            ).map(([value, label]) => (
+              <button
+                key={value}
+                type="button"
+                onClick={() => setMode(value)}
+                className={`h-8 rounded-panel text-body transition-colors ${
+                  mode === value
+                    ? 'bg-command text-white'
+                    : 'text-fg-secondary hover:bg-surface-raised hover:text-fg-primary'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
         </div>
 
         <div className="mt-4">

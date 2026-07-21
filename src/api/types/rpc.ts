@@ -101,6 +101,7 @@ export interface RunSnapshot {
     task_id: string;
     status: string;
     mode: RunMode;
+    session_id?: string;
     event_ids: string[];
     started_at?: string;
     completed_at?: string;
@@ -142,6 +143,7 @@ export interface RunSnapshot {
     reviews?: Record<string, unknown>[];
     synthesis?: Record<string, unknown>;
     output?: Record<string, unknown>;
+    result?: Record<string, unknown>;
   };
   checkpoint?: Record<string, unknown>;
   errors: RunError[];

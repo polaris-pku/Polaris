@@ -9,7 +9,7 @@ import type {
 } from '@/types';
 import type { EventChannelStatus } from '@/api/events';
 import type { Event as ContractEvent, FilePermissionOutcome } from '@/api/types';
-import type { RunEvent, RunSnapshot } from '@/api/types/rpc';
+import type { RunEvent, RunMode, RunSnapshot } from '@/api/types/rpc';
 import type { AgentFileWriteResult } from '@/lib/agentFs';
 import type { DockChannel } from '@/lib/glossary';
 
@@ -140,6 +140,7 @@ export type TaskSlice = {
     rawText: string,
     title?: string,
     completionCriteria?: string[],
+    mode?: RunMode,
   ) => { ok: true } | { ok: false; error: string };
   /** 每条后端事件都重投影一次泳道图（幂等）——「泳道图实时跟着后端走」的落点 */
   applyLiveProgress: (

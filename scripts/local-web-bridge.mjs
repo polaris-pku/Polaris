@@ -10,9 +10,9 @@ import { fileURLToPath } from 'node:url';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const host = '127.0.0.1';
 const port = Number(process.env.POLARIS_WEB_BRIDGE_PORT || 4318);
-const backendHost = path.join(root, 'backend/backend-host.cjs');
-const acpRunner = path.join(root, 'backend/acp-runner.cjs');
-const agentDir = path.join(root, 'backend/agent');
+const backendRoot = path.resolve(root, '../newide-scaffold');
+const backendEntry = path.join(backendRoot, 'src/app/backend-rpc-stdio.ts');
+const driverRunnerDir = path.resolve(root, '../acp-client-prototype');
 const stateDir = path.join(root, '.newide/web-backend-state');
 const defaultWorkspace = path.join(os.homedir(), 'Documents/polaris-workspace/default');
 const allowedOrigins = new Set(['http://127.0.0.1:5173', 'http://localhost:5173']);
@@ -23,6 +23,12 @@ const rpcMethods = new Set([
   'run.subscribe',
   'run.unsubscribe',
   'run.cancel',
+  'memory.listAgents',
+  'memory.getAgent',
+  'memory.listSkills',
+  'memory.listExperiences',
+  'memory.listMaintenance',
+  'memory.promoteSkills',
 ]);
 const ignoredDirectories = new Set(['.git', '.newide', 'node_modules', 'dist', 'release']);
 const authorizedRoots = new Set();
@@ -102,9 +108,9 @@ function stopBackend() {
 }
 
 async function startBackend(workspace = currentWorkspace) {
-  for (const required of [backendHost, acpRunner, agentDir]) {
+  for (const required of [backendEntry, driverRunnerDir]) {
     if (!fsSync.existsSync(required)) {
-      setStatus('error', `缺少开发后端文件：${required}；请先运行 pnpm build:backend`);
+      setStatus('error', `缺少开发后端文件：${required}`);
       return status;
     }
   }
@@ -114,16 +120,13 @@ async function startBackend(workspace = currentWorkspace) {
   await fs.mkdir(stateDir, { recursive: true });
   setStatus('starting');
 
-  const proc = spawn(process.execPath, [backendHost], {
-    cwd: stateDir,
+  const proc = spawn(process.execPath, ['--import', 'tsx', backendEntry], {
+    cwd: backendRoot,
     env: {
       ...process.env,
-      POLARIS_NODE_BIN: process.execPath,
-      POLARIS_ACP_RUNNER: acpRunner,
-      POLARIS_AGENT_DIR: agentDir,
-      POLARIS_STATE_DIR: stateDir,
-      ACP_AGENT_ID: process.env.ACP_AGENT_ID || 'claude',
       ACP_WORKSPACE: currentWorkspace,
+      ACP_DRIVER_RUNNER_DIR: driverRunnerDir,
+      NEWIDE_COORDINATION_DB: path.join(stateDir, 'coordination.sqlite'),
     },
     stdio: ['pipe', 'pipe', 'pipe'],
     detached: process.platform !== 'win32',

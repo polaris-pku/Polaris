@@ -3,7 +3,7 @@
  *
  * BCD 只暴露 stdio 上的行分隔 JSON-RPC，没有 HTTP 服务。桌面壳里由 Electron 主进程
  * （electron/backendBridge.cjs）拉起 BCD 并把方法/事件转成 IPC，渲染层通过
- * `window.desktop.backend` 调用；浏览器里没有这座桥，回落到 mock。
+ * `window.desktop.backend` 调用；本地浏览器通过 HTTP/SSE bridge 连接同一个 stdio 后端。
  *
  * ── 扩展位（重要）──
  * 当前 BCD 只能「创建」和「取消」，**没有任何人类回写通道**：
@@ -76,7 +76,8 @@ export interface BackendStatus {
 }
 
 export interface RunTransport {
-  readonly kind: 'ipc' | 'mock';
+  readonly kind: 'ipc' | 'web' | 'mock';
+  call<T>(method: string, params?: unknown): Promise<T>;
   ping(): Promise<PingResult>;
   createRun(params: RunCreateParams): Promise<RunCreateResult>;
   getSnapshot(runId: string): Promise<RunSnapshot>;
@@ -111,6 +112,7 @@ function createIpcTransport(bridge: NonNullable<DesktopBridge['backend']>): RunT
 
   return {
     kind: 'ipc',
+    call,
     ping: () => call<PingResult>('system.ping'),
     createRun: (params) => call<RunCreateResult>('run.create', params),
     getSnapshot: (runId) => call<RunSnapshot>('run.getSnapshot', { run_id: runId }),
@@ -126,6 +128,82 @@ function createIpcTransport(bridge: NonNullable<DesktopBridge['backend']>): RunT
     onEvent: (handler) => bridge.onEvent((payload) => handler(payload.event as RunEvent)),
     onStatus: (handler) => bridge.onStatus(handler),
     getStatus: () => bridge.getStatus(),
+  };
+}
+
+// ── Web 传输（本地 Vite + HTTP/SSE bridge）──
+
+const WEB_BRIDGE_URL = import.meta.env.VITE_WEB_BRIDGE_URL || 'http://127.0.0.1:4318';
+
+function createWebTransport(): RunTransport {
+  const eventHandlers = new Set<(event: RunEvent) => void>();
+  const statusHandlers = new Set<(status: BackendStatus) => void>();
+
+  async function call<T>(method: string, params?: unknown): Promise<T> {
+    const response = await fetch(`${WEB_BRIDGE_URL}/backend/call`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ method, params }),
+    });
+    if (!response.ok) throw new BackendError(`Web bridge HTTP ${response.status}`);
+    const result = (await response.json()) as {
+      ok: boolean;
+      result?: T;
+      error?: string;
+      code?: number;
+    };
+    if (!result.ok) throw new BackendError(result.error || '后端调用失败', result.code);
+    return result.result as T;
+  }
+
+  async function getStatus(): Promise<BackendStatus> {
+    const response = await fetch(`${WEB_BRIDGE_URL}/backend/status`);
+    if (!response.ok) throw new BackendError(`Web bridge HTTP ${response.status}`);
+    return (await response.json()) as BackendStatus;
+  }
+
+  if (typeof EventSource !== 'undefined') {
+    const source = new EventSource(`${WEB_BRIDGE_URL}/events`);
+    source.onmessage = (message) => {
+      const envelope = JSON.parse(message.data) as { type: string; payload: unknown };
+      if (envelope.type === 'run.event') {
+        const payload = envelope.payload as { event: RunEvent };
+        eventHandlers.forEach((handler) => handler(payload.event));
+      }
+      if (envelope.type === 'backend.status') {
+        const status = envelope.payload as BackendStatus;
+        statusHandlers.forEach((handler) => handler(status));
+      }
+    };
+  }
+
+  return {
+    kind: 'web',
+    call,
+    ping: () => call<PingResult>('system.ping'),
+    createRun: (params) => call<RunCreateResult>('run.create', params),
+    getSnapshot: (runId) => call<RunSnapshot>('run.getSnapshot', { run_id: runId }),
+    subscribe: async (runId) => {
+      await call('run.subscribe', { run_id: runId });
+    },
+    unsubscribe: async (runId) => {
+      await call('run.unsubscribe', { run_id: runId });
+    },
+    cancel: async (runId) => {
+      await call('run.cancel', { run_id: runId });
+    },
+    onEvent: (handler) => {
+      eventHandlers.add(handler);
+      return () => eventHandlers.delete(handler);
+    },
+    onStatus: (handler) => {
+      statusHandlers.add(handler);
+      void getStatus()
+        .then(handler)
+        .catch(() => {});
+      return () => statusHandlers.delete(handler);
+    },
+    getStatus,
   };
 }
 
@@ -159,6 +237,9 @@ function createMockTransport(): RunTransport {
 
   return {
     kind: 'mock',
+    call: async () => {
+      throw new BackendError('mock 模式不支持直接后端调用');
+    },
     ping: async () => ({ status: 'ok', protocol_version: 'mock' }),
     createRun: async (params) => {
       const id = Date.now().toString(36);
@@ -202,14 +283,18 @@ function createMockTransport(): RunTransport {
 let cached: RunTransport | null = null;
 
 /**
- * 选传输：桌面壳里有 `window.desktop.backend` 就走真实 IPC；否则 mock。
+ * 选传输：桌面壳走 IPC；本地浏览器走 Web bridge；显式开关才使用 mock。
  * `VITE_USE_MOCK=true` 可强制 mock（无 API key / 演示兜底时用）。
  */
 export function getTransport(): RunTransport {
   if (cached) return cached;
   const forceMock = import.meta.env.VITE_USE_MOCK === 'true';
   const bridge = typeof window !== 'undefined' ? window.desktop?.backend : undefined;
-  cached = !forceMock && bridge ? createIpcTransport(bridge) : createMockTransport();
+  cached = forceMock
+    ? createMockTransport()
+    : bridge
+      ? createIpcTransport(bridge)
+      : createWebTransport();
   return cached;
 }
 

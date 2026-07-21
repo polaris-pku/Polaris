@@ -55,7 +55,7 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
       };
     }),
 
-  createTask: (rawText, title, completionCriteria) => {
+  createTask: (rawText, title, completionCriteria, mode = 'single_agent') => {
     const text = rawText.trim();
     if (!text) return { ok: false, error: '需求内容不能为空。' };
     const state = get();
@@ -105,6 +105,7 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
     void bindBackendWorkspace(project)
       .then(() =>
         apiCreateRun(toTaskCreateRequest(text, completionCriteria), {
+          mode,
           projectId: state.activeProjectId ?? undefined,
           clientTaskId: newTask.id,
           title: newTask.title,
