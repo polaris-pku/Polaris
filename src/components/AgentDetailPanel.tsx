@@ -2,6 +2,7 @@ import { Check, Plus, UserCircle2 } from 'lucide-react';
 import type { Agent } from '@/types';
 import type { ExperienceView, SkillView } from '@/api/types';
 import { Button } from '@/components/ui/Button';
+import { Badge } from '@/components/ui/Badge';
 import { Fold } from '@/components/ui/Fold';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { AgentStatusPill } from '@/components/StatusPill';
@@ -38,6 +39,10 @@ export function AgentDetailPanel({ agent, assigned, onAssign, showAssign = true 
 
   const { persona, metrics } = agent;
   const derived = calculateDerivedMetrics(metrics);
+  const hiddenExperienceCount = Math.max(0, metrics.experience_count - agent.experiences.length);
+  const personaStale =
+    (metrics.experience_count > 0 && /No experiences yet/i.test(persona.experience_coverage)) ||
+    (metrics.skill_count > 0 && /No skills yet/i.test(persona.skills_overview));
 
   return (
     // key=agent.id：切换 Agent 时重置各折叠区开合
@@ -61,6 +66,11 @@ export function AgentDetailPanel({ agent, assigned, onAssign, showAssign = true 
           </div>
         </div>
         <p className="mt-3 text-body text-fg-secondary">{persona.summary}</p>
+        {personaStale && (
+          <Badge variant="danger" className="mt-2">
+            画像未刷新
+          </Badge>
+        )}
         <div className="mt-3 flex flex-wrap gap-1.5">
           {agent.tags.map((t) => (
             <span
@@ -134,7 +144,16 @@ export function AgentDetailPanel({ agent, assigned, onAssign, showAssign = true 
         </Fold>
 
         {/* —— 经验 —— */}
-        <Fold id="agent-experiences" title="经验" fact={`${metrics.experience_count} 条`}>
+        <Fold
+          id="agent-experiences"
+          title="经验"
+          fact={`${agent.experiences.length} 条可读 / ${metrics.experience_count} 条原始`}
+        >
+          {hiddenExperienceCount > 0 && (
+            <p className="mb-2 text-body text-fg-faint">
+              已隐藏 {hiddenExperienceCount} 条驱动状态回执。
+            </p>
+          )}
           {agent.experiences.length === 0 ? (
             <p className="text-body text-fg-faint">暂无沉淀经验。</p>
           ) : (

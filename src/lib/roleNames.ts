@@ -10,6 +10,11 @@ export const ROLE_NAMES: Record<string, string> = {
   test_engineer: '测试工程师',
   security_auditor: '安全审计',
   role_ts_engineer: 'TypeScript 工程师',
+  role_fullstack_engineer: '全栈工程师',
+  proposer_a: 'Council 提案 Agent A',
+  proposer_b: 'Council 提案 Agent B',
+  reviewer: 'Council 评审 Agent',
+  synthesizer: 'Council 综合 Agent',
 };
 
 /** 缺失 → 'Agent'（不回落到蛇形 id）。 */
