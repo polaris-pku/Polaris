@@ -54,7 +54,7 @@ export function AppShell({ children }: { children: ReactNode }) {
         {/* 侧栏 */}
         <aside
           className={cn(
-            'relative flex shrink-0 flex-col border-r border-edge bg-brand-deep',
+            'relative flex shrink-0 flex-col border-r border-edge bg-black',
             !navDragging.current && 'transition-[width] duration-150',
           )}
           style={{ width: navCollapsed ? 56 : navWidth }}

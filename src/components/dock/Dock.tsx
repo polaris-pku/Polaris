@@ -46,7 +46,7 @@ export function Dock() {
     <section
       aria-label="Dock"
       style={{ height: size }}
-      className="relative flex shrink-0 flex-col border-t border-edge bg-surface-void"
+      className="relative flex shrink-0 flex-col border-t border-edge bg-black"
     >
       {/* 拖拽把手（上内边缘）：120–600 */}
       <div
@@ -59,7 +59,7 @@ export function Dock() {
       <div
         role="tablist"
         aria-label="Dock 频道"
-        className="flex h-8 shrink-0 items-center gap-1 border-b border-edge bg-surface-deck px-2"
+        className="flex h-8 shrink-0 items-center gap-1 border-b border-edge bg-black px-2"
       >
         {CHANNELS.map((channel) => (
           <button
