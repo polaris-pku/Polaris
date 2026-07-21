@@ -75,7 +75,7 @@ export function buildEventRows(events: RunEvent[]): EventStreamRow[] {
     for (const event of group.events) stepIdByEventId.set(event.event_id, group.nodeId);
   }
 
-  return [...events]
+  const rows = [...events]
     .sort((a, b) => a.sequence - b.sequence)
     .map((event) => {
       const stepId = stepIdByEventId.get(event.event_id) ?? '';
@@ -90,6 +90,69 @@ export function buildEventRows(events: RunEvent[]): EventStreamRow[] {
         payload: formatPayload(event.payload),
       };
     });
+
+  return collapseDriverStreams(rows);
+}
+
+/**
+ * Driver 的 token/chunk 流属于一段输出，不是几十个独立流程状态。
+ * 连续 chunk 合并为一行；原始 sequence 与 payload 完整保留在展开内容中。
+ */
+function collapseDriverStreams(rows: EventStreamRow[]): EventStreamRow[] {
+  const collapsed: EventStreamRow[] = [];
+  for (let index = 0; index < rows.length; index += 1) {
+    const first = rows[index]!;
+    if (first.type !== 'driver.stream_event') {
+      collapsed.push(first);
+      continue;
+    }
+
+    const group = [first];
+    const streamKey = driverStreamKey(first);
+    while (
+      rows[index + 1]?.type === 'driver.stream_event' &&
+      driverStreamKey(rows[index + 1]!) === streamKey
+    ) {
+      group.push(rows[index + 1]!);
+      index += 1;
+    }
+
+    const last = group[group.length - 1]!;
+    collapsed.push({
+      ...last,
+      eventId: `driver-stream:${first.eventId}:${last.eventId}`,
+      type: `driver.output_stream × ${group.length}`,
+      payload: formatPayload({
+        event_count: group.length,
+        sequence_from: first.seq,
+        sequence_to: last.seq,
+        events: group.map((row) => ({
+          sequence: row.seq,
+          time: row.time,
+          payload: parseFormattedPayload(row.payload),
+        })),
+      }),
+    });
+  }
+  return collapsed;
+}
+
+function driverStreamKey(row: EventStreamRow): string {
+  const payload = parseFormattedPayload(row.payload);
+  if (!payload || typeof payload !== 'object') return '';
+  const record = payload as Record<string, unknown>;
+  return [record.session_id, record.role_id, record.agent_id]
+    .filter((value): value is string => typeof value === 'string')
+    .join(':');
+}
+
+function parseFormattedPayload(payload: string): unknown {
+  if (!payload) return {};
+  try {
+    return JSON.parse(payload);
+  } catch {
+    return payload;
+  }
 }
 
 /** 按步骤过滤（F3 的落点：Fold 的「原始事件 · N 条 ↗」把 stepId 送进来）。null = 不过滤。 */
