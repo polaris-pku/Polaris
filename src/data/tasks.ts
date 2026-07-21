@@ -1,6 +1,7 @@
 import type { DemoTask, WorkflowNodeData } from '@/types';
 import { workflowNodes as baseWorkflowNodes } from '@/data/workflow';
 import { recommendAgents } from '@/data/scenario';
+import type { RunMode } from '@/api/types/rpc';
 
 const cloneNodes = (): WorkflowNodeData[] =>
   baseWorkflowNodes.map((n) => ({
@@ -37,6 +38,7 @@ export function createRequirementTask(
   rawText: string,
   title?: string,
   completionCriteria?: string[],
+  runMode?: RunMode,
 ): DemoTask {
   const taskText = rawText.trim();
   const criteria = completionCriteria?.map((c) => c.trim()).filter(Boolean);
@@ -45,6 +47,7 @@ export function createRequirementTask(
     projectId,
     title: deriveTitle(taskText, title),
     taskText,
+    ...(runMode ? { runMode } : {}),
     ...(criteria?.length ? { completionCriteria: criteria } : {}),
     // N1 Triage：任务创建即带上按需求推荐的团队，团队随任务走。
     assignedAgentIds: recommendAgents(taskText).ids,

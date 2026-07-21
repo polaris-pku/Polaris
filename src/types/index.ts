@@ -14,7 +14,7 @@ import type {
   SkillView,
 } from '@/api/types';
 // 仅类型引用（编译期擦除），不构成运行时循环依赖
-import type { RunSnapshot as RpcRunSnapshot } from '@/api/types/rpc';
+import type { RunMode, RunSnapshot as RpcRunSnapshot } from '@/api/types/rpc';
 import type { PhaseKey } from '@/data/workflow';
 import type { Scenario } from '@/data/scenario';
 
@@ -112,6 +112,8 @@ export type DemoTask = {
   projectId: string;
   title: string;
   taskText: string;
+  /** 创建时请求的后端执行模式；旧存量任务缺失时按 Council 重试。 */
+  runMode?: RunMode;
   /** 该任务绑定的 Agent 团队（按需求推荐，随任务走，可自定义） */
   assignedAgentIds: string[];
   /** 后端（C）受理后回填的权威 task_id；缺失表示尚未受理或提交失败 */

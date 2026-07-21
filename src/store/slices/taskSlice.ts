@@ -82,6 +82,7 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
       text,
       title,
       completionCriteria,
+      mode,
     );
     set({
       tasks: [...persisted, newTask],
@@ -173,6 +174,7 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
       const workspacePath = await requireBackendWorkspace(project);
       const created = await apiCreateRun(toTaskCreateRequest(text, task.completionCriteria), {
         workspacePath,
+        mode: task.runMode ?? 'council',
         projectId: task.projectId,
         clientTaskId: task.id,
         title: task.title,
