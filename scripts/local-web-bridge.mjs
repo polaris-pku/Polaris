@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
+import { parseEnv } from 'node:util';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const host = '127.0.0.1';
@@ -13,6 +14,10 @@ const port = Number(process.env.POLARIS_WEB_BRIDGE_PORT || 4318);
 const backendRoot = path.resolve(root, '../newide-scaffold');
 const backendEntry = path.join(backendRoot, 'src/app/backend-rpc-stdio.ts');
 const driverRunnerDir = path.resolve(root, '../acp-client-prototype');
+const driverEnvFile = path.resolve(
+  process.env.ACP_DRIVER_ENV_FILE || path.join(driverRunnerDir, '.env'),
+);
+const driverEnvironment = readDriverEnvironment(driverEnvFile);
 const stateDir = path.join(root, '.newide/web-backend-state');
 const defaultWorkspace = path.join(os.homedir(), 'Documents/polaris-workspace/default');
 const allowedOrigins = new Set(['http://127.0.0.1:5173', 'http://localhost:5173']);
@@ -39,30 +44,49 @@ let child;
 let currentWorkspace = defaultWorkspace;
 let status = backendStatus('stopped', '');
 
+function readDriverEnvironment(filePath) {
+  if (!fsSync.existsSync(filePath)) return {};
+  return parseEnv(fsSync.readFileSync(filePath, 'utf8'));
+}
+
+function configuredValue(name) {
+  return driverEnvironment[name] || process.env[name] || '';
+}
+
+function anthropicSettings() {
+  return {
+    hasKey: Boolean(
+      configuredValue('ANTHROPIC_API_KEY') || configuredValue('ANTHROPIC_AUTH_TOKEN'),
+    ),
+    baseUrl: configuredValue('ANTHROPIC_BASE_URL'),
+    model: configuredValue('ANTHROPIC_MODEL'),
+    fastModel: configuredValue('ANTHROPIC_DEFAULT_HAIKU_MODEL'),
+  };
+}
+
 function localCredentials() {
   return fsSync.existsSync(path.join(os.homedir(), '.claude/.credentials.json'));
 }
 
 function authReady() {
-  return Boolean(
-    process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN || localCredentials(),
-  );
+  return anthropicSettings().hasKey || localCredentials();
 }
 
 function backendStatus(state, message) {
+  const configured = anthropicSettings();
   return {
     state,
     message,
     workspace: currentWorkspace,
     auth: {
       providerId: 'anthropic',
-      hasKey: Boolean(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN),
+      hasKey: configured.hasKey,
       incomplete: false,
       hasLocalCredentials: localCredentials(),
       ready: authReady(),
-      baseUrl: process.env.ANTHROPIC_BASE_URL || '',
-      model: process.env.ANTHROPIC_MODEL || '',
-      fastModel: process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL || '',
+      baseUrl: configured.baseUrl,
+      model: configured.model,
+      fastModel: configured.fastModel,
     },
     agents: [{ id: 'claude', name: 'Claude Code' }],
     providers: [
@@ -307,7 +331,7 @@ async function route(request, response) {
   if (url.pathname === '/backend/settings') {
     return json(response, 200, {
       provider: 'anthropic',
-      configured: { anthropic: { hasKey: false, baseUrl: '', model: '', fastModel: '' } },
+      configured: { anthropic: anthropicSettings() },
     });
   }
   if (url.pathname === '/fs/authorize') {
