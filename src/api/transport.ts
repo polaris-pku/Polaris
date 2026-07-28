@@ -170,6 +170,11 @@ function createWebTransport(): RunTransport {
         const payload = envelope.payload as { event: RunEvent };
         eventHandlers.forEach((handler) => handler(payload.event));
       }
+      if (envelope.type === 'task.event') {
+        // task.event payload: { task_id, event } — same event shape as run.event
+        const payload = envelope.payload as { task_id: string; event: RunEvent };
+        eventHandlers.forEach((handler) => handler(payload.event));
+      }
       if (envelope.type === 'backend.status') {
         const status = envelope.payload as BackendStatus;
         statusHandlers.forEach((handler) => handler(status));

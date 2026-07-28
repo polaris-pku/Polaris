@@ -34,6 +34,14 @@ const rpcMethods = new Set([
   'memory.listExperiences',
   'memory.listMaintenance',
   'memory.promoteSkills',
+  'memory.getCapabilities',
+  // task.* ── 断点续跑所需的最小集合。
+  'task.get',
+  'task.list',
+  'task.subscribe',
+  'task.unsubscribe',
+  'task.resume',
+  'task.cancel',
 ]);
 const ignoredDirectories = new Set(['.git', '.newide', 'node_modules', 'dist', 'release']);
 const authorizedRoots = new Set();
@@ -151,6 +159,12 @@ async function startBackend(workspace = currentWorkspace) {
       ACP_WORKSPACE: currentWorkspace,
       ACP_DRIVER_RUNNER_DIR: driverRunnerDir,
       NEWIDE_COORDINATION_DB: path.join(stateDir, 'coordination.sqlite'),
+      // Use deterministic hash embeddings by default so the bridge starts
+      // without an embedding API key; override via shell env.
+      NEWIDE_B_EMBEDDING_PROVIDER: process.env.NEWIDE_B_EMBEDDING_PROVIDER || 'hash',
+      // Default 2-minute driver timeout is too short for complex tasks.
+      // Override via ACP_DRIVER_TIMEOUT_MS in the shell that starts the bridge.
+      ACP_DRIVER_TIMEOUT_MS: process.env.ACP_DRIVER_TIMEOUT_MS || '300000',
     },
     stdio: ['pipe', 'pipe', 'pipe'],
     detached: process.platform !== 'win32',
@@ -179,6 +193,10 @@ async function startBackend(workspace = currentWorkspace) {
     }
     if (message.method === 'run.event') {
       emit('run.event', message.params);
+      return;
+    }
+    if (message.method === 'task.event') {
+      emit('task.event', message.params);
       return;
     }
     const slot = pending.get(message.id);
