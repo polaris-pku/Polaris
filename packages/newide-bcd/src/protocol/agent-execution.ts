@@ -9,6 +9,7 @@ import type {
   TaskId,
   Timestamp,
 } from '../core';
+import type { DriverStreamEventListener, DriverToolEvent } from '../driver/contract';
 
 export const AGENT_EXECUTION_STATUSES = [
   'completed',
@@ -25,19 +26,30 @@ export interface AgentExecutionRequest {
   task_id: TaskId;
   run_id: RunId;
   role_id: RoleId;
+  participant_id?: string;
+  council_seat?: 'proposer' | 'reviewer' | 'synthesizer';
+  council_seat_index?: number;
   instruction: string;
+  workspace_path?: string;
+  session_id?: string;
   input_artifact_refs: ArtifactId[];
   context_policy: string;
+  /** RFC §1.2 memory ablation; applied by production Agent execution facade. */
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
   schema_version: SchemaVersion;
 }
 
 export interface AgentExecutionResult {
   agent_run_id: AgentRunId;
+  agent_id?: string;
   role_id: RoleId;
   context_pack_ref: ContextPackId;
   driver_run_result_id: DriverRunResultId;
   artifact_refs: ArtifactRef[];
   transcript_ref: ArtifactRef;
+  session_id: string;
+  response: string;
+  tool_events: DriverToolEvent[];
   diagnostics: AgentExecutionDiagnostics;
   status: AgentExecutionStatus;
   memory_buffer_ref?: string;
@@ -47,6 +59,7 @@ export interface AgentExecutionResult {
 
 export interface AgentExecutionOptions {
   signal?: AbortSignal;
+  onDriverEvent?: DriverStreamEventListener;
 }
 
 export interface AgentExecutionFacade {

@@ -66,6 +66,11 @@ export {
 
 export { LiteLLMClientAdapter } from './adapters/litellm-client-adapter';
 export { MockLlmClient } from './adapters/mock-llm-client';
+export { LiteLLMEmbeddingProvider } from './adapters/litellm-embedding-provider';
+export {
+  HashEmbeddingProvider,
+  defaultHashEmbeddingProvider,
+} from './adapters/hash-embedding-provider';
 
 // ════════════════════════════════════════════════════════
 //  4. LLM 处理适配器（通过 LlmClient 接口依赖注入）
@@ -83,6 +88,13 @@ export { NullContextCleaner } from './adapters/null-context-cleaner';
 export { RuleBasedExperienceExtractor } from './adapters/rule-based-experience-extractor';
 export { ruleBasedSkillPromotion } from './services/skill-promotion';
 export { repositoryRetrieveMemoryForTask } from './adapters/repository-memory-retrieval';
+export {
+  resolveMemoryAblationPolicy,
+  runWithMemoryAblationPolicy,
+  getActiveMemoryAblationPolicy,
+  type MemoryAblation,
+  type MemoryAblationPolicy,
+} from './ablation-policy';
 
 // ════════════════════════════════════════════════════════
 //  6. AgentMemoryScope（Agent与Repository之间的绑定门面）

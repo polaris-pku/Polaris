@@ -7,41 +7,77 @@ import { createInterface } from 'node:readline';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import type { Readable } from 'node:stream';
-import { pathToFileURL } from 'node:url';
 import { IntegrationV0CoordinatorRunner } from '../coordinator/coordinator-runner';
-import { SynthesisAgentCouncilProvider } from '../council';
+import { SelectAgentHandler } from '../coordinator/handlers/select-agent-handler';
+import {
+  AgentBoardCouncilParticipantResolver,
+  SynthesisAgentCouncilProvider,
+} from '../council';
 import { CommandDriverTransport, ExternalDriverRuntime } from '../driver';
 import {
-  InMemoryBufferRepository,
-  InMemoryRepository,
+  LiteLLMClientAdapter,
   LiteLLMToolCallingClient,
+  type LlmClient,
   type ToolCallingClient,
 } from '../memory';
+import { BAgentProjectionAdapter, FileMarketEvidenceStore } from '../market';
 import { JsonRpcDispatcher, JsonRpcLineSession } from '../rpc/json-rpc-dispatcher';
 import { RunRpcMethods } from '../rpc/run-methods';
+import { TaskRpcMethods } from '../rpc/task-methods';
+import { MailboxRpcMethods } from '../rpc/mailbox-methods';
+import { MemoryRpcMethods } from '../rpc/memory-methods';
+import { FileRunEvidenceStore, SqliteCoordinationStore } from '../persistence';
 import { DriverRuntimeAgentExecutionFacade } from './driver-runtime-agent-execution-facade';
+import { FileAgentExecutionEvidenceStore } from './agent-execution-evidence-store';
 import { NewideBackendService } from './newide-backend-service';
+import { InMemoryRunRegistry } from './run-registry';
+import { FileRunAuditWriter } from './run-audit-writer';
+import { FileDriverStreamAuditWriter } from './driver-stream-audit-writer';
+import { ProductionGateExecutor } from './production-gate-executor';
+import type { IntegrationV0GateExecutor } from '../coordinator/gate-executor';
+import { FileRunRequestStore } from './run-request-store';
+import { FileRunTerminalOutputWriter } from './run-terminal-output-writer';
+import { TaskProcessor } from './task-processor';
+import { PersistentMailboxService } from './persistent-mailbox-service';
+import { createProductionBRuntime, type BackendBRuntime } from './production-b-runtime';
+import {
+  BMemoryMaintenanceRunner,
+  FileBMemoryMaintenanceEvidenceStore,
+} from './b-memory-maintenance-runner';
+import { BMemoryBackendService } from './b-memory-backend-service';
+import { createBPublicCapabilities } from './b-public-capabilities';
+import { createProductionStageExecutors } from './production-stage-executors';
+import { TaskExecutionLoop } from './task-execution-loop';
+import { SystemRpcMethods } from '../rpc/system-methods';
+import { createProductionSystemStatusService } from './system-status-service';
 
 export interface BackendRpcServerOptions {
   input: Readable;
   writeLine: (line: string) => void;
-  service?: NewideBackendService;
+  service: NewideBackendService;
   logError?: (message: string) => void;
 }
 
 export interface BackendRpcServer {
-  close(): void;
+  readonly closed: Promise<void>;
+  close(): Promise<void>;
 }
 
 export interface ProductionBackendServiceDependencies {
   agentLlm?: ToolCallingClient;
+  memoryLlm?: LlmClient;
+  memoryMaintenance?: BMemoryMaintenanceRunner;
+  bRuntime?: BackendBRuntime;
+  gateExecutor?: IntegrationV0GateExecutor;
 }
 
-export function createProductionBackendService(
+export async function createProductionBackendService(
   env: NodeJS.ProcessEnv = process.env,
   dependencies: ProductionBackendServiceDependencies = {},
-): NewideBackendService {
+): Promise<NewideBackendService> {
   const repoRoot = process.cwd();
+  const stateRoot = path.resolve(env.NEWIDE_STATE_ROOT?.trim() || path.join(repoRoot, '.newide'));
+  const runsRoot = path.join(stateRoot, 'runs');
   const runnerDir = path.resolve(
     env.ACP_DRIVER_RUNNER_DIR ?? path.join(repoRoot, '..', 'acp-client-prototype'),
   );
@@ -53,39 +89,221 @@ export function createProductionBackendService(
   }
   const packagePath = path.join(runnerDir, 'package.json');
   const runnerPackage = readJson(packagePath);
+  const runnerPackageIdentity = readPackageIdentity(
+    runnerPackage,
+    'acp-external-runner',
+    'unknown',
+  );
   if (!hasDriverRunScript(runnerPackage)) {
     throw new Error(`ACP driver runner has no driver:run script: ${runnerDir}`);
+  }
+
+  const driverRunnerJs = path.join(runnerDir, 'dist', 'src', 'driver', 'contract-runner.js');
+  if (!existsSync(driverRunnerJs)) {
+    throw new Error(
+      `ACP driver runner build missing: ${driverRunnerJs} (run pnpm --dir ${runnerDir} build)`,
+    );
   }
 
   const driverEnv = loadEnvFile(env.ACP_DRIVER_ENV_FILE ?? path.join(runnerDir, '.env'));
   const driver = new ExternalDriverRuntime({
     driver_id: 'acp-external',
+    capabilities: {
+      supports_acp_extension: true,
+      supports_session_load: true,
+      supports_tool_events: true,
+    },
     transport: new CommandDriverTransport({
-      command: 'pnpm',
-      args: ['--dir', runnerDir, 'driver:run'],
-      cwd: repoRoot,
+      // Invoke node directly — Windows `spawn('pnpm'/'pnpm.cmd')` is unreliable without shell.
+      command: process.execPath,
+      args: [driverRunnerJs],
+      cwd: runnerDir,
       env: {
         ...driverEnv,
         COREPACK_ENABLE_PROJECT_SPEC: env.COREPACK_ENABLE_PROJECT_SPEC ?? '0',
         PNPM_CONFIG_PM_ON_FAIL: env.PNPM_CONFIG_PM_ON_FAIL ?? 'ignore',
         ACP_AGENT_ID: env.ACP_AGENT_ID ?? 'claude',
-        ACP_WORKSPACE: env.ACP_WORKSPACE ?? path.join(repoRoot, '.newide', 'test-workspace'),
+        ACP_WORKSPACE: env.ACP_WORKSPACE ?? path.join(stateRoot, 'test-workspace'),
+        // Non-interactive eval / batch runs must not block on ACP permission prompts.
+        AUTO_APPROVE: env.AUTO_APPROVE ?? '1',
       },
-      unsetEnv: MODEL_OVERRIDE_ENV.filter((key) => driverEnv[key] === undefined),
+      unsetEnv: [
+        'NEWIDE_B_DATABASE_URL',
+        ...MODEL_OVERRIDE_ENV.filter((key) => driverEnv[key] === undefined),
+      ],
+      timeoutMs: readDriverTimeout(env.ACP_DRIVER_TIMEOUT_MS),
     }),
   });
-  const agentExecutionFacade = new DriverRuntimeAgentExecutionFacade({
-    driver,
-    repository: new InMemoryRepository(),
-    bufferRepository: new InMemoryBufferRepository(),
-    llm: dependencies.agentLlm ?? new LiteLLMToolCallingClient(),
+  let bRuntime: BackendBRuntime | undefined;
+  let memoryMaintenance: BMemoryMaintenanceRunner | undefined;
+  let coordinationStore: SqliteCoordinationStore | undefined;
+  const closeRuntime = onceAsync(async () => {
+    const failures: unknown[] = [];
+    for (const close of [
+      () => driver.shutdown(),
+      () => memoryMaintenance?.waitForIdle(),
+      () => bRuntime?.close(),
+      () => coordinationStore?.close(),
+    ]) {
+      try {
+        await close();
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) {
+      throw new AggregateError(failures, 'Failed to close production backend resources');
+    }
   });
-  const runner = new IntegrationV0CoordinatorRunner({
-    driver,
-    agentExecutionFacade,
-    councilProvider: new SynthesisAgentCouncilProvider({ agentExecutionFacade }),
-  });
-  return new NewideBackendService(runner);
+
+  try {
+    bRuntime =
+      dependencies.bRuntime ??
+      (await createProductionBRuntime(env, { repoRoot, appStateRoot: stateRoot }));
+    assertValidMarketAgentIds(bRuntime.market_agent_ids);
+    memoryMaintenance =
+      dependencies.memoryMaintenance ??
+      new BMemoryMaintenanceRunner({
+        repository: bRuntime.repository,
+        bufferRepository: bRuntime.bufferRepository,
+        llm: dependencies.memoryLlm ?? new LiteLLMClientAdapter('memory-query'),
+        evidenceStore: new FileBMemoryMaintenanceEvidenceStore(
+          path.join(bRuntime.app_state_root ?? path.join(repoRoot, '.newide'), 'b', 'maintenance'),
+        ),
+      });
+    try {
+      await memoryMaintenance.replayPending();
+    } catch {
+      throw new Error('Production B Agent manager readiness check failed');
+    }
+    const bCapabilities = createBPublicCapabilities(bRuntime, memoryMaintenance);
+    const agentExecutionFacade = new DriverRuntimeAgentExecutionFacade({
+      driver,
+      repository: bCapabilities.repository,
+      bufferRepository: bCapabilities.bufferRepository,
+      ...(bRuntime.embedding ? { embedding: bRuntime.embedding } : {}),
+      llm: dependencies.agentLlm ?? new LiteLLMToolCallingClient(),
+      memoryMaintenance: bCapabilities.maintenance,
+      evidenceStore: new FileAgentExecutionEvidenceStore({
+        root: path.join(stateRoot, 'b', 'context-packs'),
+      }),
+    });
+    const selectAgentHandler = new SelectAgentHandler({
+      projectionSource: new BAgentProjectionAdapter({
+        competitionQuery: agentExecutionFacade,
+        boardQuery: bCapabilities.boardQuery,
+        ensureAgent: (agentId) => agentExecutionFacade.ensureAgent(agentId),
+        allowedAgentIds: bRuntime.market_agent_ids,
+        candidateSource: 'allowed_catalog',
+      }),
+      evidenceStore: new FileMarketEvidenceStore({
+        root: path.join(stateRoot, 'market'),
+      }),
+    });
+    const councilProvider = new SynthesisAgentCouncilProvider({
+      agentExecutionFacade,
+      councilRoot: path.join(stateRoot, 'council'),
+      participantResolver: new AgentBoardCouncilParticipantResolver({
+        boardQuery: bCapabilities.boardQuery,
+        allowedAgentIds: bRuntime.market_agent_ids,
+        ensureAgent: (agentId) => agentExecutionFacade.ensureAgent(agentId),
+      }),
+    });
+    const gateExecutor =
+      dependencies.gateExecutor ??
+      new ProductionGateExecutor({
+        runsRoot,
+        env,
+      });
+    const runner = new IntegrationV0CoordinatorRunner({
+      driver,
+      agentExecutionFacade,
+      selectAgentHandler,
+      councilProvider,
+      gateExecutor,
+    });
+    const bMemoryService = new BMemoryBackendService(
+      bCapabilities,
+      bRuntime.embedding_info,
+    );
+
+    try {
+      await agentExecutionFacade.ready();
+    } catch {
+      throw new Error('Production B Agent manager readiness check failed');
+    }
+
+    const configuredDatabasePath =
+      env.NEWIDE_COORDINATION_DB ?? path.join(stateRoot, 'coordination.sqlite');
+    const databasePath =
+      configuredDatabasePath === ':memory:'
+        ? configuredDatabasePath
+        : path.resolve(configuredDatabasePath);
+    coordinationStore = new SqliteCoordinationStore(databasePath);
+    const mailboxService = new PersistentMailboxService(coordinationStore, agentExecutionFacade);
+    const taskProcessor = new TaskProcessor(coordinationStore, {
+      runsRoot,
+      mailboxStore: coordinationStore,
+    });
+    taskProcessor.recoverInterruptedTasks();
+    const taskExecutionLoop = new TaskExecutionLoop({
+      processor: taskProcessor,
+      evidence_store: new FileRunEvidenceStore({ root: runsRoot }),
+      executors: createProductionStageExecutors({
+        selectAgentHandler,
+        agentExecutionFacade,
+        councilProvider,
+        gateExecutor,
+        bootstrapAgentIds: bRuntime.market_agent_ids,
+        runsRoot,
+        councilRoot: path.join(stateRoot, 'council'),
+        worktreesRoot: path.join(stateRoot, 'worktrees'),
+      }),
+    });
+    const mailboxRecovery = mailboxService.replayPendingDeliveries();
+    try {
+      await mailboxRecovery;
+    } catch {
+      throw new Error('Production mailbox recovery failed');
+    }
+    const backendPackageIdentity = readPackageIdentity(
+      readJson(path.join(repoRoot, 'package.json')),
+      'newide-bcd',
+      'unknown',
+    );
+    const systemStatusService = createProductionSystemStatusService({
+      package_name: backendPackageIdentity.name,
+      package_version: backendPackageIdentity.version,
+      build_commit: env.NEWIDE_BUILD_COMMIT?.trim() || 'dev',
+      coordination_durable: databasePath !== ':memory:',
+      driver_provider_id: runnerPackageIdentity.name,
+      driver_provider_version: runnerPackageIdentity.version,
+      b_repository_mode: dependencies.bRuntime ? 'host-injected' : 'postgresql',
+      b_embedding: bRuntime.embedding_info ?? {
+        provider: 'host-managed repository',
+        readiness: 'host_managed',
+      },
+    });
+    return new NewideBackendService(
+      runner,
+      new InMemoryRunRegistry(),
+      new FileRunAuditWriter(runsRoot),
+      new FileRunTerminalOutputWriter(runsRoot),
+      new FileRunRequestStore(runsRoot),
+      taskProcessor,
+      mailboxService,
+      mailboxRecovery,
+      closeRuntime,
+      bMemoryService,
+      new FileDriverStreamAuditWriter(runsRoot),
+      taskExecutionLoop,
+      systemStatusService,
+    );
+  } catch (error) {
+    await closeRuntime().catch(() => undefined);
+    throw error;
+  }
 }
 
 const MODEL_OVERRIDE_ENV = [
@@ -95,6 +313,15 @@ const MODEL_OVERRIDE_ENV = [
   'ANTHROPIC_DEFAULT_HAIKU_MODEL',
   'CLAUDE_CODE_SUBAGENT_MODEL',
 ];
+
+function readDriverTimeout(value: string | undefined): number {
+  if (value === undefined) return 120_000;
+  const timeout = Number(value);
+  if (!Number.isInteger(timeout) || timeout <= 0) {
+    throw new Error('ACP_DRIVER_TIMEOUT_MS must be a positive integer');
+  }
+  return timeout;
+}
 
 function readJson(filePath: string): unknown {
   if (!existsSync(filePath)) return undefined;
@@ -112,36 +339,98 @@ function hasDriverRunScript(value: unknown): boolean {
   return typeof command === 'string' && command.trim().length > 0;
 }
 
+function readPackageIdentity(
+  value: unknown,
+  fallbackName: string,
+  fallbackVersion: string,
+): { name: string; version: string } {
+  if (!value || typeof value !== 'object') {
+    return { name: fallbackName, version: fallbackVersion };
+  }
+  const rawName = Reflect.get(value, 'name');
+  const rawVersion = Reflect.get(value, 'version');
+  return {
+    name:
+      typeof rawName === 'string' && rawName.trim().length > 0
+        ? rawName.trim()
+        : fallbackName,
+    version:
+      typeof rawVersion === 'string' && rawVersion.trim().length > 0
+        ? rawVersion.trim()
+        : fallbackVersion,
+  };
+}
+
 export function startBackendRpcServer(options: BackendRpcServerOptions): BackendRpcServer {
   const dispatcher = new JsonRpcDispatcher();
   const session = new JsonRpcLineSession(dispatcher, options.writeLine);
-  const methods = new RunRpcMethods(
-    options.service ?? createProductionBackendService(),
-    (method, params) => session.sendNotification(method, params),
+  const service = options.service;
+  const runMethods = new RunRpcMethods(service, (method, params) =>
+    session.sendNotification(method, params),
   );
-  methods.register(dispatcher);
+  const taskMethods = new TaskRpcMethods(service, (method, params) =>
+    session.sendNotification(method, params),
+  );
+  const mailboxMethods = new MailboxRpcMethods(service);
+  const memoryMethods = new MemoryRpcMethods(service);
+  const systemMethods = new SystemRpcMethods(service);
+  systemMethods.register(dispatcher);
+  runMethods.register(dispatcher);
+  taskMethods.register(dispatcher);
+  mailboxMethods.register(dispatcher);
+  memoryMethods.register(dispatcher);
 
   const lines = createInterface({ input: options.input, crlfDelay: Infinity });
   let pending = Promise.resolve();
+  let inputClosed = false;
+  let closePromise: Promise<void> | undefined;
+  let resolveClosed!: () => void;
+  let rejectClosed!: (error: unknown) => void;
+  const closed = new Promise<void>((resolve, reject) => {
+    resolveClosed = resolve;
+    rejectClosed = reject;
+  });
   lines.on('line', (line) => {
     pending = pending
       .then(() => session.handleLine(line))
       .catch((error: unknown) => options.logError?.(String(error)));
   });
-  lines.on('close', () => methods.dispose());
-
-  return {
-    close: () => {
-      methods.dispose();
-      lines.close();
-    },
+  const close = (): Promise<void> => {
+    if (!closePromise) {
+      closePromise = Promise.resolve().then(async () => {
+        runMethods.dispose();
+        taskMethods.dispose();
+        if (!inputClosed) lines.close();
+        await pending;
+        await service.close();
+      });
+      closePromise.then(resolveClosed, rejectClosed);
+    }
+    return closePromise;
   };
+  lines.once('close', () => {
+    inputClosed = true;
+    void close().catch((error: unknown) => options.logError?.(String(error)));
+  });
+
+  return { closed, close };
 }
 
 function loadEnvFile(filePath: string): NodeJS.ProcessEnv {
   if (!existsSync(filePath)) return {};
 
   return parseDriverEnv(readFileSync(filePath, 'utf8'));
+}
+
+export function loadRuntimeEnvDefaults(
+  env: NodeJS.ProcessEnv,
+  filePath = path.join(process.cwd(), '.env.local'),
+): NodeJS.ProcessEnv {
+  const merged = loadEnvFile(filePath);
+  for (const [key, value] of Object.entries(env)) {
+    if (value !== undefined) merged[key] = value;
+  }
+  return merged;
 }
 
 export function parseDriverEnv(content: string): NodeJS.ProcessEnv {
@@ -161,16 +450,60 @@ export function parseDriverEnv(content: string): NodeJS.ProcessEnv {
   );
 }
 
-function runMain(): void {
-  const server = startBackendRpcServer({
-    input: process.stdin,
-    writeLine: (line) => process.stdout.write(`${line}\n`),
-    logError: (message) => process.stderr.write(`${message}\n`),
-  });
-  process.once('SIGTERM', () => server.close());
-  process.once('SIGINT', () => server.close());
+export async function runBackendRpcMain(
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+  let service: NewideBackendService | undefined;
+  let server: BackendRpcServer | undefined;
+  let shutdownRequested = false;
+  const close = () => {
+    shutdownRequested = true;
+    const closing = server ? server.close() : service?.close();
+    void closing?.catch(() => undefined);
+  };
+  process.once('SIGTERM', close);
+  process.once('SIGINT', close);
+  try {
+    const runtimeEnv = materializeRuntimeEnv(loadRuntimeEnvDefaults(env));
+    service = await createProductionBackendService(runtimeEnv);
+    if (shutdownRequested) {
+      await service.close();
+      return;
+    }
+    server = startBackendRpcServer({
+      input: process.stdin,
+      writeLine: (line) => process.stdout.write(`${line}\n`),
+      service,
+      logError: (message) => process.stderr.write(`${message}\n`),
+    });
+    await server.closed;
+  } finally {
+    process.off('SIGTERM', close);
+    process.off('SIGINT', close);
+  }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  runMain();
+export function materializeRuntimeEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  for (const [key, value] of Object.entries(env)) {
+    if (value !== undefined) process.env[key] = value;
+  }
+  return env;
+}
+
+function onceAsync(operation: () => Promise<void>): () => Promise<void> {
+  let pending: Promise<void> | undefined;
+  return () => (pending ??= Promise.resolve().then(operation));
+}
+
+function assertValidMarketAgentIds(value: unknown): asserts value is readonly string[] {
+  const agentIds = Array.isArray(value) ? Array.from(value) : [];
+  const valid =
+    agentIds.length > 0 &&
+    agentIds.every(
+      (agentId) => typeof agentId === 'string' && agentId.length > 0 && agentId.trim() === agentId,
+    ) &&
+    new Set(agentIds).size === agentIds.length;
+  if (!valid) {
+    throw new Error('Production B runtime must provide non-empty, unique market_agent_ids');
+  }
 }

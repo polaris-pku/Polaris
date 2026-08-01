@@ -3,6 +3,19 @@ import type { RunSnapshot } from '../protocol/run-snapshot';
 import type { AppRunSnapshot } from './run-registry';
 
 export function projectRunSnapshot(input: AppRunSnapshot): RunSnapshot {
+  if (input.projected_snapshot) {
+    return {
+      ...structuredClone(input.projected_snapshot),
+      status: input.status,
+      current: {
+        ...input.projected_snapshot.current,
+        stage: input.current.stage,
+        active_node_code: input.current.active_node_code,
+      },
+      timeline: [...input.events],
+      errors: input.error ? [{ ...input.error }] : [...input.projected_snapshot.errors],
+    };
+  }
   const rich = input.snapshot;
   const task = rich?.task;
   const artifacts = asRecords(rich?.artifacts ?? []);
@@ -19,6 +32,7 @@ export function projectRunSnapshot(input: AppRunSnapshot): RunSnapshot {
     task_id: input.task_id,
     mode: input.mode,
     status: input.status,
+    ...(rich?.quality ? { quality: rich.quality } : {}),
     current: { ...input.current, ...(task ? { task_status: task.status } : {}) },
     ...(task
       ? {
@@ -40,6 +54,7 @@ export function projectRunSnapshot(input: AppRunSnapshot): RunSnapshot {
             task_id: input.task_id,
             status: input.status,
             mode: input.mode,
+            session_id: rich.run.session_id,
             event_ids: input.events.map((event) => event.event_id),
             ...(runStarted ? { started_at: runStarted.created_at } : {}),
             ...(terminalEvent ? { completed_at: terminalEvent.created_at } : {}),
@@ -52,7 +67,13 @@ export function projectRunSnapshot(input: AppRunSnapshot): RunSnapshot {
           delivery_report: {
             worktree_path: rich.delivery_report.worktree_path,
             files_written: [...rich.delivery_report.files_written],
+            changed_files: [...rich.delivery_report.changed_files],
             artifacts_materialized: rich.delivery_report.artifacts_materialized,
+            outcome: rich.delivery_report.outcome,
+            response: rich.delivery_report.response,
+            session_id: rich.delivery_report.session_id,
+            tool_events: asRecords(rich.delivery_report.tool_events),
+            ...(rich.quality ? { quality: rich.quality } : {}),
           },
           links: asRecord(rich.links),
         }
@@ -75,6 +96,7 @@ export function projectRunSnapshot(input: AppRunSnapshot): RunSnapshot {
         created_at: event.created_at,
         ...event.payload,
       })),
+    ...(rich?.market ? { market: { ...rich.market } } : {}),
     ...(input.mode === 'council' ? { council: projectCouncil(input, rich) } : {}),
     ...(rich?.checkpoint ? { checkpoint: asRecord(rich.checkpoint) } : {}),
     errors: input.error ? [{ ...input.error }] : [],
@@ -84,6 +106,16 @@ export function projectRunSnapshot(input: AppRunSnapshot): RunSnapshot {
             status: finalStatus,
             artifact_refs: artifactIds(artifacts),
             files_written: [...(rich?.delivery_report.files_written ?? [])],
+            ...(rich?.delivery_report
+              ? {
+                  changed_files: [...rich.delivery_report.changed_files],
+                  outcome: rich.delivery_report.outcome,
+                  response: rich.delivery_report.response,
+                  session_id: rich.delivery_report.session_id,
+                  tool_events: asRecords(rich.delivery_report.tool_events),
+                  ...(rich.quality ? { quality: rich.quality } : {}),
+                }
+              : {}),
           },
         }
       : {}),
@@ -105,10 +137,14 @@ function projectCouncil(
     required_next_actions: [...(council?.output?.required_next_actions ?? [])],
     blocked_by: [...(council?.output?.blocked_by ?? [])],
     can_create_merge_authorization: council?.can_create_merge_authorization ?? false,
+    ...(council?.participants
+      ? { participants: asRecords(council.participants) }
+      : {}),
     ...(council?.proposals ? { proposals: asRecords(council.proposals) } : {}),
     ...(council?.reviews ? { reviews: asRecords(council.reviews) } : {}),
     ...(council?.synthesis ? { synthesis: asRecord(council.synthesis) } : {}),
     ...(council?.output ? { output: asRecord(council.output) } : {}),
+    ...(council?.result ? { result: asRecord(council.result) } : {}),
   };
 }
 
