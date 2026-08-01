@@ -273,7 +273,7 @@ describePgFile('PgMemoryRepository + FileBufferRepository 组合集成', () => {
     // loadAllAgents 应自动加载 role_id
     const agent2 = manager2.getAgent(role_id);
     expect(agent2).toBeDefined();
-    expect(agent2!.getState()).toBe('sleeping');
+    expect(agent2!.getState()).toBe('idle');
 
     // handle 信息应从 PG 恢复
     const handle2 = await pgRepo.getAgent(role_id);
