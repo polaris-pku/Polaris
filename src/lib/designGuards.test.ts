@@ -182,8 +182,8 @@ describe('删掉的东西必须留在坟里', () => {
     'src/data/councilOptions.ts',
     'src/lib/runReplay.ts',
     //   data/scenario.ts  按关键词编造整套演示场景（议会议程 / 交付报告 / 需求分析）。
-    //                     消费方全删干净后只剩 recommendAgents 一个函数，已搬去
-    //                     data/agentRecommendation.ts —— 别再让「场景推导」回来。
+    //                     静态 Agent 消费方已全部删除，真实角色改由 Memory RPC 提供。
+    //                     别再让关键词组队的场景推导回来。
     'src/data/scenario.ts',
   ];
 

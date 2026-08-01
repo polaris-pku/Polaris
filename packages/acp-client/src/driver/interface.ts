@@ -24,6 +24,8 @@ export interface DriverPrompt {
   task_id: TaskId;
   run_id: RunId;
   prompt: string;
+  workspace_path?: string;
+  session_id?: DriverSessionId;
   context_pack_ref?: ContextPackRef;
   created_at: Timestamp;
   schema_version: SchemaVersion;

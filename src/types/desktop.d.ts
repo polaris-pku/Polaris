@@ -46,7 +46,7 @@ declare global {
   /** backend:call 的结果信封（主进程已兜底 try/catch，错误不抛到渲染层） */
   type DesktopBackendCallResult =
     | { ok: true; result: unknown }
-    | { ok: false; error: string; code?: number };
+    | { ok: false; error: string; code?: number; data?: unknown };
 
   /** 随包分发的 agent */
   type DesktopAgent = { id: string; name: string };
@@ -246,6 +246,7 @@ declare global {
       /** 读设置（key 只回布尔，绝不回明文） */
       getSettings: () => Promise<{
         provider: string;
+        bMemory: { configured: boolean };
         configured: Record<string, DesktopProviderConfig>;
       }>;
       /**
@@ -254,13 +255,16 @@ declare global {
        */
       saveSettings: (next: {
         provider?: string;
+        bMemory?: { databaseUrl?: string };
         providers?: Record<
           string,
           { key?: string; baseUrl?: string; model?: string; fastModel?: string }
         >;
       }) => Promise<DesktopBackendStatus>;
-      /** 订阅 BCD 推来的 run.event；返回取消订阅函数 */
-      onEvent: (cb: (payload: { run_id: string; event: unknown }) => void) => () => void;
+      /** 订阅 BCD 推来的 task.event / run.event；返回取消订阅函数 */
+      onNotification: (
+        cb: (notification: { method: 'task.event' | 'run.event'; params: unknown }) => void,
+      ) => () => void;
       /** 订阅后端进程状态变化；返回取消订阅函数 */
       onStatus: (cb: (status: DesktopBackendStatus) => void) => () => void;
     };
@@ -293,7 +297,7 @@ declare global {
     };
     /**
      * Python 终端会话（electron/terminalBridge.cjs）。
-     * 【硬红线 R3/I5】start 只能由用户手势触发，**永远不能被 backend:event 的 handler
+     * 【硬红线 R3/I5】start 只能由用户手势触发，**永远不能被 backend:notification 的 handler
      * 直接或间接调用** —— agent 会往工作区写 .py，任何事件驱动的自动执行 = agent → 宿主 RCE。
      */
     terminal?: {

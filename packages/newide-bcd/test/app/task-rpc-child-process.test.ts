@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { once } from 'node:events';
 import { createInterface } from 'node:readline';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -9,6 +9,17 @@ import { describe, expect, it } from 'vitest';
 import type { AppRunEvent } from '../../src/app/run-registry';
 import type { TaskSnapshot } from '../../src/protocol/task-snapshot';
 import { writeFakeAcpRunnerBuild } from '../fixtures/fake-acp-runner-build';
+
+function initializeGitWorkspace(workspace: string): void {
+  const git = (args: string[]) =>
+    execFileSync('git', args, { cwd: workspace, stdio: ['ignore', 'pipe', 'pipe'] });
+  git(['init', '-q']);
+  git(['config', 'user.email', 'test@example.com']);
+  git(['config', 'user.name', 'NewIDE Test']);
+  writeFileSync(path.join(workspace, 'seed.txt'), 'seed\n');
+  git(['add', '-A']);
+  git(['commit', '-qm', 'base']);
+}
 
 describe('Task-first JSON-RPC child process acceptance', () => {
   it('runs create and autonomous Council under one durable Task', async () => {
@@ -92,7 +103,10 @@ describe('Task-first JSON-RPC child process acceptance', () => {
       );
       expect(maintenance.maintenance).toEqual(
         expect.arrayContaining([
-          expect.objectContaining({ status: 'completed', evidence_uri: expect.stringMatching(/^file:/) }),
+          expect.objectContaining({
+            status: 'completed',
+            evidence_uri: expect.stringMatching(/^file:/),
+          }),
         ]),
       );
       await expect(
@@ -103,17 +117,13 @@ describe('Task-first JSON-RPC child process acceptance', () => {
       ).resolves.toMatchObject({
         maintenance: {
           status: 'completed',
-          skills: expect.arrayContaining([
-            expect.objectContaining({ review_status: 'pending' }),
-          ]),
+          skills: expect.arrayContaining([expect.objectContaining({ review_status: 'pending' })]),
         },
       });
       await expect(
         client.call('memory.listSkills', { role_id: primaryAgentId }),
       ).resolves.toMatchObject({
-        skills: expect.arrayContaining([
-          expect.objectContaining({ review_status: 'pending' }),
-        ]),
+        skills: expect.arrayContaining([expect.objectContaining({ review_status: 'pending' })]),
       });
 
       const liveCouncilEvents = client.taskEvents(created.task.task_id);
@@ -160,6 +170,7 @@ describe('Task-first JSON-RPC child process acceptance', () => {
   it('blocks an interrupted process and resumes it explicitly under the same Task', async () => {
     const runnerDir = mkdtempSync(path.join(os.tmpdir(), 'newide-task-resume-runner-'));
     const workspace = mkdtempSync(path.join(os.tmpdir(), 'newide-task-resume-workspace-'));
+    initializeGitWorkspace(workspace);
     const holdPath = path.join(runnerDir, 'hold-first-invocation');
     const enteredPath = path.join(runnerDir, 'first-invocation-entered');
     const sessionLogPath = path.join(runnerDir, 'sessions.log');
@@ -268,9 +279,7 @@ describe('Task-first JSON-RPC child process acceptance', () => {
         deadline_seconds: 60,
       });
       expect(sent.message.thread_id).toBe('thread_mailbox_e2e');
-      expect(sent.deliveries).toMatchObject([
-        { status: 'pending', retry_count: 1 },
-      ]);
+      expect(sent.deliveries).toMatchObject([{ status: 'pending', retry_count: 1 }]);
       const deliveryId = sent.deliveries[0]?.delivery_id;
       expect(deliveryId).toBeTruthy();
 
@@ -322,7 +331,9 @@ describe('Task-first JSON-RPC child process acceptance', () => {
       await secondClient.close();
       thirdClient = new RpcChildClient(spawnBackend(runnerDir));
       const replyInbox = await thirdClient.call<{
-        deliveries: Array<{ delivery: { delivery_id: string; status: string; retry_count: number } }>;
+        deliveries: Array<{
+          delivery: { delivery_id: string; status: string; retry_count: number };
+        }>;
       }>('mailbox.inbox', { agent_id: 'agent_source' });
       expect(replyInbox.deliveries).toMatchObject([
         { delivery: { delivery_id: replyDeliveryId, status: 'delivered', retry_count: 2 } },
@@ -479,9 +490,7 @@ async function waitForMaintenance(
       maintenance: Array<{ role_id: string; status: string; evidence_uri?: string }>;
     }>('memory.listMaintenance', {});
     const completedRoles = new Set(
-      result.maintenance
-        .filter((item) => item.status === 'completed')
-        .map((item) => item.role_id),
+      result.maintenance.filter((item) => item.status === 'completed').map((item) => item.role_id),
     );
     if (roleIds.every((roleId) => completedRoles.has(roleId))) return result;
     await new Promise((resolve) => setTimeout(resolve, 25));

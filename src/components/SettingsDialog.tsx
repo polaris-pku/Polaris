@@ -41,6 +41,10 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
   const [reveal, setReveal] = useState(false);
   const [saving, setSaving] = useState(false);
   const [savedConfig, setSavedConfig] = useState<Record<string, DesktopProviderConfig>>({});
+  const [databaseUrl, setDatabaseUrl] = useState('');
+  const [databaseConfigured, setDatabaseConfigured] = useState(false);
+  const [editingDatabase, setEditingDatabase] = useState(false);
+  const [revealDatabase, setRevealDatabase] = useState(false);
 
   useEffect(() => onBackendStatus(setStatus), []);
 
@@ -52,6 +56,10 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
       const id = pickProvider ?? s.provider;
       const cfg = s.configured[id];
       setSavedConfig(s.configured);
+      setDatabaseConfigured(s.bMemory.configured);
+      setDatabaseUrl('');
+      setEditingDatabase(!s.bMemory.configured);
+      setRevealDatabase(false);
       setProviderId(id);
       setBaseUrl(cfg?.baseUrl ?? '');
       setModel(cfg?.model ?? '');
@@ -78,12 +86,15 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
     try {
       const next = await backend.saveSettings({
         provider: providerId,
+        ...(editingDatabase ? { bMemory: { databaseUrl: databaseUrl.trim() } } : {}),
         providers: {
           [providerId]: {
             // 不传 key = 保留原值 —— 改模型/端点时不必重新粘一遍 key
             ...(editingKey ? { key: key.trim() } : {}),
             ...(provider.editableBaseUrl ? { baseUrl: baseUrl.trim() } : {}),
-            ...(needsEndpoint ? { model: model.trim(), fastModel: fastModel.trim() } : {}),
+            ...(needsEndpoint || providerId === 'anthropic'
+              ? { model: model.trim(), fastModel: fastModel.trim() }
+              : {}),
           },
         },
       });
@@ -102,6 +113,8 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
     model,
     fastModel,
     needsEndpoint,
+    editingDatabase,
+    databaseUrl,
     load,
   ]);
 
@@ -118,7 +131,9 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
   }, [backend, providerId, load]);
 
   const auth = status?.auth;
-  const canSave = editingKey ? !!key.trim() : true;
+  const canSave =
+    (editingKey ? !!key.trim() : true) &&
+    (editingDatabase ? !!databaseUrl.trim() : databaseConfigured);
 
   return (
     <Dialog open={open} onClose={onClose} className="max-w-lg">
@@ -260,49 +275,90 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
 
             {/* 端点（自定义服务商才可改；DeepSeek 固定，只读回显） */}
             {needsEndpoint && (
-              <div className="mt-3 space-y-3">
-                <div>
-                  <label className="mb-1 block text-body text-fg-muted">Anthropic 兼容端点</label>
-                  <input
-                    value={provider.editableBaseUrl ? baseUrl : provider.baseUrl}
-                    onChange={(e) => setBaseUrl(e.target.value)}
-                    readOnly={!provider.editableBaseUrl}
-                    placeholder="https://…/anthropic"
-                    spellCheck={false}
-                    className={cn(
-                      'w-full rounded-panel border border-edge-strong bg-brand-panel px-3 py-2 font-mono text-code outline-none placeholder:text-fg-faint focus:border-brand-purple',
-                      provider.editableBaseUrl ? 'text-brand-silver' : 'text-fg-muted',
-                    )}
-                  />
-                </div>
-                <div className="grid grid-cols-2 gap-2">
-                  <div>
-                    <label className="mb-1 block text-body text-fg-muted">主模型</label>
-                    <input
-                      value={model}
-                      onChange={(e) => setModel(e.target.value)}
-                      placeholder={provider.defaultModel || 'model-id'}
-                      spellCheck={false}
-                      className="w-full rounded-panel border border-edge-strong bg-brand-panel px-3 py-2 font-mono text-code text-brand-silver outline-none placeholder:text-fg-faint focus:border-brand-purple"
-                    />
-                  </div>
-                  <div>
-                    <label className="mb-1 block text-body text-fg-muted">快速模型（子任务）</label>
-                    <input
-                      value={fastModel}
-                      onChange={(e) => setFastModel(e.target.value)}
-                      placeholder={provider.defaultFastModel || 'model-id'}
-                      spellCheck={false}
-                      className="w-full rounded-panel border border-edge-strong bg-brand-panel px-3 py-2 font-mono text-code text-brand-silver outline-none placeholder:text-fg-faint focus:border-brand-purple"
-                    />
-                  </div>
-                </div>
-                {/* 模型名会变（服务商随时改），所以这里可改，不写死 */}
-                <p className="text-body text-fg-muted">
-                  模型名以服务商文档为准，会变；这里填的会覆盖默认值。
-                </p>
+              <div className="mt-3">
+                <label className="mb-1 block text-body text-fg-muted">Anthropic 兼容端点</label>
+                <input
+                  value={provider.editableBaseUrl ? baseUrl : provider.baseUrl}
+                  onChange={(e) => setBaseUrl(e.target.value)}
+                  readOnly={!provider.editableBaseUrl}
+                  placeholder="https://…/anthropic"
+                  spellCheck={false}
+                  className={cn(
+                    'w-full rounded-panel border border-edge-strong bg-brand-panel px-3 py-2 font-mono text-code outline-none placeholder:text-fg-faint focus:border-brand-purple',
+                    provider.editableBaseUrl ? 'text-brand-silver' : 'text-fg-muted',
+                  )}
+                />
               </div>
             )}
+
+            <div className="mt-3 grid grid-cols-2 gap-2">
+              <div>
+                <label className="mb-1 block text-body text-fg-muted">主模型</label>
+                <input
+                  value={model}
+                  onChange={(e) => setModel(e.target.value)}
+                  placeholder={provider.defaultModel || 'model-id'}
+                  spellCheck={false}
+                  className="w-full rounded-panel border border-edge-strong bg-brand-panel px-3 py-2 font-mono text-code text-brand-silver outline-none placeholder:text-fg-faint focus:border-brand-purple"
+                />
+              </div>
+              <div>
+                <label className="mb-1 block text-body text-fg-muted">快速模型（子任务）</label>
+                <input
+                  value={fastModel}
+                  onChange={(e) => setFastModel(e.target.value)}
+                  placeholder={provider.defaultFastModel || 'model-id'}
+                  spellCheck={false}
+                  className="w-full rounded-panel border border-edge-strong bg-brand-panel px-3 py-2 font-mono text-code text-brand-silver outline-none placeholder:text-fg-faint focus:border-brand-purple"
+                />
+              </div>
+            </div>
+            <p className="mt-1 text-body text-fg-muted">
+              B Agent、Memory 维护与 Coding agent 使用同一服务商；模型名按服务商实际支持填写。
+            </p>
+
+            <div className="mt-4 border-t border-edge pt-4">
+              <div className="flex items-center gap-2">
+                <span className="font-mono text-code text-brand-purple">B</span>
+                <div>
+                  <div className="text-body text-brand-silver">B Memory 数据库</div>
+                  <div className="text-body text-fg-muted">PostgreSQL 需要安装 pgvector 扩展。</div>
+                </div>
+              </div>
+              {databaseConfigured && !editingDatabase ? (
+                <div className="mt-2 flex items-center gap-2 rounded-panel border border-ok/30 bg-ok/5 px-3 py-2">
+                  <CheckCircle2 className="h-4 w-4 text-ok" />
+                  <span className="text-body text-brand-silver">连接已保存（地址不回传界面）</span>
+                  <button
+                    type="button"
+                    onClick={() => setEditingDatabase(true)}
+                    className="ml-auto text-body text-command-soft underline-offset-2 hover:underline"
+                  >
+                    更改
+                  </button>
+                </div>
+              ) : (
+                <div className="relative mt-2">
+                  <input
+                    type={revealDatabase ? 'text' : 'password'}
+                    value={databaseUrl}
+                    onChange={(e) => setDatabaseUrl(e.target.value)}
+                    placeholder="postgresql://user:password@host:5432/database"
+                    spellCheck={false}
+                    autoComplete="off"
+                    className="w-full rounded-panel border border-edge-strong bg-brand-panel px-3 py-2 pr-10 font-mono text-code text-brand-silver outline-none placeholder:text-fg-faint focus:border-brand-purple"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setRevealDatabase((value) => !value)}
+                    title={revealDatabase ? '隐藏' : '显示'}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-fg-muted hover:text-brand-silver"
+                  >
+                    {revealDatabase ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+                  </button>
+                </div>
+              )}
+            </div>
 
             <div className="mt-4 flex items-center gap-2">
               <Button

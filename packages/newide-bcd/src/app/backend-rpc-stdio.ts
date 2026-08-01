@@ -9,10 +9,7 @@ import path from 'node:path';
 import type { Readable } from 'node:stream';
 import { IntegrationV0CoordinatorRunner } from '../coordinator/coordinator-runner';
 import { SelectAgentHandler } from '../coordinator/handlers/select-agent-handler';
-import {
-  AgentBoardCouncilParticipantResolver,
-  SynthesisAgentCouncilProvider,
-} from '../council';
+import { AgentBoardCouncilParticipantResolver, SynthesisAgentCouncilProvider } from '../council';
 import { CommandDriverTransport, ExternalDriverRuntime } from '../driver';
 import {
   LiteLLMClientAdapter,
@@ -106,6 +103,7 @@ export async function createProductionBackendService(
   }
 
   const driverEnv = loadEnvFile(env.ACP_DRIVER_ENV_FILE ?? path.join(runnerDir, '.env'));
+  const driverTimeout = readDriverTimeout(env.ACP_DRIVER_TIMEOUT_MS);
   const driver = new ExternalDriverRuntime({
     driver_id: 'acp-external',
     capabilities: {
@@ -131,7 +129,7 @@ export async function createProductionBackendService(
         'NEWIDE_B_DATABASE_URL',
         ...MODEL_OVERRIDE_ENV.filter((key) => driverEnv[key] === undefined),
       ],
-      timeoutMs: readDriverTimeout(env.ACP_DRIVER_TIMEOUT_MS),
+      ...(driverTimeout !== undefined ? { timeoutMs: driverTimeout } : {}),
     }),
   });
   let bRuntime: BackendBRuntime | undefined;
@@ -223,10 +221,7 @@ export async function createProductionBackendService(
       councilProvider,
       gateExecutor,
     });
-    const bMemoryService = new BMemoryBackendService(
-      bCapabilities,
-      bRuntime.embedding_info,
-    );
+    const bMemoryService = new BMemoryBackendService(bCapabilities, bRuntime.embedding_info);
 
     try {
       await agentExecutionFacade.ready();
@@ -314,8 +309,8 @@ const MODEL_OVERRIDE_ENV = [
   'CLAUDE_CODE_SUBAGENT_MODEL',
 ];
 
-function readDriverTimeout(value: string | undefined): number {
-  if (value === undefined) return 120_000;
+function readDriverTimeout(value: string | undefined): number | undefined {
+  if (value === undefined || value.trim() === '') return undefined;
   const timeout = Number(value);
   if (!Number.isInteger(timeout) || timeout <= 0) {
     throw new Error('ACP_DRIVER_TIMEOUT_MS must be a positive integer');
@@ -350,10 +345,7 @@ function readPackageIdentity(
   const rawName = Reflect.get(value, 'name');
   const rawVersion = Reflect.get(value, 'version');
   return {
-    name:
-      typeof rawName === 'string' && rawName.trim().length > 0
-        ? rawName.trim()
-        : fallbackName,
+    name: typeof rawName === 'string' && rawName.trim().length > 0 ? rawName.trim() : fallbackName,
     version:
       typeof rawVersion === 'string' && rawVersion.trim().length > 0
         ? rawVersion.trim()
@@ -450,9 +442,7 @@ export function parseDriverEnv(content: string): NodeJS.ProcessEnv {
   );
 }
 
-export async function runBackendRpcMain(
-  env: NodeJS.ProcessEnv = process.env,
-): Promise<void> {
+export async function runBackendRpcMain(env: NodeJS.ProcessEnv = process.env): Promise<void> {
   let service: NewideBackendService | undefined;
   let server: BackendRpcServer | undefined;
   let shutdownRequested = false;

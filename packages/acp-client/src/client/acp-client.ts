@@ -277,6 +277,26 @@ export class AcpClient extends EventEmitter {
     return this.currentSession;
   }
 
+  async loadSession(
+    sessionId: string,
+    cwd: string,
+    capabilities: InitializeResult["agentCapabilities"],
+    mcpServers: McpServerConfig[] = []
+  ): Promise<SessionInfo> {
+    this.ensureInitialized();
+    if (!this.authenticated) await this.authenticate();
+    if (capabilities.loadSession !== true) {
+      throw new SessionError(`Agent ${this.adapter.agentId} does not support session loading`);
+    }
+
+    const agentId = this.adapter.agentId;
+    const extensionMcpServers = await this.getExtensionMcpServers();
+    await this.connection.loadSession(sessionId, cwd, [...mcpServers, ...extensionMcpServers]);
+    this.currentSession = { sessionId, cwd, agentId };
+    this.setState("ready");
+    return this.currentSession;
+  }
+
   async sendPrompt(message: string): Promise<TurnController> {
     this.ensureInitialized();
     if (!this.currentSession) throw new SessionError("No active session");

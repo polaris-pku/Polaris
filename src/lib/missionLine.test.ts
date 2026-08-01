@@ -121,7 +121,7 @@ describe('missionLineOf', () => {
     expect(m.headline).toBe('已提交 · 等待后端第一个事件');
   });
 
-  it('blocked：被拦下 · {原因}，副句是 required_actions[0]（只告知，不给按钮）', () => {
+  it('blocked：被拦下 · {原因}，提供显式恢复入口', () => {
     seq = 0;
     const timeline = [
       evt('agent.execution_completed', { role_id: 'backend_engineer' }, '00:00:40'),
@@ -139,7 +139,7 @@ describe('missionLineOf', () => {
     expect(m.state).toBe('blocked');
     expect(m.headline).toBe('被拦下 · 需要人工确认写入范围');
     expect(m.sub).toBe('确认 src/ 可写');
-    expect(m.retry).toBe(false);
+    expect(m.retry).toBe(true);
   });
 
   it('completed（快照未到）：files_written 是 **number**，直接当数字用', () => {

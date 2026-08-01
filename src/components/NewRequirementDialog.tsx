@@ -1,10 +1,11 @@
-import { useState, type KeyboardEvent } from 'react';
+import { useEffect, useState, type KeyboardEvent } from 'react';
 import { FilePlus2, ArrowRight, AlertTriangle } from 'lucide-react';
 import { Dialog } from '@/components/ui/Dialog';
 import { Button } from '@/components/ui/Button';
 import { Textarea } from '@/components/ui/Textarea';
 import { useDemoStore } from '@/store/useDemoStore';
 import { cn } from '@/lib/utils';
+import { findCapability, getReadiness, onReadiness } from '@/api/system';
 
 type RunModeChoice = 'single_agent' | 'council';
 
@@ -30,8 +31,15 @@ export function NewRequirementDialog({ open, onClose }: { open: boolean; onClose
   const [criteria, setCriteria] = useState('');
   const [mode, setMode] = useState<RunModeChoice>('single_agent');
   const [error, setError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [readiness, setReadiness] = useState(getReadiness());
 
-  const canSubmit = text.trim().length > 0;
+  useEffect(() => onReadiness(setReadiness), []);
+  const councilCapability = findCapability(readiness, 'council.execute');
+  const councilEnabled =
+    councilCapability?.status === 'available' || councilCapability?.status === 'degraded';
+
+  const canSubmit = text.trim().length > 0 && criteria.split('\n').some((item) => item.trim());
 
   const reset = () => {
     setText('');
@@ -46,24 +54,28 @@ export function NewRequirementDialog({ open, onClose }: { open: boolean; onClose
     onClose();
   };
 
-  const handleCreate = () => {
-    if (!canSubmit) return;
-    // 提交可能被拒（别的项目还有 run 在跑 —— 绑定工作区会杀掉它）。
-    // 被拒时**不要关对话框**：把原因摆在用户眼前，他输入的内容也原样留着。
-    const result = createTask(text, title, criteria.split('\n'), mode);
-    if (!result.ok) {
-      setError(result.error);
-      return;
+  const handleCreate = async () => {
+    if (!canSubmit || submitting) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      const result = await createTask(text, title, criteria.split('\n'), mode);
+      if (!result.ok) {
+        setError(result.error);
+        return;
+      }
+      reset();
+      onClose();
+    } finally {
+      setSubmitting(false);
     }
-    reset();
-    onClose();
   };
 
   const onTextareaKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     // Ctrl / Cmd + Enter 快捷提交
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
-      handleCreate();
+      void handleCreate();
     }
   };
 
@@ -106,7 +118,7 @@ export function NewRequirementDialog({ open, onClose }: { open: boolean; onClose
 
         <div className="mt-4">
           <label className="mb-1 block text-body text-fg-secondary">
-            验收标准（可选 · 每行一条）
+            验收标准（必填 · 每行一条）
           </label>
           <Textarea
             value={criteria}
@@ -114,7 +126,7 @@ export function NewRequirementDialog({ open, onClose }: { open: boolean; onClose
             rows={3}
             placeholder={'未授权访问返回 403\n已有单测全部通过'}
           />
-          <p className="mt-1 text-body text-fg-muted">留空则由 Agent 起草一份，随任务一起提交。</p>
+          <p className="mt-1 text-body text-fg-muted">至少填写一条可验证的完成条件。</p>
         </div>
 
         <div className="mt-4">
@@ -127,10 +139,12 @@ export function NewRequirementDialog({ open, onClose }: { open: boolean; onClose
                   key={choice.id}
                   type="button"
                   onClick={() => {
+                    if (choice.id === 'council' && !councilEnabled) return;
                     setMode(choice.id);
                   }}
+                  disabled={choice.id === 'council' && !councilEnabled}
                   className={cn(
-                    'rounded-panel border bg-surface-panel p-3 text-left transition-colors',
+                    'rounded-panel border bg-surface-panel p-3 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-45',
                     active
                       ? 'border-command/60 ring-1 ring-command/40'
                       : 'border-edge hover:border-edge-strong',
@@ -141,7 +155,11 @@ export function NewRequirementDialog({ open, onClose }: { open: boolean; onClose
                   >
                     {choice.label}
                   </div>
-                  <p className="mt-0.5 text-body text-fg-muted">{choice.desc}</p>
+                  <p className="mt-0.5 text-body text-fg-muted">
+                    {choice.id === 'council' && councilCapability?.status === 'unavailable'
+                      ? councilCapability.reason || '当前后端未提供 Council 执行能力。'
+                      : choice.desc}
+                  </p>
                 </button>
               );
             })}
@@ -160,8 +178,12 @@ export function NewRequirementDialog({ open, onClose }: { open: boolean; onClose
           <Button variant="ghost" onClick={handleClose}>
             取消
           </Button>
-          <Button variant="primary" onClick={handleCreate} disabled={!canSubmit}>
-            创建任务 <ArrowRight className="h-4 w-4" />
+          <Button
+            variant="primary"
+            onClick={() => void handleCreate()}
+            disabled={!canSubmit || submitting}
+          >
+            {submitting ? '正在提交…' : '创建任务'} <ArrowRight className="h-4 w-4" />
           </Button>
         </div>
       </div>

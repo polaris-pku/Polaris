@@ -279,15 +279,13 @@ export class TaskExecutionLoop {
               expected_cursor: cursorInput.cursor,
               invocation_id: invocationId,
               evidence_ref: evidence,
-              error:
-                result.error ??
-                {
-                  code: result.status === 'denied' ? 'gate_denied' : 'gate_blocked',
-                  message:
-                    result.status === 'denied'
-                      ? 'Production Gate denied the changeset'
-                      : 'Production Gate blocked the changeset',
-                },
+              error: result.error ?? {
+                code: result.status === 'denied' ? 'gate_denied' : 'gate_blocked',
+                message:
+                  result.status === 'denied'
+                    ? 'Production Gate denied the changeset'
+                    : 'Production Gate blocked the changeset',
+              },
               ...(result.artifact_refs ? { artifact_refs: result.artifact_refs } : {}),
             });
             controls.on_committed_events?.(committed.committed_events);
@@ -330,6 +328,7 @@ export class TaskExecutionLoop {
         }
       }
     } catch (error) {
+      if (controls.signal?.aborted) throw error;
       if (error instanceof TaskProcessorStageCommitError) throw error;
       const failureError = error instanceof StageAdvanceError ? error.originalError : error;
       const failure = stageFailure(failureError, cursorInput.cursor);
@@ -468,10 +467,7 @@ class StageAdvanceError extends Error {
 function stageContext<TCursor extends Exclude<TaskResumeCursor, 'done' | 'mailbox_wait'>>(
   state: TaskRunExecutionState,
   cursorInput: CursorInput<TCursor>,
-  controls: Pick<
-    RunTaskExecutionInput,
-    'session_id' | 'signal' | 'on_driver_event' | 'on_event'
-  >,
+  controls: Pick<RunTaskExecutionInput, 'session_id' | 'signal' | 'on_driver_event' | 'on_event'>,
 ): TaskStageExecutionContext<TCursor> {
   return {
     task_id: state.task_id,
@@ -481,9 +477,7 @@ function stageContext<TCursor extends Exclude<TaskResumeCursor, 'done' | 'mailbo
     workspace_path: state.workspace_path,
     ...(controls.session_id ? { session_id: controls.session_id } : {}),
     cursor_input: cursorInput,
-    ...(state.restarted_from_run_id
-      ? { restarted_from_run_id: state.restarted_from_run_id }
-      : {}),
+    ...(state.restarted_from_run_id ? { restarted_from_run_id: state.restarted_from_run_id } : {}),
     ...(controls.signal ? { signal: controls.signal } : {}),
     ...(controls.on_driver_event ? { on_driver_event: controls.on_driver_event } : {}),
     ...(controls.on_event ? { on_event: controls.on_event } : {}),

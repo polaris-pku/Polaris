@@ -17,7 +17,6 @@ import {
   ScrollText,
 } from 'lucide-react';
 import { useDemoStore } from '@/store/useDemoStore';
-import { getAgentById } from '@/data/agents';
 import { NewProjectDialog } from '@/components/NewProjectDialog';
 import { NewRequirementDialog } from '@/components/NewRequirementDialog';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
@@ -26,7 +25,7 @@ import { RUN_STATE_LABEL, RUN_STATE_TONE, runStateOf, type RunState } from '@/li
 import { writeTargetOf } from '@/store/lib/agentWrites';
 import { cn } from '@/lib/utils';
 import type { LiveRunState } from '@/store/types';
-import type { AgentStatus, DemoTask, FileNode, Project } from '@/types';
+import type { DemoTask, FileNode, Project } from '@/types';
 
 const GROUPS = ['files', 'tasks'] as const;
 
@@ -34,15 +33,6 @@ function defaultOpenKeys(projectId: string | null): string[] {
   if (!projectId) return [];
   return [`p:${projectId}`, ...GROUPS.map((g) => `g:${projectId}:${g}`), `d:${projectId}:src`];
 }
-
-/** Agent 在线状态的点色：只编码「在动 / 需要注意 / 无」，不新增色相。 */
-const agentDotColor: Record<AgentStatus, string> = {
-  created: 'text-fg-muted',
-  active: 'text-ok',
-  idle: 'text-fg-muted',
-  draining: 'text-human',
-  retired: 'text-fg-faint',
-};
 
 /** run 状态的点色。词表与色调都来自 runState.ts —— 这里不允许出现第二份。 */
 const TONE_DOT: Record<(typeof RUN_STATE_TONE)[RunState], string> = {
@@ -463,22 +453,16 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
                                 <span className="text-meta text-fg-faint">{taskAgents.length}</span>
                                 <ChevronRight className="ml-auto h-3 w-3 text-fg-faint opacity-0 transition-opacity group-hover/at:opacity-100" />
                               </button>
-                              {taskAgents.map((id) => {
-                                const a = getAgentById(id);
-                                if (!a) return null;
-                                return (
-                                  <button
-                                    key={id}
-                                    onClick={() => openTaskAgent(t.id, id)}
-                                    className="flex w-full items-center gap-1.5 rounded-chip px-1.5 py-1 text-left text-body text-fg-secondary transition-colors hover:bg-surface-raised hover:text-fg-primary"
-                                  >
-                                    <CircleDot
-                                      className={cn('h-3 w-3 shrink-0', agentDotColor[a.status])}
-                                    />
-                                    <span className="min-w-0 flex-1 truncate">{a.name}</span>
-                                  </button>
-                                );
-                              })}
+                              {taskAgents.map((roleId) => (
+                                <button
+                                  key={roleId}
+                                  onClick={() => openTaskAgent(t.id, roleId)}
+                                  className="flex w-full items-center gap-1.5 rounded-chip px-1.5 py-1 text-left text-body text-fg-secondary transition-colors hover:bg-surface-raised hover:text-fg-primary"
+                                >
+                                  <CircleDot className="h-3 w-3 shrink-0 text-ok" />
+                                  <span className="min-w-0 flex-1 truncate">{roleId}</span>
+                                </button>
+                              ))}
                               {taskAgents.length === 0 && <EmptyHint text="团队为空" />}
                             </div>
                           )}

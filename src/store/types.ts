@@ -10,6 +10,7 @@ import type {
 import type { EventChannelStatus } from '@/api/events';
 import type { Event as ContractEvent, FilePermissionOutcome } from '@/api/types';
 import type { RunEvent, RunSnapshot } from '@/api/types/rpc';
+import type { TaskSnapshot } from '@/api/types/task';
 import type { AgentFileWriteResult } from '@/lib/agentFs';
 import type { DockChannel } from '@/lib/glossary';
 
@@ -19,6 +20,14 @@ import type { DockChannel } from '@/lib/glossary';
  * 与 mock 剧本并存：mock 剧本仍驱动泳道图的演示推进，`liveRun` 是**后端事实**——
  * 两者不互相覆盖，UI 上分开呈现，避免把「后端真发生了什么」和「演示脚本演到哪」混为一谈。
  */
+export type LiveTaskState = {
+  snapshot: TaskSnapshot;
+  events: RunEvent[];
+  cursor?: string;
+  status: 'subscribing' | 'live' | 'error';
+  error?: string;
+};
+
 export type LiveRunState = {
   runId: string;
   taskId: string;
@@ -142,7 +151,7 @@ export type TaskSlice = {
     title?: string,
     completionCriteria?: string[],
     mode?: 'single_agent' | 'council',
-  ) => { ok: true } | { ok: false; error: string };
+  ) => Promise<{ ok: true } | { ok: false; error: string }>;
   /** 每条后端事件都重投影一次泳道图（幂等）——「泳道图实时跟着后端走」的落点 */
   applyLiveProgress: (
     runId: string,
@@ -231,6 +240,8 @@ export type DemoState = PartialExecState &
     teamCustomizationEnabled: boolean;
     isAutoRunning: boolean;
     tasks: DemoTask[];
+    /** 后端 TaskSnapshot 权威表；旧展示模型迁移期间仅作为投影缓存存在。 */
+    liveTasks: Record<string, LiveTaskState>;
     activeTaskId: string | null;
     projects: Project[];
     /** null = 停留在启动页；有值 = 已进入工作区 */

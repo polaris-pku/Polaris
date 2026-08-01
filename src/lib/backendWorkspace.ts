@@ -10,23 +10,30 @@
  * 所以重复调用不会引起无谓的重启。
  */
 import type { Project } from '@/types';
+import { getTransport } from '@/api/transport';
 
 /**
  * 把 agent 工作区绑到某个项目，并等后端就绪。
  * 浏览器里没有桌面桥（mock 模式）→ 静默跳过。
  * 返回 false 表示绑定失败（后端起不来），调用方应据此判断要不要继续提交。
  */
-export async function bindBackendWorkspace(project: Project | undefined): Promise<boolean> {
+export async function bindBackendWorkspace(project: Project | undefined): Promise<string> {
   const backend = window.desktop?.backend;
-  if (!backend || !project) return false;
-  try {
-    const status = await backend.configure({
-      projectName: project.name,
-      rootPath: project.rootPath,
-    });
-    return status.state !== 'error';
-  } catch (err) {
-    console.warn('[backend] 绑定 agent 工作区失败：', err);
-    return false;
+  if (!project) throw new Error('请先打开一个项目。');
+  if (!backend) {
+    if (getTransport().kind !== 'web') throw new Error('当前环境没有可用 backend transport。');
+    const workspace = project.rootPath?.trim();
+    if (!workspace || !workspace.startsWith('/')) {
+      throw new Error('Web 模式需要项目提供后端所在机器上的绝对 workspace_path。');
+    }
+    return workspace;
   }
+
+  const status = await backend.configure({
+    projectName: project.name,
+    rootPath: project.rootPath,
+  });
+  if (status.state === 'error') throw new Error(status.message || '后端工作区绑定失败。');
+  if (!status.workspace) throw new Error('后端没有返回绝对 workspace_path。');
+  return status.workspace;
 }

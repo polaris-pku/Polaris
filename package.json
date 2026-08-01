@@ -29,9 +29,11 @@
     "format": "prettier --check .",
     "format:fix": "prettier --write .",
     "test": "vitest run --passWithNoTests",
-    "verify": "pnpm lint && pnpm typecheck && pnpm test && pnpm design-guard",
+    "test:electron": "node --test electron/*.test.cjs",
+    "verify": "pnpm lint && pnpm typecheck && pnpm test && pnpm test:electron && pnpm design-guard",
     "prepare": "husky",
     "build:backend": "node scripts/build-backend.mjs",
+    "web:bridge": "node scripts/local-web-bridge.mjs",
     "design-guard": "node scripts/design-guard.mjs",
     "smoke:python": "node scripts/smoke-python.mjs",
     "refresh:python-catalog": "node scripts/refresh-python-catalog.mjs"

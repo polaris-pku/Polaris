@@ -35,11 +35,11 @@ contextBridge.exposeInMainWorld('desktop', {
     getSettings: () => ipcRenderer.invoke('backend:getSettings'),
     /** 存设置（填 key / 换 agent）；存完自动重启后端使其生效 */
     saveSettings: (next) => ipcRenderer.invoke('backend:saveSettings', next),
-    /** 订阅 BCD 推来的 run.event；返回取消订阅函数 */
-    onEvent: (cb) => {
+    /** 订阅 BCD 推来的 task.event / run.event；返回取消订阅函数 */
+    onNotification: (cb) => {
       const listener = (_event, payload) => cb(payload);
-      ipcRenderer.on('backend:event', listener);
-      return () => ipcRenderer.removeListener('backend:event', listener);
+      ipcRenderer.on('backend:notification', listener);
+      return () => ipcRenderer.removeListener('backend:notification', listener);
     },
     /** 订阅后端进程状态变化；返回取消订阅函数 */
     onStatus: (cb) => {
@@ -73,7 +73,7 @@ contextBridge.exposeInMainWorld('desktop', {
     },
   },
   // Python 终端会话（child_process + 管道，不是 PTY）。
-  // 【硬红线 R3/I5】start 只能由用户手势触发，永远不能出现在 backend:event 的调用链里。
+  // 【硬红线 R3/I5】start 只能由用户手势触发，永远不能出现在 backend:notification 的调用链里。
   terminal: {
     /** 新建会话。入参没有 absPath、没有 args —— 路径过 isInside 校验、argv 由主进程构造（I1/I4） */
     start: (req) => ipcRenderer.invoke('term:start', req),

@@ -1,7 +1,7 @@
 import type { DemoTask, PageKey, Project } from '@/types';
 import type { EventChannelStatus } from '@/api/events';
 import type { Event as ContractEvent } from '@/api/types';
-import type { LiveRunState, PendingRunIntent } from '@/store/types';
+import type { LiveRunState, LiveTaskState, PendingRunIntent } from '@/store/types';
 import type { AgentFileWriteResult } from '@/lib/agentFs';
 import type { DockChannel } from '@/lib/glossary';
 import { emptyTaskFields } from '@/store/lib/taskSync';
@@ -23,6 +23,7 @@ export const blankState = () => ({
   teamCustomizationEnabled: false,
   isAutoRunning: false,
   tasks: [] as DemoTask[],
+  liveTasks: {} as Record<string, LiveTaskState>,
   activeTaskId: null as string | null,
   projects: [] as Project[],
   activeProjectId: null as string | null,

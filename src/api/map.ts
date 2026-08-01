@@ -76,10 +76,14 @@ export function toRunCreateParams(
     projectId?: string;
     clientTaskId?: string;
     title?: string;
+    workspacePath?: string;
   } = {},
 ): RunCreateParams {
+  const workspacePath = options.workspacePath?.trim();
+  if (!workspacePath) throw new Error('run.create 需要绝对 workspace_path');
   return {
     prompt: req.spec,
+    workspace_path: workspacePath,
     ...(options.mode ? { mode: options.mode } : {}),
     ...(options.projectId ? { project_id: options.projectId } : {}),
     ...(options.clientTaskId ? { client_task_id: options.clientTaskId } : {}),

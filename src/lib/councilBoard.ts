@@ -28,7 +28,7 @@ export type CouncilReviewCard = {
 
 export type CouncilProposalCard = {
   proposalId: string;
-  /** 事件里的 role_id（proposer_a / proposer_b），显示名过 roleName() */
+  /** 事件里的真实长期 role_id；Council seat 只由 kind 表示，不创建伪角色。 */
   roleId: string;
   /** 以下正文字段来自终态快照；运行中为空 */
   summary: string;

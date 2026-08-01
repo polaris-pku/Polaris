@@ -1,4 +1,3 @@
-import { recommendAgents } from '@/data/agentRecommendation';
 import type { SliceCreator, TeamSlice } from '@/store/types';
 import { extractTaskFields, syncTasks } from '@/store/lib/taskSync';
 
@@ -29,16 +28,17 @@ export const createTeamSlice: SliceCreator<TeamSlice> = (set) => ({
 
   resetTeamToRecommended: () =>
     set((state) => {
-      // 恢复到"按当前需求推荐"的团队（不再是写死的固定四人）。
-      const recommended = recommendAgents(state.taskText).ids;
-      let stage = state.stage;
-      if (stage === 'idle' || stage === 'team_configured') {
-        stage = recommended.length >= 3 ? 'team_configured' : 'idle';
-      }
+      const backendTask = state.activeTaskId
+        ? state.liveTasks[state.activeTaskId]?.snapshot
+        : undefined;
+      const assignedAgentIds = [
+        backendTask?.task.role_id,
+        backendTask?.task.owner_agent_id,
+        backendTask?.market?.winner_agent_id,
+      ].filter((id): id is string => !!id);
       const patch = {
-        assignedAgentIds: [...recommended],
+        assignedAgentIds: [...new Set(assignedAgentIds)],
         teamCustomizationEnabled: false,
-        stage,
       };
       const taskFields = extractTaskFields({ ...state, ...patch });
       return {

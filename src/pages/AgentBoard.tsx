@@ -1,199 +1,298 @@
-import { useState } from 'react';
-import { ArrowRight, Users2, CheckCircle2, Sparkles, FilePlus2 } from 'lucide-react';
-import { agents, getAgentById } from '@/data/agents';
-import { recommendAgents } from '@/data/agentRecommendation';
-import { useDemoStore } from '@/store/useDemoStore';
-import { AgentCard } from '@/components/AgentCard';
-import { AgentDetailPanel } from '@/components/AgentDetailPanel';
-import { NewRequirementDialog } from '@/components/NewRequirementDialog';
-import { SidePanel } from '@/components/SidePanel';
-import { Panel } from '@/components/ui/Panel';
+import { useEffect, useState } from 'react';
+import { AlertTriangle, Brain, Loader2, Sparkles } from 'lucide-react';
+import { memoryApi } from '@/api/memory';
+import type {
+  MemoryCapabilities,
+  MemoryMaintenanceEvidence,
+  RpcAgentBoardAgentView,
+  RpcAgentBoardListItem,
+  RpcExperienceView,
+  RpcSkillView,
+} from '@/api/types/memory';
 import { Badge } from '@/components/ui/Badge';
 import { Button } from '@/components/ui/Button';
-import { roleName } from '@/lib/roleNames';
+import { EmptyState } from '@/components/ui/EmptyState';
+import { Panel } from '@/components/ui/Panel';
+import { SidePanel } from '@/components/SidePanel';
+
+interface AgentDetail {
+  agent: RpcAgentBoardAgentView;
+  skills: RpcSkillView[];
+  experiences: RpcExperienceView[];
+  maintenance: MemoryMaintenanceEvidence[];
+}
 
 export function AgentBoard() {
-  const selectedAgentId = useDemoStore((s) => s.selectedAgentId);
-  const assignedAgentIds = useDemoStore((s) => s.assignedAgentIds);
-  const selectAgent = useDemoStore((s) => s.selectAgent);
-  const assignAgent = useDemoStore((s) => s.assignAgent);
-  const teamCustomizationEnabled = useDemoStore((s) => s.teamCustomizationEnabled);
-  const enableTeamCustomization = useDemoStore((s) => s.enableTeamCustomization);
-  const resetTeamToRecommended = useDemoStore((s) => s.resetTeamToRecommended);
-  const setPage = useDemoStore((s) => s.setPage);
-  const taskText = useDemoStore((s) => s.taskText);
-  const activeTaskId = useDemoStore((s) => s.activeTaskId);
+  const [capabilities, setCapabilities] = useState<MemoryCapabilities>();
+  const [agents, setAgents] = useState<RpcAgentBoardListItem[]>([]);
+  const [selectedRoleId, setSelectedRoleId] = useState<string>();
+  const [detail, setDetail] = useState<AgentDetail>();
+  const [loading, setLoading] = useState(true);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [promoting, setPromoting] = useState(false);
+  const [error, setError] = useState<string>();
 
-  const [reqOpen, setReqOpen] = useState(false);
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    void Promise.all([memoryApi.getCapabilities(), memoryApi.listAgents()])
+      .then(([caps, listed]) => {
+        if (!active) return;
+        setCapabilities(caps.capabilities);
+        setAgents(listed.agents);
+        setSelectedRoleId((current) => current ?? listed.agents[0]?.role_id);
+      })
+      .catch((reason: unknown) => {
+        if (active) setError(reason instanceof Error ? reason.message : String(reason));
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
-  const rec = recommendAgents(taskText);
-  const recommendedIds = rec.ids;
-  const hasRequirement = !!activeTaskId && taskText.trim().length > 0;
+  useEffect(() => {
+    if (!selectedRoleId) {
+      setDetail(undefined);
+      return;
+    }
+    let active = true;
+    setDetailLoading(true);
+    void Promise.all([
+      memoryApi.getAgent(selectedRoleId),
+      memoryApi.listSkills(selectedRoleId),
+      memoryApi.listExperiences(selectedRoleId),
+      memoryApi.listMaintenance(selectedRoleId),
+    ])
+      .then(([agent, skills, experiences, maintenance]) => {
+        if (!active) return;
+        setDetail({
+          agent: agent.agent,
+          skills: skills.skills,
+          experiences: experiences.experiences,
+          maintenance: maintenance.maintenance,
+        });
+      })
+      .catch((reason: unknown) => {
+        if (active) setError(reason instanceof Error ? reason.message : String(reason));
+      })
+      .finally(() => {
+        if (active) setDetailLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [selectedRoleId]);
 
-  const selectedAgent = selectedAgentId ? (getAgentById(selectedAgentId) ?? null) : null;
-  const teamReady = assignedAgentIds.length >= 3;
+  const promote = async () => {
+    if (!selectedRoleId || promoting) return;
+    setPromoting(true);
+    setError(undefined);
+    try {
+      const result = await memoryApi.promoteSkills(selectedRoleId, 'polaris-ui');
+      setDetail((current) =>
+        current
+          ? { ...current, maintenance: [result.maintenance, ...current.maintenance] }
+          : current,
+      );
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setPromoting(false);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="flex h-full items-center justify-center text-body text-fg-muted">
+        <Loader2 className="mr-2 h-4 w-4 animate-spin" /> 正在读取 B Memory…
+      </div>
+    );
+  }
+
+  if (error && agents.length === 0) {
+    return (
+      <div className="flex h-full items-center justify-center p-6">
+        <EmptyState icon={AlertTriangle} title="B Memory 不可用" hint={error} />
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-full overflow-hidden">
-      {/* 左：抬头 + 卡片网格 */}
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <header className="flex items-end justify-between border-b border-edge px-6 py-4">
           <div>
-            <h1 className="text-title text-fg-primary">团队</h1>
-            <p className="mt-0.5 text-body text-fg-muted">组建你的 AI 工程团队</p>
+            <h1 className="text-title text-fg-primary">Agent Memory</h1>
+            <p className="mt-0.5 text-body text-fg-muted">
+              来自 PostgreSQL 的长期角色、技能与经验。
+            </p>
           </div>
-          <div className="flex items-center gap-3">
-            {/* 「团队 00 / 04」的分母是写死的 —— 真实 run 是单 agent，「0/4」在撒谎。只报实数。 */}
-            <span className="text-body text-fg-secondary">
-              团队 · <span className="tabular">{assignedAgentIds.length}</span> 人
-            </span>
-            {teamReady && <Badge variant="ok">团队就绪</Badge>}
-            {teamCustomizationEnabled ? (
-              <Button variant="secondary" size="sm" onClick={resetTeamToRecommended}>
-                恢复推荐团队
-              </Button>
-            ) : (
-              <Button variant="primary" size="sm" onClick={enableTeamCustomization}>
-                自定义团队
-              </Button>
-            )}
-          </div>
+          <EmbeddingBadge capabilities={capabilities} />
         </header>
 
         <div className="flex-1 overflow-y-auto p-6">
-          {/* 推荐来源横幅：有需求 → 展示按需求推荐的理由；无需求 → 引导先输入需求 */}
-          {hasRequirement ? (
-            <Panel className="mb-5 flex items-start gap-2">
-              <Sparkles className="mt-0.5 h-4 w-4 shrink-0 text-command-soft" />
-              <div className="min-w-0">
-                <div className="text-body text-fg-primary">已根据需求推荐团队</div>
-                <p className="mt-0.5 text-body text-fg-secondary">{rec.reason}</p>
-                <p className="mt-1 text-body text-fg-muted">
-                  可直接采用，或点右上角「自定义团队」自行增删 Agent。
-                </p>
-              </div>
-            </Panel>
-          ) : (
-            <Panel className="mb-5 flex items-center justify-between gap-3">
-              <div className="flex items-start gap-2">
-                <FilePlus2 className="mt-0.5 h-4 w-4 shrink-0 text-command-soft" />
-                <div>
-                  <div className="text-body text-fg-primary">还没有需求</div>
-                  <p className="mt-0.5 text-body text-fg-muted">
-                    新建需求后，系统会据此推荐团队；你也可以先自行挑选 Agent。
-                  </p>
-                </div>
-              </div>
-              <Button
-                variant="primary"
-                size="sm"
-                onClick={() => {
-                  setReqOpen(true);
-                }}
-              >
-                <FilePlus2 className="h-4 w-4" /> 新建需求
-              </Button>
+          {error && (
+            <Panel className="mb-4 flex items-start gap-2 border-human/30">
+              <AlertTriangle className="mt-0.5 h-4 w-4 text-human-soft" />
+              <span className="text-body text-fg-secondary">{error}</span>
             </Panel>
           )}
-
           <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
             {agents.map((agent) => (
-              <AgentCard
-                key={agent.id}
-                agent={agent}
-                selected={selectedAgentId === agent.id}
-                assigned={assignedAgentIds.includes(agent.id)}
-                recommended={recommendedIds.includes(agent.id)}
-                onSelect={() => {
-                  selectAgent(agent.id);
-                }}
-                onAssign={() => {
-                  assignAgent(agent.id);
-                }}
-                showAssign={teamCustomizationEnabled}
-              />
+              <button
+                key={agent.role_id}
+                type="button"
+                onClick={() => setSelectedRoleId(agent.role_id)}
+                className={`rounded-panel border bg-surface-panel p-4 text-left transition-colors hover:border-edge-strong ${
+                  selectedRoleId === agent.role_id ? 'border-command/60' : 'border-edge'
+                }`}
+              >
+                <div className="flex items-center gap-3">
+                  <div className="flex h-10 w-10 items-center justify-center rounded-panel border border-edge-strong bg-surface-raised font-mono text-title text-command-soft">
+                    {agent.name.slice(0, 2).toUpperCase()}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-title text-fg-primary">{agent.name}</div>
+                    <div className="truncate font-mono text-code text-fg-muted">
+                      {agent.role_id}
+                    </div>
+                  </div>
+                  <Badge variant={agent.status === 'active' ? 'ok' : 'default'}>
+                    {agent.status}
+                  </Badge>
+                </div>
+                <p className="mt-3 line-clamp-2 text-body text-fg-secondary">
+                  {agent.persona_summary || '暂无 Persona 摘要'}
+                </p>
+                <div className="mt-3 flex items-center justify-between text-body text-fg-muted">
+                  <div className="flex gap-1.5">
+                    {(agent.tags ?? []).slice(0, 3).map((tag) => (
+                      <span
+                        key={tag}
+                        className="rounded-chip border border-edge px-1.5 font-mono text-code"
+                      >
+                        {tag}
+                      </span>
+                    ))}
+                  </div>
+                  <span>
+                    技能 {agent.skill_count} · 经验 {agent.experience_count}
+                  </span>
+                </div>
+              </button>
             ))}
           </div>
-
-          {/* 团队概览 */}
-          <Panel className="mt-6">
-            <div className="mb-3 flex items-center gap-2">
-              <Users2 className="h-4 w-4 text-command-soft" />
-              <h2 className="text-title text-fg-primary">团队概览</h2>
-              <span className="ml-2 text-body text-fg-muted">
-                {hasRequirement
-                  ? '系统已根据需求推荐团队（可点右上角「自定义团队」调整）'
-                  : '新建需求后系统会据此推荐团队'}
-              </span>
-            </div>
-
-            {assignedAgentIds.length === 0 ? (
-              <p className="text-body text-fg-muted">当前团队为空。建议保持至少 3 名 Agent。</p>
-            ) : (
-              <div className="flex flex-wrap gap-2">
-                {assignedAgentIds.map((id) => {
-                  const a = getAgentById(id);
-                  if (!a) return null;
-                  return (
-                    <div
-                      key={id}
-                      className="flex items-center gap-2 rounded-panel border border-edge-strong bg-surface-raised px-3 py-1 text-body text-fg-primary"
-                    >
-                      <CheckCircle2 className="h-3.5 w-3.5 text-ok" />
-                      {a.name}
-                      <span className="text-fg-muted">{roleName(a.role_id)}</span>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-
-            {teamReady && (
-              <div className="mt-4 flex items-center justify-between gap-3 border-t border-edge pt-4">
-                <span className="text-body text-fg-secondary">
-                  团队已就绪，可前往任务页下发任务。
-                </span>
-                <Button
-                  variant="primary"
-                  size="sm"
-                  onClick={() => {
-                    setPage('tasks');
-                  }}
-                >
-                  前往任务 <ArrowRight className="h-4 w-4" />
-                </Button>
-              </div>
-            )}
-          </Panel>
         </div>
       </div>
 
-      {/* 右：详情面板 */}
       <SidePanel
         side="right"
-        title="Agent 详情"
-        defaultWidth={360}
-        minWidth={300}
-        maxWidth={560}
-        storageKey="agent-detail"
+        title="Memory 详情"
+        defaultWidth={390}
+        minWidth={320}
+        maxWidth={600}
+        storageKey="agent-memory-detail"
         className="bg-black"
       >
-        <AgentDetailPanel
-          agent={selectedAgent}
-          assigned={selectedAgent ? assignedAgentIds.includes(selectedAgent.id) : false}
-          onAssign={() => {
-            if (selectedAgent) assignAgent(selectedAgent.id);
-          }}
-          showAssign={teamCustomizationEnabled}
-        />
+        {detailLoading ? (
+          <div className="flex h-full items-center justify-center text-body text-fg-muted">
+            <Loader2 className="mr-2 h-4 w-4 animate-spin" /> 正在加载详情…
+          </div>
+        ) : detail ? (
+          <div className="space-y-5 p-4">
+            <div>
+              <h2 className="text-title text-fg-primary">{detail.agent.name}</h2>
+              <p className="mt-1 font-mono text-code text-fg-muted">{detail.agent.role_id}</p>
+            </div>
+            <section>
+              <h3 className="mb-2 text-body text-fg-primary">Persona</h3>
+              <pre className="max-h-48 overflow-auto whitespace-pre-wrap rounded-panel border border-edge bg-surface-void p-3 font-mono text-code text-fg-secondary">
+                {JSON.stringify(detail.agent.persona, null, 2)}
+              </pre>
+            </section>
+            <section>
+              <div className="mb-2 flex items-center justify-between">
+                <h3 className="text-body text-fg-primary">Skills · {detail.skills.length}</h3>
+                {capabilities?.operations.promote_skills?.status === 'available' && (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => void promote()}
+                    disabled={promoting}
+                  >
+                    <Sparkles className="h-3.5 w-3.5" />
+                    {promoting ? '处理中…' : '生成 pending Skill'}
+                  </Button>
+                )}
+              </div>
+              <div className="space-y-2">
+                {detail.skills.map((skill) => (
+                  <Panel key={skill.id} className="p-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-body text-fg-primary">{skill.description}</span>
+                      <Badge variant={skill.review_status === 'pending' ? 'human' : 'default'}>
+                        {skill.review_status}
+                      </Badge>
+                    </div>
+                    <p className="mt-1 line-clamp-3 text-body text-fg-muted">{skill.content}</p>
+                  </Panel>
+                ))}
+              </div>
+            </section>
+            <section>
+              <h3 className="mb-2 text-body text-fg-primary">
+                Experiences · {detail.experiences.length}
+              </h3>
+              <div className="space-y-2">
+                {detail.experiences.map((experience) => (
+                  <Panel key={experience.id} className="p-3">
+                    <div className="text-body text-fg-primary">{experience.description}</div>
+                    <p className="mt-1 line-clamp-3 text-body text-fg-muted">
+                      {experience.content}
+                    </p>
+                  </Panel>
+                ))}
+              </div>
+            </section>
+            <section>
+              <h3 className="mb-2 text-body text-fg-primary">维护证据</h3>
+              <div className="space-y-2">
+                {detail.maintenance.map((item) => (
+                  <Panel key={item.maintenance_ref} className="p-3">
+                    <div className="flex items-center justify-between">
+                      <span className="font-mono text-code text-fg-secondary">{item.kind}</span>
+                      <Badge variant={item.status === 'completed' ? 'ok' : 'default'}>
+                        {item.status}
+                      </Badge>
+                    </div>
+                    {item.kind === 'skill_promotion' && (
+                      <p className="mt-1 text-body text-human-soft">
+                        生成的 Skill 保持 pending，尚未批准。
+                      </p>
+                    )}
+                  </Panel>
+                ))}
+              </div>
+            </section>
+          </div>
+        ) : (
+          <EmptyState icon={Brain} title="选择一个 Agent" hint="详情与记忆会按需从后端加载。" />
+        )}
       </SidePanel>
-
-      <NewRequirementDialog
-        open={reqOpen}
-        onClose={() => {
-          setReqOpen(false);
-        }}
-      />
     </div>
+  );
+}
+
+function EmbeddingBadge({ capabilities }: { capabilities?: MemoryCapabilities }) {
+  const embedding = capabilities?.embedding;
+  if (!embedding) return null;
+  const degraded = embedding.provider === 'HashEmbeddingProvider';
+  return (
+    <Badge variant={degraded ? 'human' : 'ok'}>
+      {degraded ? 'Hash embedding · degraded' : `${embedding.provider} · ready`}
+    </Badge>
   );
 }

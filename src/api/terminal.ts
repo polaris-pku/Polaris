@@ -3,7 +3,7 @@
  *
  * 形状与 ./events.ts 完全同构（模块级 Set<Handler> + 幂等 attach）：
  * **推送通道每 namespace 只有一个**，靠 payload 里的 `sessionId` 分流 ——
- * 与 `backend:event` 靠 `run_id` 分流是同一个道理。绝不为每个会话开一条 `term:data:<id>`：
+ * 与 `backend:notification` 靠 `run_id` 分流是同一个道理。绝不为每个会话开一条 `term:data:<id>`：
  * preload 的取消订阅是按通道 removeListener 的，多通道必然泄漏 listener。
  *
  * 两类消费者：

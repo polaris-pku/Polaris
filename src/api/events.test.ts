@@ -39,9 +39,13 @@ function installFakeBackend() {
     getStatus: vi.fn(async () => READY_STATUS),
     configure: vi.fn(async () => READY_STATUS),
     restart: vi.fn(async () => READY_STATUS),
-    getSettings: vi.fn(async () => ({ provider: 'anthropic', configured: {} })),
+    getSettings: vi.fn(async () => ({
+      provider: 'anthropic',
+      bMemory: { configured: true },
+      configured: {},
+    })),
     saveSettings: vi.fn(async () => READY_STATUS),
-    onEvent: vi.fn(() => () => {}),
+    onNotification: vi.fn(() => () => {}),
     onStatus: vi.fn(() => () => {}),
   };
   vi.stubGlobal('window', { desktop: { isDesktop: true, platform: 'linux', backend } });
@@ -95,9 +99,13 @@ describe('watchRun', () => {
       getStatus: vi.fn(async () => READY_STATUS),
       configure: vi.fn(async () => READY_STATUS),
       restart: vi.fn(async () => READY_STATUS),
-      getSettings: vi.fn(async () => ({ provider: 'anthropic', configured: {} })),
+      getSettings: vi.fn(async () => ({
+        provider: 'anthropic',
+        bMemory: { configured: true },
+        configured: {},
+      })),
       saveSettings: vi.fn(async () => READY_STATUS),
-      onEvent: vi.fn(() => () => {}),
+      onNotification: vi.fn(() => () => {}),
       onStatus: vi.fn(() => () => {}),
     };
     vi.stubGlobal('window', { desktop: { isDesktop: true, platform: 'linux', backend } });

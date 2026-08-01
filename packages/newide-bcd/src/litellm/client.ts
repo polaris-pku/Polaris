@@ -206,13 +206,26 @@ export class LiteLLMClient {
     let factory: ProviderFactory;
     switch (provider) {
       case 'openai': {
-        const { openai } = await import('@ai-sdk/openai');
-        factory = (id) => openai(id);
+        const { createOpenAI } = await import('@ai-sdk/openai');
+        const apiKey = process.env.NEWIDE_LLM_API_KEY || process.env.OPENAI_API_KEY;
+        const baseURL = process.env.NEWIDE_LLM_BASE_URL || process.env.OPENAI_BASE_URL;
+        const provider = createOpenAI({
+          ...(apiKey ? { apiKey } : {}),
+          ...(baseURL ? { baseURL } : {}),
+        });
+        factory = (id) => provider.chat(id);
         break;
       }
       case 'anthropic': {
-        const { anthropic } = await import('@ai-sdk/anthropic');
-        factory = (id) => anthropic(id);
+        const { createAnthropic } = await import('@ai-sdk/anthropic');
+        const apiKey = process.env.NEWIDE_LLM_API_KEY || process.env.ANTHROPIC_API_KEY;
+        const authToken = process.env.ANTHROPIC_AUTH_TOKEN;
+        const baseURL = process.env.NEWIDE_LLM_BASE_URL || process.env.ANTHROPIC_BASE_URL;
+        const provider = createAnthropic({
+          ...(apiKey ? { apiKey } : authToken ? { authToken } : {}),
+          ...(baseURL ? { baseURL } : {}),
+        });
+        factory = (id) => provider.messages(id);
         break;
       }
       default:
@@ -280,7 +293,9 @@ export class LiteLLMClient {
     const params: Record<string, unknown> = {
       model,
       messages,
-      temperature: request.temperature ?? resolved.temperature,
+      ...(resolved.provider === 'anthropic'
+        ? {}
+        : { temperature: request.temperature ?? resolved.temperature }),
       maxOutputTokens: request.maxTokens ?? resolved.maxTokens,
     };
 
@@ -324,7 +339,9 @@ export class LiteLLMClient {
       model,
       messages,
       tools: toAiTools(schemas, handlers),
-      temperature: request.temperature ?? resolved.temperature,
+      ...(resolved.provider === 'anthropic'
+        ? {}
+        : { temperature: request.temperature ?? resolved.temperature }),
       maxOutputTokens: request.maxTokens ?? resolved.maxTokens,
       maxSteps: maxRounds,
     };
@@ -357,7 +374,9 @@ export class LiteLLMClient {
     const params: Record<string, unknown> = {
       model,
       messages,
-      temperature: request.temperature ?? resolved.temperature,
+      ...(resolved.provider === 'anthropic'
+        ? {}
+        : { temperature: request.temperature ?? resolved.temperature }),
       maxOutputTokens: request.maxTokens ?? resolved.maxTokens,
     };
 
@@ -386,7 +405,9 @@ export class LiteLLMClient {
       model,
       schema: jsonSchema(schema.schema as Record<string, unknown>),
       messages,
-      temperature: request.temperature ?? resolved.temperature,
+      ...(resolved.provider === 'anthropic'
+        ? {}
+        : { temperature: request.temperature ?? resolved.temperature }),
       maxOutputTokens: request.maxTokens ?? resolved.maxTokens,
     };
 
