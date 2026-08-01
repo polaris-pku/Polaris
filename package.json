@@ -2,6 +2,15 @@
   "name": "newide-bcd",
   "version": "0.1.0",
   "private": true,
+  "bin": {
+    "newide": "dist/newide.mjs"
+  },
+  "files": [
+    "dist/newide.mjs",
+    "dist/config/*.yaml",
+    "README.md",
+    "LICENSE"
+  ],
   "type": "module",
   "packageManager": "pnpm@11.5.1",
   "engines": {
@@ -9,7 +18,8 @@
     "pnpm": ">=9"
   },
   "scripts": {
-    "build": "tsc -b",
+    "build": "tsc -b && pnpm build:cli",
+    "build:cli": "node scripts/build-cli.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "format": "prettier --check .",
@@ -19,8 +29,22 @@
     "example:basic": "tsx src/examples/basic-flow.ts",
     "example:integration-v0": "tsx src/examples/integration-v0.ts",
     "example:driver-adapter": "tsx src/examples/driver-adapter-flow.ts",
-    "backend:rpc": "node --import tsx src/app/backend-rpc-stdio.ts",
+    "backend:rpc": "node --import tsx src/app/backend-rpc-entry.ts",
     "rpc:smoke": "node --import tsx scripts/rpc-smoke.ts",
+    "acceptance:real": "node --import tsx scripts/real-acceptance.ts",
+    "eval:instance": "tsx eval/run-instance.ts",
+    "eval:smoke": "tsx eval/run-smoke.ts",
+    "eval:sweevo-harness": "tsx eval/run-sweevo-harness.ts",
+    "eval:record-harness": "tsx eval/record-harness-result.ts",
+    "eval:cooperbench-case": "tsx eval/cooperbench/run-case.ts",
+    "eval:cooperbench-smoke": "tsx eval/cooperbench/run-smoke.ts",
+    "eval:cooperbench-harness": "tsx eval/cooperbench/run-harness.ts",
+    "eval:cooperbench-record": "tsx eval/cooperbench/record-harness-result.ts",
+    "eval:verify-backend-contract": "tsx eval/scripts/verify-backend-contract.ts",
+    "eval:check-harness": "wsl --cd . -e bash eval/scripts/check-harness-env.sh",
+    "eval:ensure-mirrors": "tsx eval/scripts/ensure-sweevo-mirrors.ts",
+    "eval:council:smoke": "tsx scripts/run-sweevo-memory-ablation.ts --subset v0-smoke --instance-id psf__requests_v2.27.0_v2.27.1 --ablations B2 --run-harness",
+    "eval:sweevo-ablation": "tsx scripts/run-sweevo-memory-ablation.ts",
     "prepare": "husky"
   },
   "lint-staged": {
@@ -32,13 +56,14 @@
     ]
   },
   "dependencies": {
-    "@ai-sdk/anthropic": "^4.0.9",
-    "@ai-sdk/openai": "^4.0.8",
-    "ai": "^7.0.17",
-    "js-yaml": "^5.2.1",
-    "pg": "^8.22.0",
-    "yaml": "^2.9.0",
-    "zod": "^4.0.5"
+    "@ai-sdk/anthropic": "4.0.9",
+    "@ai-sdk/openai": "4.0.8",
+    "ai": "7.0.17",
+    "expr-eval": "2.0.2",
+    "js-yaml": "5.2.1",
+    "pg": "8.22.0",
+    "yaml": "2.9.0",
+    "zod": "4.4.3"
   },
   "devDependencies": {
     "@commitlint/cli": "^21.0.2",
@@ -47,6 +72,7 @@
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^24.0.1",
     "@types/pg": "^8.20.0",
+    "esbuild": "^0.28.1",
     "eslint": "^9.29.0",
     "eslint-config-prettier": "^10.1.8",
     "globals": "^16.2.0",

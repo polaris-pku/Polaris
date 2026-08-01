@@ -1,25 +1,28 @@
 import { z } from 'zod';
+import { TASK_STATUSES } from '../core';
 import { runEventSchema } from './run-event';
 
 const recordSchema = z.record(z.string(), z.unknown());
-const taskStatusSchema = z.enum([
-  'created',
-  'triaged',
-  'ready',
-  'claimed',
-  'running',
-  'waiting_input',
-  'waiting_help',
-  'pending_gate',
-  'pending_council',
-  'reviewing',
-  'blocked',
-  'escalated',
-  'merging',
-  'completed',
-  'failed',
-  'cancelled',
-]);
+const taskStatusSchema = z.enum(TASK_STATUSES);
+const runOutcomeSchema = z
+  .object({
+    status: z.enum(['verified', 'best_effort', 'failed', 'blocked', 'cancelled']),
+    reason: z.string().min(1),
+    criteria: z.array(
+      z
+        .object({
+          criterion_id: z.string().min(1),
+          description: z.string().min(1),
+          status: z.enum(['satisfied', 'failed', 'unverified']),
+          gate_result_refs: z.array(z.string()),
+          audit_refs: z.array(z.string()),
+        })
+        .strict(),
+    ),
+    gate_result_refs: z.array(z.string()),
+    artifact_refs: z.array(z.string()),
+  })
+  .strict();
 
 export const runSnapshotSchema = z
   .object({
@@ -29,6 +32,7 @@ export const runSnapshotSchema = z
     task_id: z.string().min(1),
     mode: z.enum(['single_agent', 'council']),
     status: z.enum(['running', 'completed', 'failed', 'cancelled']),
+    quality: runOutcomeSchema.optional(),
     current: z
       .object({
         stage: z.enum(['executing', 'council', 'delivery', 'intervention']),
@@ -58,6 +62,7 @@ export const runSnapshotSchema = z
         task_id: z.string().min(1),
         status: z.string().min(1),
         mode: z.enum(['single_agent', 'council']),
+        session_id: z.string().min(1).optional(),
         event_ids: z.array(z.string().min(1)),
         started_at: z.string().min(1).optional(),
         completed_at: z.string().min(1).optional(),
@@ -76,7 +81,13 @@ export const runSnapshotSchema = z
       .object({
         worktree_path: z.string().min(1).optional(),
         files_written: z.array(z.string()),
+        changed_files: z.array(z.string()).optional(),
         artifacts_materialized: z.number().int().nonnegative(),
+        outcome: z.enum(['completed_files', 'completed_response', 'failed']).optional(),
+        response: z.string().optional(),
+        session_id: z.string().min(1).optional(),
+        tool_events: z.array(recordSchema).optional(),
+        quality: runOutcomeSchema.optional(),
       })
       .strict()
       .optional(),
@@ -85,6 +96,17 @@ export const runSnapshotSchema = z
     agent_runs: z.array(recordSchema),
     artifacts: z.array(recordSchema),
     gates: z.array(recordSchema),
+    market: z
+      .object({
+        winner_agent_id: z.string().min(1),
+        winner_bid_id: z.string().min(1),
+        ledger_ref: z.string().min(1),
+        audit_ref: z.string().min(1),
+        policy_version: z.string().min(1),
+        seed: z.string().min(1),
+      })
+      .strict()
+      .optional(),
     council: z
       .object({
         enabled: z.literal(true),
@@ -97,10 +119,12 @@ export const runSnapshotSchema = z
         required_next_actions: z.array(z.string()),
         blocked_by: z.array(z.string()),
         can_create_merge_authorization: z.boolean(),
+        participants: z.array(recordSchema).optional(),
         proposals: z.array(recordSchema).optional(),
         reviews: z.array(recordSchema).optional(),
         synthesis: recordSchema.optional(),
         output: recordSchema.optional(),
+        result: recordSchema.optional(),
       })
       .strict()
       .optional(),
@@ -119,6 +143,12 @@ export const runSnapshotSchema = z
         status: z.enum(['completed', 'failed', 'cancelled']),
         artifact_refs: z.array(z.string()),
         files_written: z.array(z.string()),
+        changed_files: z.array(z.string()).optional(),
+        outcome: z.enum(['completed_files', 'completed_response', 'failed']).optional(),
+        response: z.string().optional(),
+        session_id: z.string().min(1).optional(),
+        tool_events: z.array(recordSchema).optional(),
+        quality: runOutcomeSchema.optional(),
       })
       .strict()
       .optional(),

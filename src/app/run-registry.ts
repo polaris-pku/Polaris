@@ -6,6 +6,7 @@
 import type { FrontendRunSnapshot } from '../coordinator/frontend-run-snapshot';
 import { SCHEMA_VERSION, createId } from '../core';
 import { projectRunEventSource, type RunEvent } from '../protocol/run-event';
+import type { RunSnapshot } from '../protocol/run-snapshot';
 
 export type AppRunMode = 'single_agent' | 'council';
 export type AppRunStatus = 'running' | 'completed' | 'failed' | 'cancelled';
@@ -26,6 +27,7 @@ export interface AppRunSnapshot {
   };
   events: AppRunEvent[];
   snapshot?: FrontendRunSnapshot;
+  projected_snapshot?: RunSnapshot;
   error?: { code: string; message: string; details?: Record<string, unknown> };
 }
 
@@ -48,6 +50,12 @@ export interface StagedTerminalTransition {
   token: string;
   event: AppRunEvent;
   snapshot: AppRunSnapshot;
+}
+
+export interface RunCancellationReason {
+  code: string;
+  message: string;
+  details?: Record<string, unknown>;
 }
 
 const EVENT_NODE_CODES: Readonly<Record<string, string>> = {
@@ -121,16 +129,28 @@ export class InMemoryRunRegistry {
     return event;
   }
 
-  complete(runId: string, snapshot: FrontendRunSnapshot): AppRunSnapshot {
+  complete(runId: string, snapshot?: FrontendRunSnapshot): AppRunSnapshot {
     const record = this.require(runId);
     if (record.events.some((event) => event.type === 'run.completed')) {
       record.status = 'completed';
       record.current = { stage: 'delivery', active_node_code: 'N18' };
-      record.snapshot = snapshot;
+      if (snapshot) record.snapshot = snapshot;
       return this.clone(record);
+    }
+    if (!snapshot) {
+      throw new Error(`Run ${runId} cannot complete without terminal event or snapshot`);
     }
     const staged = this.stageTerminal(runId, { status: 'completed', snapshot });
     return staged ? this.commitTerminal(runId, staged) : this.getSnapshot(runId);
+  }
+
+  setProjectedSnapshot(runId: string, snapshot: RunSnapshot): AppRunSnapshot {
+    const record = this.require(runId);
+    if (snapshot.run_id !== runId || snapshot.task_id !== record.task_id) {
+      throw new Error(`Projected snapshot identity does not match Run ${runId}`);
+    }
+    record.projected_snapshot = snapshot;
+    return this.clone(record);
   }
 
   stageTerminal(
@@ -144,7 +164,7 @@ export class InMemoryRunRegistry {
           details?: Record<string, unknown>;
           snapshot?: FrontendRunSnapshot;
         }
-      | { status: 'cancelled' },
+      | { status: 'cancelled'; reason?: RunCancellationReason },
   ): StagedTerminalTransition | undefined {
     const record = this.require(runId);
     if (record.status !== 'running' || record.terminalReservation) return undefined;
@@ -164,7 +184,14 @@ export class InMemoryRunRegistry {
             message: input.message,
             ...(input.details ? { details: input.details } : {}),
           }
-        : { status: input.status };
+        : input.status === 'cancelled' && input.reason
+          ? {
+              status: input.status,
+              code: input.reason.code,
+              message: input.reason.message,
+              ...(input.reason.details ? { details: input.reason.details } : {}),
+            }
+          : { status: input.status };
     const event = this.buildEvent(record, type, payload);
     const snapshot: AppRunSnapshot = {
       ...this.clone(record),
@@ -186,6 +213,9 @@ export class InMemoryRunRegistry {
               ...(input.details ? { details: input.details } : {}),
             },
           }
+        : {}),
+      ...(input.status === 'cancelled' && input.reason
+        ? { error: { ...input.reason } }
         : {}),
     };
     return { token, event, snapshot };
@@ -226,10 +256,17 @@ export class InMemoryRunRegistry {
     return this.clone(this.require(runId));
   }
 
-  cancel(runId: string): AppRunSnapshot {
+  listSnapshots(): AppRunSnapshot[] {
+    return [...this.records.values()].map((record) => this.clone(record));
+  }
+
+  cancel(runId: string, reason?: RunCancellationReason): AppRunSnapshot {
     const record = this.require(runId);
     if (record.status !== 'running') return this.clone(record);
-    const staged = this.stageTerminal(runId, { status: 'cancelled' });
+    const staged = this.stageTerminal(runId, {
+      status: 'cancelled',
+      ...(reason ? { reason } : {}),
+    });
     if (!staged) return this.clone(record);
     return this.commitTerminal(runId, staged);
   }
@@ -282,6 +319,13 @@ export class InMemoryRunRegistry {
       terminalReservation: _terminalReservation,
       ...snapshot
     } = record;
-    return { ...snapshot, current: { ...snapshot.current }, events: [...snapshot.events] };
+    return {
+      ...snapshot,
+      current: { ...snapshot.current },
+      events: [...snapshot.events],
+      ...(snapshot.projected_snapshot
+        ? { projected_snapshot: structuredClone(snapshot.projected_snapshot) }
+        : {}),
+    };
   }
 }

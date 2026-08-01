@@ -4,7 +4,9 @@ import tseslint from 'typescript-eslint';
 import prettier from 'eslint-config-prettier';
 
 export default tseslint.config(
-  { ignores: ['dist/', 'node_modules/', 'coverage/'] },
+  {
+    ignores: ['dist/', 'node_modules/', 'coverage/', '.newide/', '.claude/worktrees/'],
+  },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
@@ -23,6 +25,14 @@ export default tseslint.config(
           varsIgnorePattern: '^_',
         },
       ],
+    },
+  },
+  {
+    files: ['**/*.mjs'],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: 'module',
+      globals: globals.node,
     },
   },
   {

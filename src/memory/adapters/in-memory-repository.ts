@@ -16,6 +16,7 @@ import type {
 import type { EmbeddingProvider } from '../ports/embedding-provider';
 import type { MemoryRepository, MemoryVectorSearchOptions } from '../ports/memory-repository';
 import { defaultHashEmbeddingProvider } from './hash-embedding-provider';
+import { cosineSimilarity } from '../utils/vector';
 import {
   createSeedHandle,
   createSeedMetrics,
@@ -131,6 +132,15 @@ export class InMemoryRepository implements MemoryRepository {
     store.metrics.promoted_skill_count += 1;
   }
 
+  async updateSkill(role_id: string, skill: SkillRecord): Promise<void> {
+    const store = this.requireStore(role_id);
+    const index = store.skills.findIndex((item) => item.id === skill.id);
+    if (index === -1) {
+      throw new Error(`Skill not found: ${skill.id}`);
+    }
+    store.skills[index] = await this.withDescriptionEmbedding(skill);
+  }
+
   async updateExperience(role_id: string, experience: ExperienceRecord): Promise<void> {
     const store = this.requireStore(role_id);
     const index = store.experiences.findIndex((item) => item.id === experience.id);
@@ -175,7 +185,7 @@ async function rankByVectorSimilarity<T extends SkillRecord | ExperienceRecord>(
         : await embedding.embed(item.description);
     scored.push({
       item,
-      similarity: embedding.cosineSimilarity(options.query_embedding, itemEmbedding),
+      similarity: cosineSimilarity(options.query_embedding, itemEmbedding),
     });
   }
 
