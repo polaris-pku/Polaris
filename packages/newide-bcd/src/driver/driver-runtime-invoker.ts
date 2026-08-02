@@ -1,6 +1,14 @@
 import { SCHEMA_VERSION, createId, nowTimestamp, type ArtifactRef } from '../core';
 import { runDriverPromptWithSignal } from './abortable-driver-run';
-import type { DriverRunResult, DriverRuntimeHandle } from './contract';
+import type { DriverRunResult, DriverRuntimeHandle, DriverStreamEventListener } from './contract';
+import {
+  createDefaultDriverReturnConverter,
+  type DriverReturnConverter,
+} from './driver-return-converter';
+import {
+  buildDriverReturnInstruction,
+  shouldWriteDriverReportFile,
+} from './driver-return-instruction';
 
 export interface DriverRuntimeInvokerMemoryItem {
   id: string;
@@ -11,6 +19,8 @@ export interface DriverRuntimeInvokerMemoryItem {
 export interface DriverRuntimeInvokerInput {
   task_id: string;
   run_id?: string;
+  workspace_path?: string;
+  session_id?: string;
   call_id: string;
   source_driver: string;
   driver_context: {
@@ -22,6 +32,7 @@ export interface DriverRuntimeInvokerInput {
 
 export interface DriverRuntimeInvokerOptions {
   signal?: AbortSignal;
+  onDriverEvent?: DriverStreamEventListener;
 }
 
 export interface DriverRuntimeReport {
@@ -48,7 +59,10 @@ export interface DriverRuntimeInvocationResult {
   execution: DriverRunResult;
 }
 
-export function createDriverRuntimeInvoker(driver: DriverRuntimeHandle) {
+export function createDriverRuntimeInvoker(
+  driver: DriverRuntimeHandle,
+  converter: DriverReturnConverter = createDefaultDriverReturnConverter(),
+) {
   return async function invokeDriverRuntime(
     input: DriverRuntimeInvokerInput,
     options?: DriverRuntimeInvokerOptions,
@@ -59,71 +73,50 @@ export function createDriverRuntimeInvoker(driver: DriverRuntimeHandle) {
       );
     }
 
+    const runId = input.run_id ?? input.call_id;
     let execution: DriverRunResult;
     try {
       execution = await runDriverPromptWithSignal(
         driver,
         {
           task_id: input.task_id,
-          run_id: input.run_id ?? input.call_id,
-          prompt: deterministicJson({
-            task_instruction: input.driver_context.task_instruction,
-            skills: input.driver_context.skills,
-            experiences: input.driver_context.experiences,
-          }),
+          run_id: runId,
+          ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
+          ...(input.session_id ? { session_id: input.session_id } : {}),
+          prompt: buildDriverPrompt(input),
           created_at: nowTimestamp(),
           schema_version: SCHEMA_VERSION,
         },
         options?.signal,
+        options?.onDriverEvent,
       );
     } catch (error) {
       if (isAbort(error, options?.signal)) throw error;
       execution = failedExecution(driver, input, error);
     }
 
-    return { report: buildReport(input, execution), execution };
+    const report = await converter(execution, {
+      ...(execution.response ? { transcriptText: execution.response } : {}),
+      instruction: input.driver_context.task_instruction,
+      sourceDriver: input.source_driver,
+      taskId: input.task_id,
+      ...(input.workspace_path ? { workspace: input.workspace_path } : {}),
+    });
+    return { report, execution };
   };
 }
 
-function buildReport(
-  input: DriverRuntimeInvokerInput,
-  execution: DriverRunResult,
-): DriverRuntimeReport {
-  const succeeded = execution.status === 'succeeded';
-  return {
-    artifacts: execution.artifacts.map((artifact) => ({
-      type: artifact.type,
-      path: artifact.uri,
-      summary: artifactSummary(artifact),
-    })),
-    summary: `Driver ${execution.status} (${execution.driver_run_result_id}).`,
-    decisions: [],
-    blockers: succeeded ? [] : [buildBlocker(execution)],
-    referenced_experiences: input.driver_context.experiences.map((experience) => ({
-      experience_id: experience.id,
-      applied: false,
-      effectiveness: 'not_applicable',
-      note: `Driver result ${execution.driver_run_result_id} did not evidence use of experience ${experience.id}.`,
-    })),
-    assumptions: [],
-  };
-}
-
-function artifactSummary(artifact: ArtifactRef): string {
-  const summary = artifact.metadata?.summary;
-  return typeof summary === 'string' && summary.length > 0
-    ? summary
-    : `${artifact.type} artifact ${artifact.artifact_id}`;
-}
-
-function buildBlocker(execution: DriverRunResult): DriverRuntimeReport['blockers'][number] {
-  const error = execution.error;
-  return {
-    blocker: error?.message ?? `Driver ended with status ${execution.status}`,
-    attempts: [...execution.diagnostics.notes],
-    resolution: error ? `${error.code}${error.retryable ? ' (retryable)' : ''}` : execution.status,
-    resolved: false,
-  };
+function buildDriverPrompt(input: DriverRuntimeInvokerInput): string {
+  const context = deterministicJson({
+    task_instruction: input.driver_context.task_instruction,
+    skills: input.driver_context.skills,
+    experiences: input.driver_context.experiences,
+  });
+  const reportInstruction = buildDriverReturnInstruction({
+    taskId: input.task_id,
+    writeReportFile: shouldWriteDriverReportFile(),
+  });
+  return `${context}\n\n${reportInstruction}`;
 }
 
 function failedExecution(
@@ -137,6 +130,7 @@ function failedExecution(
     driver_run_result_id: createId('driver_result'),
     session_id: driver.session_id,
     status: 'failed',
+    response: '',
     artifacts: [],
     transcript_ref: syntheticTranscript(driver, input, message, created_at),
     tool_events: [],

@@ -226,7 +226,7 @@ export function missionLineOf({
         state,
         headline: `被拦下 · ${gate?.reason ?? '需要人工确认'}`,
         sub: gate?.requiredAction || undefined,
-        retry: false,
+        retry: true,
       };
     }
 

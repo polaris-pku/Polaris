@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 import { SCHEMA_VERSION, type ArtifactRef } from '../core';
-import type { DriverPrompt, DriverRunResult, DriverRuntimeHandle } from './contract';
+import type {
+  DriverPrompt,
+  DriverRunResult,
+  DriverRuntimeHandle,
+  DriverStreamEvent,
+  DriverStreamEventListener,
+} from './contract';
 import { createDriverRuntimeInvoker } from './driver-runtime-invoker';
 
 describe('createDriverRuntimeInvoker', () => {
@@ -14,26 +20,41 @@ describe('createDriverRuntimeInvoker', () => {
     expect(driver.prompts[0]).toMatchObject({
       task_id: 'task_1',
       run_id: 'run_1',
+      workspace_path: '/tmp/newide-project',
+      session_id: 'session_existing',
       schema_version: SCHEMA_VERSION,
     });
-    expect(driver.prompts[0]?.prompt).toBe(
+    expect(driver.prompts[0]?.prompt).toContain(
       '{"experiences":[{"content":"Experience body","description":"Experience","id":"exp_1"}],"skills":[{"content":"Skill body","description":"Skill","id":"skill_1"}],"task_instruction":"Implement it"}',
     );
+    expect(driver.prompts[0]?.prompt).toContain('<<<DRIVER_RETURN>>>');
+    expect(driver.prompts[0]?.prompt).toContain('referenced_experiences');
     expect(output.execution).toEqual(successResult());
     expect(output.report).toEqual({
       artifacts: [{ type: 'patch', path: 'artifact://patch/1', summary: 'Changed one file' }],
-      summary: 'Driver succeeded (driver_result_1).',
-      decisions: [],
-      blockers: [],
-      referenced_experiences: [
+      summary:
+        'Task: "Implement it" Driver "driver_1" finished with status "succeeded" in 12ms. Produced 1 artifact(s): patch(artifact://patch/1). Notes: complete.',
+      decisions: [
         {
-          experience_id: 'exp_1',
-          applied: false,
-          effectiveness: 'not_applicable',
-          note: 'Driver result driver_result_1 did not evidence use of experience exp_1.',
+          point: 'Task execution approach',
+          options: ['delegate_to_driver', 'handle_directly'],
+          chosen: 'delegate_to_driver',
+          reason: 'Task "Implement it" delegated to driver "driver_1".',
         },
       ],
-      assumptions: [],
+      blockers: [],
+      referenced_experiences: [],
+      assumptions: [
+        {
+          assumption: 'Driver "driver_1" correctly executed the task',
+          risk_if_wrong:
+            'Output may be incomplete or incorrect; requires manual review of artifacts',
+        },
+        {
+          assumption: 'All 1 artifact(s) are valid and complete',
+          risk_if_wrong: 'Missing or corrupted artifacts could cause downstream failures',
+        },
+      ],
     });
   });
 
@@ -82,18 +103,17 @@ describe('createDriverRuntimeInvoker', () => {
       const output = await createDriverRuntimeInvoker(new TestDriver(result))(invocationInput());
 
       expect(output.execution).toBe(result);
-      expect(output.report.blockers).toEqual([
-        {
-          blocker: 'Driver stopped',
-          attempts: ['first attempt failed'],
-          resolution: 'DRIVER_ERROR (retryable)',
-          resolved: false,
-        },
-      ]);
-      expect(output.report.referenced_experiences[0]).toMatchObject({
-        applied: false,
-        effectiveness: 'not_applicable',
-      });
+      expect(output.report.blockers).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            blocker: 'Driver stopped',
+            attempts: ['first attempt failed'],
+            resolution: 'Pending retry (error is retryable)',
+            resolved: false,
+          }),
+        ]),
+      );
+      expect(output.report.referenced_experiences).toEqual([]);
     },
   );
 
@@ -127,7 +147,25 @@ describe('createDriverRuntimeInvoker', () => {
     controller.abort(new DOMException('cancelled by caller', 'AbortError'));
 
     await expect(running).rejects.toMatchObject({ name: 'AbortError' });
-    expect(driver.interrupt).toHaveBeenCalledWith('cancelled by caller');
+    expect(driver.interrupt).toHaveBeenCalledWith('cancelled by caller', 'run_1');
+  });
+
+  it('forwards incremental driver events while the invocation is active', async () => {
+    const driver = new TestDriver(successResult());
+    const events: DriverStreamEvent[] = [];
+
+    await createDriverRuntimeInvoker(driver)(invocationInput(), {
+      onDriverEvent: (event) => events.push(event),
+    });
+
+    expect(events).toEqual([
+      expect.objectContaining({
+        event_type: 'agent_message_chunk',
+        task_id: 'task_1',
+        run_id: 'run_1',
+      }),
+    ]);
+    expect(driver.eventListeners.size).toBe(0);
   });
 
   it('is structurally assignable to the expected B-facing shape', () => {
@@ -151,7 +189,7 @@ describe('createDriverRuntimeInvoker', () => {
     };
     type Expected = (
       input: ReturnType<typeof invocationInput>,
-      options?: { signal?: AbortSignal },
+      options?: { signal?: AbortSignal; onDriverEvent?: DriverStreamEventListener },
     ) => Promise<{ report: BReport; execution: DriverRunResult }>;
     const expected: Expected = createDriverRuntimeInvoker(new TestDriver(successResult()));
 
@@ -181,14 +219,29 @@ class TestDriver implements DriverRuntimeHandle {
     supports_permission_events: false,
   };
   readonly prompts: DriverPrompt[] = [];
+  readonly eventListeners = new Set<DriverStreamEventListener>();
   readonly interrupt = vi.fn(async (_reason: string) => undefined);
 
   constructor(private readonly result: DriverRunResult | Error | Promise<DriverRunResult>) {}
 
   async sendPrompt(input: DriverPrompt): Promise<DriverRunResult> {
     this.prompts.push(input);
+    for (const listener of this.eventListeners) {
+      listener({
+        schema_version: 'driver-event.v1',
+        event_type: 'agent_message_chunk',
+        task_id: input.task_id,
+        run_id: input.run_id,
+        payload: { text: 'live output' },
+      });
+    }
     if (this.result instanceof Error) throw this.result;
     return this.result;
+  }
+
+  subscribeToEvents(listener: DriverStreamEventListener): () => void {
+    this.eventListeners.add(listener);
+    return () => this.eventListeners.delete(listener);
   }
 
   async collectTranscript(): Promise<ArtifactRef> {
@@ -200,6 +253,8 @@ function invocationInput() {
   return {
     task_id: 'task_1',
     run_id: 'run_1',
+    workspace_path: '/tmp/newide-project',
+    session_id: 'session_existing',
     call_id: 'call_1',
     source_driver: 'driver_1',
     driver_context: {

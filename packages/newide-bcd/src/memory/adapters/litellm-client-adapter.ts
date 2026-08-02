@@ -34,6 +34,7 @@ function loadEnvFile(filePath: string): void {
 }
 
 function loadLocalEnv(): void {
+  if (process.env.NEWIDE_LITELLM_CONFIG_DIR?.trim()) return;
   const moduleDir = dirname(fileURLToPath(import.meta.url));
   const projectRoot = resolve(moduleDir, '..', '..', '..');
   const memoryDir = resolve(moduleDir, '..');
@@ -58,12 +59,19 @@ export class LiteLLMClientAdapter implements LlmClient {
   constructor(taskName: string = 'memory-query') {
     loadLocalEnv();
     this.client = new LiteLLMClient();
-    this.client.registerProvider('openai', async (modelId: string) => {
-      const { openai } = await import('@ai-sdk/openai');
-      return openai.chat(modelId);
-    });
-    this.client.loadConfig();
+    this.client.loadConfig(process.env.NEWIDE_LITELLM_CONFIG_DIR?.trim() || undefined);
     this.taskName = taskName;
+
+    const model = process.env.NEWIDE_LLM_MODEL?.trim();
+    if (model) {
+      this.client.modelPool.config.setModels(taskName, [
+        {
+          provider: process.env.NEWIDE_LLM_PROVIDER?.trim() || 'anthropic',
+          model,
+          order: 1,
+        },
+      ]);
+    }
   }
 
   async complete(input: {

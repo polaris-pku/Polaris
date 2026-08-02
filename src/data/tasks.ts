@@ -1,6 +1,5 @@
 import type { DemoTask, WorkflowNodeData } from '@/types';
 import { workflowNodes as baseWorkflowNodes } from '@/data/workflow';
-import { recommendAgents } from '@/data/agentRecommendation';
 
 const cloneNodes = (): WorkflowNodeData[] =>
   baseWorkflowNodes.map((n) => ({
@@ -40,8 +39,8 @@ export function createRequirementTask(
     title: deriveTitle(taskText, title),
     taskText,
     ...(criteria?.length ? { completionCriteria: criteria } : {}),
-    // N1 Triage：任务创建即带上按需求推荐的团队，团队随任务走。
-    assignedAgentIds: recommendAgents(taskText).ids,
+    // 真实角色由后端 Market / B Memory 决定；前端不再创建静态团队。
+    assignedAgentIds: [],
     stage: 'analyzing',
     analysisReady: true,
     nodes: cloneNodes(),

@@ -122,6 +122,14 @@ export class PtyConnection implements AgentConnection {
     return { sessionId: this.sessionId };
   }
 
+  async loadSession(
+    _sessionId: string,
+    _cwd: string,
+    _mcpServers?: McpServerConfig[]
+  ): Promise<SessionRecord> {
+    throw new PtyError("PTY connections do not support session loading");
+  }
+
   async sendPrompt(sessionId: string, message: string): Promise<TurnController> {
     if (!this.ptyProcess) throw new PtyError("Not connected");
     if (this.activeTurn && !this.activeTurn.completed) {

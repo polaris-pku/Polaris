@@ -11,7 +11,7 @@
 //   I3  spawn(bin, argv, { shell: false })。永不拼命令字符串，不用 exec / execSync。
 //   I4  argv 由主进程构造（script → ['-u', abs]；repl → ['-i','-u']）。入参里没有 argv 通道 ——
 //       渲染层能传一个 '-c' 就能打穿「代码必须是磁盘上一个可见文件」这条不变量。
-//   I5  绝不自动运行：term:start 只由用户手势触发，永远不能被 backend:event 的 handler 调用。
+//   I5  绝不自动运行：term:start 只由用户手势触发，永远不能被 backend:notification 的 handler 调用。
 //       agent 会往工作区写 .py —— 任何事件驱动的执行 = agent → 宿主的静默 RCE。
 //   I6  子进程 env 是白名单，不是 {...process.env} 的减法（否则 print(os.environ) 就把 API key 打出来）。
 //   I9  16ms 批量 flush + 单包 64KB + 单会话 5MB 上限 + 2000 行 ring buffer。

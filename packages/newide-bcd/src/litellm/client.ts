@@ -12,7 +12,18 @@
  *   const resp = await client.complete({ task: 'classify-intent', messages });
  */
 
-import { generateText, streamText, generateObject, jsonSchema, type ModelMessage } from 'ai';
+import { readFileSync, existsSync } from 'node:fs';
+import { resolve, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import {
+  generateText,
+  streamText,
+  generateObject,
+  jsonSchema,
+  embed,
+  type EmbeddingModel,
+  type ModelMessage,
+} from 'ai';
 import { ModelPool } from './model-pool';
 import { MethodRouter } from './methods/method-router';
 import { ToolRegistry } from './tools/tool-registry';
@@ -23,6 +34,8 @@ import type {
   LiteLLMClientOptions,
   CompletionRequest,
   CompletionResponse,
+  EmbeddingRequest,
+  EmbeddingResponse,
   StreamChunk,
   JsonSchema,
   ToolHandler,
@@ -81,6 +94,46 @@ function fromAiToolCalls(toolCalls: unknown[]): ToolCall[] {
 }
 
 // ═══════════════════════════════════════════════════════════
+// Env file loader (lightweight — no dotenv dependency)
+// ═══════════════════════════════════════════════════════════
+
+function loadEnvFiles(configDir?: string): void {
+  const candidates: string[] = [];
+
+  // 1) Working directory .env
+  candidates.push('.env');
+
+  // 2) src/memory/.env (relative from config dir default)
+  if (!configDir) {
+    const moduleDir = dirname(fileURLToPath(import.meta.url));
+    const projectRoot = resolve(moduleDir, '..', '..');
+    candidates.push(resolve(projectRoot, 'src', 'memory', '.env'));
+    candidates.push(resolve(projectRoot, '.env.local'));
+  }
+
+  for (const filePath of candidates) {
+    if (!existsSync(filePath)) continue;
+    try {
+      const content = readFileSync(filePath, 'utf-8');
+      for (const line of content.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) continue;
+        const eqIdx = trimmed.indexOf('=');
+        if (eqIdx < 0) continue;
+        const key = trimmed.slice(0, eqIdx).trim();
+        const value = trimmed.slice(eqIdx + 1).trim();
+        // Don't overwrite already-set env vars
+        if (!process.env[key]) {
+          process.env[key] = value;
+        }
+      }
+    } catch {
+      // skip unreadable files
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════
 // LiteLLM Client
 // ═══════════════════════════════════════════════════════════
 
@@ -90,6 +143,9 @@ export class LiteLLMClient {
   readonly modelPool: ModelPool;
   readonly methods: MethodRouter;
   readonly tools: ToolRegistry;
+
+  /** Embedding vector dimensions — from EMBEDDING_DIMENSIONS env var, default 1536 */
+  readonly dimensions: number;
 
   /** Instance-level provider registry — no cross-instance pollution. */
   private readonly providers = new Map<string, ProviderFactory>();
@@ -105,6 +161,8 @@ export class LiteLLMClient {
       taskConfigs: [],
       debug: false,
     };
+
+    this.dimensions = parseInt(process.env.EMBEDDING_DIMENSIONS ?? '1536', 10);
 
     this.modelPool = new ModelPool({
       defaultTimeoutMs: this.config.defaultTimeoutMs,
@@ -148,13 +206,26 @@ export class LiteLLMClient {
     let factory: ProviderFactory;
     switch (provider) {
       case 'openai': {
-        const { openai } = await import('@ai-sdk/openai');
-        factory = (id) => openai(id);
+        const { createOpenAI } = await import('@ai-sdk/openai');
+        const apiKey = process.env.NEWIDE_LLM_API_KEY || process.env.OPENAI_API_KEY;
+        const baseURL = process.env.NEWIDE_LLM_BASE_URL || process.env.OPENAI_BASE_URL;
+        const provider = createOpenAI({
+          ...(apiKey ? { apiKey } : {}),
+          ...(baseURL ? { baseURL } : {}),
+        });
+        factory = (id) => provider.chat(id);
         break;
       }
       case 'anthropic': {
-        const { anthropic } = await import('@ai-sdk/anthropic');
-        factory = (id) => anthropic(id);
+        const { createAnthropic } = await import('@ai-sdk/anthropic');
+        const apiKey = process.env.NEWIDE_LLM_API_KEY || process.env.ANTHROPIC_API_KEY;
+        const authToken = process.env.ANTHROPIC_AUTH_TOKEN;
+        const baseURL = process.env.NEWIDE_LLM_BASE_URL || process.env.ANTHROPIC_BASE_URL;
+        const provider = createAnthropic({
+          ...(apiKey ? { apiKey } : authToken ? { authToken } : {}),
+          ...(baseURL ? { baseURL } : {}),
+        });
+        factory = (id) => provider.messages(id);
         break;
       }
       default:
@@ -173,6 +244,43 @@ export class LiteLLMClient {
     return factory(modelId);
   }
 
+  private readonly embeddingProviders = new Map<string, EmbeddingModel>();
+
+  /**
+   * Resolve a provider for embedding models.
+   *
+   * Separate from resolveProvider because the same provider (e.g. openai)
+   * uses a different interface for embeddings: `openai.embedding(id)` vs `openai(id)`.
+   */
+  private async resolveEmbeddingProvider(
+    provider: string,
+    modelId: string,
+  ): Promise<EmbeddingModel> {
+    const cacheKey = `embed:${provider}:${modelId}`;
+    const cached = this.embeddingProviders.get(cacheKey);
+    if (cached) return cached;
+
+    switch (provider) {
+      case 'openai': {
+        const embeddingApiKey = process.env.EMBEDDING_API_KEY;
+        const embeddingBaseURL = process.env.EMBEDDING_BASE_URL;
+        const { createOpenAI } = await import('@ai-sdk/openai');
+        const instance = createOpenAI({
+          ...(embeddingApiKey ? { apiKey: embeddingApiKey } : {}),
+          ...(embeddingBaseURL ? { baseURL: embeddingBaseURL } : {}),
+        });
+        const embeddingModel = instance.embedding(modelId);
+        this.embeddingProviders.set(cacheKey, embeddingModel);
+        return embeddingModel;
+      }
+      default:
+        throw new Error(
+          `No embedding provider for "${provider}". ` +
+            `Only "openai" is supported for embeddings.`,
+        );
+    }
+  }
+
   // ═════════════════════════════════════════════════════════
   // Public API: Direct Completion
   // ═════════════════════════════════════════════════════════
@@ -185,7 +293,9 @@ export class LiteLLMClient {
     const params: Record<string, unknown> = {
       model,
       messages,
-      temperature: request.temperature ?? resolved.temperature,
+      ...(resolved.provider === 'anthropic'
+        ? {}
+        : { temperature: request.temperature ?? resolved.temperature }),
       maxOutputTokens: request.maxTokens ?? resolved.maxTokens,
     };
 
@@ -229,7 +339,9 @@ export class LiteLLMClient {
       model,
       messages,
       tools: toAiTools(schemas, handlers),
-      temperature: request.temperature ?? resolved.temperature,
+      ...(resolved.provider === 'anthropic'
+        ? {}
+        : { temperature: request.temperature ?? resolved.temperature }),
       maxOutputTokens: request.maxTokens ?? resolved.maxTokens,
       maxSteps: maxRounds,
     };
@@ -262,7 +374,9 @@ export class LiteLLMClient {
     const params: Record<string, unknown> = {
       model,
       messages,
-      temperature: request.temperature ?? resolved.temperature,
+      ...(resolved.provider === 'anthropic'
+        ? {}
+        : { temperature: request.temperature ?? resolved.temperature }),
       maxOutputTokens: request.maxTokens ?? resolved.maxTokens,
     };
 
@@ -291,7 +405,9 @@ export class LiteLLMClient {
       model,
       schema: jsonSchema(schema.schema as Record<string, unknown>),
       messages,
-      temperature: request.temperature ?? resolved.temperature,
+      ...(resolved.provider === 'anthropic'
+        ? {}
+        : { temperature: request.temperature ?? resolved.temperature }),
       maxOutputTokens: request.maxTokens ?? resolved.maxTokens,
     };
 
@@ -300,10 +416,40 @@ export class LiteLLMClient {
   }
 
   // ═════════════════════════════════════════════════════════
+  // Public API: Embedding
+  // ═════════════════════════════════════════════════════════
+
+  async embed(request: EmbeddingRequest): Promise<EmbeddingResponse> {
+    const resolved = this.modelPool.resolve(request.task);
+    const model = await this.resolveEmbeddingProvider(resolved.provider, resolved.model);
+    const inputs = typeof request.input === 'string' ? [request.input] : request.input;
+
+    // When batch > 1, call sequentially (AI SDK embed() is single-input)
+    const allEmbeddings: number[][] = [];
+    let totalTokens = 0;
+
+    for (const text of inputs) {
+      const result = await embed({
+        model,
+        value: text,
+      });
+      allEmbeddings.push(result.embedding as number[]);
+      totalTokens += result.usage?.tokens ?? 0;
+    }
+
+    return {
+      model: resolved.model,
+      embeddings: allEmbeddings,
+      usage: { prompt_tokens: totalTokens, completion_tokens: 0, total_tokens: totalTokens },
+    };
+  }
+
+  // ═════════════════════════════════════════════════════════
   // Public API: Setup
   // ═════════════════════════════════════════════════════════
 
   loadConfig(dirPath?: string): this {
+    loadEnvFiles(dirPath);
     const { tasks } = loadLitellmConfig(dirPath);
     this.modelPool.withConfigs(tasks);
     return this;

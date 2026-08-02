@@ -5,8 +5,9 @@
  * 所以这里把运行时依赖全部物化：
  *
  *   backend/
- *     backend-host.cjs      BCD 后端（esbuild 单文件；driver 已注入为「包内 node 跑包内 A」）
- *     acp-runner.cjs        A 的 ACP runner（esbuild 单文件）
+ *     backend-host.cjs      BCD production composition（esbuild 单文件）
+ *     acp-runner/           production factory 期望的 A runner package layout
+ *     config/               B Agent / Memory 的 LiteLLM 路由配置
  *     runtime/node[.exe]    Node 运行时（agent 的 JS 外壳要用；agent 本体是原生二进制）
  *     agent/                claude-agent-acp + Claude Code 原生二进制（npm 扁平安装）
  *
@@ -17,7 +18,15 @@
  */
 import { build } from 'esbuild';
 import { execFileSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  cpSync,
+  copyFileSync,
+  mkdirSync,
+  rmSync,
+  existsSync,
+  readFileSync,
+  writeFileSync,
+} from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -32,7 +41,9 @@ const targetOs = arg('target-os', process.platform);
 const targetCpu = arg('target-cpu', process.arch);
 
 /** agent 版本跟 A 的依赖走，不另立一套版本号 */
-const acpPkg = JSON.parse(readFileSync(path.join(root, 'packages/acp-client/package.json'), 'utf8'));
+const acpPkg = JSON.parse(
+  readFileSync(path.join(root, 'packages/acp-client/package.json'), 'utf8'),
+);
 const agentVersion = acpPkg.dependencies['@agentclientprotocol/claude-agent-acp'];
 
 console.log(`[backend] 目标平台 ${targetOs}-${targetCpu}`);
@@ -61,11 +72,36 @@ await build({
 });
 
 console.log('[backend] 打包 A 的 ACP runner…');
+const acpRunnerDir = path.join(out, 'acp-runner');
+const acpRunnerEntry = path.join(acpRunnerDir, 'dist', 'src', 'driver', 'contract-runner.js');
+mkdirSync(path.dirname(acpRunnerEntry), { recursive: true });
 await build({
   ...common,
   entryPoints: [path.join(root, 'packages/acp-client/src/driver/contract-runner.ts')],
-  outfile: path.join(out, 'acp-runner.cjs'),
+  outfile: acpRunnerEntry,
 });
+writeFileSync(
+  path.join(acpRunnerDir, 'package.json'),
+  JSON.stringify(
+    {
+      name: acpPkg.name,
+      version: acpPkg.version,
+      private: true,
+      scripts: { 'driver:run': 'node dist/src/driver/contract-runner.js' },
+    },
+    null,
+    2,
+  ),
+);
+
+console.log('[backend] 复制 B Agent / Memory 模型配置…');
+cpSync(path.join(root, 'packages/newide-bcd/src/litellm/config'), path.join(out, 'config'), {
+  recursive: true,
+});
+writeFileSync(
+  path.join(out, 'package.json'),
+  JSON.stringify({ name: 'polaris-backend', private: true, version: '0.1.0' }, null, 2),
+);
 
 // ── 2. Node 运行时 ──
 // agent 的 JS 外壳（claude-agent-acp）要用 node 跑；Claude Code 本体是原生二进制，不需要 node。

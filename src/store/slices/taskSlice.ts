@@ -1,9 +1,9 @@
 import type { DemoTask, Project } from '@/types';
 import { createRequirementTask } from '@/data/tasks';
 
-import { createRun as apiCreateRun } from '@/api/client';
 import { unwatchRun, watchRun } from '@/api/events';
-import { toTaskCreateRequest } from '@/api/map';
+import { taskApi, unwatchTask, watchTask } from '@/api/task';
+import { runApi } from '@/api/run';
 import { bindBackendWorkspace } from '@/lib/backendWorkspace';
 import { buildLiveProgressReplay, buildLiveRunReplay, liveProducedFiles } from '@/lib/liveReplay';
 import { projectLiveBoard } from '@/lib/liveBoard';
@@ -54,7 +54,7 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
       };
     }),
 
-  createTask: (rawText, title, completionCriteria, mode) => {
+  createTask: async (rawText, title, completionCriteria, mode) => {
     const text = rawText.trim();
     if (!text) return { ok: false, error: '需求内容不能为空。' };
     const state = get();
@@ -68,139 +68,154 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
       return { ok: false, error: workspaceBlockedMessage(state.projects, bindable.blockingTask) };
     }
 
-    get().stopAutoRun();
-    // 先把当前活动任务的实时状态回写，避免切走时丢进度
-    const persisted = state.activeTaskId
-      ? syncTasks(state.tasks, state.activeTaskId, extractTaskFields(state))
-      : state.tasks;
-    // N1 Triage：读需求 → 建议角色/组队（C 的职责）。团队随任务创建（createRequirementTask
-    // 内部按需求推荐），由 taskToState 带入实时状态；输入需求后直接进 Task Board 看分析。
-    const newTask = {
-      ...createRequirementTask(uid('task'), state.activeProjectId, text, title, completionCriteria),
-      // 执行方式存在任务上：retrySubmit 要靠它重建提交参数
-      ...(mode ? { mode } : {}),
-    };
-    set({
-      tasks: [...persisted, newTask],
-      activeTaskId: newTask.id,
-      currentPage: 'tasks',
-      teamCustomizationEnabled: false,
-      ...taskToState(newTask),
-      isAutoRunning: false,
-    });
-    // N2/N3：本地乐观创建后异步提交协调器（C）。后端没有「只建 Task 不建 Run」的入口——
-    // run.create 一次性建 Task + Run 并立刻开跑，所以受理成功即回填 task_id + run_id，
-    // 并把事件通道切到这个 run（订阅后后端会重放它已发生的全部事件，去重在 events.ts 里做）。
-    // 提交失败不回滚本地任务（mock 演示流仍可走），仅留日志。
-    //
-    // ⚠️ 提交前必须先把后端工作区对齐到当前项目。
-    // 「agent 写到哪」是后端的**全局状态**（BCD 只在启动时读一次 ACP_WORKSPACE），不跟着任务走。
-    // 只要期间有任何东西 re-configure 过后端（切项目、外部进程、手动重启），这次需求就会把文件
-    // 写进**别的项目目录** —— 而界面上完全看不出来：run 照样 completed，产物却不在你的项目里。
-    // 曾实测到：用户在 A 项目提的需求，文件落到了 B 项目下。
-    const project = state.projects.find((p) => p.id === state.activeProjectId);
-    void bindBackendWorkspace(project)
-      .then(() =>
-        apiCreateRun(toTaskCreateRequest(text, completionCriteria), {
-          ...(mode ? { mode } : {}),
-          projectId: state.activeProjectId ?? undefined,
-          clientTaskId: newTask.id,
-          title: newTask.title,
-        }),
-      )
-      .then((created) => {
-        set((s) => ({
-          tasks: s.tasks.map((t) =>
-            t.id === newTask.id
-              ? {
-                  ...t,
-                  contractTaskId: created.task_id,
-                  contractRunId: created.run_id,
-                  submitError: undefined,
-                }
-              : t,
-          ),
-        }));
-        return watchRun(created.run_id);
-      })
-      .catch((err: unknown) => {
-        // 提交失败不回滚本地任务（mock 演示流仍可走），但**必须让用户看见**。
-        // 从前这里只有一句 console.warn —— 用户以为自己提交了需求，实际拿到的是一个
-        // 没有后端 run 的本地演示任务，界面上没有任何迹象。
-        const message = err instanceof Error ? err.message : String(err);
-        console.warn('[api] run.create 提交失败，任务仅存在于本地：', err);
-        set((s) => ({
-          tasks: s.tasks.map((t) => (t.id === newTask.id ? { ...t, submitError: message } : t)),
-        }));
-      });
-
-    return { ok: true };
-  },
-
-  /**
-   * 把一个**已存在**的本地任务重新提交给后端 —— `未提交到后端 · 点击重试` 的唯一出路。
-   *
-   * 走的是和 createTask **完全相同**的后端路径（绑工作区 → run.create → watchRun），
-   * 只是不再新建本地任务：这次提交失败的那条需求，用户不该被迫重新打一遍字。
-   *
-   * 拒绝条件也与 createTask 完全一致：别的项目还有 run 在跑时**必须拒绝** ——
-   * 绑定工作区会重启 BCD，把正在干活的 agent 一起杀掉。调用方必须把 error 显示出来。
-   *
-   * 失败的 run 重试时会拿到一个新的 run_id：老的那次 run 已经是历史，退订它并丢掉它的
-   * 实时状态，否则 liveRuns 里会堆着一堆再也不会有事件的死条目。
-   */
-  retrySubmit: async (taskId) => {
-    const state = get();
-    const task = state.tasks.find((t) => t.id === taskId);
-    if (!task) return { ok: false, error: '任务不存在。' };
-
-    const text = task.taskText.trim();
-    if (!text) return { ok: false, error: '需求内容不能为空。' };
-
-    const bindable = canBindWorkspace(state, task.projectId);
-    if (!bindable.ok) {
-      return { ok: false, error: workspaceBlockedMessage(state.projects, bindable.blockingTask) };
-    }
-
-    const staleRunId = task.contractRunId;
-    const project = state.projects.find((p) => p.id === task.projectId);
+    const criteria = completionCriteria?.map((item) => item.trim()).filter(Boolean) ?? [];
+    if (criteria.length === 0) return { ok: false, error: '请至少填写一条验收标准。' };
 
     try {
-      await bindBackendWorkspace(project);
-      const created = await apiCreateRun(toTaskCreateRequest(text, task.completionCriteria), {
-        ...(task.mode ? { mode: task.mode } : {}),
-        projectId: task.projectId,
-        clientTaskId: task.id,
-        title: task.title,
+      const project = state.projects.find((item) => item.id === state.activeProjectId);
+      const workspacePath = await bindBackendWorkspace(project);
+      const clientTaskId = uid('task');
+      const snapshot = await taskApi.create({
+        spec: text,
+        completion_criteria: criteria,
+        workspace_path: workspacePath,
+        ...(mode ? { mode } : {}),
+        project_id: state.activeProjectId,
+        client_task_id: clientTaskId,
+        ...(title?.trim() ? { title: title.trim() } : {}),
       });
-
-      if (staleRunId && staleRunId !== created.run_id) {
-        void unwatchRun(staleRunId);
-        set((s) => ({ liveRuns: dropRun(s.liveRuns, staleRunId) }));
-      }
-
-      set((s) => ({
-        tasks: s.tasks.map((t) =>
-          t.id === task.id
-            ? {
-                ...t,
-                contractTaskId: created.task_id,
-                contractRunId: created.run_id,
-                submitError: undefined,
-              }
-            : t,
+      const currentRunId = snapshot.current_run?.run_id;
+      const newTask = {
+        ...createRequirementTask(
+          snapshot.task.task_id,
+          state.activeProjectId,
+          snapshot.task.spec,
+          title,
+          snapshot.task.completion_criteria,
         ),
+        contractTaskId: snapshot.task.task_id,
+        ...(currentRunId ? { contractRunId: currentRunId } : {}),
+        ...(mode ? { mode } : {}),
+      };
+      const persisted = state.activeTaskId
+        ? syncTasks(state.tasks, state.activeTaskId, extractTaskFields(state))
+        : state.tasks;
+      set((current) => ({
+        tasks: [...persisted, newTask],
+        liveTasks: {
+          ...current.liveTasks,
+          [snapshot.task.task_id]: { snapshot, events: [], status: 'subscribing' },
+        },
+        activeTaskId: newTask.id,
+        currentPage: 'tasks',
+        teamCustomizationEnabled: false,
+        ...taskToState(newTask),
+        isAutoRunning: false,
       }));
-
-      await watchRun(created.run_id);
+      try {
+        await watchTask(snapshot.task.task_id, {
+          onSnapshot: (nextSnapshot) => {
+            set((current) => ({
+              liveTasks: {
+                ...current.liveTasks,
+                [nextSnapshot.task.task_id]: {
+                  ...(current.liveTasks[nextSnapshot.task.task_id] ?? {
+                    events: [],
+                    status: 'subscribing' as const,
+                  }),
+                  snapshot: nextSnapshot,
+                  status: 'live',
+                },
+              },
+            }));
+          },
+          onEvent: (event) => {
+            set((current) => {
+              const liveTask = current.liveTasks[event.task_id];
+              if (!liveTask) return {};
+              const events = [...liveTask.events, event].sort(
+                (left, right) => left.sequence - right.sequence,
+              );
+              return {
+                liveTasks: {
+                  ...current.liveTasks,
+                  [event.task_id]: { ...liveTask, events, cursor: event.event_id, status: 'live' },
+                },
+              };
+            });
+          },
+        });
+        if (currentRunId) await watchRun(currentRunId);
+      } catch (subscriptionError) {
+        const message =
+          subscriptionError instanceof Error
+            ? subscriptionError.message
+            : String(subscriptionError);
+        set((current) => {
+          const liveTask = current.liveTasks[snapshot.task.task_id];
+          return liveTask
+            ? {
+                liveTasks: {
+                  ...current.liveTasks,
+                  [snapshot.task.task_id]: { ...liveTask, status: 'error', error: message },
+                },
+              }
+            : {};
+        });
+      }
       return { ok: true };
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.warn('[api] run.create 重试仍失败，任务仍只存在于本地：', err);
-      set((s) => ({
-        tasks: s.tasks.map((t) => (t.id === task.id ? { ...t, submitError: message } : t)),
-      }));
-      return { ok: false, error: message };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  },
+
+  retrySubmit: async (taskId) => {
+    const state = get();
+    const task = state.tasks.find((item) => item.id === taskId);
+    const backendTaskId = task?.contractTaskId;
+    if (!task || !backendTaskId) return { ok: false, error: '任务尚未被后端受理。' };
+
+    try {
+      const snapshot = await taskApi.get(backendTaskId);
+      if (snapshot.task.status === 'blocked') {
+        const resumed = await taskApi.resume(backendTaskId);
+        set((current) => ({
+          liveTasks: {
+            ...current.liveTasks,
+            [backendTaskId]: {
+              ...(current.liveTasks[backendTaskId] ?? { events: [] }),
+              snapshot: resumed,
+              status: 'live',
+            },
+          },
+          tasks: current.tasks.map((item) =>
+            item.id === task.id
+              ? { ...item, contractRunId: resumed.current_run?.run_id, submitError: undefined }
+              : item,
+          ),
+        }));
+        if (resumed.current_run) await watchRun(resumed.current_run.run_id);
+      } else {
+        const restartable = snapshot.run_history.find(
+          (run) =>
+            run.run_id === task.contractRunId &&
+            run.restartable &&
+            ['failed', 'cancelled', 'interrupted'].includes(run.status),
+        );
+        if (!restartable) return { ok: false, error: '这次执行不支持重启。' };
+        const restarted = await runApi.restart(restartable.run_id);
+        set((current) => ({
+          tasks: current.tasks.map((item) =>
+            item.id === task.id
+              ? { ...item, contractRunId: restarted.run_id, submitError: undefined }
+              : item,
+          ),
+        }));
+        await watchRun(restarted.run_id);
+      }
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
     }
   },
 
@@ -443,6 +458,12 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
     const state = get();
     const target = state.tasks.find((t) => t.id === taskId);
     if (!target) return;
+    if (target.contractTaskId) {
+      void unwatchTask(target.contractTaskId);
+      void taskApi.cancel(target.contractTaskId).catch((error: unknown) => {
+        console.warn('[api] task.cancel 失败：', error);
+      });
+    }
     // 先回写当前活动任务的实时状态，避免误删非活动任务时丢活动任务进度
     const synced = state.activeTaskId
       ? syncTasks(state.tasks, state.activeTaskId, extractTaskFields(state))
@@ -461,6 +482,11 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
       const { activeTaskId, taskState } = pickProjectTask(remaining, target.projectId);
       set({
         tasks: remaining,
+        liveTasks: target.contractTaskId
+          ? Object.fromEntries(
+              Object.entries(state.liveTasks).filter(([id]) => id !== target.contractTaskId),
+            )
+          : state.liveTasks,
         liveRuns,
         activeTaskId,
         currentPage: 'tasks',
@@ -468,7 +494,15 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
         ...taskState,
       });
     } else {
-      set({ tasks: remaining, liveRuns });
+      set({
+        tasks: remaining,
+        liveTasks: target.contractTaskId
+          ? Object.fromEntries(
+              Object.entries(state.liveTasks).filter(([id]) => id !== target.contractTaskId),
+            )
+          : state.liveTasks,
+        liveRuns,
+      });
     }
   },
 });

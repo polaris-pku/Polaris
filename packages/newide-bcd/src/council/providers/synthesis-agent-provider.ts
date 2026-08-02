@@ -4,8 +4,19 @@
  * Council 的真实 agent-backed MVP provider。它只依赖 B 方向 AgentExecutionFacade，
  * 不直接调用 A 方向 DriverRuntimeHandle。
  */
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
 import { SCHEMA_VERSION, createId, nowTimestamp, type ArtifactRef } from '../../core';
+import {
+  isMaterializableFileArtifact,
+  readArtifactBytes,
+} from '../../coordinator/artifact-content';
 import type { AgentExecutionFacade, AgentExecutionResult } from '../../protocol/agent-execution';
+import type { CouncilParticipantResolver } from '../council-participant-resolver';
+import type {
+  CouncilParticipantBinding,
+  CouncilSeat,
+} from '../council-participant';
 import type {
   CouncilDecision,
   CouncilExecutionOptions,
@@ -18,6 +29,7 @@ import type {
   Proposal,
   Review,
 } from '../contract';
+import { prepareCouncilWorkspace } from '../council-workspace';
 
 export type CouncilRoleFailureCode =
   | 'COUNCIL_PROPOSAL_FAILED'
@@ -25,6 +37,7 @@ export type CouncilRoleFailureCode =
   | 'COUNCIL_SYNTHESIS_FAILED';
 
 type CouncilPhase = 'proposal' | 'review' | 'synthesis';
+type CouncilRoleFailureDetails = Record<string, unknown>;
 
 export class CouncilRoleExecutionError extends Error {
   readonly code: CouncilRoleFailureCode;
@@ -32,10 +45,11 @@ export class CouncilRoleExecutionError extends Error {
 
   constructor(
     readonly council_phase: CouncilPhase,
-    readonly role_id: string,
+    readonly participant: CouncilParticipantBinding,
     readonly agent_status: AgentExecutionResult['status'],
     readonly agent_run_id?: string,
     readonly driver_run_result_id?: string,
+    readonly failure_details: CouncilRoleFailureDetails = {},
   ) {
     super(`Council ${council_phase} role failed`);
     this.name = 'CouncilRoleExecutionError';
@@ -46,23 +60,32 @@ export class CouncilRoleExecutionError extends Error {
     return {
       phase: this.phase,
       council_phase: this.council_phase,
-      role_id: this.role_id,
+      ...participantAuditPayload(this.participant),
       agent_status: this.agent_status,
       ...(this.agent_run_id ? { agent_run_id: this.agent_run_id } : {}),
       ...(this.driver_run_result_id ? { driver_run_result_id: this.driver_run_result_id } : {}),
+      ...(Object.keys(this.failure_details).length > 0
+        ? { failure_details: { ...this.failure_details } }
+        : {}),
     };
   }
 }
 
 export interface SynthesisAgentCouncilProviderOptions {
   agentExecutionFacade: AgentExecutionFacade;
+  participantResolver?: CouncilParticipantResolver;
+  councilRoot?: string;
 }
 
 export class SynthesisAgentCouncilProvider implements CouncilProvider {
   private readonly agentExecutionFacade: AgentExecutionFacade;
+  private readonly participantResolver: CouncilParticipantResolver | undefined;
+  private readonly councilRoot: string;
 
   constructor(options: SynthesisAgentCouncilProviderOptions) {
     this.agentExecutionFacade = options.agentExecutionFacade;
+    this.participantResolver = options.participantResolver;
+    this.councilRoot = options.councilRoot ?? '.newide/council';
   }
 
   async runCouncilRound(
@@ -70,122 +93,221 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     options?: CouncilExecutionOptions,
   ): Promise<CouncilRunResult> {
     const executionRunId = input.run_id ?? createId('run');
-    const proposerA = await this.runRole(
-      input,
-      executionRunId,
-      'proposer_a',
-      `Produce proposal A for: ${input.question}. Create or modify a concrete candidate file in the workspace so the proposal has an artifact.`,
-      input.evidence_pack?.artifact_refs ?? [],
-      'proposal',
-      options,
-    );
-    const proposalA = buildProposal(input, proposerA);
-    await emitLifecycle(options, completedProposalEvent(proposalA, proposerA));
-    const proposerB = await this.runRole(
-      input,
-      executionRunId,
-      'proposer_b',
-      `Produce proposal B for: ${input.question}. Create or modify a concrete alternative candidate file in the workspace so the proposal has an artifact.`,
-      input.evidence_pack?.artifact_refs ?? [],
-      'proposal',
-      options,
-    );
-    const proposalB = buildProposal(input, proposerB);
-    await emitLifecycle(options, completedProposalEvent(proposalB, proposerB));
-    const generatedProposals = [proposalA, proposalB];
+    const participants = await this.resolveParticipants(input, executionRunId);
+    const proposers = participants
+      .filter((participant) => participant.seat === 'proposer')
+      .sort((left, right) => left.seat_index - right.seat_index);
+    const reviewerParticipant = requireSeat(participants, 'reviewer');
+    const synthesizerParticipant = requireSeat(participants, 'synthesizer');
+    const councilDir = path.join(this.councilRoot, executionRunId);
+    const generatedResults: AgentExecutionResult[] = [];
+    const diagnosticRefs: string[] = [];
+    const generatedProposals: Proposal[] = [];
+
+    for (const participant of proposers) {
+      const label = String.fromCharCode(65 + participant.seat_index);
+      const workspace = participantWorkspace(councilDir, participant);
+      await prepareCouncilWorkspace(input.workspace_path, workspace);
+      const result = await this.tryRunRole(
+        input,
+        executionRunId,
+        participant,
+        `Produce proposal ${label} for: ${input.question}. Work only in this isolated role workspace and implement a concrete candidate solution.`,
+        input.evidence_pack?.artifact_refs ?? [],
+        'proposal',
+        workspace,
+        options,
+        diagnosticRefs,
+      );
+      if (!result) continue;
+      generatedResults.push(result);
+      const proposal = buildProposal(input, participant, result);
+      generatedProposals.push(proposal);
+      await emitLifecycle(options, completedProposalEvent(proposal, participant, result));
+    }
+
     const proposals = [...input.proposals, ...generatedProposals];
-    const reviewer = await this.runRole(
+    const candidateArtifacts = [
+      ...(input.candidate_artifacts ?? []),
+      ...generatedResults.flatMap((result) => result.artifact_refs),
+    ];
+    const reviewerWorkspace = participantWorkspace(councilDir, reviewerParticipant);
+    await prepareCouncilWorkspace(input.workspace_path, reviewerWorkspace);
+    await stageArtifacts(reviewerWorkspace, candidateArtifacts);
+    const reviewer = await this.tryRunRole(
       input,
       executionRunId,
-      'reviewer',
-      `Review proposals: ${proposals.map((proposal) => proposal.proposal_id).join(', ')}`,
+      reviewerParticipant,
+      buildReviewerInstruction(input.question, proposals),
       proposals.flatMap((proposal) => proposal.artifact_refs),
       'review',
+      reviewerWorkspace,
       options,
+      diagnosticRefs,
     );
-    const reviews = proposals.map((proposal) => buildReview(proposal, reviewer));
-    await emitLifecycle(options, {
-      type: 'council.review.completed',
-      payload: {
-        role_id: reviewer.role_id,
-        agent_run_id: reviewer.agent_run_id,
-        driver_run_result_id: reviewer.driver_run_result_id,
-        proposal_ids: proposals.map((proposal) => proposal.proposal_id),
-        review_ids: reviews.map((review) => review.review_id),
-        artifact_refs: reviewer.artifact_refs.map((artifact) => artifact.artifact_id),
-      },
-    });
-    const synthesizer = await this.runRole(
-      input,
-      executionRunId,
-      'synthesizer',
-      `Synthesize the final candidate from proposals and reviews for: ${input.question}. Create or modify the concrete final candidate file in the workspace; a file artifact is required.`,
-      proposals.flatMap((proposal) => proposal.artifact_refs),
-      'synthesis',
-      options,
+    if (reviewer) generatedResults.push(reviewer);
+    const reviews = buildReviews(proposals, reviewerParticipant, reviewer);
+    if (reviewer) {
+      await emitLifecycle(options, {
+        type: 'council.review.completed',
+        payload: {
+          ...participantAuditPayload(reviewerParticipant),
+          agent_run_id: reviewer.agent_run_id,
+          driver_run_result_id: reviewer.driver_run_result_id,
+          context_pack_ref: reviewer.context_pack_ref,
+          memory_buffer_ref: reviewer.memory_buffer_ref,
+          session_id: reviewer.session_id,
+          proposal_ids: proposals.map((proposal) => proposal.proposal_id),
+          review_ids: reviews.map((review) => review.review_id),
+          artifact_refs: reviewer.artifact_refs.map((artifact) => artifact.artifact_id),
+        },
+      });
+    }
+
+    const synthesizerWorkspace = participantWorkspace(councilDir, synthesizerParticipant);
+    await prepareCouncilWorkspace(input.workspace_path, synthesizerWorkspace);
+    await stageArtifacts(synthesizerWorkspace, candidateArtifacts);
+    await fs.mkdir(synthesizerWorkspace, { recursive: true });
+    await fs.writeFile(
+      path.join(synthesizerWorkspace, 'reviews.json'),
+      JSON.stringify(reviews, null, 2),
+      'utf-8',
     );
-    const synthesis = buildSynthesis(input, proposals, reviews, synthesizer);
-    await emitLifecycle(options, {
-      type: 'council.synthesis.completed',
-      payload: {
-        role_id: synthesizer.role_id,
-        agent_run_id: synthesizer.agent_run_id,
-        driver_run_result_id: synthesizer.driver_run_result_id,
-        synthesis_id: synthesis.synthesis_id,
-        artifact_refs: synthesis.artifact_refs,
-      },
-    });
-    const selectedArtifactRefs = synthesizer.artifact_refs.map((artifact) => artifact.artifact_id);
-    const generatedArtifactRefs = [
-      ...proposerA.artifact_refs,
-      ...proposerB.artifact_refs,
-      ...reviewer.artifact_refs,
-      ...synthesizer.artifact_refs,
-    ];
+    let synthesizer: AgentExecutionResult | undefined;
+    const maxRounds = Math.min(Math.max(input.max_rounds ?? 2, 1), 2);
+    for (let round = 1; round <= maxRounds; round += 1) {
+      synthesizer = await this.tryRunRole(
+        input,
+        executionRunId,
+        synthesizerParticipant,
+        buildSynthesisInstruction(input.question, round),
+        proposals.flatMap((proposal) => proposal.artifact_refs),
+        'synthesis',
+        synthesizerWorkspace,
+        options,
+        diagnosticRefs,
+      );
+      if (synthesizer) generatedResults.push(synthesizer);
+      if (synthesizer?.artifact_refs.some(isMaterializableFileArtifact)) break;
+    }
+
+    const synthesis = synthesizer
+      ? buildSynthesis(input, proposals, reviews, synthesizerParticipant, synthesizer)
+      : undefined;
+    if (synthesis && synthesizer) {
+      await emitLifecycle(options, {
+        type: 'council.synthesis.completed',
+        payload: {
+          ...participantAuditPayload(synthesizerParticipant),
+          agent_run_id: synthesizer.agent_run_id,
+          driver_run_result_id: synthesizer.driver_run_result_id,
+          context_pack_ref: synthesizer.context_pack_ref,
+          memory_buffer_ref: synthesizer.memory_buffer_ref,
+          session_id: synthesizer.session_id,
+          synthesis_id: synthesis.synthesis_id,
+          artifact_refs: synthesis.artifact_refs,
+        },
+      });
+    }
+    const selectedArtifactRefs =
+      synthesizer?.artifact_refs
+        .filter(isMaterializableFileArtifact)
+        .map((artifact) => artifact.artifact_id) ?? [];
+    const generatedArtifactRefs = generatedResults.flatMap((result) => result.artifact_refs);
     const decision = buildDecision(input, synthesis, selectedArtifactRefs);
 
     return {
       council_run_id: createId('council_run'),
       ...(input.run_id ? { run_id: input.run_id } : {}),
       task_id: input.task_id,
+      participants,
       proposals,
       reviews,
-      synthesis,
+      ...(synthesis ? { synthesis } : {}),
       decision,
       output: buildOutput(input, decision, generatedArtifactRefs),
       generated_artifact_refs: generatedArtifactRefs,
       selected_artifact_refs: selectedArtifactRefs,
+      ...(diagnosticRefs.length > 0 ? { diagnostic_refs: diagnosticRefs } : {}),
       created_at: nowTimestamp(),
       schema_version: SCHEMA_VERSION,
     };
   }
 
+  private async tryRunRole(
+    input: CouncilRoundInput,
+    executionRunId: string,
+    participant: CouncilParticipantBinding,
+    instruction: string,
+    inputArtifactRefs: string[],
+    phase: CouncilPhase,
+    workspacePath: string,
+    options: CouncilExecutionOptions | undefined,
+    diagnosticRefs: string[],
+  ): Promise<AgentExecutionResult | undefined> {
+    try {
+      return await this.runRole(
+        input,
+        executionRunId,
+        participant,
+        instruction,
+        inputArtifactRefs,
+        phase,
+        workspacePath,
+        options,
+      );
+    } catch (error) {
+      if (options?.signal?.aborted) throw error;
+      if (!(error instanceof CouncilRoleExecutionError)) throw error;
+      diagnosticRefs.push(`${error.code}:${participant.participant_id}`);
+      return undefined;
+    }
+  }
+
   private async runRole(
     input: CouncilRoundInput,
     executionRunId: string,
-    roleId: string,
+    participant: CouncilParticipantBinding,
     instruction: string,
     inputArtifactRefs: string[] = input.evidence_pack?.artifact_refs ?? [],
     phase: CouncilPhase,
+    workspacePath: string,
     options?: CouncilExecutionOptions,
   ): Promise<AgentExecutionResult> {
+    await fs.mkdir(workspacePath, { recursive: true });
     let result: AgentExecutionResult;
     try {
       result = await this.agentExecutionFacade.runAgent(
         {
           task_id: input.task_id,
           run_id: executionRunId,
-          role_id: roleId,
-          instruction,
+          role_id: participant.agent_id,
+          participant_id: participant.participant_id,
+          council_seat: participant.seat,
+          council_seat_index: participant.seat_index,
+          instruction: requireDriverDelegation(instruction),
+          workspace_path: workspacePath,
           input_artifact_refs: inputArtifactRefs,
-          context_policy: 'council_synthesis_default',
+          context_policy: `council_${participant.seat}`,
           schema_version: SCHEMA_VERSION,
         },
-        options?.signal ? { signal: options.signal } : undefined,
+        options?.signal || options?.onDriverEvent
+          ? {
+              ...(options.signal ? { signal: options.signal } : {}),
+              ...(options.onDriverEvent ? { onDriverEvent: options.onDriverEvent } : {}),
+            }
+          : undefined,
       );
     } catch (error) {
       if (options?.signal?.aborted) throw error;
-      const failure = new CouncilRoleExecutionError(phase, roleId, 'failed');
+      const failure = new CouncilRoleExecutionError(
+        phase,
+        participant,
+        'failed',
+        undefined,
+        undefined,
+        errorDetails(error),
+      );
       await emitFailureLifecycle(options, failure);
       throw failure;
     }
@@ -193,28 +315,55 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     if (result.status !== 'completed') {
       const failure = new CouncilRoleExecutionError(
         phase,
-        roleId,
+        participant,
         result.status,
         result.agent_run_id,
         result.driver_run_result_id,
+        agentFailureDetails(result),
       );
       await emitFailureLifecycle(options, failure);
       throw failure;
     }
     return result;
   }
+
+  private async resolveParticipants(
+    input: CouncilRoundInput,
+    executionRunId: string,
+  ): Promise<CouncilParticipantBinding[]> {
+    const participants =
+      input.participants ??
+      (await this.participantResolver?.resolve({
+        run_id: executionRunId,
+        task_id: input.task_id,
+        question: input.question,
+        ...(input.participant_profile_refs
+          ? { participant_profile_refs: input.participant_profile_refs }
+          : {}),
+      }));
+    if (!participants) {
+      throw new Error(
+        'Council participants are required; configure a participant resolver or pass explicit bindings',
+      );
+    }
+    return validateParticipants(participants);
+  }
 }
 
 function completedProposalEvent(
   proposal: Proposal,
+  participant: CouncilParticipantBinding,
   result: AgentExecutionResult,
 ): CouncilLifecycleEvent {
   return {
     type: 'council.proposal.completed',
     payload: {
-      role_id: result.role_id,
+      ...participantAuditPayload(participant),
       agent_run_id: result.agent_run_id,
       driver_run_result_id: result.driver_run_result_id,
+      context_pack_ref: result.context_pack_ref,
+      memory_buffer_ref: result.memory_buffer_ref,
+      session_id: result.session_id,
       proposal_id: proposal.proposal_id,
       artifact_refs: proposal.artifact_refs,
     },
@@ -249,16 +398,126 @@ function failureCode(phase: CouncilPhase): CouncilRoleFailureCode {
   return 'COUNCIL_SYNTHESIS_FAILED';
 }
 
-function buildProposal(input: CouncilRoundInput, result: AgentExecutionResult): Proposal {
+function errorDetails(error: unknown): CouncilRoleFailureDetails {
+  if (error instanceof Error) {
+    return {
+      error_name: error.name,
+      error_message: error.message,
+    };
+  }
+  return { error_message: String(error) };
+}
+
+function agentFailureDetails(result: AgentExecutionResult): CouncilRoleFailureDetails {
+  const details: CouncilRoleFailureDetails = {};
+  const diagnostics = result.diagnostics;
+  const dispatchStatus = diagnostics.dispatch_status;
+  if (typeof dispatchStatus === 'string') details.dispatch_status = dispatchStatus;
+  const driverErrorCode = diagnostics.driver_error_code;
+  if (typeof driverErrorCode === 'string') details.driver_error_code = driverErrorCode;
+  const driverError = diagnostics.driver_error;
+  if (driverError && typeof driverError === 'object' && !Array.isArray(driverError)) {
+    const record = driverError as Record<string, unknown>;
+    if (typeof record.code === 'string') details.driver_error_code = record.code;
+    if (typeof record.message === 'string') details.driver_error_message = record.message;
+    if (typeof record.retryable === 'boolean') details.retryable = record.retryable;
+  }
+  return details;
+}
+
+function validateParticipants(
+  input: readonly CouncilParticipantBinding[],
+): CouncilParticipantBinding[] {
+  const participants = input.map((participant) => ({
+    ...participant,
+    ...(participant.conflict_flags
+      ? { conflict_flags: [...participant.conflict_flags] }
+      : {}),
+  }));
+  const participantIds = new Set<string>();
+  for (const participant of participants) {
+    if (!/^[A-Za-z0-9_-]+$/.test(participant.participant_id)) {
+      throw new Error(`Invalid Council participant_id: ${participant.participant_id}`);
+    }
+    if (!participant.agent_id.trim()) {
+      throw new Error('Council participant agent_id must not be empty');
+    }
+    if (!Number.isInteger(participant.seat_index) || participant.seat_index < 0) {
+      throw new Error(`Invalid Council seat_index for ${participant.participant_id}`);
+    }
+    if (participantIds.has(participant.participant_id)) {
+      throw new Error(`Duplicate Council participant_id: ${participant.participant_id}`);
+    }
+    participantIds.add(participant.participant_id);
+  }
+  const proposers = participants.filter((participant) => participant.seat === 'proposer');
+  if (proposers.length !== 2 || new Set(proposers.map((item) => item.seat_index)).size !== 2) {
+    throw new Error('Council requires exactly two distinct proposer seats');
+  }
+  for (const seat of ['reviewer', 'synthesizer'] as const) {
+    if (participants.filter((participant) => participant.seat === seat).length !== 1) {
+      throw new Error(`Council requires exactly one ${seat} seat`);
+    }
+  }
+  return participants;
+}
+
+function requireSeat(
+  participants: readonly CouncilParticipantBinding[],
+  seat: Exclude<CouncilSeat, 'proposer'>,
+): CouncilParticipantBinding {
+  return participants.find((participant) => participant.seat === seat)!;
+}
+
+function participantWorkspace(
+  councilDir: string,
+  participant: CouncilParticipantBinding,
+): string {
+  return path.join(councilDir, participant.participant_id);
+}
+
+function participantAuditPayload(
+  participant: CouncilParticipantBinding,
+): Record<string, unknown> {
+  return {
+    participant_id: participant.participant_id,
+    seat: participant.seat,
+    council_seat: participant.seat,
+    seat_index: participant.seat_index,
+    agent_id: participant.agent_id,
+    ...(participant.role_profile_ref
+      ? { role_profile_ref: participant.role_profile_ref }
+      : {}),
+    ...(participant.conflict_flags
+      ? { conflict_flags: participant.conflict_flags }
+      : {}),
+  };
+}
+
+function requireDriverDelegation(instruction: string): string {
+  return [
+    instruction,
+    '',
+    'Council execution requirement: call the invoke_driver tool before marking the task complete. Do not complete this role only from the top-level Agent.',
+  ].join('\n');
+}
+
+function buildProposal(
+  input: CouncilRoundInput,
+  participant: CouncilParticipantBinding,
+  result: AgentExecutionResult,
+): Proposal {
   return {
     proposal_id: createId('proposal'),
     ...(input.run_id ? { run_id: input.run_id } : {}),
     task_id: input.task_id,
-    agent_id: result.role_id,
+    agent_id: result.agent_id ?? participant.agent_id,
     artifact_refs: result.artifact_refs.map((artifact) => artifact.artifact_id),
-    summary: `${result.role_id} generated a council proposal.`,
+    summary: result.response?.trim() || `${result.role_id} generated a council proposal.`,
     claims: [],
-    affected_paths: [],
+    affected_paths: result.artifact_refs.flatMap((artifact) =>
+      artifact.content?.target_path ? [artifact.content.target_path] : [],
+    ),
     assumptions: [],
     known_risks: [],
     completion_evidence: [result.driver_run_result_id],
@@ -267,33 +526,59 @@ function buildProposal(input: CouncilRoundInput, result: AgentExecutionResult): 
   };
 }
 
-function buildReview(proposal: Proposal, result: AgentExecutionResult): Review {
-  return {
-    review_id: createId('review'),
-    proposal_id: proposal.proposal_id,
-    reviewer_id: result.role_id,
-    verdict: result.status === 'completed' ? 'approve' : 'needs_revision',
-    reason: `${result.role_id} reviewed proposal ${proposal.proposal_id}.`,
-    created_at: nowTimestamp(),
-    schema_version: SCHEMA_VERSION,
-  };
+function buildReviews(
+  proposals: readonly Proposal[],
+  participant: CouncilParticipantBinding,
+  result: AgentExecutionResult | undefined,
+): Review[] {
+  const parsed = result ? parseReviewPayload(result.response) : undefined;
+  return proposals.map((proposal) => {
+    const item = parsed?.find((candidate) => candidate.proposal_id === proposal.proposal_id);
+    if (!item) {
+      return {
+        review_id: createId('review'),
+        proposal_id: proposal.proposal_id,
+        reviewer_id: result?.agent_id ?? participant.agent_id,
+        verdict: 'needs_revision',
+        reason: result
+          ? 'Reviewer did not return a valid structured review for this proposal.'
+          : 'Reviewer execution failed; proposal remains unverified.',
+        unmet_criteria: ['structured_review'],
+        evidence_refs: [],
+        created_at: nowTimestamp(),
+        schema_version: SCHEMA_VERSION,
+      };
+    }
+    return {
+      review_id: createId('review'),
+      proposal_id: proposal.proposal_id,
+      reviewer_id: result?.agent_id ?? participant.agent_id,
+      verdict: item.verdict,
+      reason: item.reason,
+      unmet_criteria: [...item.unmet_criteria],
+      evidence_refs: [...item.evidence_refs],
+      created_at: nowTimestamp(),
+      schema_version: SCHEMA_VERSION,
+    };
+  });
 }
 
 function buildSynthesis(
   input: CouncilRoundInput,
   proposals: Proposal[],
   reviews: Review[],
+  participant: CouncilParticipantBinding,
   result: AgentExecutionResult,
 ): CouncilSynthesis {
   return {
     synthesis_id: createId('council_synthesis'),
     ...(input.run_id ? { run_id: input.run_id } : {}),
     task_id: input.task_id,
-    synthesizer_id: result.role_id,
+    synthesizer_id: result.agent_id ?? participant.agent_id,
     input_proposal_ids: proposals.map((proposal) => proposal.proposal_id),
     input_review_ids: reviews.map((review) => review.review_id),
     artifact_refs: result.artifact_refs.map((artifact) => artifact.artifact_id),
-    summary: 'Synthesis agent produced a final candidate artifact.',
+    summary: result.response?.trim() || 'Synthesis agent produced a final candidate artifact.',
     created_at: nowTimestamp(),
     schema_version: SCHEMA_VERSION,
   };
@@ -301,7 +586,7 @@ function buildSynthesis(
 
 function buildDecision(
   input: CouncilRoundInput,
-  synthesis: CouncilSynthesis,
+  synthesis: CouncilSynthesis | undefined,
   selectedArtifactRefs: string[],
 ): CouncilDecision {
   const hasSelection = selectedArtifactRefs.length > 0;
@@ -311,12 +596,12 @@ function buildDecision(
     task_id: input.task_id,
     decision_mode: input.decision_mode,
     selected_artifact_refs: selectedArtifactRefs,
-    verdict: hasSelection ? 'select' : 'needs_human',
+    verdict: hasSelection ? 'select' : 'request_revision',
     reason: hasSelection
       ? 'Synthesis agent produced the selected final candidate artifact.'
-      : 'Synthesis agent did not produce a selectable artifact.',
+      : 'Synthesis was unavailable; Coordinator must select the best reviewed proposal.',
     evidence_refs: [
-      synthesis.synthesis_id,
+      ...(synthesis ? [synthesis.synthesis_id] : []),
       ...(input.evidence_pack ? [input.evidence_pack.evidence_pack_id] : []),
     ],
     can_create_merge_authorization: false,
@@ -334,14 +619,94 @@ function buildOutput(
     output_id: createId('council_output'),
     ...(input.run_id ? { run_id: input.run_id } : {}),
     task_id: input.task_id,
-    status: decision.verdict === 'select' ? 'selected' : 'needs_human',
+    status: decision.verdict === 'select' ? 'selected' : 'request_revision',
     decision_ref: decision.decision_id,
     selected_artifact_refs: decision.selected_artifact_refs,
     generated_artifact_refs: generatedArtifactRefs,
-    required_next_actions: decision.verdict === 'select' ? ['post_council_gate'] : ['human_review'],
-    blocked_by: decision.verdict === 'select' ? [] : ['council_no_synthesis_artifact'],
+    required_next_actions:
+      decision.verdict === 'select' ? ['post_council_gate'] : ['coordinator_best_effort_selection'],
+    blocked_by: [],
     can_create_merge_authorization: false,
     created_at: nowTimestamp(),
     schema_version: SCHEMA_VERSION,
   };
+}
+
+interface ParsedReview {
+  proposal_id: string;
+  verdict: Review['verdict'];
+  reason: string;
+  unmet_criteria: string[];
+  evidence_refs: string[];
+}
+
+function parseReviewPayload(response: string | undefined): ParsedReview[] | undefined {
+  const source = (response ?? '')
+    .trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/, '');
+  try {
+    const value = JSON.parse(source) as { reviews?: unknown };
+    if (!Array.isArray(value.reviews)) return undefined;
+    return value.reviews.flatMap((entry) => {
+      if (!entry || typeof entry !== 'object') return [];
+      const proposalId = Reflect.get(entry, 'proposal_id');
+      const verdict = Reflect.get(entry, 'verdict');
+      const reason = Reflect.get(entry, 'reason');
+      const unmetCriteria = Reflect.get(entry, 'unmet_criteria');
+      const evidenceRefs = Reflect.get(entry, 'evidence_refs');
+      if (
+        typeof proposalId !== 'string' ||
+        !['approve', 'reject', 'needs_revision'].includes(String(verdict)) ||
+        typeof reason !== 'string' ||
+        !Array.isArray(unmetCriteria) ||
+        !unmetCriteria.every((item) => typeof item === 'string') ||
+        !Array.isArray(evidenceRefs) ||
+        !evidenceRefs.every((item) => typeof item === 'string')
+      ) {
+        return [];
+      }
+      return [
+        {
+          proposal_id: proposalId,
+          verdict: verdict as Review['verdict'],
+          reason,
+          unmet_criteria: unmetCriteria,
+          evidence_refs: evidenceRefs,
+        },
+      ];
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+function buildReviewerInstruction(question: string, proposals: readonly Proposal[]): string {
+  return [
+    `Review the isolated proposal inputs for: ${question}.`,
+    `Proposal ids: ${proposals.map((proposal) => proposal.proposal_id).join(', ')}.`,
+    'Return JSON only: {"reviews":[{"proposal_id":"...","verdict":"approve|reject|needs_revision","reason":"...","unmet_criteria":[],"evidence_refs":[]}]}.',
+    'A successful tool call is not approval; verdict must be based on the proposal evidence.',
+  ].join(' ');
+}
+
+function buildSynthesisInstruction(question: string, round: number): string {
+  return [
+    `Synthesis round ${String(round)} for: ${question}.`,
+    'Read the staged proposal inputs and reviews.json in this isolated workspace.',
+    'Implement the concrete final candidate changes in the repository workspace.',
+    'Do not merely describe a decision; at least one materializable file change is required.',
+  ].join(' ');
+}
+
+async function stageArtifacts(workspace: string, artifacts: readonly ArtifactRef[]): Promise<void> {
+  await fs.mkdir(workspace, { recursive: true });
+  for (const artifact of artifacts) {
+    if (!isMaterializableFileArtifact(artifact)) continue;
+    const targetPath = artifact.content?.target_path;
+    if (!targetPath) continue;
+    const target = path.join(workspace, 'inputs', artifact.artifact_id, targetPath);
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await fs.writeFile(target, await readArtifactBytes(artifact));
+  }
 }

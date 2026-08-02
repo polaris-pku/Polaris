@@ -8,6 +8,22 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.2-pg17-bookworm
+        env:
+          POSTGRES_DB: newide_b
+          POSTGRES_USER: newide
+          POSTGRES_PASSWORD: newide_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U newide -d newide_b"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      MEMORY_PG_TEST_URL: postgresql://newide:newide_ci@127.0.0.1:5432/newide_b
     steps:
       - uses: actions/checkout@v4
       # pnpm 版本由 package.json 的 packageManager 字段决定（避免双重指定冲突）
@@ -20,4 +36,7 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm verify
+      - run: pnpm --filter newide-bcd verify
+      - run: pnpm --filter acp-client-prototype verify
       - run: pnpm build
+      - run: pnpm build:backend

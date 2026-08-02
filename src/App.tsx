@@ -9,6 +9,11 @@ import { CouncilBoard } from '@/pages/CouncilBoard';
 import { FileViewer } from '@/pages/FileViewer';
 import { ProjectLauncher } from '@/pages/ProjectLauncher';
 import { useDemoStore } from '@/store/useDemoStore';
+import { bootstrapBackend } from '@/api/system';
+import { taskApi, watchTask } from '@/api/task';
+import { runApi } from '@/api/run';
+import { createRequirementTask } from '@/data/tasks';
+import { taskToState } from '@/store/lib/taskSync';
 
 export default function App() {
   const activeProjectId = useDemoStore((s) => s.activeProjectId);
@@ -23,6 +28,150 @@ export default function App() {
    * 这正是「用户根本不知道自己需要哪些认证 token」的根源。
    */
   const [settingsOpen, setSettingsOpen] = useState(false);
+
+  useEffect(() => {
+    if (!window.desktop?.backend) return;
+    const subscriptions: Array<() => Promise<void>> = [];
+    let cancelled = false;
+
+    void bootstrapBackend()
+      .then(() => taskApi.list())
+      .then(async ({ tasks: snapshots }) => {
+        if (cancelled) return;
+        useDemoStore.setState((state) => {
+          const known = new Set(state.tasks.map((task) => task.contractTaskId));
+          const recovered = snapshots
+            .filter((snapshot) => !known.has(snapshot.task.task_id))
+            .map((snapshot) => ({
+              ...createRequirementTask(
+                snapshot.task.task_id,
+                state.activeProjectId ?? 'backend',
+                snapshot.task.spec,
+                undefined,
+                snapshot.task.completion_criteria,
+              ),
+              contractTaskId: snapshot.task.task_id,
+              ...(snapshot.current_run
+                ? { contractRunId: snapshot.current_run.run_id }
+                : snapshot.run_history[0]
+                  ? { contractRunId: snapshot.run_history[0].run_id }
+                  : {}),
+              assignedAgentIds: [
+                snapshot.task.role_id,
+                snapshot.task.owner_agent_id,
+                snapshot.market?.winner_agent_id,
+              ].filter((id): id is string => !!id),
+            }));
+          const recoveredRuns = Object.fromEntries(
+            snapshots.flatMap((snapshot) => {
+              const run = snapshot.current_run ?? snapshot.run_history[0];
+              if (!run) return [];
+              return [
+                [
+                  run.run_id,
+                  {
+                    runId: run.run_id,
+                    taskId: run.task_id,
+                    status: run.status === 'interrupted' ? ('failed' as const) : run.status,
+                    timeline: [] as import('@/api/types/rpc').RunEvent[],
+                    snapshot: null,
+                    error: run.error?.message ?? null,
+                  },
+                ] as const,
+              ];
+            }),
+          );
+          const tasks = [...state.tasks, ...recovered];
+          const shouldActivateRecovered = !state.activeTaskId && recovered.length > 0;
+          const activeTask = shouldActivateRecovered ? recovered[0] : undefined;
+          return {
+            tasks,
+            ...(activeTask
+              ? {
+                  activeTaskId: activeTask.id,
+                  activeProjectId: activeTask.projectId,
+                  currentPage: 'tasks' as const,
+                  ...taskToState(activeTask),
+                }
+              : {}),
+            liveRuns: { ...state.liveRuns, ...recoveredRuns },
+            liveTasks: Object.fromEntries(
+              snapshots.map((snapshot) => [
+                snapshot.task.task_id,
+                { snapshot, events: [], status: 'subscribing' as const },
+              ]),
+            ),
+          };
+        });
+
+        for (const snapshot of snapshots) {
+          const run = snapshot.current_run ?? snapshot.run_history[0];
+          if (run) {
+            void runApi.getSnapshot(run.run_id).then((runSnapshot) => {
+              useDemoStore.setState((state) => {
+                const current = state.liveRuns[run.run_id];
+                return current
+                  ? {
+                      liveRuns: {
+                        ...state.liveRuns,
+                        [run.run_id]: {
+                          ...current,
+                          snapshot: runSnapshot,
+                          timeline: runSnapshot.timeline,
+                        },
+                      },
+                    }
+                  : {};
+              });
+              useDemoStore.getState().attachLiveRun(run.run_id, runSnapshot);
+            });
+          }
+          subscriptions.push(
+            await watchTask(snapshot.task.task_id, {
+              onSnapshot(nextSnapshot) {
+                useDemoStore.setState((state) => ({
+                  liveTasks: {
+                    ...state.liveTasks,
+                    [nextSnapshot.task.task_id]: {
+                      ...(state.liveTasks[nextSnapshot.task.task_id] ?? { events: [] }),
+                      snapshot: nextSnapshot,
+                      status: 'live',
+                    },
+                  },
+                }));
+              },
+              onEvent(event) {
+                useDemoStore.setState((state) => {
+                  const current = state.liveTasks[event.task_id];
+                  if (!current) return {};
+                  return {
+                    liveTasks: {
+                      ...state.liveTasks,
+                      [event.task_id]: {
+                        ...current,
+                        events: [...current.events, event].sort(
+                          (left, right) => left.sequence - right.sequence,
+                        ),
+                        cursor: event.event_id,
+                        status: 'live',
+                      },
+                    },
+                  };
+                });
+              },
+            }),
+          );
+        }
+      })
+      .catch((error: unknown) => {
+        console.warn('[backend] RPC bootstrap failed:', error);
+      });
+
+    return () => {
+      cancelled = true;
+      for (const unsubscribe of subscriptions) void unsubscribe();
+    };
+  }, []);
 
   /**
    * 原生菜单的应用内导航（仅 macOS 有菜单栏；Win/Linux 是 `setApplicationMenu(null)`）。

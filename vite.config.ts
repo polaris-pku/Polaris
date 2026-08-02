@@ -9,6 +9,7 @@ export default defineConfig(({ command }) => ({
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),
+      '@rpc-methods': path.resolve(__dirname, './electron/backend-rpc-methods.json'),
     },
   },
   server: {

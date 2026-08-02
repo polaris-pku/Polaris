@@ -14,6 +14,8 @@ import type { SelectionMode } from './artifact-finalizer';
 import type { ArtifactOutput } from './artifact-output';
 import type { CouncilDecision } from '../council';
 import type { MaterializationFailure, MaterializationResult } from './worktree-materializer';
+import type { CompletionCriteriaEvaluation } from './completion-criteria-evaluator';
+import type { RunOutcome } from './run-outcome';
 
 export type RunResultStatus = 'completed' | 'failed';
 
@@ -27,12 +29,16 @@ export interface IntegrationRunOutputPaths {
   event_log_path: string;
   audit_path: string;
   frontend_snapshot_path: string;
+  changeset_manifest_path: string;
+  delivery_receipt_path: string;
 }
 
 export interface IntegrationRunResultManifest {
   run_id: RunId;
   task_id: TaskId;
   status: RunResultStatus;
+  run_outcome: RunOutcome;
+  completion_evaluation: CompletionCriteriaEvaluation;
   mode: SelectionMode;
   driver_id: string;
   artifact_outputs: ArtifactOutput[];
@@ -47,11 +53,15 @@ export interface IntegrationRunResultManifest {
   event_log_path: string;
   audit_path: string;
   frontend_snapshot_path: string;
+  changeset_manifest_path: string;
+  delivery_receipt_path: string;
+  changeset_manifest_ref: string;
   council_decision_path?: string;
   council_proposals_path?: string;
   council_reviews_path?: string;
   council_synthesis_path?: string;
   council_output_path?: string;
+  council_result_path?: string;
   council_verdict?: CouncilDecision['verdict'];
   council_decision_mode?: CouncilDecision['decision_mode'];
   created_at: Timestamp;
@@ -84,6 +94,8 @@ export function buildRunOutputPaths(
     event_log_path: path.join(runDir, 'event-log.json'),
     audit_path: path.join(runDir, 'audit.jsonl'),
     frontend_snapshot_path: path.join(runDir, 'frontend-snapshot.json'),
+    changeset_manifest_path: path.join(runDir, 'changeset-manifest.json'),
+    delivery_receipt_path: path.join(runDir, 'delivery.json'),
   };
 }
 
@@ -91,6 +103,8 @@ export interface BuildRunResultManifestInput {
   run_id: RunId;
   task_id: TaskId;
   status: RunResultStatus;
+  run_outcome: RunOutcome;
+  completion_evaluation: CompletionCriteriaEvaluation;
   mode: SelectionMode;
   driver_id: string;
   artifact_outputs: readonly ArtifactOutput[];
@@ -105,11 +119,15 @@ export interface BuildRunResultManifestInput {
   event_log_path: string;
   audit_path: string;
   frontend_snapshot_path: string;
+  changeset_manifest_path: string;
+  delivery_receipt_path: string;
+  changeset_manifest_ref: string;
   council_decision_path?: string;
   council_proposals_path?: string;
   council_reviews_path?: string;
   council_synthesis_path?: string;
   council_output_path?: string;
+  council_result_path?: string;
   council_verdict?: CouncilDecision['verdict'];
   council_decision_mode?: CouncilDecision['decision_mode'];
   created_at: Timestamp;
@@ -123,6 +141,8 @@ export function buildRunResultManifest(
     run_id: input.run_id,
     task_id: input.task_id,
     status: input.status,
+    run_outcome: input.run_outcome,
+    completion_evaluation: input.completion_evaluation,
     mode: input.mode,
     driver_id: input.driver_id,
     artifact_outputs: [...input.artifact_outputs],
@@ -137,6 +157,9 @@ export function buildRunResultManifest(
     event_log_path: input.event_log_path,
     audit_path: input.audit_path,
     frontend_snapshot_path: input.frontend_snapshot_path,
+    changeset_manifest_path: input.changeset_manifest_path,
+    delivery_receipt_path: input.delivery_receipt_path,
+    changeset_manifest_ref: input.changeset_manifest_ref,
     ...(input.council_decision_path ? { council_decision_path: input.council_decision_path } : {}),
     ...(input.council_proposals_path
       ? { council_proposals_path: input.council_proposals_path }
@@ -146,6 +169,7 @@ export function buildRunResultManifest(
       ? { council_synthesis_path: input.council_synthesis_path }
       : {}),
     ...(input.council_output_path ? { council_output_path: input.council_output_path } : {}),
+    ...(input.council_result_path ? { council_result_path: input.council_result_path } : {}),
     ...(input.council_verdict ? { council_verdict: input.council_verdict } : {}),
     ...(input.council_decision_mode ? { council_decision_mode: input.council_decision_mode } : {}),
     created_at: input.created_at,

@@ -70,7 +70,8 @@ function attach() {
   if (attached) return;
   attached = true;
   const transport = getTransport();
-  transport.onEvent((event) => {
+  transport.onNotification((notification) => {
+    const event = notification.params.event;
     if (seen.has(event.event_id)) return;
     seen.add(event.event_id);
     runHandlers.forEach((h) => h(event));
@@ -139,7 +140,7 @@ export async function watchRun(runId: string): Promise<void> {
   attach();
   subscribedRunIds.add(runId);
   try {
-    await getTransport().subscribe(runId);
+    await getTransport().call('run.subscribe', { run_id: runId });
   } catch (err) {
     // 订阅失败不能把它留在集合里 —— 否则后续重试会被当成「已订阅」直接跳过，永远收不到事件。
     subscribedRunIds.delete(runId);
@@ -156,7 +157,9 @@ export async function unwatchRun(runId?: string): Promise<void> {
   if (targets.length === 0) return;
   const transport = getTransport();
   for (const id of targets) subscribedRunIds.delete(id);
-  await Promise.all(targets.map((id) => transport.unsubscribe(id).catch(() => {})));
+  await Promise.all(
+    targets.map((id) => transport.call('run.unsubscribe', { run_id: id }).catch(() => {})),
+  );
 }
 
 /** 当前正在关注的所有 run。 */

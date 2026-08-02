@@ -36,18 +36,13 @@ const NODE_BIN = path.join(
   process.platform === 'win32' ? 'node.exe' : 'node',
 );
 const BACKEND_HOST = path.join(BACKEND_DIR, 'backend-host.cjs');
-const ACP_RUNNER = path.join(BACKEND_DIR, 'acp-runner.cjs');
+const ACP_RUNNER_DIR = path.join(BACKEND_DIR, 'acp-runner');
+const LITELLM_CONFIG_DIR = path.join(BACKEND_DIR, 'config');
 const AGENT_DIR = path.join(BACKEND_DIR, 'agent');
 
-/** BCD 只能被创建/取消，没有人类回写通道 —— 这里的方法名即当前后端的全部能力面。 */
-const RPC_METHODS = [
-  'system.ping',
-  'run.create',
-  'run.getSnapshot',
-  'run.subscribe',
-  'run.unsubscribe',
-  'run.cancel',
-];
+const RPC_METHODS = require('./backend-rpc-methods.json');
+const RPC_METHOD_SET = new Set(RPC_METHODS);
+const RPC_NOTIFICATIONS = new Set(['task.event', 'run.event']);
 
 /** @type {import('child_process').ChildProcess | null} */
 let child = null;
@@ -126,8 +121,8 @@ function waitForReady(timeoutMs = 30_000) {
   });
 }
 
-function pushEvent(params) {
-  getWindow()?.webContents.send('backend:event', params);
+function pushNotification(method, params) {
+  getWindow()?.webContents.send('backend:notification', { method, params });
 }
 
 // ── 认证 ──
@@ -152,11 +147,10 @@ const PROVIDERS = [
     keyHint: '以 sk-ant- 开头',
     consoleUrl: 'https://console.anthropic.com/settings/keys',
     consoleName: 'Anthropic Console',
-    /** 官方端点：不需要 base URL / 模型名，直接用 ANTHROPIC_API_KEY */
     baseUrl: '',
     editableBaseUrl: false,
-    defaultModel: '',
-    defaultFastModel: '',
+    defaultModel: 'claude-opus-5',
+    defaultFastModel: 'claude-haiku-4-5',
   },
   {
     id: 'deepseek',
@@ -211,26 +205,20 @@ function currentProvider() {
  * 本机是否已有 Claude Code 的登录态（开发机常见）。
  * 只有走 Anthropic 官方端点时才算数 —— 指向 DeepSeek 却用本机 Anthropic 登录态是矛盾的。
  */
-function hasLocalCredentials(providerId) {
-  if (providerId !== 'anthropic') return false;
-  try {
-    return fs.existsSync(path.join(app.getPath('home'), '.claude', '.credentials.json'));
-  } catch {
-    return false;
-  }
+function hasLocalCredentials() {
+  return false;
 }
 
 /** 配置是否完整：非官方端点必须同时有 key / baseUrl / model，缺一不可。 */
 function providerComplete(p) {
   if (!p.key) return false;
-  if (p.def.id === 'anthropic') return true;
-  return !!p.baseUrl && !!p.model;
+  return !!p.model && (p.def.id === 'anthropic' || !!p.baseUrl);
 }
 
 /** 认证是否就绪：配置完整，或本机已有登录态。 */
 function authState() {
   const p = currentProvider();
-  const local = hasLocalCredentials(p.def.id);
+  const local = hasLocalCredentials();
   return {
     providerId: p.def.id,
     hasKey: !!p.key,
@@ -254,14 +242,37 @@ function authState() {
  */
 function readAuthEnv() {
   const p = currentProvider();
-  if (!providerComplete(p)) return { set: {}, unset: [] };
+  if (!providerComplete(p) && !hasLocalCredentials()) return { set: {}, unset: [] };
+
+  const model = p.model || 'claude-opus-5';
+  const llmBaseUrl = p.baseUrl
+    ? `${p.baseUrl.replace(/\/+$/, '')}${p.baseUrl.replace(/\/+$/, '').endsWith('/v1') ? '' : '/v1'}`
+    : '';
+  const llm = {
+    NEWIDE_LLM_PROVIDER: 'anthropic',
+    NEWIDE_LLM_MODEL: model,
+    NEWIDE_LLM_API_KEY: p.key,
+    ...(llmBaseUrl ? { NEWIDE_LLM_BASE_URL: llmBaseUrl } : {}),
+  };
 
   if (p.def.id === 'anthropic') {
-    return { set: { ANTHROPIC_API_KEY: p.key }, unset: ['ANTHROPIC_BASE_URL'] };
+    return {
+      set: {
+        ...llm,
+        ANTHROPIC_API_KEY: p.key,
+        ANTHROPIC_MODEL: p.model,
+        ANTHROPIC_DEFAULT_OPUS_MODEL: p.model,
+        ANTHROPIC_DEFAULT_SONNET_MODEL: p.model,
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: p.fastModel,
+        CLAUDE_CODE_SUBAGENT_MODEL: p.fastModel,
+      },
+      unset: ['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN'],
+    };
   }
 
   return {
     set: {
+      ...llm,
       ANTHROPIC_BASE_URL: p.baseUrl,
       ANTHROPIC_AUTH_TOKEN: p.key,
       ANTHROPIC_MODEL: p.model,
@@ -284,7 +295,8 @@ function preflight() {
   const missing = [
     [NODE_BIN, 'Node 运行时'],
     [BACKEND_HOST, 'BCD 后端'],
-    [ACP_RUNNER, 'ACP runner'],
+    [ACP_RUNNER_DIR, 'ACP runner'],
+    [LITELLM_CONFIG_DIR, '模型配置'],
     [AGENT_DIR, 'agent 运行时'],
   ].find(([p]) => !fs.existsSync(p));
 
@@ -359,7 +371,7 @@ function start({ workspace, agentId } = {}, { force = false } = {}) {
   // NSIS 默认装到 %LOCALAPPDATA%\Programs 恰好可写；一旦按机器安装（Program Files）或 macOS
   // 只读挂载，mkdir 直接 EPERM，而 BCD 把它吞进 try/catch 变成 MATERIALIZATION_FAILED ——
   // 又是一次没有报错栈的静默失败。而且每次自动更新都会把这些产物冲掉。
-  const stateDir = path.join(app.getPath('userData'), 'backend-state');
+  const stateDir = path.join(app.getPath('userData'), 'backend-state', 'rpc-v1');
   try {
     fs.mkdirSync(stateDir, { recursive: true });
   } catch (err) {
@@ -368,16 +380,30 @@ function start({ workspace, agentId } = {}, { force = false } = {}) {
   }
 
   const auth = readAuthEnv();
+  if (!authState().ready) {
+    setStatus('error', '请先在设置中完成模型与认证配置。');
+    return;
+  }
+  const bDatabaseUrl = readSettings().bMemory?.databaseUrl || process.env.NEWIDE_B_DATABASE_URL;
+  if (!bDatabaseUrl) {
+    setStatus('error', '请先在设置中配置 B Memory PostgreSQL（需要 pgvector）。');
+    return;
+  }
   const env = {
     ...process.env,
-    // 后端宿主自己会据此拼出 agent 的路径（见 electron/backend-host.ts）
     POLARIS_NODE_BIN: NODE_BIN,
-    POLARIS_ACP_RUNNER: ACP_RUNNER,
     POLARIS_AGENT_DIR: AGENT_DIR,
-    POLARIS_STATE_DIR: stateDir,
+    NEWIDE_STATE_ROOT: stateDir,
+    NEWIDE_COORDINATION_DB: path.join(stateDir, 'coordination.sqlite'),
+    NEWIDE_B_DATABASE_URL: bDatabaseUrl,
+    NEWIDE_B_EMBEDDING_PROVIDER: 'hash',
+    NEWIDE_B_EMBEDDING_DIMENSIONS: '32',
+    NEWIDE_LITELLM_CONFIG_DIR: LITELLM_CONFIG_DIR,
+    NEWIDE_BUILD_COMMIT: process.env.NEWIDE_BUILD_COMMIT || 'dev',
+    ACP_DRIVER_RUNNER_DIR: ACP_RUNNER_DIR,
+    ACP_DRIVER_ENV_FILE: path.join(stateDir, 'driver.env'),
     ACP_AGENT_ID: resolvedAgentId,
     ACP_WORKSPACE: resolvedWorkspace,
-    // 用户在设置里配的服务商 + key —— 分发出去的用户没有本机登录态，只能靠它认证
     ...auth.set,
   };
   // 走第三方端点时必须**删掉** ANTHROPIC_API_KEY（而不是置空）——
@@ -432,8 +458,8 @@ function start({ workspace, agentId } = {}, { force = false } = {}) {
     } catch {
       return; // pnpm 自己的输出会混进来，非 JSON 行直接丢弃
     }
-    if (msg.method === 'run.event') {
-      pushEvent(msg.params);
+    if (RPC_NOTIFICATIONS.has(msg.method)) {
+      pushNotification(msg.method, msg.params);
       return;
     }
     const slot = msg.id != null ? pending.get(msg.id) : undefined;
@@ -512,7 +538,7 @@ function send(method, params) {
 
 /** 渲染层的调用入口：方法白名单 + 等后端就绪 + 发请求。 */
 async function call(method, params) {
-  if (!RPC_METHODS.includes(method)) {
+  if (!RPC_METHOD_SET.has(method)) {
     throw new Error(`未授权的 RPC 方法：${method}`);
   }
   await waitForReady();
@@ -526,7 +552,7 @@ function setupBackendBridge(windowGetter) {
     try {
       return { ok: true, result: await call(method, params) };
     } catch (err) {
-      return { ok: false, error: err.message, code: err.code };
+      return { ok: false, error: err.message, code: err.code, data: err.data };
     }
   });
 
@@ -538,6 +564,7 @@ function setupBackendBridge(windowGetter) {
     const s = readSettings();
     return {
       provider: s.provider ?? 'anthropic',
+      bMemory: { configured: !!s.bMemory?.databaseUrl },
       // 每个服务商各自的配置（key 一律只回布尔）
       configured: Object.fromEntries(
         PROVIDERS.map((p) => {
@@ -581,8 +608,15 @@ function setupBackendBridge(windowGetter) {
 
     // 只提交本模块负责的两个顶层键：settings.cjs 的合并语义会保留 python 等其它顶层块，
     // 且写入是串行的 —— 与 Python 安装器的并发回写不会互相吃掉对方（这正是原实现的 bug）。
+    const bMemory = { ...(current.bMemory ?? {}) };
+    if (typeof next.bMemory?.databaseUrl === 'string') {
+      if (next.bMemory.databaseUrl === '') delete bMemory.databaseUrl;
+      else bMemory.databaseUrl = next.bMemory.databaseUrl.trim();
+    }
+
     await writeSettings({
       providers,
+      bMemory,
       provider: next.provider ?? current.provider ?? 'anthropic',
     });
 

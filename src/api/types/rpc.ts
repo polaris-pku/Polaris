@@ -9,6 +9,31 @@
  * `run.getSnapshot` 通过 RPC 实时返回的形状。两者不同，不要混用。
  */
 import type { CouncilVerdict } from './council';
+import type {
+  PingResult,
+  SystemCapabilities,
+  SystemLiveness,
+  SystemReadiness,
+  SystemSchemaManifest,
+  SystemVersion,
+} from './system';
+import type { TaskCreateParams, TaskSnapshot, TaskSubscribeResult } from './task';
+import type {
+  MemoryCapabilities,
+  MemoryMaintenanceEvidence,
+  RpcAgentBoardAgentView,
+  RpcAgentBoardListItem,
+  RpcExperienceView,
+  RpcSkillView,
+} from './memory';
+import type {
+  MailboxDelivery,
+  MailboxEnvelope,
+  MailboxMessage,
+  MailboxRecipient,
+  MailboxReplyParams,
+  MailboxSendParams,
+} from './mailbox';
 
 /** run.event 的来源方向（由 event.type 前缀推导，见后端 projectRunEventSource）。 */
 export type RunEventSource = 'coordinator' | 'agent' | 'driver' | 'memory' | 'gate' | 'council';
@@ -79,6 +104,7 @@ export interface RunSnapshot {
   task_id: string;
   mode: RunMode;
   status: RunStatus;
+  quality?: Record<string, unknown>;
   current: {
     stage: RunStage;
     active_node_code: string;
@@ -102,6 +128,7 @@ export interface RunSnapshot {
     task_id: string;
     status: string;
     mode: RunMode;
+    session_id?: string;
     event_ids: string[];
     started_at?: string;
     completed_at?: string;
@@ -114,13 +141,27 @@ export interface RunSnapshot {
   delivery_report?: {
     worktree_path?: string;
     files_written: string[];
+    changed_files?: string[];
     artifacts_materialized: number;
+    outcome?: 'completed_files' | 'completed_response' | 'failed';
+    response?: string;
+    session_id?: string;
+    tool_events?: Record<string, unknown>[];
+    quality?: Record<string, unknown>;
   };
   links?: Record<string, unknown>;
   timeline: RunEvent[];
   agent_runs: Record<string, unknown>[];
   artifacts: Record<string, unknown>[];
   gates: Record<string, unknown>[];
+  market?: {
+    winner_agent_id: string;
+    winner_bid_id: string;
+    ledger_ref: string;
+    audit_ref: string;
+    policy_version: string;
+    seed: string;
+  };
   /**
    * council 模式才有。
    *
@@ -148,6 +189,7 @@ export interface RunSnapshot {
     required_next_actions: string[];
     blocked_by: string[];
     can_create_merge_authorization: boolean;
+    participants?: Record<string, unknown>[];
     proposals?: Record<string, unknown>[];
     reviews?: Record<string, unknown>[];
     synthesis?: Record<string, unknown>;
@@ -159,6 +201,12 @@ export interface RunSnapshot {
     status: 'completed' | 'failed' | 'cancelled';
     artifact_refs: string[];
     files_written: string[];
+    changed_files?: string[];
+    outcome?: 'completed_files' | 'completed_response' | 'failed';
+    response?: string;
+    session_id?: string;
+    tool_events?: Record<string, unknown>[];
+    quality?: Record<string, unknown>;
   };
 }
 
@@ -179,10 +227,13 @@ export function isFrontendWorkflowV01(
 
 export interface RunCreateParams {
   prompt: string;
+  workspace_path: string;
+  session_id?: string;
   mode?: RunMode;
   project_id?: string;
   client_task_id?: string;
   title?: string;
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
 }
 
 export interface RunCreateResult {
@@ -191,7 +242,106 @@ export interface RunCreateResult {
   status: 'running';
 }
 
-export interface PingResult {
-  status: 'ok';
-  protocol_version: string;
+export interface RpcMethodMap {
+  'system.ping': { params: Record<string, never>; result: PingResult };
+  'system.liveness': { params: Record<string, never>; result: SystemLiveness };
+  'system.readiness': { params: Record<string, never>; result: SystemReadiness };
+  'system.capabilities': {
+    params: { require?: string[] };
+    result: SystemCapabilities;
+  };
+  'system.version': { params: Record<string, never>; result: SystemVersion };
+  'system.schema': { params: Record<string, never>; result: SystemSchemaManifest };
+
+  'task.create': { params: TaskCreateParams; result: TaskSnapshot };
+  'task.get': { params: { task_id: string }; result: TaskSnapshot };
+  'task.list': { params: Record<string, never>; result: { tasks: TaskSnapshot[] } };
+  'task.cancel': { params: { task_id: string }; result: TaskSnapshot };
+  'task.resume': { params: { task_id: string }; result: TaskSnapshot };
+  'task.startCouncil': { params: { task_id: string }; result: TaskSnapshot };
+  'task.subscribe': {
+    params: { task_id: string; after_event_id?: string };
+    result: TaskSubscribeResult;
+  };
+  'task.unsubscribe': {
+    params: { task_id: string };
+    result: { unsubscribed: true };
+  };
+
+  'run.create': { params: RunCreateParams; result: RunCreateResult };
+  'run.getSnapshot': { params: { run_id: string }; result: RunSnapshot };
+  'run.list': { params: Record<string, never>; result: { runs: Record<string, unknown>[] } };
+  'run.cancel': { params: { run_id: string }; result: { cancelled: true } };
+  'run.restart': {
+    params: { run_id: string };
+    result: {
+      run_id: string;
+      task_id: string;
+      restarted_from_run_id: string;
+      status: 'running';
+    };
+  };
+  'run.subscribe': { params: { run_id: string }; result: { subscribed: true } };
+  'run.unsubscribe': { params: { run_id: string }; result: { unsubscribed: true } };
+
+  'memory.getCapabilities': {
+    params: Record<string, never>;
+    result: { capabilities: MemoryCapabilities };
+  };
+  'memory.listAgents': {
+    params: Record<string, never>;
+    result: { agents: RpcAgentBoardListItem[] };
+  };
+  'memory.getAgent': {
+    params: { role_id: string };
+    result: { agent: RpcAgentBoardAgentView };
+  };
+  'memory.listSkills': { params: { role_id: string }; result: { skills: RpcSkillView[] } };
+  'memory.listExperiences': {
+    params: { role_id: string };
+    result: { experiences: RpcExperienceView[] };
+  };
+  'memory.listMaintenance': {
+    params: { role_id?: string };
+    result: { maintenance: MemoryMaintenanceEvidence[] };
+  };
+  'memory.promoteSkills': {
+    params: { role_id: string; requested_by?: string };
+    result: { maintenance: MemoryMaintenanceEvidence };
+  };
+
+  'mailbox.send': {
+    params: MailboxSendParams;
+    result: { message: MailboxMessage; deliveries: MailboxDelivery[] };
+  };
+  'mailbox.inbox': {
+    params: MailboxRecipient & { after_delivery_id?: string };
+    result: { deliveries: MailboxEnvelope[] };
+  };
+  'mailbox.ack': {
+    params: MailboxRecipient & { delivery_id: string };
+    result: MailboxDelivery;
+  };
+  'mailbox.reply': {
+    params: MailboxReplyParams;
+    result: {
+      source_delivery: MailboxDelivery;
+      reply: { message: MailboxMessage; deliveries: MailboxDelivery[] };
+    };
+  };
 }
+
+export type RpcMethod = keyof RpcMethodMap;
+export type RpcParams<M extends RpcMethod> = RpcMethodMap[M]['params'];
+export type RpcResult<M extends RpcMethod> = RpcMethodMap[M]['result'];
+
+export interface RpcNotificationMap {
+  'task.event': { task_id: string; event: RunEvent };
+  'run.event': { run_id: string; event: RunEvent };
+}
+
+export type RpcNotification = {
+  [M in keyof RpcNotificationMap]: { method: M; params: RpcNotificationMap[M] };
+}[keyof RpcNotificationMap];
+
+export type { PingResult };

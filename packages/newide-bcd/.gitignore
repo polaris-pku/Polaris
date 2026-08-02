@@ -11,7 +11,11 @@ coverage/
 .env.*
 !.env.example
 
+# 本地读码/Agent 交接笔记，不入仓
+agent_context.json
+
 # 本地状态 / 会话转储 / 归档
+.newide/
 *.session.json
 my-session.json
 *.zip
@@ -20,6 +24,9 @@ my-session.json
 
 # memory 本地设计文档（Spec + 代码导读 + 模块导读），不入仓
 src/memory/docs/
+
+# 本地架构、设计与执行计划文档，不入仓
+docs/
 
 # editor & OS
 .DS_Store
@@ -30,9 +37,16 @@ src/memory/docs/
 # Claude Code 本地文件
 **/CLAUDE.md
 .claude/
-.newide/
 
 # ZCode 本地计划文件
 .zcode/
 
 /.npmrc
+
+# AI 驱动测试生成残留 — 脚手架 / 报告 / 子项目
+DL_RESULT.md
+jwt-auth-system/
+
+
+*[^ -~]*
+docs/

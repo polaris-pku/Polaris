@@ -422,10 +422,10 @@ export function createLlmDriverReturnConverter(llm: LlmClient): DriverReturnConv
  * ```
  */
 export function createDefaultDriverReturnConverter(llm?: LlmClient): DriverReturnConverter {
-  return async (
+  return (
     result: DriverRunResult,
     options?: DriverReturnConverterOptions,
-  ): Promise<DriverReturn> => {
+  ): DriverReturn | Promise<DriverReturn> => {
     const src = options?.sourceDriver ?? result.diagnostics.driver_id;
 
     // ── 优先级1：从 Agent 写入的 report.txt 文件读取 ──
@@ -455,34 +455,7 @@ export function createDefaultDriverReturnConverter(llm?: LlmClient): DriverRetur
 
     // ── 优先级3：LLM 推理（从 transcript 或 metadata 生成，仅在提供 llm 时启用）──
     if (llm) {
-      try {
-        const userPrompt = buildLlmPrompt(result, options);
-        const raw = await llm.complete({
-          messages: [
-            { role: 'system', content: LLM_DRIVER_RETURN_SYSTEM_PROMPT },
-            { role: 'user', content: userPrompt },
-          ],
-          responseFormat: { type: 'json_object' },
-        });
-
-        try {
-          const driverReturn = parseLlmDriverReturn(raw);
-          console.error(
-            `[DriverReturnConverter] six-field report generated via LLM (source: ${src})`,
-          );
-          return driverReturn;
-        } catch (parseError) {
-          const reason = parseError instanceof Error ? parseError.message : String(parseError);
-          console.error(
-            `[DriverReturnConverter] LLM output was malformed (${reason}); falling back to construction (source: ${src})`,
-          );
-        }
-      } catch (llmError) {
-        const reason = llmError instanceof Error ? llmError.message : String(llmError);
-        console.error(
-          `[DriverReturnConverter] LLM call error (${reason}); falling back to construction (source: ${src})`,
-        );
-      }
+      return convertWithLlmOrFallback(llm, result, options, src);
     }
 
     // ── 优先级4（最终降级）：元数据构造 ──
@@ -493,14 +466,57 @@ export function createDefaultDriverReturnConverter(llm?: LlmClient): DriverRetur
   };
 }
 
+async function convertWithLlmOrFallback(
+  llm: LlmClient,
+  result: DriverRunResult,
+  options: DriverReturnConverterOptions | undefined,
+  src: string,
+): Promise<DriverReturn> {
+  try {
+    const userPrompt = buildLlmPrompt(result, options);
+    const raw = await llm.complete({
+      messages: [
+        { role: 'system', content: LLM_DRIVER_RETURN_SYSTEM_PROMPT },
+        { role: 'user', content: userPrompt },
+      ],
+      responseFormat: { type: 'json_object' },
+    });
+
+    try {
+      const driverReturn = parseLlmDriverReturn(raw);
+      console.error(`[DriverReturnConverter] six-field report generated via LLM (source: ${src})`);
+      return driverReturn;
+    } catch (parseError) {
+      const reason = parseError instanceof Error ? parseError.message : String(parseError);
+      console.error(
+        `[DriverReturnConverter] LLM output was malformed (${reason}); falling back to construction (source: ${src})`,
+      );
+    }
+  } catch (llmError) {
+    const reason = llmError instanceof Error ? llmError.message : String(llmError);
+    console.error(
+      `[DriverReturnConverter] LLM call error (${reason}); falling back to construction (source: ${src})`,
+    );
+  }
+
+  console.error(
+    `[DriverReturnConverter] six-field report generated via construction (source: ${src})`,
+  );
+  return constructDriverReturnFromResult(result, options);
+}
+
 function mapArtifacts(artifacts: ArtifactRef[]): DriverReturn['artifacts'] {
-  return artifacts.map((a) => ({
-    type: a.type,
-    path: a.uri,
-    summary: a.metadata?.prompt_length
-      ? `Produced by ${a.producer_id}, task ${a.task_id}`
-      : `${a.type} artifact from ${a.producer_id}`,
-  }));
+  return artifacts.map((artifact) => {
+    const summary = artifact.metadata?.summary;
+    return {
+      type: artifact.type,
+      path: artifact.uri,
+      summary:
+        typeof summary === 'string' && summary.length > 0
+          ? summary
+          : `${artifact.type} artifact ${artifact.artifact_id}`,
+    };
+  });
 }
 
 function buildSummary(result: DriverRunResult, options?: DriverReturnConverterOptions): string {

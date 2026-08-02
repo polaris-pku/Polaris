@@ -18,7 +18,8 @@
     "noFallthroughCasesInSwitch": true,
     "baseUrl": ".",
     "paths": {
-      "@/*": ["./src/*"]
+      "@/*": ["./src/*"],
+      "@rpc-methods": ["./electron/backend-rpc-methods.json"]
     }
   },
   "include": ["src"]

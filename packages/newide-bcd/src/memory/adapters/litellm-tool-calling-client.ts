@@ -64,6 +64,7 @@ function loadEnvFile(filePath: string): void {
 }
 
 function loadLocalEnv(): void {
+  if (process.env.NEWIDE_LITELLM_CONFIG_DIR?.trim()) return;
   const moduleDir = dirname(fileURLToPath(import.meta.url));
   const projectRoot = resolve(moduleDir, '..', '..', '..');
   const memoryDir = resolve(moduleDir, '..');
@@ -88,12 +89,23 @@ function loadLocalEnv(): void {
 async function resolveProviderModel(provider: string, modelId: string): Promise<LanguageModel> {
   switch (provider) {
     case 'openai': {
-      const { openai } = await import('@ai-sdk/openai');
-      return openai.chat(modelId) as LanguageModel;
+      const { createOpenAI } = await import('@ai-sdk/openai');
+      const apiKey = process.env.NEWIDE_LLM_API_KEY || process.env.OPENAI_API_KEY;
+      const baseURL = process.env.NEWIDE_LLM_BASE_URL || process.env.OPENAI_BASE_URL;
+      return createOpenAI({
+        ...(apiKey ? { apiKey } : {}),
+        ...(baseURL ? { baseURL } : {}),
+      }).chat(modelId) as LanguageModel;
     }
     case 'anthropic': {
-      const { anthropic } = await import('@ai-sdk/anthropic');
-      return anthropic(modelId) as LanguageModel;
+      const { createAnthropic } = await import('@ai-sdk/anthropic');
+      const apiKey = process.env.NEWIDE_LLM_API_KEY || process.env.ANTHROPIC_API_KEY;
+      const authToken = process.env.ANTHROPIC_AUTH_TOKEN;
+      const baseURL = process.env.NEWIDE_LLM_BASE_URL || process.env.ANTHROPIC_BASE_URL;
+      return createAnthropic({
+        ...(apiKey ? { apiKey } : authToken ? { authToken } : {}),
+        ...(baseURL ? { baseURL } : {}),
+      }).messages(modelId) as LanguageModel;
     }
     default:
       throw new Error(
@@ -187,11 +199,7 @@ export class LiteLLMToolCallingClient implements ToolCallingClient {
     }
 
     this.client = new LiteLLMClient();
-    this.client.registerProvider('openai', async (modelId: string) => {
-      const { openai } = await import('@ai-sdk/openai');
-      return openai.chat(modelId);
-    });
-    this.client.loadConfig();
+    this.client.loadConfig(process.env.NEWIDE_LITELLM_CONFIG_DIR?.trim() || undefined);
   }
 
   async completeWithTools(input: {
@@ -208,14 +216,14 @@ export class LiteLLMToolCallingClient implements ToolCallingClient {
     let maxTokens: number;
 
     if (this.modelOverride) {
-      providerName = 'openai';
+      providerName = process.env.NEWIDE_LLM_PROVIDER?.trim() || 'openai';
       modelId = this.modelOverride;
       temperature = 0.3;
       maxTokens = 2000;
     } else {
       const resolved = this.client.modelPool.resolve(this.taskName);
-      providerName = resolved.provider;
-      modelId = resolved.model;
+      providerName = process.env.NEWIDE_LLM_PROVIDER?.trim() || resolved.provider;
+      modelId = process.env.NEWIDE_LLM_MODEL?.trim() || resolved.model;
       temperature = resolved.temperature;
       maxTokens = resolved.maxTokens;
     }
@@ -308,7 +316,7 @@ export class LiteLLMToolCallingClient implements ToolCallingClient {
       model,
       ...(systemParts.length > 0 ? { system: systemParts.join('\n\n') } : {}),
       messages: aiMessages,
-      temperature,
+      ...(providerName === 'anthropic' ? {} : { temperature }),
       maxOutputTokens: maxTokens,
     };
     if (liteTools.length > 0) {

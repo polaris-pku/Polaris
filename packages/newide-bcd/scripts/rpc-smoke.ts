@@ -9,8 +9,14 @@ import {
   startBackendRpcServer,
   type BackendRpcServer,
 } from '../src/app/backend-rpc-stdio';
-import type { ToolCallingClient } from '../src/memory';
+import {
+  InMemoryBufferRepository,
+  InMemoryRepository,
+  type LlmClient,
+  type ToolCallingClient,
+} from '../src/memory';
 import type { RunSnapshot } from '../src/protocol/run-snapshot';
+import { writeFakeAcpRunnerBuild } from '../test/fixtures/fake-acp-runner-build';
 
 interface JsonRpcMessage {
   jsonrpc: '2.0';
@@ -24,6 +30,7 @@ interface JsonRpcMessage {
 type SmokeMode = 'single_agent' | 'council' | 'all';
 
 const smokeMode = readSmokeMode(process.argv.slice(2));
+const workspacePath = path.resolve(process.env.RPC_SMOKE_WORKSPACE ?? process.cwd());
 
 const configuredRunnerDir = process.env.RPC_SMOKE_ACP_RUNNER_DIR;
 const usesTemporaryRunner = configuredRunnerDir === undefined;
@@ -49,9 +56,19 @@ if (usesTemporaryRunner) {
   localServer = startBackendRpcServer({
     input,
     writeLine: (line) => localOutput!.write(`${line}\n`),
-    service: createProductionBackendService(
+    service: await createProductionBackendService(
       { ...process.env, ACP_DRIVER_RUNNER_DIR: runnerDir },
-      { agentLlm: invokeDriverLlm() },
+      {
+        agentLlm: invokeDriverLlm(),
+        memoryLlm: deterministicMaintenanceLlm(),
+        bRuntime: {
+          repository: new InMemoryRepository(),
+          bufferRepository: new InMemoryBufferRepository(),
+          app_state_root: process.env.NEWIDE_B_APP_STATE_ROOT ?? path.join(process.cwd(), '.newide'),
+          market_agent_ids: ['role_fullstack_engineer', 'role_ts_engineer'],
+          close: async () => undefined,
+        },
+      },
     ),
   });
   backendInput = input;
@@ -92,6 +109,7 @@ createInterface({ input: backendOutput }).on('line', (line) => {
 let nextId = 1;
 const runIds: string[] = [];
 const taskIds: string[] = [];
+const generatedFiles: string[] = [];
 let backendExitError: Error | undefined;
 
 try {
@@ -142,6 +160,9 @@ try {
       ...taskIds.map((taskId) =>
         fs.rm(`.newide/worktrees/${taskId}`, { recursive: true, force: true }),
       ),
+      ...(usesTemporaryRunner
+        ? generatedFiles.map((file) => fs.rm(file, { force: true }))
+        : []),
       ...(usesTemporaryRunner ? [fs.rm(runnerDir, { recursive: true, force: true })] : []),
     ]);
   }
@@ -156,7 +177,7 @@ async function runAndVerify(mode: 'single_agent' | 'council'): Promise<Record<st
       : '编写一个网页贪吃蛇游戏。请以 snake-council.html 为最终候选文件，要求可直接在浏览器打开运行，包含键盘控制、计分和重新开始功能。';
   const created = await request<{ run_id: string; task_id: string; status: 'running' }>(
     'run.create',
-    { prompt, mode },
+    { prompt, mode, workspace_path: workspacePath },
   );
   runIds.push(created.run_id);
   taskIds.push(created.task_id);
@@ -178,6 +199,9 @@ async function runAndVerify(mode: 'single_agent' | 'council'): Promise<Record<st
   assert(snapshot.artifacts.length > 0, `${mode} snapshot has no artifacts`);
   assert(snapshot.gates.length > 0, `${mode} snapshot has no gates`);
   assert(snapshot.final_output?.status === 'completed', `${mode} final output is incomplete`);
+  if (usesTemporaryRunner) {
+    generatedFiles.push(...snapshot.final_output.files_written);
+  }
   const sourceFile = usesTemporaryRunner
     ? undefined
     : await validateSnakeArtifact(
@@ -190,7 +214,10 @@ async function runAndVerify(mode: 'single_agent' | 'council'): Promise<Record<st
       snapshot.council.can_create_merge_authorization === false,
       'Council unexpectedly authorizes merge',
     );
-    assert(snapshot.gates.length === 2, 'Council did not execute pre and post gates');
+    assert(
+      snapshot.gates.length >= 1,
+      'Council did not execute the authoritative post-Council Gate',
+    );
     const eventTypes = snapshot.timeline.map((event) => event.type);
     const councilCompleted = eventTypes.indexOf('council.completed');
     const artifactSelected = eventTypes.indexOf('artifact.selected');
@@ -244,7 +271,7 @@ async function runAndVerify(mode: 'single_agent' | 'council'): Promise<Record<st
 async function createAndCancel(): Promise<Record<string, unknown>> {
   const created = await request<{ run_id: string; task_id: string; status: 'running' }>(
     'run.create',
-    { prompt: 'RPC smoke cancellation', mode: 'single_agent' },
+    { prompt: 'RPC smoke cancellation', mode: 'single_agent', workspace_path: workspacePath },
   );
   runIds.push(created.run_id);
   taskIds.push(created.task_id);
@@ -301,11 +328,20 @@ function readTimeoutMs(): number {
 }
 
 async function assertRunFiles(runId: string): Promise<void> {
-  await Promise.all([
-    fs.access(`.newide/runs/${runId}/audit.jsonl`),
-    fs.access(`.newide/runs/${runId}/result.json`),
-    fs.access(`.newide/runs/${runId}/frontend-snapshot.json`),
-  ]);
+  const files = [
+    `.newide/runs/${runId}/audit.jsonl`,
+    `.newide/runs/${runId}/result.json`,
+    `.newide/runs/${runId}/frontend-snapshot.json`,
+  ];
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const visible = await Promise.all(
+      files.map((file) => fs.access(file).then(() => true, () => false)),
+    );
+    if (visible.every(Boolean)) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  await Promise.all(files.map((file) => fs.access(file)));
 }
 
 async function request<T = unknown>(method: string, params: unknown): Promise<T> {
@@ -359,7 +395,7 @@ async function waitForCancellationEffects(): Promise<void> {
 
 async function waitForBackendClose(): Promise<number | null> {
   if (!child || !childClosed) {
-    localServer?.close();
+    await localServer?.close();
     localOutput?.end();
     return 0;
   }
@@ -403,6 +439,24 @@ function invokeDriverLlm(): ToolCallingClient {
           },
         ],
       };
+    },
+  };
+}
+
+function deterministicMaintenanceLlm(): LlmClient {
+  return {
+    async complete() {
+      return JSON.stringify({
+        experiences: [
+          {
+            description: 'RPC smoke execution lesson',
+            content: 'Keep production RPC composition behind explicit ports.',
+            type: 'positive',
+            confidence: 0.9,
+            tags: ['rpc'],
+          },
+        ],
+      });
     },
   };
 }
@@ -455,6 +509,7 @@ process.stdin.on('end', () => {
 });
 `,
     );
+    writeFakeAcpRunnerBuild(directory, { importFromRunnerRoot: 'fake-driver.mjs' });
     return directory;
   } catch (error) {
     await fs.rm(directory, { recursive: true, force: true });

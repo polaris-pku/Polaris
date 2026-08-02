@@ -43,6 +43,7 @@ export interface CreateRunOptions {
   projectId?: string;
   clientTaskId?: string;
   title?: string;
+  workspacePath?: string;
 }
 
 /**
@@ -57,7 +58,8 @@ export async function createRun(
 ): Promise<CreatedRun> {
   let created: RunCreateResult;
   try {
-    created = await getTransport().createRun(toRunCreateParams(req, options));
+    const params = toRunCreateParams(req, options);
+    created = await getTransport().call('run.create', params);
   } catch (err) {
     throw new ApiError(`run.create 失败: ${errText(err)}`, codeOf(err));
   }
@@ -86,7 +88,7 @@ export async function createRun(
 /** 拉取 run 完整快照。形状是双态的 —— 消费前用 `isFrontendWorkflowV01` 守卫。 */
 export async function getRunSnapshot(runId: string): Promise<RunSnapshot> {
   try {
-    return await getTransport().getSnapshot(runId);
+    return await getTransport().call('run.getSnapshot', { run_id: runId });
   } catch (err) {
     throw new ApiError(`run.getSnapshot 失败: ${errText(err)}`, codeOf(err));
   }
@@ -95,7 +97,7 @@ export async function getRunSnapshot(runId: string): Promise<RunSnapshot> {
 /** 取消 run。注意：对已终态的 run，后端抛的是通用 -32603 而非有类型的错误。 */
 export async function cancelRun(runId: string): Promise<void> {
   try {
-    await getTransport().cancel(runId);
+    await getTransport().call('run.cancel', { run_id: runId });
   } catch (err) {
     throw new ApiError(`run.cancel 失败: ${errText(err)}`, codeOf(err));
   }

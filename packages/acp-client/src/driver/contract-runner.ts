@@ -57,11 +57,18 @@ function parseDriverPrompt(raw: string): DriverPrompt {
   if (parsed.context_pack_ref !== undefined && !isRecord(parsed.context_pack_ref)) {
     throw new Error("DriverPrompt.context_pack_ref must be an object when provided.");
   }
+  for (const field of ["workspace_path", "session_id"] as const) {
+    if (parsed[field] !== undefined && (typeof parsed[field] !== "string" || !parsed[field])) {
+      throw new Error(`DriverPrompt.${field} must be a non-empty string when provided.`);
+    }
+  }
 
   return {
     task_id: parsed.task_id as string,
     run_id: parsed.run_id as string,
     prompt: parsed.prompt as string,
+    ...(typeof parsed.workspace_path === "string" ? { workspace_path: parsed.workspace_path } : {}),
+    ...(typeof parsed.session_id === "string" ? { session_id: parsed.session_id } : {}),
     context_pack_ref: parsed.context_pack_ref as DriverPrompt["context_pack_ref"],
     created_at: typeof parsed.created_at === "string" ? parsed.created_at : nowTimestamp(),
     schema_version:
@@ -75,6 +82,7 @@ async function runContractPrompt(
 ): Promise<DriverRunResult> {
   const startedAtMs = Date.now();
   const events: ConnectionEvent[] = [];
+  const workspace = input.workspace_path ? resolve(input.workspace_path) : options.workspace;
   let sessionId: string | undefined;
   let client: ReturnType<AcpClientBuilder["build"]> | undefined;
 
@@ -83,13 +91,15 @@ async function runContractPrompt(
       .withAgent(options.agentId)
       .withVerbose(false)
       .withAutoApprove(process.env.AUTO_APPROVE === "1")
-      .withSandboxDir(options.workspace)
+      .withSandboxDir(workspace)
       .build();
 
-    await client.initialize();
+    const initialized = await client.initialize();
     await client.authenticate();
 
-    const session = await client.createSession(options.workspace);
+    const session = input.session_id
+      ? await client.loadSession(input.session_id, workspace, initialized.agentCapabilities)
+      : await client.createSession(workspace);
     sessionId = session.sessionId;
 
     const turn = await client.sendPrompt(input.prompt);
@@ -396,12 +406,13 @@ function errorMessage(error: unknown): string {
 
 async function main(): Promise<void> {
   const agentId = process.env.ACP_AGENT_ID || "mock-driver";
-  const workspace = resolve(process.env.ACP_WORKSPACE || process.cwd());
+  const defaultWorkspace = resolve(process.env.ACP_WORKSPACE || process.cwd());
   const startedAtMs = Date.now();
   let input: DriverPrompt | undefined;
 
   try {
     input = parseDriverPrompt(await readStdin());
+    const workspace = resolve(input.workspace_path || defaultWorkspace);
     const result = await runContractPrompt(input, { agentId, workspace });
     process.stdout.write(`${JSON.stringify(result)}\n`);
     if (result.error?.code === "DRIVER_RUNNER_ERROR") {
@@ -412,7 +423,7 @@ async function main(): Promise<void> {
     const result = buildRunResult({
       input,
       agentId,
-      workspace,
+      workspace: resolve(input?.workspace_path || defaultWorkspace),
       startedAtMs,
       events: [],
       error,
