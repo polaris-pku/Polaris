@@ -1,4 +1,5 @@
 import type { RunEvent } from './rpc';
+import type { CouncilOutcome } from './council';
 
 export type TaskRunStatus = 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted';
 export type RunMode = 'single_agent' | 'council';
@@ -68,6 +69,7 @@ export interface TaskSnapshot {
       verification_refs: string[];
       decision_record_ref: string;
     };
+    outcome?: CouncilOutcome;
   };
   waiting_reason?: string;
   warnings: string[];
