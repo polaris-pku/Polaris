@@ -181,7 +181,17 @@ export async function createProductionBackendService(
           (key) => driverEnv[key] === undefined && env[key] === undefined,
         ),
       ],
-      timeoutMs: readDriverTimeout(env.ACP_DRIVER_TIMEOUT_MS),
+      // 不设 ACP_DRIVER_TIMEOUT_MS 就不传 timeoutMs —— 这是本仓库既有的行为，上游把
+      // readDriverTimeout 改成恒返回 120_000 后被动翻转了，这里恢复回来。
+      // 原因：CommandDriverTransport 在非 Windows 下把 detached 跟 timeoutMs 绑在一起
+      // （command-driver-transport.ts 里 `options.detached = true`），而清理 agent 依赖
+      // 进程组（backendBridge 以组长身份启动后端，再 kill(-pid)）。driver 一旦 detached
+      // 就脱离该组，切项目 / 重绑工作区时会留下孤儿 agent 继续往旧工作区写文件。
+      // 等上游把 detached 从 timeoutMs 解绑后再考虑恢复默认超时。
+      ...(() => {
+        const timeoutMs = readDriverTimeout(env.ACP_DRIVER_TIMEOUT_MS);
+        return timeoutMs === undefined ? {} : { timeoutMs };
+      })(),
     }),
   });
   let bRuntime: BackendBRuntime | undefined;
@@ -527,8 +537,8 @@ function toOpenAiCompatibleBaseUrl(value: string | undefined): string | undefine
   return normalized.replace(/\/(?:anthropic|v1)$/i, '');
 }
 
-function readDriverTimeout(value: string | undefined): number {
-  if (value === undefined) return 120_000;
+function readDriverTimeout(value: string | undefined): number | undefined {
+  if (value === undefined || value.trim() === '') return undefined;
   const timeout = Number(value);
   if (!Number.isInteger(timeout) || timeout <= 0) {
     throw new Error('ACP_DRIVER_TIMEOUT_MS must be a positive integer');
