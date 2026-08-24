@@ -9,7 +9,20 @@ export default ts.config(
   // packages/ 下的 A、BCD 各自带 eslint 配置与 lint 命令（前端这套规则不适用于它们）。
   // 全量 lint 用 pnpm -r lint。
   // backend/ 是 scripts/build-backend.mjs 生成的打包产物（esbuild 单文件 + agent 运行时），不 lint。
-  { ignores: ['dist/', 'node_modules/', 'coverage/', 'packages/', 'release/', 'backend/'] },
+  // `.newide/` 是后端运行时状态目录（.gitignore 已忽略）。Council 会把整个仓库复制一份
+  // 到每个 participant 的工作区（.newide/**/council/**/cp_*/），跑过一次真实任务后
+  // 它就有上千个文件——不排掉的话 `pnpm verify` 会扫进去然后炸。
+  {
+    ignores: [
+      'dist/',
+      'node_modules/',
+      'coverage/',
+      'packages/',
+      'release/',
+      'backend/',
+      '.newide/',
+    ],
+  },
   js.configs.recommended,
   ...ts.configs.recommended,
   {
