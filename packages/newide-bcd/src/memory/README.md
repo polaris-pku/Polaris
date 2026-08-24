@@ -6,7 +6,7 @@
 - 顶层 LLM 的多轮工具调用；
 - 当前 Agent 私有 Skill / Experience 的检索；
 - Driver 调用结果写入 pending Buffer；
-- 离线经验提取和技能晋升；
+- 离线经验提取、技能晋升和 Persona 演化；
 - 内存、文件和 PostgreSQL 存储适配器；
 - 面向 Coordinator 和前端的查询契约。
 
@@ -138,7 +138,7 @@ if (selected) {
 
 `dispatchTask()` 当前实际会返回 `completed`、`no_driver_invocation`、`blocked` 或 `failed`。类型中还保留了 `cancelled`、`max_rounds_exceeded` 等状态，但当前实现没有对应返回分支；达到最大轮次后会完成循环，再按是否调用 Driver 返回状态。
 
-`retireAgent()` 目前是空实现。运行时也没有公开的 `start()`、`stop()`、`wakeAll()` 或 `tickAll()` 调度 API；`dispatchTask()` 会在一次调用内同步跑完整个循环。
+`retireAgent(role_id, options?)` 执行优雅退休（draining → 资产处置 → retired），可选创建替代 Agent（clean_slate / seeded_slate）；对已退休 Agent 幂等。运行时没有公开的 `start()`、`stop()`、`wakeAll()` 或 `tickAll()` 调度 API；`dispatchTask()` 会在一次调用内同步跑完整个循环。
 
 ### 工具
 
@@ -164,8 +164,24 @@ if (selected) {
 | `processPendingBuffer(memory, seq, input)`             | 对单条 Buffer 执行“提取 + 晋升 + processed”旧式组合流程   |
 | `extractBuffer(memory, seq, llm)`                      | 使用 LLM 提取并保存，但不会把 Buffer 标记为 processed     |
 | `promoteExperiences(memory, llm)`                      | 使用 LLM 扫描并晋升当前 Agent 的合格 Experience           |
+| `reviewSkill(repository, { role_id, skill_id, decision, reviewer })` | 对 pending 状态 Skill 做人工审批（approved / rejected 严格状态机，拒绝时清除来源经验 promoted_to） |
 
 技能晋升候选必须同时满足：`type === 'positive'`、`confidence > 0.95`、尚未设置 `promoted_to`。是否真正生成 Skill 仍由注入的晋升实现决定。
+
+**触发策略与降级**：`checkAndExtract` / `checkAndPromote` 在**执行前**用策略端口评估是否触发——`BufferTriggerPolicy`（`BatchBufferTriggerPolicy`：pending ≥3 / 最老 ≥6h / 含 ineffective；`AlwaysExtractPolicy`：无条件）+ `PromotionTriggerPolicy`（`DefaultPromotionTriggerPolicy`：eligible ≥5 / 高信 >0.98 / 距上次 ≥24h）。两个 Processor 均无内置调度器，**触发方是外部调用者**（后台 Worker / 定时器 / 前端主动）。LLM 版提取/晋升/归纳（`LlmExperienceExtractor` / `LlmSkillPromotion` / `LlmPersonaInduction`）内部在 LLM 失败或空结果时**降级到规则版**（`RuleBasedExperienceExtractor` / `ruleBasedSkillPromotion` / `ruleBasedPersonaInduction`），规则版仅作兜底，主线全走 LLM。
+
+### Persona 演化
+
+| API                                                    | 作用                                                      |
+| ------------------------------------------------------ | --------------------------------------------------------- |
+| `PersonaEvolutionProcessor.evolveAll(memory)`          | 手动触发 Persona 归纳（无条件，version++）                |
+| `PersonaEvolutionProcessor.checkAndEvolve(memory)`     | 先检查 `PersonaTriggerPolicy`，满足条件后触发归纳         |
+| `ruleBasedPersonaInduction(memory, input)`             | 规则版归纳（内部调 `memory.savePersona` 写入）            |
+| `LlmPersonaInduction(llm).induce(memory, input)`       | LLM 版归纳，失败降级规则版                                |
+| `DefaultPersonaTriggerPolicy`                          | 技能增长 ≥3 / ≥7 天定期（有新经验）/ ≥30 天强制刷新       |
+| `savePersona(persona)`（`AgentMemoryScope` / `MemoryRepository`） | Persona 写入 API，同步 `AgentHandle.persona`   |
+
+Persona 演化与 Agent 解耦：Agent 只读 `getPersona()`，演化由外部主动触发；演化后新 Persona 从下一次 `buildAgentSystemPrompt` 生效。版本处理为简单覆盖 version++（不保留历史）。漂移-余弦门控 / 技能收缩门控待 drift-embedding 能力，属 future work。
 
 ### 查询和跨模块契约
 
@@ -186,9 +202,19 @@ if (selected) {
 
 `createAgentMemoryScope(repository, buffers, role_id)` 把两个仓库绑定到单个 Agent，供工具、Processor 和服务层使用。
 
-### PostgreSQL
+### PostgreSQL / 嵌入式 PGlite
 
-`PgMemoryRepository` 使用 PostgreSQL 和 `pgvector`。默认 `autoMigrate: true`，首次访问时会调用 `ensurePgMemorySchema()` 创建扩展、表和索引；数据库用户需要具备相应权限。默认嵌入实现是确定性的 `HashEmbeddingProvider`，用于本地开发和测试，不是语义嵌入模型。生产环境应通过 `PgMemoryRepository` 构造参数注入合适的 `EmbeddingProvider`。
+`PgMemoryRepository` 使用 PostgreSQL 和 `pgvector`，但只依赖最小 `SqlPool` 端口，
+因此同一个仓库实现可对接两种引擎：
+
+- **外部 PostgreSQL**：`NEWIDE_B_DATABASE_URL` 指向自托管/云托管（Neon、Supabase、RDS）实例；
+- **嵌入式 PGlite**：不设置 `NEWIDE_B_DATABASE_URL` 时，`createProductionBRuntime` 自动使用
+  `PGlitePool`（WASM PostgreSQL + pgvector），进程内运行、零安装、无需 Docker，
+  数据持久化到 `<appStateRoot>/b/pglite`（可用 `NEWIDE_B_PGLITE_DATA_DIR` 覆盖，`:memory:` 表示内存）。
+
+两者共享同一套 SQL 与 `ensurePgMemorySchema()` 建表逻辑。默认 `autoMigrate: true`，首次访问时自动建表；
+数据库用户需要具备相应权限。默认嵌入实现是确定性的 `HashEmbeddingProvider`，用于本地开发和测试，
+不是语义嵌入模型。生产环境应通过 `PgMemoryRepository` 构造参数注入合适的 `EmbeddingProvider`。
 
 ### 文件 Buffer
 
@@ -258,7 +284,7 @@ pnpm exec tsx src/memory/test/integration/api-smoke.ts
 	memory/
 	  adapters/   Repository、LLM、检索、策略等端口实现
 	  ports/      存储、LLM、提取、查询等接口
-	  prompts/    Agent、上下文清理、经验提取和技能晋升 Prompt
+	  prompts/    Agent、上下文清理、经验提取、技能晋升和 Persona 归纳 Prompt
 	  runtime/    Agent、Manager、Tool 和离线 Processor
 	  services/   Buffer 写入、记忆检索和后处理服务
 	  mvp/        早期演示与 Mock 实现，不能代表当前运行时入口
@@ -302,9 +328,9 @@ pnpm exec tsx src/memory/test/integration/api-smoke.ts
 
 > **测试用临时方案**：`src/memory/test/drivers/llm-driver.ts` 提供了一个基于本地 `claude` CLI 的简单 `DriverHandler` 实现，用于集成测试。它不适用于生产环境，仅用于在缺少真实 Driver 时验证 Agent → Driver 的完整调用链路。
 
-### 4. Agent 生命周期管理不完整
+### 4. 退休检测管线不完整
 
-`AgentManager.retireAgent()` 当前为**空实现**（仅含 `// TODO` 注释），调用后不会执行任何清理操作（如移除 Agent 状态、释放资源、通知存储层等）。退役 Agent 的完整生命周期管理尚未实现。
+`AgentManager.retireAgent()` 已实现优雅退休（状态迁移 + 资产处置 + 可选替代 Agent），Metrics 采集也已接入 `collectCompetitionClaims`（竞标）与 `dispatchTask`（任务结果）。但 week3 RFC 的**三层退休检测管线**（统计扫描 → Persona 漂移 → 全面评估）尚未实现——当前只有 `evaluateRetirementSignals()` 这个轻量统计层，调用方（维护 runner / 定时器）需要自行决定何时触发退休。Persona 漂移（`persona_drift`）字段也尚未被 Persona 演化填充。
 
 ### 5. 任务完成检测是简单启发式
 
@@ -335,9 +361,9 @@ pnpm exec tsx src/memory/test/integration/api-smoke.ts
 
 `extractBuffer()` 使用 LLM 提取经验并保存，但**不会**把 Buffer 从 `pending` 标记为 `processed`。这与 `processPendingBuffer()` 的行为不一致——后者在保存经验后会更新 Buffer 状态。调用方如果不了解这一区别，反复调用 `extractBuffer()` 会导致同一条 Buffer 被重复提取。
 
-### 10. PG + File 组合的集成测试缺失
+### 10. PG + File 组合集成测试需 DB 环境
 
-当前 `PgMemoryRepository` 和 `FileBufferRepository` 各有独立的单元测试，但**没有**同时使用 PG + File 的组合集成测试（即 `createAgentRuntime({ storage: { pg: {...}, agentStateRoot: '...' } })` 跑完整 Agent loop 的测试）。生产环境使用 PG + File 时，Agent 从 dispatchTask 到写 Buffer 的完整链路没有自动化回归覆盖。
+`PgMemoryRepository` + `FileBufferRepository` 的组合集成测试已存在（`src/memory/test/integration/pg-file-integration.test.ts`，跑 `AgentManager` 在双仓库组合下的完整流程），但整个套件在缺少 `MEMORY_PG_TEST_URL` 时**自动跳过**（见问题 #11）。由于 CI 通常不提供 PostgreSQL，该组合链路在生产 CI 中未自动化运行。
 
 ### 11. PG Repository 测试未纳入 CI
 

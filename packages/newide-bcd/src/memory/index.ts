@@ -48,11 +48,18 @@ export * as schemas from './schemas';
 
 export { InMemoryRepository } from './adapters/in-memory-repository';
 export { InMemoryBufferRepository } from './adapters/in-memory-buffer-repository';
+export { cosineSimilarity } from './utils/vector';
 export {
   PgMemoryRepository,
   type PgMemoryRepositoryOptions,
 } from './adapters/pg-memory-repository';
 export { ensurePgMemorySchema } from './adapters/pg-memory-schema';
+export {
+  createPGlitePool,
+  PGlitePool,
+  type PGlitePoolOptions,
+} from './adapters/pglite-pool';
+export type { SqlPool, SqlClient, SqlQueryResult } from './ports/sql-pool';
 export {
   FileBufferRepository,
   type FileBufferRepositoryOptions,
@@ -79,6 +86,7 @@ export {
 export { LlmExperienceExtractor } from './adapters/llm-experience-extractor';
 export { LlmContextCleaner } from './adapters/context-cleaner';
 export { LlmSkillPromotion } from './adapters/llm-skill-promotion';
+export { LlmPersonaInduction } from './adapters/llm-persona-induction';
 
 // ════════════════════════════════════════════════════════
 //  5. 非 LLM 适配器（降级/测试用）
@@ -87,6 +95,39 @@ export { LlmSkillPromotion } from './adapters/llm-skill-promotion';
 export { NullContextCleaner } from './adapters/null-context-cleaner';
 export { RuleBasedExperienceExtractor } from './adapters/rule-based-experience-extractor';
 export { ruleBasedSkillPromotion } from './services/skill-promotion';
+export { ruleBasedPersonaInduction } from './services/rule-based-persona-induction';
+export {
+  reviewSkill,
+  type ReviewSkillInput,
+  type SkillReviewDecision,
+} from './services/skill-review';
+export {
+  createSkill,
+  updateSkill,
+  deleteSkill,
+  publishSkillToMarket,
+  updateExperience,
+  deleteExperience,
+  type CreateSkillInput,
+  type CreateSkillOptions,
+  type SkillWritePatch,
+  type ExperienceWritePatch,
+} from './services/memory-writer';
+export {
+  mergePersonaPatch,
+  regeneratePersona,
+  type PersonaPatch,
+  type PersonaInducer,
+} from './services/persona-update';
+export {
+  applyUserRating,
+  type RateTaskInput,
+  type UserRatingResult,
+} from './services/feedback';
+export {
+  computeMemoryOverview,
+  type MemoryOverview,
+} from './services/memory-overview';
 export { repositoryRetrieveMemoryForTask } from './adapters/repository-memory-retrieval';
 export {
   resolveMemoryAblationPolicy,
@@ -126,6 +167,73 @@ export {
 } from './services/memory-cycle';
 
 // ════════════════════════════════════════════════════════
+//  8.5 Metrics 采集与退休（Agent 生命周期管理）
+// ════════════════════════════════════════════════════════
+
+export {
+  recordBid,
+  recordTaskOutcome,
+  evaluateRetirementSignals,
+  RETIREMENT_THRESHOLDS,
+  type TaskOutcome,
+  type RetirementSignals,
+} from './services/metrics';
+export {
+  disposeRetiredAssets,
+  createReplacementAgent,
+  type RetireOptions,
+  type RetireResult,
+  type RetireAssetDisposition,
+  type RetireAssetInput,
+} from './services/retirement';
+
+// ════════════════════════════════════════════════════════
+//  8.6 技能市场（Skill Market）
+//     skill.market_search / skill.market_import（Spec §6.2）
+// ════════════════════════════════════════════════════════
+
+export {
+  marketSearch,
+  marketImport,
+  DEFAULT_MARKET_TOP_K,
+  type MarketSearchQuery,
+} from './services/skill-market';
+export type {
+  MarketSearchOptions,
+  MarketImportResult,
+  TransferSkillToMarketOptions,
+} from './ports/memory-repository';
+/** 技能市场池 Agent 的固定 role_id（退休技能迁移至此名下） */
+export { MARKET_POOL_ROLE_ID } from './schemas';
+
+// ════════════════════════════════════════════════════════
+//  8.7 三重门控退休检测（week3 RFC §8.2 触发机制）
+//     RetirementDetector + 统计 / Persona 漂移 / LLM 三层评估器
+// ════════════════════════════════════════════════════════
+
+export { RetirementDetector } from './services/retirement-detection';
+export { StatisticalRetirementEvaluator } from './services/retirement-detection';
+export { PersonaDriftEvaluator, computePersonaDrift } from './services/retirement-detection';
+export { LlmRetirementEvaluator } from './services/retirement-detection';
+export {
+  parseRetirementEvaluation,
+  buildRetirementEvaluationUserPrompt,
+  suggestRetireReason,
+} from './services/retirement-detection';
+export {
+  RETIREMENT_COOLDOWNS,
+  PERSONA_DRIFT_THRESHOLDS,
+  type RetirementAction,
+  type RetirementLayer,
+  type RetirementEvaluation,
+  type RetirementEvaluationInput,
+  type RetirementEvaluator,
+  type RetirementLayerOutcome,
+  type RetirementScanResult,
+  type RetirementDetectorOptions,
+} from './services/retirement-detection';
+
+// ════════════════════════════════════════════════════════
 //  9. MemoryProvider（给 Coordinator 用）
 // ════════════════════════════════════════════════════════
 
@@ -137,6 +245,7 @@ export { RepositoryMemoryProvider } from './adapters/repository-memory-provider'
 // ════════════════════════════════════════════════════════
 
 export { RepositoryAgentBoardQuery } from './adapters/agent-board-query';
+export { toSkillView, toExperienceView } from './adapters/agent-board-query';
 
 // ════════════════════════════════════════════════════════
 //  11. Agent 运行时
@@ -157,6 +266,7 @@ export {
 
 export { ExperienceExtractorProcessor } from './runtime/experience-extractor-processor';
 export { SkillPromotionProcessor } from './runtime/skill-promotion-processor';
+export { PersonaEvolutionProcessor } from './runtime/persona-evolution-processor';
 
 // ════════════════════════════════════════════════════════
 //  13. Tool-calling 运行时（Agent loop 工具调用模式）
@@ -166,8 +276,6 @@ export { ToolRegistry } from './runtime/tool';
 export { QueryMemoryTool as AgentQueryMemoryTool } from './runtime/tools/query-memory-tool';
 export { InvokeDriverTool } from './runtime/tools/invoke-driver-tool';
 export type { DriverTask, DriverHandler } from './runtime/tools/invoke-driver-tool';
-export { DeepSeekToolCallingClient } from './adapters/deepseek-tool-calling-client';
-export type { DeepSeekToolCallingClientOptions } from './adapters/deepseek-tool-calling-client';
 export { LiteLLMToolCallingClient } from './adapters/litellm-tool-calling-client';
 export type { LiteLLMToolCallingClientOptions } from './adapters/litellm-tool-calling-client';
 
@@ -197,6 +305,7 @@ export { buildAgentSystemPrompt } from './prompts/agent-system-prompt';
 export { BatchBufferTriggerPolicy } from './adapters/batch-buffer-trigger-policy';
 export { AlwaysExtractPolicy } from './adapters/always-extract-policy';
 export { DefaultPromotionTriggerPolicy } from './adapters/default-promotion-trigger-policy';
+export { DefaultPersonaTriggerPolicy } from './adapters/default-persona-trigger-policy';
 
 // ════════════════════════════════════════════════════════
 //  18. 竞争派单（Competition Claim）
@@ -214,42 +323,33 @@ export type { CompetitionClaimEvaluator } from './ports/competition-claim-evalua
 export { createMockCompetitionClaimEvaluator } from './adapters/mock-competition-claim-evaluator';
 
 // ════════════════════════════════════════════════════════
-//  19. Mock 适配器
-// ════════════════════════════════════════════════════════
-
-export { MockExperienceExtractor } from './mvp/adapters/mock-experience-extractor';
-
-// ════════════════════════════════════════════════════════
 //  20. Port 接口类型（供外部实现者使用）
 // ════════════════════════════════════════════════════════
 
-export type { BufferRepository, SaveBufferResult } from './ports/buffer-repository';
+export type {
+  BufferRepository,
+  DeadLetterEntry,
+  SaveBufferResult,
+} from './ports/buffer-repository';
 export type { MemoryRepository, MemoryVectorSearchOptions } from './ports/memory-repository';
 export type { AgentMemoryScope } from './ports/agent-memory-scope';
 export type { ExperienceExtractor } from './ports/experience-extractor';
 export type { EmbeddingProvider } from './ports/embedding-provider';
 export type { LlmClient, LlmMessage } from './ports/llm-client';
-export type { SkillMarketPort, SkillMarketSearchResult } from './ports/skill-market-port';
 export type { AgentContextCleaner, AgentContextCleanInput } from './ports/agent-context-cleaner';
 export type { BufferTriggerPolicy } from './ports/buffer-trigger-policy';
 export type { PromotionTriggerPolicy } from './ports/promotion-trigger-policy';
+export type { PersonaTriggerPolicy } from './ports/persona-trigger-policy';
+export type { PersonaInductionInput } from './services/rule-based-persona-induction';
 export type {
   AgentBoardQuery,
   AgentBoardListItem,
   AgentBoardAgentView,
   SkillView,
   ExperienceView,
+  SkillListFilter,
+  ExperienceListFilter,
 } from './ports/agent-board-query';
-export type {
-  ExternalMemoryRepository,
-  SearchAccessibleMemoriesInput,
-  SearchAccessibleMemoriesOutput,
-  SearchAccessibleMemoryHit,
-  LoadAccessibleMemoriesInput,
-  LoadAccessibleMemoriesOutput,
-  RecordMemoryUsageFeedbackInput,
-  MemoryItemType,
-} from './ports/external-memory-repository';
 
 // ════════════════════════════════════════════════════════
 //  21. Agent 运行时类型
@@ -257,6 +357,12 @@ export type {
 
 export type { AgentTaskRequest, AgentLoopState } from './agent-types';
 export type { AgentToolConfig } from './runtime/agent';
+export type {
+  AgentHandle,
+  CreateAgentSpec,
+  PersonaDef,
+  UserRating,
+} from './schemas';
 
 // ════════════════════════════════════════════════════════
 //  22. Tool-calling 类型

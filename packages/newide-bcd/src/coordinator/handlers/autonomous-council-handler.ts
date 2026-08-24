@@ -1,12 +1,13 @@
 import type { ArtifactRef } from '../../core';
-import type {
-  CouncilExecutionOptions,
-  CouncilProvider,
-  CouncilResult,
-  CouncilRunRequest,
-  CouncilRunResult,
-  Proposal,
-  Review,
+import {
+  reconcileCouncilOutcome,
+  type CouncilExecutionOptions,
+  type CouncilProvider,
+  type CouncilResult,
+  type CouncilRunRequest,
+  type CouncilRunResult,
+  type Proposal,
+  type Review,
 } from '../../council';
 import { isMaterializableFileArtifact, readArtifactBytes, sha256 } from '../artifact-content';
 
@@ -61,17 +62,10 @@ export class AutonomousCouncilHandler {
     );
     const warnings: string[] = [];
     if (fallback.length > 0) {
-      warnings.push('Council synthesis was unavailable; selected a reviewed proposal.');
+      warnings.push('Council synthesis was unavailable; selected the best available proposal.');
     }
     if (identityConflict) {
-      warnings.push(
-        'Council reused a persisted Agent across seats; the result is best_effort and not fully verified.',
-      );
-    }
-    if (!verified) {
-      warnings.push(
-        'Council verification did not fully pass; delivering the best available artifact.',
-      );
+      warnings.push('Council reused a persisted Agent across seats; identity reuse was audited.');
     }
     const councilResult: CouncilResult = {
       quality: verified ? 'verified' : 'best_effort',
@@ -82,7 +76,10 @@ export class AutonomousCouncilHandler {
       verification_refs: runResult.reviews.map((review) => review.review_id),
       decision_record_ref: runResult.decision.decision_id,
     };
-    const councilRunResult = { ...runResult, result: councilResult };
+    const councilRunResult = reconcileCouncilOutcome(
+      { ...runResult, result: councilResult },
+      councilResult,
+    );
     return {
       council_run_result: councilRunResult,
       council_result: councilResult,

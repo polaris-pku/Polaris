@@ -1,13 +1,14 @@
 /**
- * §1 SWE-EVO Council memory ablation batch: subset × B0/B1/B2.
+ * §1 SWE-EVO memory ablation batch: subset × B0/B1/B2.
  *
- * Council roles run against isolated git worktrees created from the instance base commit.
+ * Agent writes directly into an ephemeral git worktree @ base_commit.
  * After the run, eval collects the patch via git diff (collectWorktreePatch).
  * Repo mirrors are lazy-cloned under .newide/eval-mirrors (NEWIDE_SWE_MIRRORS_ROOT).
  *
  * Usage:
+ *   pnpm eval:sweevo-ablation -- --subset v0-requests-3-prctx --mode council --ablations B0,B1,B2 --run-harness
  *   pnpm eval:sweevo-ablation -- --subset v0-smoke --instance-id conan-io__conan_2.0.14_2.0.15 --ablations B2 --harness-dry-run
- *   pnpm eval:sweevo-ablation -- --subset v0-smoke
+ *   pnpm eval:sweevo-ablation -- --subset v0-smoke --instance-id conan-io__conan_2.0.14_2.0.15 --ablations B0 --mode council --run-harness
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, promises as fs, readFileSync } from 'node:fs';
@@ -22,6 +23,20 @@ import {
 } from '../eval/prepare-worktree';
 import { runEvalInstance } from '../eval/run-instance-core';
 import type { MemoryAblation, SweEvoInstance } from '../eval/types';
+import {
+  isDriverStreamUsage,
+  projectTaskDriverUsage,
+  type TaskDriverUsage,
+} from '../src/app/driver-usage-projector';
+import {
+  collectClaudeSessionUsage,
+  isPopulatedRunTokenUsage,
+  type RunTokenUsageSummary,
+} from '../src/telemetry';
+import {
+  prepareAblationArmIsolation,
+  waitForRunMaintenance,
+} from './ablation-arm-isolation';
 
 interface JsonRpcMessage {
   jsonrpc: '2.0';
@@ -32,54 +47,37 @@ interface JsonRpcMessage {
   error?: { code: number; message: string; data?: unknown };
 }
 
+type EvaluationRunMode = 'single_agent' | 'council';
+
 interface BackendClient {
   request<T>(method: string, params: unknown): Promise<T>;
   waitForTerminal(runId: string, timeoutMs: number): Promise<Record<string, unknown>>;
+  waitForTaskTerminal(taskId: string, timeoutMs: number): Promise<TaskTerminalSnapshot>;
   close(): Promise<void>;
 }
 
-interface TokenUsage {
-  input_tokens: number;
-  output_tokens: number;
-  cache_creation_input_tokens: number;
-  cache_read_input_tokens: number;
-  /** input + cache_creation + cache_read (Claude billed input-ish total). */
-  total_input_tokens: number;
-  total_tokens: number;
+interface TaskTerminalSnapshot {
+  task: { task_id: string; status: string };
+  run_history: Array<{ run_id: string; status: string }>;
+}
+
+interface TokenUsage extends RunTokenUsageSummary {
+  /** Backward-compatible alias of call_count for Claude assistant turns. */
   assistant_messages: number;
-  source: 'claude_session_jsonl' | 'unavailable';
-  session_path?: string;
-  session_id?: string;
-}
-
-interface CouncilSessionUsage {
-  session_id: string;
-  role_id?: string;
-  started_at?: string;
-  finished_at?: string;
-  duration_ms?: number;
-  context_tokens_used?: number;
-  cost?: { amount: number; currency: string };
-  event_count: number;
-}
-
-interface CouncilUsage {
-  source: 'driver_stream_audit';
-  session_count: number;
-  driver_duration_ms: number;
-  context_tokens_used: number;
-  cost_by_currency: Record<string, number>;
-  sessions: CouncilSessionUsage[];
 }
 
 interface InstanceRow {
   ablation: MemoryAblation;
+  run_mode: EvaluationRunMode;
   instance_id: string;
+  /** 1-based position within the arm; memory accumulates across the sequence. */
+  instance_seq: number;
   repo: string;
   base_commit: string;
   mirror_path?: string;
   worktree_path?: string;
   backend_run_id?: string;
+  final_backend_run_id?: string;
   backend_task_id?: string;
   snapshot_status?: string;
   summary_path?: string;
@@ -90,48 +88,70 @@ interface InstanceRow {
   wall_ms?: number;
   driver_duration_ms?: number;
   maintenance_wait_ms?: number;
+  maintenance_ref?: string;
+  maintenance_status?: string;
   token_usage?: TokenUsage;
-  council_usage?: CouncilUsage;
+  driver_usage?: TaskDriverUsage;
   eval_run_dir?: string;
   eval_predictions_path?: string;
-  eval_result?: {
-    resolved_count: number;
-    unresolved_count: number;
-    applied_count: number;
-    p2p_regression_count: number;
-    harness_report_path?: string;
-  };
   eval_error?: string;
+  /** True when a real harness report scored this instance. */
+  harness_scored?: boolean;
+  resolved?: boolean;
+  applied?: boolean;
+  p2p_regression?: boolean;
   status: 'ok' | 'failed' | 'skipped_eval';
 }
 
 const repoRoot = process.cwd();
-const configuredEnv = {
+const startedAt = new Date();
+const stamp = startedAt.toISOString().replace(/[:.]/g, '-');
+// Load dotenv before reading timeout knobs so .env.local actually applies.
+const fileEnv = {
   ...loadEnvFile(path.join(repoRoot, '.env')),
   ...loadEnvFile(path.join(repoRoot, '.env.local')),
 };
-for (const [key, value] of Object.entries(configuredEnv)) {
-  process.env[key] ??= value;
+// Harness adapter and path helpers read process.env, not baseEnv.
+for (const [key, value] of Object.entries(fileEnv)) {
+  if (value !== undefined) process.env[key] ??= value;
 }
-const startedAt = new Date();
-const stamp = startedAt.toISOString().replace(/[:.]/g, '-');
-const experimentRoot = path.resolve(
-  process.env.NEWIDE_SWEEVO_ABLATION_ROOT ??
-    path.join(repoRoot, '.newide', 'eval', 'sweevo-ablation'),
-  stamp,
+// Agent budget: 45 minutes (paper-aligned). ACCEPTANCE_RUN_TIMEOUT_MS overrides.
+// Set ACCEPTANCE_RUN_TIMEOUT_MS=0 for no wall-clock cancel (wait until terminal).
+const runTimeoutRaw = process.env.ACCEPTANCE_RUN_TIMEOUT_MS ?? fileEnv.ACCEPTANCE_RUN_TIMEOUT_MS;
+const unlimitedRunTimeout = runTimeoutRaw === '0';
+const runTimeoutMs = unlimitedRunTimeout
+  ? 0
+  : readPositiveInt(runTimeoutRaw, 2_700_000);
+// Wait slightly longer than the driver budget so the driver timeout (clean
+// terminal state) fires before this script force-cancels the run.
+// Unlimited: never force-cancel; driver still needs a finite ACP_DRIVER_TIMEOUT_MS.
+const runWaitMs = unlimitedRunTimeout ? Number.POSITIVE_INFINITY : runTimeoutMs + 300_000;
+/** Driver timeout when run budget is unlimited (7d). Backend requires a positive int. */
+const unlimitedDriverTimeoutMs = 7 * 24 * 60 * 60 * 1000;
+const maintenanceWaitMs = readPositiveInt(
+  process.env.ABLATION_MAINTENANCE_WAIT_MS ?? fileEnv.ABLATION_MAINTENANCE_WAIT_MS,
+  45_000,
 );
-const runTimeoutMs = readPositiveInt(process.env.ACCEPTANCE_RUN_TIMEOUT_MS, 2_700_000);
-const maintenanceWaitMs = readPositiveInt(process.env.ABLATION_MAINTENANCE_WAIT_MS, 45_000);
 const mirrorsRoot = resolveMirrorsRoot(readFlag('--mirrors-root'));
 
 const subsetId = readFlag('--subset') ?? 'v0-smoke';
 const instanceIdFilter = readFlag('--instance-id');
 const ablations = parseAblations(readFlag('--ablations') ?? 'B0,B1,B2');
 const modelName = readFlag('--model') ?? 'claude-acp-real';
+const runMode = parseRunMode(readFlag('--mode') ?? 'single_agent');
 const runHarness = hasFlag('--run-harness');
 const harnessDryRun = hasFlag('--harness-dry-run');
 const skipEval = hasFlag('--skip-eval');
 const keepWorktree = hasFlag('--keep-worktree');
+const experimentDirOverride = readFlag('--experiment-dir');
+const experimentRoot = experimentDirOverride
+  ? path.resolve(repoRoot, experimentDirOverride)
+  : path.resolve(
+      process.env.NEWIDE_SWEEVO_ABLATION_ROOT ??
+        fileEnv.NEWIDE_SWEEVO_ABLATION_ROOT ??
+        path.join(repoRoot, '.newide', 'eval-runs', 'sweevo-ablation'),
+      stamp,
+    );
 
 await fs.mkdir(experimentRoot, { recursive: true });
 
@@ -150,49 +170,213 @@ for (const id of instanceIds) {
   getInstanceOrThrow(instancesById, id);
 }
 
-const baseEnv = {
+const databaseUrlTemplate =
+  process.env.NEWIDE_ABLATION_DATABASE_URL_TEMPLATE ??
+  fileEnv.NEWIDE_ABLATION_DATABASE_URL_TEMPLATE ??
+  'postgresql://newide:newide_local@127.0.0.1:55432/newide_{ablation}';
+
+const driverRunnerRaw =
+  process.env.ACP_DRIVER_RUNNER_DIR ?? fileEnv.ACP_DRIVER_RUNNER_DIR;
+const driverEnvFileRaw = process.env.ACP_DRIVER_ENV_FILE ?? fileEnv.ACP_DRIVER_ENV_FILE;
+const sweEvoRootRaw = process.env.NEWIDE_SWE_EVO_ROOT ?? fileEnv.NEWIDE_SWE_EVO_ROOT;
+const baseEnv: NodeJS.ProcessEnv = {
   ...process.env,
-  ACP_DRIVER_RUNNER_DIR:
-    process.env.ACP_DRIVER_RUNNER_DIR ?? path.resolve(repoRoot, '..', 'acp-client-prototype'),
-  ACP_DRIVER_TIMEOUT_MS: process.env.ACP_DRIVER_TIMEOUT_MS ?? '600000',
+  ...fileEnv,
+  ACP_DRIVER_RUNNER_DIR: path.resolve(
+    repoRoot,
+    driverRunnerRaw ?? path.join('..', 'acp-client-prototype'),
+  ),
+  ...(driverEnvFileRaw
+    ? { ACP_DRIVER_ENV_FILE: path.resolve(repoRoot, driverEnvFileRaw) }
+    : {}),
+  ...(sweEvoRootRaw ? { NEWIDE_SWE_EVO_ROOT: path.resolve(repoRoot, sweEvoRootRaw) } : {}),
 };
-baseEnv.NEWIDE_B_EMBEDDING_PROVIDER ??= 'hash';
-if (baseEnv.NEWIDE_B_EMBEDDING_PROVIDER === 'hash') {
-  baseEnv.NEWIDE_B_EMBEDDING_DIMENSIONS ??= '32';
+// Driver timeout must not undercut the run budget, or the agent is silently
+// killed early and the arm comparison becomes a timeout comparison.
+if (unlimitedRunTimeout) {
+  baseEnv.ACP_DRIVER_TIMEOUT_MS ??= String(unlimitedDriverTimeoutMs);
+  if (readPositiveInt(baseEnv.ACP_DRIVER_TIMEOUT_MS, unlimitedDriverTimeoutMs) < unlimitedDriverTimeoutMs) {
+    log(
+      `warn: ACP_DRIVER_TIMEOUT_MS=${String(baseEnv.ACP_DRIVER_TIMEOUT_MS)} too low for unlimited run; raising to ${String(unlimitedDriverTimeoutMs)}ms`,
+    );
+    baseEnv.ACP_DRIVER_TIMEOUT_MS = String(unlimitedDriverTimeoutMs);
+  }
+} else {
+  baseEnv.ACP_DRIVER_TIMEOUT_MS ??= String(runTimeoutMs);
+  if (readPositiveInt(baseEnv.ACP_DRIVER_TIMEOUT_MS, runTimeoutMs) < runTimeoutMs) {
+    log(
+      `warn: ACP_DRIVER_TIMEOUT_MS=${String(baseEnv.ACP_DRIVER_TIMEOUT_MS)} < run budget ${String(runTimeoutMs)}ms; raising to match`,
+    );
+    baseEnv.ACP_DRIVER_TIMEOUT_MS = String(runTimeoutMs);
+  }
+}
+// SWE-EVO paper alignment: deny WebFetch/WebSearch and network Bash at ACP permission gate.
+// Override with NEWIDE_SWE_EVO_BLOCK_INTERNET=0 only for debugging.
+baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET ??= '1';
+// Anti-hacking: jail the agent process to the current workspace only (bubblewrap).
+// Override with NEWIDE_EVAL_FS_JAIL=0 only for debugging.
+baseEnv.NEWIDE_EVAL_FS_JAIL ??= '1';
+// Translate benchmark policy into ACP's generic process-sandbox contract.
+baseEnv.ACP_DENY_NETWORK_TOOLS ??= baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET;
+baseEnv.ACP_DENY_PATH_SUBSTRINGS_JSON ??= JSON.stringify([
+  'eval-mirrors',
+  '/eval/data',
+  'test_patch',
+  'patch_without_test',
+  'site-packages',
+  'dist-packages',
+  'miniconda',
+  'anaconda',
+]);
+baseEnv.ACP_PROCESS_SANDBOX ??= baseEnv.NEWIDE_EVAL_FS_JAIL;
+baseEnv.ACP_PROCESS_SANDBOX_HIDE_PYTHON_PACKAGES ??= '1';
+baseEnv.ACP_PROCESS_SANDBOX_RO_PATHS_JSON ??= JSON.stringify([
+  '.claude/settings.json',
+  '.git/config',
+]);
+if (baseEnv.NEWIDE_EVAL_FS_JAIL_BWRAP) {
+  baseEnv.ACP_PROCESS_SANDBOX_BWRAP ??= baseEnv.NEWIDE_EVAL_FS_JAIL_BWRAP;
+}
+if (baseEnv.NEWIDE_EVAL_FS_JAIL_NPM_CACHE) {
+  baseEnv.ACP_PROCESS_SANDBOX_NPM_CACHE ??= baseEnv.NEWIDE_EVAL_FS_JAIL_NPM_CACHE;
+}
+if (baseEnv.NEWIDE_EVAL_FS_JAIL_EXTRA_RO_BINDS) {
+  baseEnv.ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON ??= JSON.stringify(
+    baseEnv.NEWIDE_EVAL_FS_JAIL_EXTRA_RO_BINDS.split(path.delimiter).filter(Boolean),
+  );
 }
 
 log(`experiment root: ${experimentRoot}`);
 log(`mirrors root: ${mirrorsRoot}`);
-log(`subset=${subsetId} instances=${instanceIds.length} ablations=${ablations.join(',')}`);
+log(`subset=${subsetId} instances=${instanceIds.length} ablations=${ablations.join(',')} mode=${runMode}`);
 log(`ACP_DRIVER_RUNNER_DIR: ${baseEnv.ACP_DRIVER_RUNNER_DIR}`);
-
-const armReports: Array<{ ablation: MemoryAblation; instances: InstanceRow[] }> = [];
+log(
+  `ACCEPTANCE_RUN_TIMEOUT_MS: ${unlimitedRunTimeout ? '0 (unlimited)' : String(runTimeoutMs)}`,
+);
+log(`ACP_DRIVER_TIMEOUT_MS: ${baseEnv.ACP_DRIVER_TIMEOUT_MS}`);
+log(`NEWIDE_SWE_EVO_BLOCK_INTERNET: ${baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET}`);
+log(`NEWIDE_SWE_EVO_PYTHON: ${process.env.NEWIDE_SWE_EVO_PYTHON?.trim() || 'python (default)'}`);
+log(`NEWIDE_EVAL_FS_JAIL: ${baseEnv.NEWIDE_EVAL_FS_JAIL}`);
+const permissionBuildPath = path.join(
+  String(baseEnv.ACP_DRIVER_RUNNER_DIR),
+  'dist',
+  'src',
+  'client-methods',
+  'permission-handler.js',
+);
+const permissionBuildSupportsOfflineBlock =
+  existsSync(permissionBuildPath) &&
+  readFileSync(permissionBuildPath, 'utf-8').includes('ACP_DENY_NETWORK_TOOLS');
+if (baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET === '1' && !permissionBuildSupportsOfflineBlock) {
+  throw new Error(
+    [
+      'Offline evaluation requested (NEWIDE_SWE_EVO_BLOCK_INTERNET=1) but the ACP driver build',
+      `at ${permissionBuildPath} does not enforce the internet block.`,
+      'Rebuild acp-client-prototype (pnpm build) or set NEWIDE_SWE_EVO_BLOCK_INTERNET=0 (debug only).',
+    ].join(' '),
+  );
+}
+const jailBuildPath = path.join(
+  String(baseEnv.ACP_DRIVER_RUNNER_DIR),
+  'dist',
+  'src',
+  'security',
+  'eval-fs-jail.js',
+);
+if (baseEnv.NEWIDE_EVAL_FS_JAIL === '1' && !baseEnv.ACP_PROCESS_SANDBOX_HOME) {
+  const evalClaudeHome = path.join(experimentRoot, 'claude-home');
+  await fs.mkdir(path.join(evalClaudeHome, '.claude'), { recursive: true });
+  const settings = buildEvalClaudeSettings();
+  if (Object.keys(settings).length > 0) {
+    await fs.writeFile(
+      path.join(evalClaudeHome, '.claude', 'settings.json'),
+      `${JSON.stringify(settings, null, 2)}\n`,
+      'utf-8',
+    );
+  }
+  baseEnv.ACP_PROCESS_SANDBOX_HOME = evalClaudeHome;
+  log(`eval Claude home: ${evalClaudeHome}`);
+}
+if (baseEnv.NEWIDE_EVAL_FS_JAIL === '1') {
+  if (!existsSync(jailBuildPath)) {
+    throw new Error(
+      [
+        'Eval FS jail requested (NEWIDE_EVAL_FS_JAIL=1) but the ACP driver build is missing',
+        `${jailBuildPath}.`,
+        'Rebuild acp-client-prototype (pnpm build) or set NEWIDE_EVAL_FS_JAIL=0 (debug only).',
+      ].join(' '),
+    );
+  }
+  const bwrapPath = baseEnv.ACP_PROCESS_SANDBOX_BWRAP?.trim() || '/usr/bin/bwrap';
+  if (!existsSync(bwrapPath)) {
+    throw new Error(
+      [
+        'Eval FS jail requested (NEWIDE_EVAL_FS_JAIL=1) but bubblewrap was not found',
+        `at ${bwrapPath}.`,
+        'Install bubblewrap or set NEWIDE_EVAL_FS_JAIL_BWRAP to the bwrap binary.',
+      ].join(' '),
+    );
+  }
+  log(`eval FS jail bwrap: ${bwrapPath}`);
+}
+const armReports: Array<{
+  ablation: MemoryAblation;
+  state_root: string;
+  database_schema: string;
+  total_count: number;
+  scored_count: number;
+  resolved_count: number;
+  intent_to_treat_resolved_rate: number;
+  applied_count: number;
+  p2p_regression_count: number;
+  instances: InstanceRow[];
+}> = [];
 
 for (const ablation of ablations) {
   const armDir = path.join(experimentRoot, ablation);
   await fs.mkdir(armDir, { recursive: true });
-  const configuredDbUrl = baseEnv.NEWIDE_B_DATABASE_URL?.trim();
-  const dbUrl =
-    ablations.length === 1 && configuredDbUrl
-      ? configuredDbUrl
-      : `postgresql://newide:newide_local@127.0.0.1:55432/newide_${ablation.toLowerCase()}`;
+  const dbUrl = resolveAblationDatabaseUrl(databaseUrlTemplate, ablation);
+  const isolation = await prepareAblationArmIsolation({
+    experiment_root: experimentRoot,
+    arm: ablation,
+    database_url: dbUrl,
+  });
+  await fs.mkdir(isolation.state_root, { recursive: true });
   log('');
   log(`=== arm ${ablation} ===`);
+  log(`state root: ${isolation.state_root}`);
+  log(`database schema: ${isolation.database_schema}`);
 
   const backend = await startBackend(ablation, {
     ...baseEnv,
-    NEWIDE_B_DATABASE_URL: dbUrl,
+    NEWIDE_B_DATABASE_URL: isolation.database_url,
+    NEWIDE_B_EMBEDDING_PROVIDER: baseEnv.NEWIDE_B_EMBEDDING_PROVIDER ?? 'hash',
+    NEWIDE_B_EMBEDDING_DIMENSIONS: baseEnv.NEWIDE_B_EMBEDDING_DIMENSIONS ?? '32',
+    NEWIDE_STATE_ROOT: isolation.state_root,
+    ...(runMode === 'council'
+      ? {
+          NEWIDE_COUNCIL_STRATEGY: baseEnv.NEWIDE_COUNCIL_STRATEGY ?? 'plan_first',
+          NEWIDE_COUNCIL_SEATS:
+            baseEnv.NEWIDE_COUNCIL_SEATS ??
+            'role_fullstack_engineer,role_ts_engineer,role_code_reviewer,role_synthesis_engineer',
+          NEWIDE_AUCTION_ENABLED: baseEnv.NEWIDE_AUCTION_ENABLED ?? '0',
+          NEWIDE_PRIMARY_AGENT_ID:
+            baseEnv.NEWIDE_PRIMARY_AGENT_ID ?? 'role_fullstack_engineer',
+        }
+      : {}),
   });
 
   const rows: InstanceRow[] = [];
   try {
-    for (const instanceId of instanceIds) {
+    for (const [instanceIndex, instanceId] of instanceIds.entries()) {
       const instance = getInstanceOrThrow(instancesById, instanceId);
       const row = await runOneInstance({
         ablation,
         armDir,
         backend,
         instance,
+        instanceSeq: instanceIndex + 1,
+        stateRoot: isolation.state_root,
       });
       rows.push(row);
       await fs.writeFile(
@@ -208,13 +392,28 @@ for (const ablation of ablations) {
     await backend.close();
   }
 
-  const armSummary = { ablation, instances: rows };
+  const armSummary = {
+    ablation,
+    state_root: isolation.state_root,
+    database_schema: isolation.database_schema,
+    total_count: rows.length,
+    scored_count: rows.filter((row) => row.harness_scored === true).length,
+    resolved_count: rows.filter((row) => row.resolved === true).length,
+    intent_to_treat_resolved_rate:
+      rows.length > 0 ? rows.filter((row) => row.resolved === true).length / rows.length : 0,
+    applied_count: rows.filter((row) => row.applied === true).length,
+    p2p_regression_count: rows.filter((row) => row.p2p_regression === true).length,
+    instances: rows,
+  };
   armReports.push(armSummary);
   await fs.writeFile(path.join(armDir, 'arm-summary.json'), JSON.stringify(armSummary, null, 2));
 }
 
 const finishedAt = new Date();
-const metricsRows = armReports.flatMap((arm) => arm.instances);
+// Merge sibling arm-summary.json files so parallel --ablations B0|B1|B2
+// processes writing into the same --experiment-dir still produce one summary.
+const mergedArms = await loadMergedArmReports(experimentRoot, armReports);
+const metricsRows = mergedArms.flatMap((arm) => arm.instances);
 const metricsPath = path.join(experimentRoot, 'metrics.jsonl');
 await fs.writeFile(
   metricsPath,
@@ -223,9 +422,9 @@ await fs.writeFile(
 );
 const timingTotals = summarizeTiming(metricsRows);
 const tokenTotals = summarizeTokens(metricsRows);
+const driverUsageTotals = summarizeDriverUsage(metricsRows);
 const summary = {
-  schema_version: 'sweevo-council-memory-ablation.v0',
-  execution_mode: 'council',
+  schema_version: 'sweevo-memory-ablation.v0',
   started_at: startedAt.toISOString(),
   finished_at: finishedAt.toISOString(),
   wall_ms: finishedAt.getTime() - startedAt.getTime(),
@@ -233,22 +432,17 @@ const summary = {
   mirrors_root: mirrorsRoot,
   subset_id: subsetId,
   instance_ids: instanceIds,
-  ablations,
+  ablations: [...new Set([...ablations, ...mergedArms.map((arm) => arm.ablation)])],
+  run_mode: runMode,
   model_name: modelName,
-  embedding_runtime: {
-    provider: baseEnv.NEWIDE_B_EMBEDDING_PROVIDER,
-    dimensions: Number(baseEnv.NEWIDE_B_EMBEDDING_DIMENSIONS ?? 0),
-    semantic_quality:
-      baseEnv.NEWIDE_B_EMBEDDING_PROVIDER === 'hash' ? 'degraded_non_semantic' : 'semantic',
-  },
   run_harness: runHarness,
   harness_dry_run: harnessDryRun,
   skip_eval: skipEval,
   metrics_path: metricsPath,
   timing_totals: timingTotals,
   token_totals: tokenTotals,
-  council_usage_totals: summarizeCouncilUsage(metricsRows),
-  arms: armReports,
+  driver_usage_totals: driverUsageTotals,
+  arms: mergedArms,
 };
 const summaryPath = path.join(experimentRoot, 'summary.json');
 await fs.writeFile(summaryPath, JSON.stringify(summary, null, 2), 'utf-8');
@@ -256,10 +450,10 @@ log('');
 log(`summary: ${summaryPath}`);
 log(`metrics: ${metricsPath}`);
 log(
-  `totals wall_ms=${String(timingTotals.wall_ms)} driver_ms=${String(timingTotals.driver_duration_ms)} tokens=${String(tokenTotals.total_tokens)} (in=${String(tokenTotals.total_input_tokens)} out=${String(tokenTotals.output_tokens)})`,
+  `totals wall_ms=${String(timingTotals.wall_ms)} driver_ms=${String(timingTotals.driver_duration_ms)} tokens=${String(tokenTotals.total_tokens)} (in=${String(tokenTotals.total_input_tokens)} out=${String(tokenTotals.output_tokens)}) driver_context=${String(driverUsageTotals.context_tokens_used)} (${String(driverUsageTotals.instances_with_driver_usage)}/${String(driverUsageTotals.instances)})`,
 );
 
-const failed = armReports.some((arm) => arm.instances.some((row) => row.status === 'failed'));
+const failed = mergedArms.some((arm) => arm.instances.some((row) => row.status === 'failed'));
 if (failed) process.exitCode = 1;
 
 // ---------------------------------------------------------------------------
@@ -269,14 +463,22 @@ async function runOneInstance(input: {
   armDir: string;
   backend: BackendClient;
   instance: SweEvoInstance;
+  instanceSeq: number;
+  stateRoot: string;
 }): Promise<InstanceRow> {
-  const { ablation, armDir, backend, instance } = input;
+  const { ablation, armDir, backend, instance, instanceSeq, stateRoot } = input;
   const row: InstanceRow = {
     ablation,
+    run_mode: runMode,
     instance_id: instance.instance_id,
+    instance_seq: instanceSeq,
     repo: instance.repo,
     base_commit: instance.base_commit,
     status: 'failed',
+    harness_scored: false,
+    resolved: false,
+    applied: false,
+    p2p_regression: false,
   };
 
   let prepared:
@@ -304,10 +506,11 @@ async function runOneInstance(input: {
       outRoot: path.join(armDir, 'worktrees', runKey),
     });
     row.worktree_path = prepared.worktreePath;
+    await writeEvalOfflineClaudeSettings(prepared.worktreePath);
 
     const created = await backend.request<{ run_id: string; task_id: string }>('run.create', {
       prompt: buildPrompt(instance),
-      mode: 'council',
+      mode: runMode,
       workspace_path: prepared.worktreePath,
       memory_ablation: ablation,
       title: `${ablation}-${instance.instance_id}`,
@@ -316,27 +519,45 @@ async function runOneInstance(input: {
     row.backend_task_id = created.task_id;
 
     await backend.request('run.subscribe', { run_id: created.run_id });
-    const snapshot = await backend.waitForTerminal(created.run_id, runTimeoutMs);
+    const taskSnapshot = await backend.waitForTaskTerminal(created.task_id, runWaitMs);
+    const finalRunId = latestTerminalRunId(taskSnapshot);
+    row.final_backend_run_id = finalRunId;
+    const snapshot = await backend.waitForTerminal(finalRunId, runWaitMs);
     row.snapshot_status = String(snapshot.status ?? '');
-    row.council_usage = await collectCouncilUsage(created.run_id);
-    if (row.council_usage.session_count > 0) {
-      row.driver_duration_ms = row.council_usage.driver_duration_ms;
-    }
 
     if (ablation !== 'B0') {
       row.maintenance_wait_ms = maintenanceWaitMs;
-      await sleep(maintenanceWaitMs);
+      const maintenance = await waitForRunMaintenance(
+        backend.request,
+        finalRunId,
+        maintenanceWaitMs,
+      );
+      row.maintenance_ref = maintenance.maintenance_ref;
+      row.maintenance_status = maintenance.status;
+      // 'skipped' (no durable buffer to extract) is a legitimate data point for
+      // the memory arms, not an infra failure; only 'failed' aborts the row.
+      if (maintenance.status !== 'completed' && maintenance.status !== 'skipped') {
+        throw new Error(
+          `Memory maintenance ${maintenance.maintenance_ref} ended as ${maintenance.status}`,
+        );
+      }
     }
 
-    const summaryPath = path.join(repoRoot, '.newide', 'runs', created.run_id, 'summary.json');
+    const summaryPath = path.join(stateRoot, 'runs', finalRunId, 'summary.json');
     row.summary_path = summaryPath;
     const summary = await readJsonIfExists(summaryPath);
     if (summary && typeof summary === 'object') {
       const summaryObj = summary as {
+        memory_ablation?: unknown;
         worktree_path?: unknown;
         session_id?: unknown;
         driver_diagnostics?: { duration_ms?: unknown };
       };
+      if (summaryObj.memory_ablation !== ablation) {
+        throw new Error(
+          `Backend summary ablation mismatch: expected ${ablation}, got ${String(summaryObj.memory_ablation)}`,
+        );
+      }
       if ('worktree_path' in summaryObj) {
         row.summary_worktree_path = String(summaryObj.worktree_path ?? '');
       }
@@ -344,16 +565,18 @@ async function runOneInstance(input: {
         row.session_id = summaryObj.session_id;
       }
       const driverMs = summaryObj.driver_diagnostics?.duration_ms;
-      if (
-        row.driver_duration_ms === undefined &&
-        typeof driverMs === 'number' &&
-        Number.isFinite(driverMs)
-      ) {
+      if (typeof driverMs === 'number' && Number.isFinite(driverMs)) {
         row.driver_duration_ms = Math.max(0, Math.floor(driverMs));
       }
     }
 
-    row.token_usage = await collectClaudeTokenUsage({
+    row.driver_usage = await resolveInstanceDriverUsage({
+      summary,
+      stateRoot,
+      taskId: row.backend_task_id,
+    });
+    row.token_usage = await resolveInstanceTokenUsage({
+      summary,
       sessionId: row.session_id,
       worktreePath: prepared.worktreePath,
     });
@@ -372,28 +595,31 @@ async function runOneInstance(input: {
         datasetSubset: subsetId,
         outRoot: path.join(armDir, 'eval'),
         runId: `${runKey}_${stamp}`,
+        instanceSeq,
         backendSummaryPath: summaryPath,
         worktreePath: prepared.worktreePath,
         allowDirtyWorktree: true,
         keepWorktree: true,
         runSweEvoHarness: runHarness || harnessDryRun,
         harnessDryRun,
+        ...(baseEnv.NEWIDE_SWE_EVO_ROOT ? { sweEvoRoot: baseEnv.NEWIDE_SWE_EVO_ROOT } : {}),
       });
       row.eval_run_dir = evalResult.runDir;
       row.eval_predictions_path = evalResult.summary.predictions_path;
-      row.eval_result = {
-        resolved_count: evalResult.summary.resolved_count,
-        unresolved_count: evalResult.summary.unresolved_count,
-        applied_count: evalResult.summary.applied_count,
-        p2p_regression_count: evalResult.summary.p2p_regression_count,
-        ...(evalResult.summary.harness_report_path
-          ? { harness_report_path: evalResult.summary.harness_report_path }
-          : {}),
-      };
-      row.status =
-        row.snapshot_status === 'succeeded' || row.snapshot_status === 'completed'
-          ? 'ok'
-          : 'failed';
+      const scored =
+        Boolean(evalResult.summary.harness_report_path) &&
+        evalResult.summary.resolved_count + evalResult.summary.unresolved_count > 0;
+      row.harness_scored = scored;
+      if (scored) {
+        row.resolved = evalResult.summary.resolved_count > 0;
+        row.applied = evalResult.summary.applied_count > 0;
+        row.p2p_regression = evalResult.summary.p2p_regression_count > 0;
+      }
+      const snapshotOk =
+        row.snapshot_status === 'succeeded' || row.snapshot_status === 'completed';
+      // With --run-harness, a run only counts as ok when it was actually scored;
+      // snapshot success alone must not masquerade as an evaluated result.
+      row.status = snapshotOk && (!runHarness || scored) ? 'ok' : 'failed';
     } catch (error) {
       row.eval_error = error instanceof Error ? error.message : String(error);
       row.status = 'failed';
@@ -409,7 +635,7 @@ async function runOneInstance(input: {
     row.wall_finished_at = new Date(wallFinishedAt).toISOString();
     row.wall_ms = Math.max(0, wallFinishedAt - wallStartedAt);
     log(
-      `  metrics wall_ms=${String(row.wall_ms)} driver_ms=${String(row.driver_duration_ms ?? '-')} tokens=${String(row.token_usage?.total_tokens ?? '-')} source=${row.token_usage?.source ?? 'unavailable'}`,
+      `  metrics wall_ms=${String(row.wall_ms)} driver_ms=${String(row.driver_duration_ms ?? '-')} tokens=${String(row.token_usage?.total_tokens ?? '-')} source=${row.token_usage?.source ?? 'unavailable'} driver_context=${String(row.driver_usage?.context_tokens_used ?? '-')} driver_sessions=${String(row.driver_usage?.sessions.length ?? 0)}`,
     );
     if (prepared && !keepWorktree) {
       try {
@@ -430,7 +656,14 @@ function buildPrompt(instance: SweEvoInstance): string {
     'You are fixing a real GitHub issue in an already-checked-out repository worktree.',
     'Edit files directly in the workspace. Do not only describe a plan.',
     'Produce a minimal correct patch that addresses the problem statement.',
-    'Do not modify benchmark tests or add test files; the harness injects its own hidden test patch.',
+    'Do not add, edit, delete, rename, or generate tests or test-runner configuration.',
+    'Changes to tests, conftest.py, pytest/tox/nox/Jest/Vitest configuration are rejected.',
+    '',
+    'Offline evaluation constraints (SWE-EVO paper alignment):',
+    '- You have NO internet access. Do not use WebFetch, WebSearch, or any browser tool.',
+    '- Do not use shell/network commands (curl, wget, gh, Invoke-WebRequest, etc.) to reach GitHub or any remote host.',
+    '- URLs in the problem statement are citations only; reason from the provided text and the local workspace at base_commit.',
+    '- Do not fetch or apply remote PR patches; solve from the local tree + problem statement alone.',
     '',
     `Repository: ${instance.repo}`,
     `Instance: ${instance.instance_id}`,
@@ -441,258 +674,117 @@ function buildPrompt(instance: SweEvoInstance): string {
   ].join('\n');
 }
 
-function emptyTokenUsage(
-  source: TokenUsage['source'] = 'unavailable',
-  extras: Partial<TokenUsage> = {},
-): TokenUsage {
-  return {
-    input_tokens: 0,
-    output_tokens: 0,
-    cache_creation_input_tokens: 0,
-    cache_read_input_tokens: 0,
-    total_input_tokens: 0,
-    total_tokens: 0,
-    assistant_messages: 0,
-    source,
-    ...extras,
-  };
-}
-
-async function collectCouncilUsage(runId: string): Promise<CouncilUsage> {
-  const streamPath = path.join(repoRoot, '.newide', 'runs', runId, 'driver-stream.jsonl');
-  const sessions = new Map<
-    string,
-    CouncilSessionUsage & { started_ms?: number; finished_ms?: number }
-  >();
-
-  if (existsSync(streamPath)) {
-    const stream = await fs.readFile(streamPath, 'utf-8');
-    for (const line of stream.split(/\r?\n/)) {
-      if (!line.trim()) continue;
-      let record: {
-        event?: {
-          event_type?: string;
-          session_id?: string;
-          role_id?: string;
-          created_at?: string;
-          payload?: {
-            sessionId?: string;
-            update?: {
-              used?: number;
-              cost?: { amount?: number; currency?: string };
-            };
-          };
-        };
-      };
-      try {
-        record = JSON.parse(line) as typeof record;
-      } catch {
-        continue;
-      }
-      const event = record.event;
-      const sessionId = event?.session_id ?? event?.payload?.sessionId;
-      if (!event || !sessionId) continue;
-
-      const current = sessions.get(sessionId) ?? {
-        session_id: sessionId,
-        event_count: 0,
-      };
-      current.event_count += 1;
-      if (event.role_id) current.role_id = event.role_id;
-
-      const eventMs = event.created_at ? Date.parse(event.created_at) : Number.NaN;
-      if (event.event_type === 'driver.turn_started' && Number.isFinite(eventMs)) {
-        current.started_at = event.created_at;
-        current.started_ms = eventMs;
-      }
-      if (
-        (event.event_type === 'driver.turn_completed' ||
-          event.event_type === 'driver.turn_failed') &&
-        Number.isFinite(eventMs)
-      ) {
-        current.finished_at = event.created_at;
-        current.finished_ms = eventMs;
-      }
-
-      const used = event.payload?.update?.used;
-      if (typeof used === 'number' && Number.isFinite(used)) {
-        current.context_tokens_used = Math.max(
-          current.context_tokens_used ?? 0,
-          Math.max(0, Math.floor(used)),
-        );
-      }
-      const cost = event.payload?.update?.cost;
-      if (
-        cost &&
-        typeof cost.amount === 'number' &&
-        Number.isFinite(cost.amount) &&
-        typeof cost.currency === 'string'
-      ) {
-        current.cost = { amount: cost.amount, currency: cost.currency };
-      }
-      sessions.set(sessionId, current);
-    }
-  }
-
-  const projected = [...sessions.values()].map((session): CouncilSessionUsage => {
-    const durationMs =
-      session.started_ms !== undefined && session.finished_ms !== undefined
-        ? Math.max(0, session.finished_ms - session.started_ms)
-        : undefined;
-    return {
-      session_id: session.session_id,
-      ...(session.role_id ? { role_id: session.role_id } : {}),
-      ...(session.started_at ? { started_at: session.started_at } : {}),
-      ...(session.finished_at ? { finished_at: session.finished_at } : {}),
-      ...(durationMs !== undefined ? { duration_ms: durationMs } : {}),
-      ...(session.context_tokens_used !== undefined
-        ? { context_tokens_used: session.context_tokens_used }
-        : {}),
-      ...(session.cost ? { cost: session.cost } : {}),
-      event_count: session.event_count,
+function buildEvalClaudeSettings(): Record<string, unknown> {
+  const settings: Record<string, unknown> = {};
+  if (baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET === '1') {
+    settings.permissions = {
+      deny: [
+        'WebFetch',
+        'WebSearch',
+        'WebFetch(*)',
+        'Bash(curl *)',
+        'Bash(wget *)',
+        'Bash(gh *)',
+        'Bash(Invoke-WebRequest *)',
+        'Bash(iwr *)',
+      ],
     };
-  });
-
-  const costByCurrency: Record<string, number> = {};
-  for (const session of projected) {
-    if (!session.cost) continue;
-    costByCurrency[session.cost.currency] =
-      (costByCurrency[session.cost.currency] ?? 0) + session.cost.amount;
   }
+  const model = baseEnv.ANTHROPIC_MODEL?.trim();
+  if (model) {
+    settings.model = model;
+  }
+  const env: Record<string, string> = {};
+  for (const key of [
+    'ANTHROPIC_BASE_URL',
+    'ANTHROPIC_AUTH_TOKEN',
+    'ANTHROPIC_API_KEY',
+    'ANTHROPIC_MODEL',
+    'ANTHROPIC_DEFAULT_OPUS_MODEL',
+    'ANTHROPIC_DEFAULT_SONNET_MODEL',
+    'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+    'CLAUDE_CODE_SUBAGENT_MODEL',
+    'CLAUDE_CODE_EFFORT_LEVEL',
+    'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC',
+    'CLAUDE_CONFIG_DIR',
+  ] as const) {
+    const value = baseEnv[key]?.trim();
+    if (value) env[key] = value;
+  }
+  if (!env.CLAUDE_CODE_EFFORT_LEVEL) env.CLAUDE_CODE_EFFORT_LEVEL = 'max';
+  if (!env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC) {
+    env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1';
+  }
+  if (Object.keys(env).length > 0) settings.env = env;
+  return settings;
+}
 
+/** Defense-in-depth Claude Code deny list for SWE-EVO offline eval. */
+async function writeEvalOfflineClaudeSettings(worktreePath: string): Promise<void> {
+  const settings = buildEvalClaudeSettings();
+  if (Object.keys(settings).length === 0) return;
+  const claudeDir = path.join(worktreePath, '.claude');
+  await fs.mkdir(claudeDir, { recursive: true });
+  await fs.writeFile(
+    path.join(claudeDir, 'settings.json'),
+    `${JSON.stringify(settings, null, 2)}\n`,
+    'utf-8',
+  );
+}
+
+function toAblationTokenUsage(summary: RunTokenUsageSummary): TokenUsage {
   return {
-    source: 'driver_stream_audit',
-    session_count: projected.length,
-    driver_duration_ms: projected.reduce((sum, session) => sum + (session.duration_ms ?? 0), 0),
-    context_tokens_used: projected.reduce(
-      (sum, session) => sum + (session.context_tokens_used ?? 0),
-      0,
-    ),
-    cost_by_currency: costByCurrency,
-    sessions: projected,
+    ...summary,
+    assistant_messages: summary.call_count,
   };
 }
 
-function encodeClaudeProjectDir(worktreePath: string): string {
-  return path
-    .resolve(worktreePath)
-    .replaceAll(':', '')
-    .replaceAll('\\', '-')
-    .replaceAll('/', '-');
+function readSummaryTokenUsage(summary: unknown): TokenUsage | undefined {
+  if (!summary || typeof summary !== 'object') return undefined;
+  const tokenUsage = (summary as { token_usage?: unknown }).token_usage;
+  if (!isPopulatedRunTokenUsage(tokenUsage)) return undefined;
+  return toAblationTokenUsage(tokenUsage);
 }
 
-async function collectClaudeTokenUsage(input: {
+function readSummaryDriverUsage(summary: unknown): TaskDriverUsage | undefined {
+  if (!summary || typeof summary !== 'object') return undefined;
+  const obj = summary as { driver_usage?: unknown; token_usage?: unknown };
+  if (isDriverStreamUsage(obj.driver_usage)) {
+    return obj.driver_usage;
+  }
+  if (isDriverStreamUsage(obj.token_usage)) {
+    return obj.token_usage;
+  }
+  return undefined;
+}
+
+async function resolveInstanceDriverUsage(input: {
+  summary: unknown;
+  stateRoot: string;
+  taskId?: string;
+}): Promise<TaskDriverUsage | undefined> {
+  const fromSummary = readSummaryDriverUsage(input.summary);
+  if (fromSummary) return fromSummary;
+  if (!input.taskId) return undefined;
+  const projected = await projectTaskDriverUsage(
+    path.join(input.stateRoot, 'runs'),
+    input.taskId,
+  );
+  return projected.available ? projected : undefined;
+}
+
+async function resolveInstanceTokenUsage(input: {
+  summary: unknown;
   sessionId?: string;
   worktreePath: string;
 }): Promise<TokenUsage> {
-  const claudeRoot = path.join(process.env.USERPROFILE ?? process.env.HOME ?? '', '.claude');
-  if (!claudeRoot || !existsSync(claudeRoot)) return emptyTokenUsage();
-
-  const candidates: string[] = [];
-  if (input.sessionId) {
-    const projectDir = path.join(
-      claudeRoot,
-      'projects',
-      encodeClaudeProjectDir(input.worktreePath),
-    );
-    candidates.push(path.join(projectDir, `${input.sessionId}.jsonl`));
-    candidates.push(path.join(claudeRoot, 'sessions', `${input.sessionId}.json`));
-  }
-
-  // Fallback: newest jsonl under the encoded project dir (useful if session_id mapping drifts).
-  const projectDir = path.join(claudeRoot, 'projects', encodeClaudeProjectDir(input.worktreePath));
-  if (existsSync(projectDir)) {
-    try {
-      const files = (await fs.readdir(projectDir))
-        .filter((name) => name.endsWith('.jsonl'))
-        .map((name) => path.join(projectDir, name));
-      const ranked = await Promise.all(
-        files.map(async (filePath) => ({
-          filePath,
-          mtimeMs: (await fs.stat(filePath)).mtimeMs,
-        })),
-      );
-      ranked.sort((a, b) => b.mtimeMs - a.mtimeMs);
-      for (const entry of ranked.slice(0, 3)) {
-        if (!candidates.includes(entry.filePath)) candidates.push(entry.filePath);
-      }
-    } catch {
-      // ignore listing failures
-    }
-  }
-
-  for (const candidate of candidates) {
-    if (!existsSync(candidate) || !candidate.endsWith('.jsonl')) continue;
-    try {
-      const usage = await sumUsageFromClaudeJsonl(candidate, input.sessionId);
-      if (usage.assistant_messages > 0) return usage;
-    } catch {
-      // try next candidate
-    }
-  }
-  return emptyTokenUsage('unavailable', {
-    session_id: input.sessionId,
+  const fromSummary = readSummaryTokenUsage(input.summary);
+  if (fromSummary) return fromSummary;
+  const scraped = await collectClaudeSessionUsage({
+    ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+    worktreePath: input.worktreePath,
   });
-}
-
-async function sumUsageFromClaudeJsonl(
-  filePath: string,
-  expectedSessionId?: string,
-): Promise<TokenUsage> {
-  const text = await fs.readFile(filePath, 'utf-8');
-  let inputTokens = 0;
-  let outputTokens = 0;
-  let cacheCreation = 0;
-  let cacheRead = 0;
-  let assistantMessages = 0;
-  let matchedSessionId = expectedSessionId;
-
-  for (const line of text.split(/\r?\n/)) {
-    if (!line.trim()) continue;
-    let obj: {
-      type?: string;
-      sessionId?: string;
-      message?: { usage?: Record<string, unknown> };
-      usage?: Record<string, unknown>;
-    };
-    try {
-      obj = JSON.parse(line) as typeof obj;
-    } catch {
-      continue;
-    }
-    if (expectedSessionId && obj.sessionId && obj.sessionId !== expectedSessionId) continue;
-    if (obj.sessionId) matchedSessionId = obj.sessionId;
-    const usage = obj.message?.usage ?? obj.usage;
-    if (!usage || typeof usage !== 'object') continue;
-    if (obj.type !== 'assistant' && !obj.message?.usage) continue;
-
-    const nextInput = Number(usage.input_tokens ?? 0);
-    const nextOutput = Number(usage.output_tokens ?? 0);
-    const nextCacheCreation = Number(usage.cache_creation_input_tokens ?? 0);
-    const nextCacheRead = Number(usage.cache_read_input_tokens ?? 0);
-    if (![nextInput, nextOutput, nextCacheCreation, nextCacheRead].every(Number.isFinite)) {
-      continue;
-    }
-    inputTokens += nextInput;
-    outputTokens += nextOutput;
-    cacheCreation += nextCacheCreation;
-    cacheRead += nextCacheRead;
-    assistantMessages += 1;
-  }
-
-  const totalInput = inputTokens + cacheCreation + cacheRead;
-  return {
-    input_tokens: inputTokens,
-    output_tokens: outputTokens,
-    cache_creation_input_tokens: cacheCreation,
-    cache_read_input_tokens: cacheRead,
-    total_input_tokens: totalInput,
-    total_tokens: totalInput + outputTokens,
-    assistant_messages: assistantMessages,
-    source: assistantMessages > 0 ? 'claude_session_jsonl' : 'unavailable',
-    session_path: filePath,
-    session_id: matchedSessionId,
-  };
+  return toAblationTokenUsage(scraped);
 }
 
 function summarizeTiming(rows: InstanceRow[]): {
@@ -719,7 +811,12 @@ function summarizeTokens(rows: InstanceRow[]): {
   instances_with_tokens: number;
   instances: number;
 } {
-  const withTokens = rows.filter((row) => row.token_usage?.source === 'claude_session_jsonl');
+  const withTokens = rows.filter(
+    (row) =>
+      row.token_usage &&
+      row.token_usage.source !== 'unavailable' &&
+      (row.token_usage.total_tokens > 0 || row.token_usage.call_count > 0),
+  );
   return {
     input_tokens: withTokens.reduce((sum, row) => sum + (row.token_usage?.input_tokens ?? 0), 0),
     output_tokens: withTokens.reduce((sum, row) => sum + (row.token_usage?.output_tokens ?? 0), 0),
@@ -741,31 +838,26 @@ function summarizeTokens(rows: InstanceRow[]): {
   };
 }
 
-function summarizeCouncilUsage(rows: InstanceRow[]): {
-  instances: number;
-  sessions: number;
-  driver_duration_ms: number;
+function summarizeDriverUsage(rows: InstanceRow[]): {
   context_tokens_used: number;
-  cost_by_currency: Record<string, number>;
+  reported_cost_usd: number;
+  sessions: number;
+  instances_with_driver_usage: number;
+  instances: number;
 } {
-  const costByCurrency: Record<string, number> = {};
-  for (const row of rows) {
-    for (const [currency, amount] of Object.entries(row.council_usage?.cost_by_currency ?? {})) {
-      costByCurrency[currency] = (costByCurrency[currency] ?? 0) + amount;
-    }
-  }
+  const withDriver = rows.filter((row) => row.driver_usage?.available === true);
   return {
+    context_tokens_used: withDriver.reduce(
+      (sum, row) => sum + (row.driver_usage?.context_tokens_used ?? 0),
+      0,
+    ),
+    reported_cost_usd: withDriver.reduce((sum, row) => {
+      const usd = row.driver_usage?.reported_costs.find((cost) => cost.currency === 'USD');
+      return sum + (usd?.amount ?? 0);
+    }, 0),
+    sessions: withDriver.reduce((sum, row) => sum + (row.driver_usage?.sessions.length ?? 0), 0),
+    instances_with_driver_usage: withDriver.length,
     instances: rows.length,
-    sessions: rows.reduce((sum, row) => sum + (row.council_usage?.session_count ?? 0), 0),
-    driver_duration_ms: rows.reduce(
-      (sum, row) => sum + (row.council_usage?.driver_duration_ms ?? 0),
-      0,
-    ),
-    context_tokens_used: rows.reduce(
-      (sum, row) => sum + (row.council_usage?.context_tokens_used ?? 0),
-      0,
-    ),
-    cost_by_currency: costByCurrency,
   };
 }
 
@@ -816,14 +908,7 @@ async function startBackend(label: string, env: NodeJS.ProcessEnv): Promise<Back
       }, 60_000).unref();
     });
     child.stdin?.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
-    const response = await Promise.race([
-      waiting,
-      closed.then((code) => {
-        throw new Error(
-          `[${label}] backend exited before ${method} responded (code=${String(code)}). stderr=${stderr.join('')}`,
-        );
-      }),
-    ]);
+    const response = await waiting;
     if (response.error) {
       throw new Error(
         `[${label}] ${method}: ${String(response.error.code)} ${response.error.message} stderr=${stderr.join('')}`,
@@ -838,7 +923,8 @@ async function startBackend(label: string, env: NodeJS.ProcessEnv): Promise<Back
   return {
     request,
     waitForTerminal: async (runId, timeoutMs) => {
-      const deadline = Date.now() + timeoutMs;
+      const unlimited = !Number.isFinite(timeoutMs) || timeoutMs <= 0;
+      const deadline = unlimited ? Number.POSITIVE_INFINITY : Date.now() + timeoutMs;
       while (Date.now() < deadline) {
         const snapshot = await request<Record<string, unknown>>('run.getSnapshot', {
           run_id: runId,
@@ -846,7 +932,41 @@ async function startBackend(label: string, env: NodeJS.ProcessEnv): Promise<Back
         if (snapshot.status !== 'running') return snapshot;
         await sleep(1_000);
       }
+
+      // Timeout must cancel the live run; otherwise the shared backend keeps the
+      // ACP driver busy and the next instance starves with zero tool events.
+      log(`[${label}] run ${runId} timed out after ${String(timeoutMs)}ms; cancelling`);
+      try {
+        await request('run.cancel', { run_id: runId });
+      } catch (error) {
+        log(
+          `[${label}] warn: run.cancel failed for ${runId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+      const cancelDeadline = Date.now() + 60_000;
+      while (Date.now() < cancelDeadline) {
+        const snapshot = await request<Record<string, unknown>>('run.getSnapshot', {
+          run_id: runId,
+        });
+        if (snapshot.status !== 'running') break;
+        await sleep(500);
+      }
+
       throw new Error(`[${label}] run ${runId} did not finish within ${String(timeoutMs)}ms`);
+    },
+    waitForTaskTerminal: async (taskId, timeoutMs) => {
+      const unlimited = !Number.isFinite(timeoutMs) || timeoutMs <= 0;
+      const deadline = unlimited ? Number.POSITIVE_INFINITY : Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const snapshot = await request<TaskTerminalSnapshot>('task.get', { task_id: taskId });
+        if (['completed', 'failed', 'cancelled', 'blocked'].includes(snapshot.task.status)) {
+          return snapshot;
+        }
+        await sleep(1_000);
+      }
+      throw new Error(`[${label}] task ${taskId} did not finish within ${String(timeoutMs)}ms`);
     },
     close: async () => {
       child.stdin?.end();
@@ -861,6 +981,12 @@ async function startBackend(label: string, env: NodeJS.ProcessEnv): Promise<Back
       }
     },
   };
+}
+
+function latestTerminalRunId(snapshot: TaskTerminalSnapshot): string {
+  const latest = snapshot.run_history[0];
+  if (!latest) throw new Error(`Task ${snapshot.task.task_id} has no terminal Run`);
+  return latest.run_id;
 }
 
 function parseAblations(raw: string): MemoryAblation[] {
@@ -878,6 +1004,40 @@ function parseAblations(raw: string): MemoryAblation[] {
   }
   if (out.length === 0) throw new Error('At least one ablation is required.');
   return out;
+}
+
+function parseRunMode(raw: string): EvaluationRunMode {
+  if (raw === 'single_agent' || raw === 'council') return raw;
+  throw new Error(`Invalid --mode "${raw}". Expected single_agent|council.`);
+}
+
+async function loadMergedArmReports(
+  root: string,
+  localArms: Array<{
+    ablation: MemoryAblation;
+    state_root: string;
+    database_schema: string;
+    scored_count: number;
+    resolved_count: number;
+    applied_count: number;
+    p2p_regression_count: number;
+    instances: InstanceRow[];
+  }>,
+): Promise<typeof localArms> {
+  const byAblation = new Map(localArms.map((arm) => [arm.ablation, arm]));
+  for (const ablation of ['B0', 'B1', 'B2', 'B3'] as MemoryAblation[]) {
+    if (byAblation.has(ablation)) continue;
+    const candidate = path.join(root, ablation, 'arm-summary.json');
+    const parsed = await readJsonIfExists(candidate);
+    if (!parsed || typeof parsed !== 'object') continue;
+    const arm = parsed as (typeof localArms)[number];
+    if (arm.ablation === ablation && Array.isArray(arm.instances)) {
+      byAblation.set(ablation, arm);
+    }
+  }
+  return [...byAblation.values()].sort((left, right) =>
+    left.ablation.localeCompare(right.ablation),
+  );
 }
 
 function sanitizeFileName(value: string): string {
@@ -920,6 +1080,13 @@ async function readJsonIfExists(filePath: string): Promise<unknown> {
   }
 }
 
+function resolveAblationDatabaseUrl(template: string, ablation: MemoryAblation): string {
+  if (!template.includes('{ablation}')) {
+    throw new Error('NEWIDE_ABLATION_DATABASE_URL_TEMPLATE must contain {ablation}');
+  }
+  return template.replaceAll('{ablation}', ablation.toLowerCase());
+}
+
 function readPositiveInt(raw: string | undefined, fallback: number): number {
   const value = Number(raw);
   return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
@@ -928,6 +1095,7 @@ function readPositiveInt(raw: string | undefined, fallback: number): number {
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
 
 function log(message: string): void {
   process.stderr.write(`${message}\n`);

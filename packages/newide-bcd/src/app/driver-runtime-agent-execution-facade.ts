@@ -3,31 +3,54 @@ import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { SCHEMA_VERSION, createId, nowTimestamp, type ArtifactRef } from '../core';
+import {
+  SCHEMA_VERSION,
+  createId,
+  nowTimestamp,
+  type AgentMessageType,
+  type ArtifactRef,
+} from '../core';
 import {
   diffWorkspaceFiles,
+  isDeliverableWorkspacePath,
   snapshotWorkspaceFiles,
   type WorkspaceFileSnapshot,
 } from '../coordinator/workspace-change-detector';
 import {
   AgentManager,
   InvokeDriverTool,
+  LlmRetirementEvaluator,
   createAgentMemoryScope,
   repositoryRetrieveMemoryForTask,
   resolveMemoryAblationPolicy,
   runWithMemoryAblationPolicy,
   type AgentTaskRequest,
+  type AgentHandle,
   type BufferRepository,
   type CollectCompetitionClaimsOptions,
   type CompetitionClaimBatch,
+  type CreateAgentSpec,
   type DispatchTaskResult,
   type DriverContext,
   type DriverTask,
   type EmbeddingProvider,
+  type LlmClient,
   type MemoryRetrievalResult,
   type MemoryRepository,
+  type RetireOptions,
+  type RetireResult,
+  type RetirementEvaluator,
+  type RetirementScanResult,
   type ToolCallingClient,
 } from '../memory';
+import {
+  MailboxSendTool,
+  expectsMailboxReply,
+  type MailboxSendToolInput,
+  type MailboxToolOutcome,
+  type PersistedMailboxEnvelope,
+  type PersistentMailboxService,
+} from '../mailbox';
 import type {
   AgentExecutionFacade,
   AgentExecutionOptions,
@@ -36,9 +59,9 @@ import type {
   AgentExecutionStatus,
 } from '../protocol/agent-execution';
 import type {
-  AgentMailboxWakePort,
-  AgentMailboxWakeRequestV1,
-} from '../protocol/agent-mailbox-wake';
+  ParticipantSessionProvisionRequest,
+  ParticipantSessionRegistry,
+} from '../coordination/participant-session-registry';
 import type {
   DriverRunResult,
   DriverRunStatus,
@@ -66,12 +89,23 @@ export interface DriverRuntimeAgentExecutionFacadeOptions {
   embedding?: EmbeddingProvider;
   evidenceStore?: AgentExecutionEvidenceStore;
   memoryMaintenance?: BMemoryMaintenancePort;
+  mailbox?: {
+    service: PersistentMailboxService;
+    /** 协作名册：静态数组或动态提供者（每次使用时查询，支持运行时新增 Agent） */
+    allowedRoleIds: readonly string[] | (() => Promise<readonly string[]>);
+    defaultDeadlineSeconds?: number;
+    sessionRegistry?: ParticipantSessionRegistry;
+  };
 }
 
 interface InvocationContext {
   task_id: string;
   run_id: string;
+  role_id: string;
+  context_policy: string;
   instruction: string;
+  driver_instruction: string;
+  driver_instruction_locked: boolean;
   workspace_path?: string;
   session_id?: string;
   signal?: AbortSignal;
@@ -80,6 +114,11 @@ interface InvocationContext {
   retrieval: MemoryRetrievalResult;
   driver_invocation_context?: DriverRuntimeInvokerInput['driver_context'];
   agent_system_prompt_sha256?: string;
+  inbound_mailbox?: PersistedMailboxEnvelope;
+  notice_mailboxes: PersistedMailboxEnvelope[];
+  mailbox_outcomes: MailboxToolOutcome[];
+  mailbox_sequence: number;
+  collaboration_brief?: string;
   driver_attempts: number;
   abortObserved: boolean;
 }
@@ -89,14 +128,16 @@ const TOP_LEVEL_MEMORY_ITEM_LIMIT = 5;
 const TOP_LEVEL_MEMORY_ID_LIMIT = 120;
 const TOP_LEVEL_MEMORY_DESCRIPTION_LIMIT = 240;
 const TOP_LEVEL_MEMORY_CONTENT_LIMIT = 1_000;
+const DEFAULT_MAILBOX_DEADLINE_SECONDS = 300;
+const PRODUCTION_EXECUTION_CONTRACT =
+  'Production execution contract: call invoke_driver for task work; a text-only answer is not task completion.';
 
-export class DriverRuntimeAgentExecutionFacade
-  implements AgentExecutionFacade, AgentMailboxWakePort
-{
+export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
   private readonly manager: Promise<AgentManager>;
   private readonly roleReady = new Map<string, Promise<AgentManager>>();
   private readonly invalidatedRoles = new Set<string>();
   private readonly executionQueues = new Map<string, Promise<void>>();
+  private readonly sessionProvisioning = new Map<string, Promise<string>>();
   private readonly invocationContext = new AsyncLocalStorage<InvocationContext>();
   private readonly invokeDriverRuntime: ReturnType<typeof createDriverRuntimeInvoker>;
 
@@ -110,15 +151,23 @@ export class DriverRuntimeAgentExecutionFacade
   }
 
   private createManager(): Promise<AgentManager> {
+    const tools = [
+      new InvokeDriverTool((task) => this.invokeDriver(task)),
+      ...(this.options.mailbox
+        ? [new MailboxSendTool((input) => this.sendMailbox(input))]
+        : []),
+    ];
     return AgentManager.create(this.options.repository, this.options.bufferRepository, {
       tools: {
         llm: {
           completeWithTools: (input) => this.completeWithTools(input),
         },
-        tools: [new InvokeDriverTool((task) => this.invokeDriver(task))],
-        maxToolCalls: 4,
+        tools,
+        maxToolCalls: this.options.mailbox ? 6 : 4,
       },
       ...(this.options.embedding ? { embedding: this.options.embedding } : {}),
+      // 三重门控退休检测的 LLM 层：把 ToolCallingClient 适配为 LlmClient
+      retirementEvaluator: createToolRetirementEvaluator(this.options.llm),
     });
   }
 
@@ -126,10 +175,62 @@ export class DriverRuntimeAgentExecutionFacade
     await this.ensureRole(agentId);
   }
 
-  async wakeAgent(request: AgentMailboxWakeRequestV1): Promise<void> {
-    const agentId = request.recipient_agent_id ?? request.recipient_role_id;
-    if (!agentId) throw new Error('Mailbox wake requires an Agent or role recipient');
-    await this.ensureAgent(agentId);
+  async provisionParticipantSession(input: ParticipantSessionProvisionRequest): Promise<string> {
+    const workspacePath = path.resolve(input.workspace_path);
+    const existing = this.options.mailbox?.sessionRegistry?.get(
+      input.task_id,
+      workspacePath,
+      input.role_id,
+    );
+    if (existing) return existing;
+    const key = `${input.task_id}\u0000${workspacePath}\u0000${input.role_id}`;
+    const pending = this.sessionProvisioning.get(key);
+    if (pending) return pending;
+    const provisioning = this.createParticipantSession({
+      ...input,
+      workspace_path: workspacePath,
+    }).finally(() => this.sessionProvisioning.delete(key));
+    this.sessionProvisioning.set(key, provisioning);
+    return provisioning;
+  }
+
+  private async createParticipantSession(
+    input: ParticipantSessionProvisionRequest,
+  ): Promise<string> {
+    await this.ensureRole(input.role_id);
+    const result = await this.options.driver.sendPrompt({
+      task_id: input.task_id,
+      run_id: `${input.run_id}:session-provision:${input.role_id}`,
+      prompt: [
+        'NewIDE session initialization only.',
+        `Register this ACP session for collaboration role ${input.role_id}.`,
+        'Do not modify files, call tools, or solve the task. Reply with SESSION_READY and stop.',
+        'This instruction applies only to this initialization turn; every later turn must follow its newest task instruction instead.',
+      ].join('\n'),
+      workspace_path: input.workspace_path,
+      created_at: nowTimestamp(),
+      schema_version: SCHEMA_VERSION,
+    });
+    const usableSession =
+      Boolean(result.session_id) &&
+      result.session_id !== this.options.driver.session_id &&
+      result.session_id !== 'session-unavailable';
+    // Claude Agent SDK can stream SESSION_READY then throw a DeepSeek 402 on a
+    // follow-up (title / telemetry). The init turn already succeeded.
+    const sessionReady = /\bSESSION_READY\b/.test(result.response ?? '');
+    if (!usableSession || (result.status !== 'succeeded' && !sessionReady)) {
+      const detail = result.error?.message ?? result.diagnostics.notes.join('; ');
+      throw new Error(
+        `ACP did not create a usable Session for ${input.role_id} (status=${result.status}${detail ? `, detail=${detail}` : ''})`,
+      );
+    }
+    this.options.mailbox?.sessionRegistry?.register({
+      task_id: input.task_id,
+      workspace_path: input.workspace_path,
+      role_id: input.role_id,
+      session_id: result.session_id,
+    });
+    return result.session_id;
   }
 
   async collectCompetitionClaims(
@@ -137,6 +238,59 @@ export class DriverRuntimeAgentExecutionFacade
     options?: CollectCompetitionClaimsOptions,
   ): Promise<CompetitionClaimBatch> {
     return (await this.manager).collectCompetitionClaims(task, options);
+  }
+
+  /**
+   * 优雅退休（week3 RFC §12）：委托给持有该 role 的 AgentManager。
+   *
+   * 选择 roleReady 中该 role 当前的 Manager（可能因 abort 恢复而重建），
+   * 否则退回基座 Manager（create 时已从 Repository 预加载全部 Agent）。
+   */
+  async retireAgent(roleId: string, options: RetireOptions = {}): Promise<RetireResult> {
+    const manager = await (this.roleReady.get(roleId) ?? this.manager);
+    return manager.retireAgent(roleId, options);
+  }
+
+  /**
+   * 显式创建 Agent（memory.createAgent）：走基座 AgentManager.createAgent，
+   * 保证内存 map、buffer 初始化与 QueryMemoryTool 注入与 DB 一致。
+   */
+  async createAgent(spec: CreateAgentSpec): Promise<AgentHandle> {
+    const manager = await this.manager;
+    return manager.createAgent(spec);
+  }
+
+  /**
+   * 更新 Agent 元数据（名称 / 标签）：委托 repository.updateAgentMeta。
+   * Agent 运行时实例通过 scope 读 repository，无需重建。
+   */
+  async updateAgent(
+    roleId: string,
+    patch: { name?: string; tags?: string[] },
+  ): Promise<AgentHandle> {
+    await this.options.repository.updateAgentMeta(roleId, patch);
+    return this.options.repository.getAgent(roleId);
+  }
+
+  /**
+   * 硬删除 Agent（memory.deleteAgent）：委托基座 AgentManager.deleteAgent。
+   * 安全前置（retired）与确认参数由 AgentManager / RPC 层保证；
+   * `options.force` 允许删除未退休 Agent（级联丢弃其全部资产）。
+   */
+  async deleteAgent(roleId: string, options?: { force?: boolean }): Promise<void> {
+    const manager = await this.manager;
+    await manager.deleteAgent(roleId, options);
+  }
+
+  /**
+   * 三重门控退休检测（week3 RFC §8.2）：委托给持有该 role 的 AgentManager。
+   *
+   * 只产出 recommended_action 与逐层证据，不自动退休。
+   * @param roleId 指定扫描单个 Agent；缺省扫描全部活跃 Agent。
+   */
+  async runRetirementScan(roleId?: string): Promise<RetirementScanResult[]> {
+    const manager = roleId ? (this.roleReady.get(roleId) ?? this.manager) : this.manager;
+    return (await manager).scanForRetirements(roleId);
   }
 
   async runAgent(
@@ -147,17 +301,74 @@ export class DriverRuntimeAgentExecutionFacade
     const normalizedInput = input.workspace_path
       ? { ...input, workspace_path: path.resolve(input.workspace_path) }
       : input;
-    const runtimeRoleId = normalizedInput.role_id;
+    let boundSession =
+      normalizedInput.workspace_path && this.options.mailbox?.sessionRegistry
+        ? this.options.mailbox.sessionRegistry.get(
+            normalizedInput.task_id,
+            normalizedInput.workspace_path,
+            normalizedInput.role_id,
+          )
+        : undefined;
+    if (
+      !normalizedInput.session_id &&
+      !boundSession &&
+      normalizedInput.workspace_path &&
+      this.options.mailbox?.sessionRegistry
+    ) {
+      boundSession = await this.provisionParticipantSession({
+        task_id: normalizedInput.task_id,
+        workspace_path: normalizedInput.workspace_path,
+        role_id: normalizedInput.role_id,
+        run_id: normalizedInput.run_id,
+      });
+    }
+    const scopedInput =
+      normalizedInput.session_id || !boundSession
+        ? normalizedInput
+        : { ...normalizedInput, session_id: boundSession };
+    const runtimeRoleId = scopedInput.role_id;
+    // Mailbox semantics serialize one logical role, while different roles
+    // remain runnable in parallel even when they share a workspace.
     const queueKeys = [
       `role:${runtimeRoleId}`,
-      ...(normalizedInput.workspace_path ? [`workspace:${normalizedInput.workspace_path}`] : []),
     ];
     return this.enqueue(
       queueKeys,
       async () => {
         throwIfAborted(options?.signal);
-        const manager = await this.ensureRole(runtimeRoleId);
-        return this.execute(manager, normalizedInput, runtimeRoleId, options);
+        let manager = await this.ensureRole(runtimeRoleId);
+        if (manager.getAgent(runtimeRoleId)?.hasPendingTask()) {
+          await this.recoverRole(runtimeRoleId);
+          manager = await this.ensureRole(runtimeRoleId);
+        }
+        let result: AgentExecutionResult;
+        try {
+          result = await this.execute(manager, scopedInput, runtimeRoleId, options);
+        } catch (error) {
+          await this.recoverRole(runtimeRoleId);
+          throw error;
+        }
+        if (result.status !== 'completed') {
+          await this.recoverRole(runtimeRoleId);
+        }
+        const effectiveSessionId = scopedInput.session_id ?? result.session_id;
+        if (
+          effectiveSessionId &&
+          scopedInput.workspace_path &&
+          this.options.mailbox?.sessionRegistry &&
+          result.status === 'completed'
+        ) {
+          this.options.mailbox.sessionRegistry.register({
+            task_id: scopedInput.task_id,
+            workspace_path: scopedInput.workspace_path,
+            role_id: scopedInput.role_id,
+            session_id: effectiveSessionId,
+          });
+        }
+        if (result.status === 'completed' && scopedInput.workspace_path) {
+          this.finishNoticeMailbox(scopedInput, result);
+        }
+        return result;
       },
       options?.signal,
     );
@@ -177,6 +388,18 @@ export class DriverRuntimeAgentExecutionFacade
       call_id: createId('call'),
       source_driver: this.options.driver.driver_id,
     };
+    const inboundMailbox = input.mailbox_delivery_id
+      ? this.requireInboundMailbox(input)
+      : undefined;
+    const noticeMailboxes =
+      !input.mailbox_delivery_id && input.workspace_path && this.options.mailbox
+        ? this.options.mailbox.service
+            .inbox(input.task_id, input.workspace_path, input.role_id)
+            .filter(
+              (envelope) =>
+                isMailboxDeliveryAvailable(envelope) && !envelopeExpectsReply(envelope),
+            )
+        : [];
     return runWithMemoryAblationPolicy(ablationPolicy, async () => {
       const retrieval = await withAbort(
         repositoryRetrieveMemoryForTask(
@@ -201,10 +424,18 @@ export class DriverRuntimeAgentExecutionFacade
       const invocation: InvocationContext = {
         task_id: input.task_id,
         run_id: input.run_id,
+        role_id: runtimeRoleId,
+        context_policy: input.context_policy,
         instruction: input.instruction,
+        driver_instruction: input.driver_instruction ?? input.instruction,
+        driver_instruction_locked: input.driver_instruction !== undefined,
         ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
         ...(input.session_id ? { session_id: input.session_id } : {}),
         retrieval,
+        ...(inboundMailbox ? { inbound_mailbox: inboundMailbox } : {}),
+        notice_mailboxes: noticeMailboxes,
+        mailbox_outcomes: [],
+        mailbox_sequence: 0,
         driver_attempts: 0,
         abortObserved: false,
         ...(options?.signal ? { signal: options.signal } : {}),
@@ -229,10 +460,9 @@ export class DriverRuntimeAgentExecutionFacade
       );
 
       if (invocation.abortObserved || (invocation.signal?.aborted && !invocation.execution)) {
-        await this.recoverRole(runtimeRoleId);
         throwIfAborted(invocation.signal);
       }
-      return this.buildResult(
+      const result = await this.buildResult(
         input,
         dispatched,
         runtimeRoleId,
@@ -241,7 +471,17 @@ export class DriverRuntimeAgentExecutionFacade
         invocation.driver_attempts,
         invocation.driver_invocation_context,
         invocation.agent_system_prompt_sha256,
+        invocation.mailbox_outcomes,
       );
+      if (inboundMailbox && result.status === 'completed') {
+        this.finishInboundMailbox(
+          inboundMailbox,
+          result,
+          invocation.mailbox_outcomes,
+          input.session_id,
+        );
+      }
+      return result;
     });
   }
 
@@ -285,13 +525,322 @@ export class DriverRuntimeAgentExecutionFacade
       if (systemPromptSha256) {
         invocation.agent_system_prompt_sha256 ??= systemPromptSha256;
       }
+      const pendingReply = invocation.mailbox_outcomes.find(
+        (outcome) => outcome.kind === 'request' && outcome.wait_for_reply,
+      );
+      const completedReply = invocation.mailbox_outcomes.find(
+        (outcome) => outcome.kind === 'reply',
+      );
+      if (pendingReply) {
+        return {
+          content: `Mailbox request ${pendingReply.message_id} persisted; waiting for ${pendingReply.to_role_id}. [done]`,
+          tool_calls: undefined,
+        };
+      }
+      if (completedReply) {
+        return {
+          content: `Mailbox reply ${completedReply.message_id} persisted. [done]`,
+          tool_calls: undefined,
+        };
+      }
+      if (
+        shouldFinalizeAfterSuccessfulDriver(invocation.context_policy) &&
+        invocation.execution?.status === 'succeeded'
+      ) {
+        // Council and single-agent production persist their result through the Driver.
+        // A second top-level model turn only restates completion and can fail
+        // independently after the artifact was already written.
+        return {
+          content: invocation.context_policy?.startsWith('council_')
+            ? 'The Council Driver phase completed successfully. [done]'
+            : 'The Driver phase completed successfully. [done]',
+          tool_calls: undefined,
+        };
+      }
+      invocation.collaboration_brief ??= await this.buildCollaborationBrief(invocation);
       return await withAbort(
-        this.options.llm.completeWithTools(withTopLevelMemoryContext(input, invocation.retrieval)),
+        this.options.llm.completeWithTools(
+          withTopLevelExecutionContext(
+            input,
+            invocation.retrieval,
+            invocation.collaboration_brief,
+          ),
+        ),
         invocation.signal,
       );
     } catch (error) {
       if (invocation.signal?.aborted) invocation.abortObserved = true;
       throw error;
+    }
+  }
+
+  private requireInboundMailbox(input: AgentExecutionRequest): PersistedMailboxEnvelope {
+    const mailbox = this.options.mailbox;
+    if (!mailbox || !input.mailbox_delivery_id) {
+      throw new Error('Mailbox delivery execution requires configured Mailbox runtime');
+    }
+    const envelope = mailbox.service.getEnvelope(input.mailbox_delivery_id);
+    if (
+      envelope.message.task_id !== input.task_id ||
+      envelope.delivery.task_id !== input.task_id ||
+      envelope.delivery.recipient_role_id !== input.role_id ||
+      !input.workspace_path ||
+      path.resolve(envelope.message.workspace_path) !== path.resolve(input.workspace_path) ||
+      path.resolve(envelope.delivery.workspace_path) !== path.resolve(input.workspace_path)
+    ) {
+      throw new Error('Mailbox delivery does not match the Agent invocation scope');
+    }
+    return envelope;
+  }
+
+  /** 解析 mailbox 协作名册：支持静态数组与动态提供者（每次使用时查询） */
+  private async resolveAllowedRoleIds(): Promise<readonly string[]> {
+    const allowed = this.options.mailbox?.allowedRoleIds;
+    if (!allowed) return [];
+    return typeof allowed === 'function' ? allowed() : allowed;
+  }
+
+  private async isAllowedMailboxRecipient(roleId: string): Promise<boolean> {
+    const allowed = await this.resolveAllowedRoleIds();
+    return allowed.includes(roleId);
+  }
+
+  private async sendMailbox(input: MailboxSendToolInput): Promise<MailboxToolOutcome> {
+    const mailbox = this.options.mailbox;
+    const invocation = this.invocationContext.getStore();
+    if (!mailbox || !invocation) {
+      throw new Error('mailbox.send was called outside a configured Agent invocation');
+    }
+    const kind = input.kind ?? legacyMailboxKind(input.type);
+    const content = input.content ?? legacyMailboxContent(input.payload);
+    if (!input.to_role_id?.trim() || !kind || !content) {
+      throw new Error('mailbox_send requires to_role_id, kind and content');
+    }
+    if (!invocation.workspace_path) {
+      throw new Error('mailbox.send requires a workspace-bound Agent invocation');
+    }
+    if (!await this.isAllowedMailboxRecipient(input.to_role_id)) {
+      throw new Error(`Mailbox recipient ${input.to_role_id} is not in the collaboration roster`);
+    }
+    const waitForReply = expectsMailboxReply(kind);
+    if (waitForReply && invocation.context_policy === 'council_primary_plan') {
+      throw new Error(
+        'Council primary planning is independent: write council-plan.md instead of waiting for a Mailbox reply',
+      );
+    }
+    invocation.mailbox_sequence += 1;
+    if (
+      waitForReply &&
+      invocation.mailbox_outcomes.some(
+        (outcome) => outcome.kind === 'request' && outcome.wait_for_reply,
+      )
+    ) {
+      throw new Error('An Agent turn can wait for only one Mailbox reply');
+    }
+    const idempotencyKey = `${invocation.run_id}:mailbox:${String(invocation.mailbox_sequence)}`;
+    const deadlineSeconds =
+      mailbox.defaultDeadlineSeconds ?? DEFAULT_MAILBOX_DEADLINE_SECONDS;
+
+    if (
+      invocation.inbound_mailbox &&
+      envelopeExpectsReply(invocation.inbound_mailbox)
+    ) {
+      const inbound = invocation.inbound_mailbox;
+      if (input.to_role_id !== inbound.message.from_role_id) {
+        throw new Error(
+          `Mailbox reply must target the sender role ${inbound.message.from_role_id}`,
+        );
+      }
+      const sessionId = invocation.execution?.session_id ?? invocation.session_id;
+      if (!sessionId) {
+        throw new Error('Invoke the driver before replying so the target Session is known');
+      }
+      const source = mailbox.service.markInjected(
+        inbound.delivery.delivery_id,
+        invocation.role_id,
+        sessionId,
+      );
+      const reply = await mailbox.service.reply({
+        source_delivery_id: source.delivery_id,
+        from_role_id: invocation.role_id,
+        kind: kind === 'request' ? 'notice' : kind,
+        content,
+        ...(input.type ? { type: input.type } : {}),
+        ...(input.payload ? { payload: { ...input.payload } } : {}),
+        ...(input.artifact_refs ? { artifact_refs: [...input.artifact_refs] } : {}),
+        requires_ack: false,
+        idempotency_key: idempotencyKey,
+      });
+      const replyDelivery = reply.reply.deliveries[0];
+      if (!replyDelivery) throw new Error('Mailbox reply did not create a Delivery');
+      const outcome: MailboxToolOutcome = {
+        kind: 'reply',
+        message_id: reply.reply.message.message_id,
+        delivery_id: replyDelivery.delivery_id,
+        thread_id: reply.reply.message.thread_id,
+        from_role_id: invocation.role_id,
+        to_role_id: replyDelivery.recipient_role_id,
+        status: replyDelivery.status === 'injected' ? 'injected' : 'pending',
+        wait_for_reply: false,
+        source_delivery_id: source.delivery_id,
+      };
+      invocation.mailbox_outcomes.push(outcome);
+      return outcome;
+    }
+    if (invocation.inbound_mailbox && !invocation.execution) {
+      throw new Error(
+        'Process the inbound Mailbox delivery with invoke_driver before sending another message',
+      );
+    }
+
+    const sent = await mailbox.service.send({
+      task_id: invocation.task_id,
+      workspace_path: invocation.workspace_path,
+      thread_id: createId('thread'),
+      from_role_id: invocation.role_id,
+      to_role_id: input.to_role_id,
+      kind,
+      content,
+      ...(input.type ? { type: input.type } : {}),
+      ...(input.payload ? { payload: { ...input.payload } } : {}),
+      ...(input.artifact_refs ? { artifact_refs: [...input.artifact_refs] } : {}),
+      requires_ack: waitForReply,
+      ...(waitForReply ? { deadline_seconds: deadlineSeconds } : {}),
+      idempotency_key: idempotencyKey,
+    });
+    const delivery = sent.deliveries[0];
+    if (!delivery) throw new Error('Mailbox send did not create a Delivery');
+    const outcome: MailboxToolOutcome = {
+      kind: waitForReply ? 'request' : 'notice',
+      message_id: sent.message.message_id,
+      delivery_id: delivery.delivery_id,
+      thread_id: sent.message.thread_id,
+      from_role_id: invocation.role_id,
+      to_role_id: delivery.recipient_role_id,
+      status: 'pending',
+      wait_for_reply: waitForReply,
+    };
+    invocation.mailbox_outcomes.push(outcome);
+    return outcome;
+  }
+
+  private finishInboundMailbox(
+    inbound: PersistedMailboxEnvelope,
+    result: AgentExecutionResult,
+    outcomes: readonly MailboxToolOutcome[],
+    boundSessionId?: string,
+  ): void {
+    const mailbox = this.options.mailbox;
+    if (!mailbox) return;
+    const current = mailbox.service.getEnvelope(inbound.delivery.delivery_id).delivery;
+    const injected =
+      current.status === 'pending'
+      ? mailbox.service.markInjected(
+            current.delivery_id,
+            current.recipient_role_id,
+            boundSessionId ?? result.session_id,
+          )
+        : current;
+    const replied = outcomes.some(
+      (outcome) =>
+        outcome.kind === 'reply' && outcome.source_delivery_id === injected.delivery_id,
+    );
+    if (
+      injected.status === 'injected' &&
+      (!envelopeExpectsReply(inbound) || replied)
+    ) {
+      mailbox.service.ack(injected.delivery_id, injected.recipient_role_id);
+    }
+  }
+
+  private async buildCollaborationBrief(invocation: InvocationContext): Promise<string> {
+    const mailbox = this.options.mailbox;
+    if (!mailbox) return '';
+    const allowed = new Set(await this.resolveAllowedRoleIds());
+    const roleIds = (await this.options.repository.listAgentIds()).filter((roleId) =>
+      allowed.has(roleId),
+    );
+    const members = await Promise.all(
+      roleIds.map((roleId) => this.options.repository.getAgent(roleId)),
+    );
+    const inbound = invocation.inbound_mailbox;
+    return [
+      'Collaboration brief:',
+      `- Current role: ${invocation.role_id}`,
+      `- Task: ${invocation.task_id}`,
+      `- Workspace: ${invocation.workspace_path ?? '(not bound)'}`,
+      '- Available teammate roles:',
+      ...members.map(
+        (member) =>
+          `  - ${member.role_id} (${member.name}, ${member.status}): ${truncate(member.persona.summary, TOP_LEVEL_MEMORY_DESCRIPTION_LIMIT)}`,
+      ),
+      '- Communication: use mailbox_send(to_role_id, kind, content, artifact_refs?).',
+      ...(inbound
+        ? [
+            '- Inbound delivery takes precedence over the original Task wording; do not repeat the original outbound request.',
+          ]
+        : []),
+      ...(inbound
+        ? [
+            'Inbound mailbox envelope:',
+            `- delivery_id: ${inbound.delivery.delivery_id}`,
+            `- message_id: ${inbound.message.message_id}`,
+            `- thread_id: ${inbound.message.thread_id}`,
+            `- from_role_id: ${inbound.message.from_role_id}`,
+            `- kind: ${inbound.message.kind ?? legacyMailboxKind(inbound.message.type) ?? 'notice'}`,
+            `- content: ${inbound.message.content ?? legacyMailboxContent(inbound.message.payload) ?? JSON.stringify(inbound.message.payload)}`,
+            ...(inbound.message.artifact_refs.length > 0
+              ? [`- artifact_refs: ${JSON.stringify(inbound.message.artifact_refs)}`]
+              : []),
+            ...(envelopeExpectsReply(inbound)
+              ? [
+                  '- Process the request through invoke_driver first, then reply with mailbox_send to the sender role.',
+                ]
+              : [
+                  '- Process this message through invoke_driver and continue the Task; no Mailbox acknowledgement tool call is required.',
+                ]),
+          ]
+        : []),
+      ...(invocation.notice_mailboxes.length > 0
+        ? [
+            'Durable notices available on this natural turn:',
+            ...invocation.notice_mailboxes.map(
+              (notice) =>
+                `- delivery_id: ${notice.delivery.delivery_id}; from_role_id: ${notice.message.from_role_id}; ` +
+                `content: ${notice.message.content ?? legacyMailboxContent(notice.message.payload) ?? JSON.stringify(notice.message.payload)}` +
+                (notice.message.artifact_refs.length > 0
+                  ? `; artifact_refs: ${JSON.stringify(notice.message.artifact_refs)}`
+                  : ''),
+            ),
+          ]
+        : []),
+    ].join('\n');
+  }
+
+  private finishNoticeMailbox(
+    input: AgentExecutionRequest,
+    result: AgentExecutionResult,
+  ): void {
+    const mailbox = this.options.mailbox;
+    if (!mailbox || !input.workspace_path) return;
+    const notices = mailbox.service
+      .inbox(input.task_id, input.workspace_path, input.role_id)
+      .filter(
+        (envelope) => isMailboxDeliveryAvailable(envelope) && !envelopeExpectsReply(envelope),
+      );
+    for (const notice of notices) {
+      const current = mailbox.service.getEnvelope(notice.delivery.delivery_id).delivery;
+      const injected =
+        current.status === 'pending'
+          ? mailbox.service.markInjected(
+              current.delivery_id,
+              current.recipient_role_id,
+              input.session_id ?? result.session_id,
+            )
+          : current;
+      if (injected.status === 'injected') {
+        mailbox.service.ack(injected.delivery_id, injected.recipient_role_id);
+      }
     }
   }
 
@@ -306,7 +855,7 @@ export class DriverRuntimeAgentExecutionFacade
     throwIfAborted(invocation.signal);
     try {
       const driverInvocationContext: DriverRuntimeInvokerInput['driver_context'] = {
-        task_instruction: invocation.instruction,
+        task_instruction: invocation.driver_instruction,
         skills: deduplicateMemoryItems([
           ...toDriverMemoryItems(invocation.retrieval.skills),
           ...toMemoryItems('skill', task.context?.skills),
@@ -314,7 +863,9 @@ export class DriverRuntimeAgentExecutionFacade
         experiences: deduplicateMemoryItems([
           ...toDriverMemoryItems(invocation.retrieval.experiences),
           ...toMemoryItems('experience', task.context?.experiences),
-          ...delegationContext(invocation.instruction, task.instruction),
+          ...(invocation.driver_instruction_locked
+            ? []
+            : delegationContext(invocation.driver_instruction, task.instruction)),
         ]),
       };
       invocation.driver_invocation_context = driverInvocationContext;
@@ -360,6 +911,7 @@ export class DriverRuntimeAgentExecutionFacade
     driverAttempts: number,
     driverInvocationContext: DriverRuntimeInvokerInput['driver_context'] | undefined,
     agentSystemPromptSha256: string | undefined,
+    mailboxOutcomes: readonly MailboxToolOutcome[],
   ): Promise<AgentExecutionResult> {
     const memoryMaintenance = await this.processMemoryMaintenance(
       input,
@@ -375,6 +927,7 @@ export class DriverRuntimeAgentExecutionFacade
         agentSystemPromptSha256,
         workspaceArtifacts,
         memoryMaintenance,
+        mailboxOutcomes,
       );
     }
 
@@ -421,6 +974,9 @@ export class DriverRuntimeAgentExecutionFacade
         },
         promotion: dispatched.cycle.promotion.check,
         agent_runtime: agentRuntime,
+        ...(mailboxOutcomes.length > 0
+          ? { mailbox_outcomes: mailboxOutcomes.map((outcome) => ({ ...outcome })) }
+          : {}),
         ...(memoryMaintenance ? { memory_maintenance: memoryMaintenance } : {}),
         context_pack_persisted: contextEvidence.persisted,
         ...(contextEvidence.uri ? { context_pack_uri: contextEvidence.uri } : {}),
@@ -445,8 +1001,12 @@ export class DriverRuntimeAgentExecutionFacade
     agentSystemPromptSha256: string | undefined,
     workspaceArtifacts: ArtifactRef[],
     memoryMaintenance: BMemoryMaintenanceEvidence | undefined,
+    mailboxOutcomes: readonly MailboxToolOutcome[],
   ): Promise<AgentExecutionResult> {
     const created_at = nowTimestamp();
+    const mailboxWait = mailboxOutcomes.find(
+      (outcome) => outcome.kind === 'request' && outcome.wait_for_reply,
+    );
     const errorCode = `B_${dispatched.status.toUpperCase()}`;
     const errorMessage = dispatched.cycle.buffer_snapshot.driver_return.summary;
     const transcript: ArtifactRef = {
@@ -476,19 +1036,25 @@ export class DriverRuntimeAgentExecutionFacade
       driver_run_result_id: createId('driver_result'),
       artifact_refs: [...workspaceArtifacts],
       transcript_ref: transcript,
-      session_id: this.options.driver.session_id,
-      response: '',
+      session_id: input.session_id ?? this.options.driver.session_id,
+      response: mailboxWait
+        ? `Waiting for Mailbox reply from ${mailboxWait.to_role_id}.`
+        : '',
       tool_events: [],
       diagnostics: {
         driver_id: this.options.driver.driver_id,
-        driver_status: 'failed',
+        driver_status: mailboxWait ? 'not_invoked' : 'failed',
         dispatch_status: dispatched.status,
-        driver_error_code: errorCode,
-        driver_error: {
-          code: errorCode,
-          message: errorMessage,
-          retryable: dispatched.status === 'blocked',
-        },
+        ...(mailboxWait
+          ? { mailbox_wait: true }
+          : {
+              driver_error_code: errorCode,
+              driver_error: {
+                code: errorCode,
+                message: errorMessage,
+                retryable: dispatched.status === 'blocked',
+              },
+            }),
         context_policy: input.context_policy,
         input_artifact_refs: [...input.input_artifact_refs],
         buffer_seq: dispatched.cycle.buffer_seq,
@@ -497,11 +1063,18 @@ export class DriverRuntimeAgentExecutionFacade
           skills: dispatched.cycle.retrieval.skills.length,
         },
         agent_runtime: agentRuntime,
+        ...(mailboxOutcomes.length > 0
+          ? { mailbox_outcomes: mailboxOutcomes.map((outcome) => ({ ...outcome })) }
+          : {}),
         ...(memoryMaintenance ? { memory_maintenance: memoryMaintenance } : {}),
         context_pack_persisted: contextEvidence.persisted,
         ...(contextEvidence.uri ? { context_pack_uri: contextEvidence.uri } : {}),
       },
-      status: dispatched.status === 'cancelled' ? 'cancelled' : 'failed',
+      status: mailboxWait
+        ? 'completed'
+        : dispatched.status === 'cancelled'
+          ? 'cancelled'
+          : 'failed',
       memory_buffer_ref: contextEvidence.memory_buffer_ref,
       created_at,
       schema_version: SCHEMA_VERSION,
@@ -648,6 +1221,30 @@ export class DriverRuntimeAgentExecutionFacade
   }
 }
 
+function envelopeExpectsReply(envelope: PersistedMailboxEnvelope): boolean {
+  return (
+    !envelope.message.reply_to_message_id &&
+    expectsMailboxReply(envelope.message.kind ?? legacyMailboxKind(envelope.message.type) ?? 'notice')
+  );
+}
+
+function isMailboxDeliveryAvailable(envelope: PersistedMailboxEnvelope): boolean {
+  return envelope.delivery.status === 'pending' || envelope.delivery.status === 'injected';
+}
+
+function legacyMailboxKind(
+  type: AgentMessageType | undefined,
+): 'request' | 'notice' | undefined {
+  if (!type) return undefined;
+  return expectsMailboxReply(type) ? 'request' : 'notice';
+}
+
+function legacyMailboxContent(payload: Record<string, unknown> | undefined): string | undefined {
+  if (!payload) return undefined;
+  if (typeof payload.content === 'string' && payload.content.trim()) return payload.content;
+  return JSON.stringify(payload);
+}
+
 function hashSystemPrompt(
   messages: Array<{ role: string; content: string | null }>,
 ): string | undefined {
@@ -671,6 +1268,10 @@ function buildAgentRuntimeEvidence(
     persona_generated_at: persona.generated_at,
     ...(systemPromptSha256 ? { system_prompt_sha256: systemPromptSha256 } : {}),
   };
+}
+
+function shouldFinalizeAfterSuccessfulDriver(contextPolicy: string | undefined): boolean {
+  return Boolean(contextPolicy?.startsWith('council_') || contextPolicy === 'production_task_loop');
 }
 
 function mapStatus(
@@ -733,12 +1334,14 @@ function withRetrievedMemory(
   };
 }
 
-function withTopLevelMemoryContext(
+function withTopLevelExecutionContext(
   input: Parameters<ToolCallingClient['completeWithTools']>[0],
   retrieval: MemoryRetrievalResult,
+  collaborationBrief: string,
 ): Parameters<ToolCallingClient['completeWithTools']>[0] {
   const memoryContext = renderTopLevelMemoryContext(retrieval);
-  if (!memoryContext) return input;
+  const context = [memoryContext, collaborationBrief].filter(Boolean).join('\n\n');
+  if (!context) return input;
 
   let injected = false;
   return {
@@ -746,7 +1349,10 @@ function withTopLevelMemoryContext(
     messages: input.messages.map((message) => {
       if (injected || message.role !== 'user' || message.content === null) return message;
       injected = true;
-      return { ...message, content: `${message.content}\n\n${memoryContext}` };
+      return {
+        ...message,
+        content: `${PRODUCTION_EXECUTION_CONTRACT}\n\n${message.content}\n\n${context}`,
+      };
     }),
   };
 }
@@ -843,7 +1449,36 @@ async function collectWorkspaceArtifacts(
   return artifacts;
 }
 
-function mergeArtifacts(
+/**
+ * 把 ToolCallingClient 适配为退休评估的 LlmClient，并构建三重门控的 LLM 层评估器。
+ *
+ * 生产路径：DriverRuntimeAgentExecutionFacade 持有的是 ToolCallingClient，
+ * 而记忆模块的 LlmRetirementEvaluator 需要 LlmClient；这里做最小适配，
+ * 不带工具调用（退休评估是纯文本 JSON 输出）。
+ */
+export function createToolRetirementEvaluator(llm: ToolCallingClient): RetirementEvaluator {
+  const adapter: LlmClient = {
+    async complete(input) {
+      const result = await llm.completeWithTools({
+        messages: input.messages.map((message) => ({
+          role: message.role,
+          content: message.content ?? '',
+        })),
+        tools: [],
+        tool_choice: 'none',
+      });
+      return result.content ?? '';
+    },
+  };
+  return new LlmRetirementEvaluator(adapter);
+}
+
+/** Normalize artifact target paths so Windows `\` and POSIX `/` compare equal. */
+export function normalizeArtifactTargetPath(value: string): string {
+  return value.replace(/\\/g, '/');
+}
+
+export function mergeArtifacts(
   driverArtifacts: readonly ArtifactRef[],
   workspaceArtifacts: readonly ArtifactRef[],
 ): ArtifactRef[] {
@@ -853,21 +1488,12 @@ function mergeArtifacts(
   // Driver edit snippets when both artifacts target the same path.
   for (const artifact of [...workspaceArtifacts, ...driverArtifacts]) {
     const target = artifact.content?.target_path;
-    if (target && seenTargets.has(target)) continue;
-    if (target) seenTargets.add(target);
+    const key = target ? normalizeArtifactTargetPath(target) : undefined;
+    if (key && seenTargets.has(key)) continue;
+    if (key) seenTargets.add(key);
     result.push(artifact);
   }
   return result;
-}
-
-function isDeliverableWorkspacePath(relativePath: string): boolean {
-  const parts = relativePath.split('/');
-  return (
-    parts.every((part) => part !== '.claude' && part !== '.newide') &&
-    !parts.some((part) => part.startsWith('.')) &&
-    !relativePath.endsWith('_report.txt') &&
-    path.basename(relativePath) !== '.DS_Store'
-  );
 }
 
 function mediaTypeFor(relativePath: string): string {

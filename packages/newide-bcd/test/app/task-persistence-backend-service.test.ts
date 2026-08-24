@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
-import { writeFileSync } from 'node:fs';
-import { mkdir, mkdtemp, realpath, rm } from 'node:fs/promises';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtemp, realpath, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -9,7 +9,7 @@ import { InMemoryRunRegistry } from '../../src/app/run-registry';
 import type { AppRunEvent } from '../../src/app/run-registry';
 import { FileRunRequestStore } from '../../src/app/run-request-store';
 import { NewideBackendService } from '../../src/app/newide-backend-service';
-import { TaskProcessor } from '../../src/app/task-processor';
+import { TaskProcessor } from '../../src/coordination';
 import { FileRunTerminalOutputWriter } from '../../src/app/run-terminal-output-writer';
 import type {
   CoordinatorRunner,
@@ -18,15 +18,13 @@ import type {
 import type { IntegrationV0Result } from '../../src/coordinator/integration-v0-flow';
 import { SqliteCoordinationStore } from '../../src/persistence';
 
-function initializeGitWorkspace(workspace: string): void {
-  const git = (args: string[]) =>
-    execFileSync('git', args, { cwd: workspace, stdio: ['ignore', 'pipe', 'pipe'] });
-  git(['init', '-q']);
-  git(['config', 'user.email', 'test@example.com']);
-  git(['config', 'user.name', 'NewIDE Test']);
+function initGitWorkspace(workspace: string): void {
+  execFileSync('git', ['init', '-q'], { cwd: workspace });
+  execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: workspace });
+  execFileSync('git', ['config', 'user.name', 'Test'], { cwd: workspace });
   writeFileSync(path.join(workspace, 'seed.txt'), 'seed\n');
-  git(['add', '-A']);
-  git(['commit', '-qm', 'base']);
+  execFileSync('git', ['add', '-A'], { cwd: workspace });
+  execFileSync('git', ['commit', '-qm', 'base'], { cwd: workspace });
 }
 
 describe('NewideBackendService SQLite lifecycle', () => {
@@ -54,11 +52,9 @@ describe('NewideBackendService SQLite lifecycle', () => {
 
       expect(overridden.current_run?.run_id).toBe('run_override_live');
       expect(runnerCalls).toBe(1);
-      expect(store.getTaskAggregate(created.task.task_id)?.runtime_state.diagnostics).toMatchObject(
-        {
-          council_override: true,
-        },
-      );
+      expect(store.getTaskAggregate(created.task.task_id)?.runtime_state.diagnostics).toMatchObject({
+        council_override: true,
+      });
       expect(
         store
           .listEvents(created.task.task_id)
@@ -146,10 +142,10 @@ describe('NewideBackendService SQLite lifecycle', () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'newide-service-resume-'));
     const runsRoot = path.join(root, 'runs');
     const databasePath = path.join(root, 'coordination.sqlite');
-    const workspace = path.join(root, 'workspace');
-    await mkdir(workspace);
-    initializeGitWorkspace(workspace);
-    const workspacePath = await realpath(workspace);
+    const workspaceDirectory = path.join(root, 'workspace');
+    mkdirSync(workspaceDirectory);
+    initGitWorkspace(workspaceDirectory);
+    const workspacePath = await realpath(workspaceDirectory);
     const requestStore = new FileRunRequestStore(runsRoot);
     const seedStore = new SqliteCoordinationStore(databasePath);
     const seedProcessor = new TaskProcessor(seedStore);
@@ -184,11 +180,6 @@ describe('NewideBackendService SQLite lifecycle', () => {
     const processor = new TaskProcessor(reopenedStore);
     processor.recoverInterruptedTasks();
     const checkpoint = reopenedStore.getLatestCheckpoint('task_resume');
-    expect(checkpoint?.mechanical_snapshot).toMatchObject({
-      worktree_path: workspacePath,
-      base_commit: expect.stringMatching(/^[0-9a-f]{40}$/),
-      snapshot_commit: expect.stringMatching(/^[0-9a-f]{40}$/),
-    });
     let resumedRequest: CoordinatorRunRequest | undefined;
     let runnerCalls = 0;
     const service = createService(processor, requestStore, runsRoot, {

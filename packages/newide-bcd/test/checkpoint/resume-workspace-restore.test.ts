@@ -8,7 +8,7 @@ import { FileRunAuditWriter } from '../../src/app/run-audit-writer';
 import { InMemoryRunRegistry } from '../../src/app/run-registry';
 import { FileRunRequestStore } from '../../src/app/run-request-store';
 import { NewideBackendService } from '../../src/app/newide-backend-service';
-import { TaskProcessor } from '../../src/app/task-processor';
+import { TaskProcessor } from '../../src/coordination';
 import { FileRunTerminalOutputWriter } from '../../src/app/run-terminal-output-writer';
 import type { CoordinatorRunner } from '../../src/coordinator/coordinator-runner';
 import type { IntegrationV0Result } from '../../src/coordinator/integration-v0-flow';
@@ -105,7 +105,7 @@ describe('resume restores workspace content from the checkpoint anchor', () => {
     }
   });
 
-  it('rejects resume and audits the skipped restore for a non-Git workspace', async () => {
+  it('blocks resume and audits the skipped restore for a non-Git workspace', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'newide-resume-plain-'));
     const workspace = await realpath(root);
     const runsRoot = path.join(root, '.runs');
@@ -132,18 +132,15 @@ describe('resume restores workspace content from the checkpoint anchor', () => {
       processor.beginRun({
         task_id: 'task_plain',
         run_id: 'run_interrupted',
-        task_request: {
-          spec: 'No git here',
-          completion_criteria: ['An unverifiable anchor fails closed'],
-        },
+        task_request: { spec: 'No git here', completion_criteria: ['unsafe resume is blocked'] },
         workspace_path: workspace,
         mode: 'single_agent',
       });
       processor.recoverInterruptedTasks();
 
       await expect(service.resumeTask('task_plain')).rejects.toMatchObject({
+        name: 'TaskResumeAnchorError',
         code: 'CHECKPOINT_ANCHOR_INVALID',
-        taskId: 'task_plain',
         reason: 'anchor_not_recoverable',
       });
       expect(runnerCalls).toBe(0);

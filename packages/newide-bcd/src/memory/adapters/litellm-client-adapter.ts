@@ -2,7 +2,7 @@
  * LiteLLMClientAdapter — 将 LiteLLMClient 适配为 LlmClient 接口
  *
  * 实现 LlmClient（complete）：用于上下文清理、经验提取、技能晋升。
- * Tool-calling（Agent dispatch）请使用 DeepSeekToolCallingClient。
+ * Tool-calling（Agent dispatch）请使用 LiteLLMToolCallingClient。
  *
  * 自动加载项目根目录的 .env.local（已 gitignore），将其中定义的
  * 环境变量注入 process.env，供 AI SDK provider（如 @ai-sdk/openai）使用。
@@ -12,6 +12,7 @@ import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { LiteLLMClient } from '../../litellm';
 import type { LiteLLMMessage } from '../../litellm';
+import { recordProxyLlmUsage } from '../../telemetry/llm-usage-ledger';
 import type { LlmClient, LlmMessage } from '../ports/llm-client';
 
 function loadEnvFile(filePath: string): void {
@@ -34,7 +35,6 @@ function loadEnvFile(filePath: string): void {
 }
 
 function loadLocalEnv(): void {
-  if (process.env.NEWIDE_LITELLM_CONFIG_DIR?.trim()) return;
   const moduleDir = dirname(fileURLToPath(import.meta.url));
   const projectRoot = resolve(moduleDir, '..', '..', '..');
   const memoryDir = resolve(moduleDir, '..');
@@ -59,19 +59,12 @@ export class LiteLLMClientAdapter implements LlmClient {
   constructor(taskName: string = 'memory-query') {
     loadLocalEnv();
     this.client = new LiteLLMClient();
-    this.client.loadConfig(process.env.NEWIDE_LITELLM_CONFIG_DIR?.trim() || undefined);
+    this.client.registerProvider('openai', async (modelId: string) => {
+      const { openai } = await import('@ai-sdk/openai');
+      return openai.chat(modelId);
+    });
+    this.client.loadConfig();
     this.taskName = taskName;
-
-    const model = process.env.NEWIDE_LLM_MODEL?.trim();
-    if (model) {
-      this.client.modelPool.config.setModels(taskName, [
-        {
-          provider: process.env.NEWIDE_LLM_PROVIDER?.trim() || 'anthropic',
-          model,
-          order: 1,
-        },
-      ]);
-    }
   }
 
   async complete(input: {
@@ -103,6 +96,12 @@ export class LiteLLMClientAdapter implements LlmClient {
       responseFormat: input.responseFormat
         ? { name: 'response', schema: { type: 'object' }, strict: true }
         : undefined,
+    });
+    await recordProxyLlmUsage({
+      input_tokens: response.usage?.prompt_tokens ?? 0,
+      output_tokens: response.usage?.completion_tokens ?? 0,
+      model: response.model || this.taskName,
+      source: 'proxy',
     });
     return response.content;
   }

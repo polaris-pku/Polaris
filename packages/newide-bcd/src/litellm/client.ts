@@ -131,6 +131,19 @@ function loadEnvFiles(configDir?: string): void {
       // skip unreadable files
     }
   }
+
+  // deepseek 凭证 → OpenAI 兼容环境（与 src/memory 下 adapter 的映射一致）。
+  // 必须在任何 `@ai-sdk/openai` 首次 import 之前完成：该包在模块加载时创建
+  // 默认 provider 并读取 OPENAI_BASE_URL，若此时未设置会把 baseURL 钉死在
+  // https://api.openai.com/v1，之后所有 LLM 调用都会连到 api.openai.com。
+  if (process.env.LLM_PROVIDER === 'deepseek' && process.env.DEEPSEEK_API_KEY) {
+    if (!process.env.OPENAI_API_KEY) {
+      process.env.OPENAI_API_KEY = process.env.DEEPSEEK_API_KEY;
+    }
+    if (!process.env.OPENAI_BASE_URL) {
+      process.env.OPENAI_BASE_URL = 'https://api.deepseek.com/v1';
+    }
+  }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -207,25 +220,28 @@ export class LiteLLMClient {
     switch (provider) {
       case 'openai': {
         const { createOpenAI } = await import('@ai-sdk/openai');
-        const apiKey = process.env.NEWIDE_LLM_API_KEY || process.env.OPENAI_API_KEY;
-        const baseURL = process.env.NEWIDE_LLM_BASE_URL || process.env.OPENAI_BASE_URL;
-        const provider = createOpenAI({
-          ...(apiKey ? { apiKey } : {}),
-          ...(baseURL ? { baseURL } : {}),
-        });
-        factory = (id) => provider.chat(id);
+        // 显式按当前 env 创建 provider，而不是使用模块级默认 `openai` 实例
+        // （后者在模块加载时读取 OPENAI_BASE_URL，可能已被钉死为 api.openai.com）。
+        factory = (id) =>
+          createOpenAI({
+            ...(process.env.OPENAI_API_KEY ? { apiKey: process.env.OPENAI_API_KEY } : {}),
+            ...(process.env.OPENAI_BASE_URL ? { baseURL: process.env.OPENAI_BASE_URL } : {}),
+          })(id);
         break;
       }
       case 'anthropic': {
         const { createAnthropic } = await import('@ai-sdk/anthropic');
-        const apiKey = process.env.NEWIDE_LLM_API_KEY || process.env.ANTHROPIC_API_KEY;
-        const authToken = process.env.ANTHROPIC_AUTH_TOKEN;
-        const baseURL = process.env.NEWIDE_LLM_BASE_URL || process.env.ANTHROPIC_BASE_URL;
-        const provider = createAnthropic({
-          ...(apiKey ? { apiKey } : authToken ? { authToken } : {}),
-          ...(baseURL ? { baseURL } : {}),
-        });
-        factory = (id) => provider.messages(id);
+        const apiKey =
+          process.env.ANTHROPIC_AUTH_TOKEN ||
+          process.env.ANTHROPIC_API_KEY ||
+          process.env.DEEPSEEK_API_KEY;
+        factory = (id) =>
+          createAnthropic({
+            ...(apiKey ? { apiKey } : {}),
+            ...(process.env.ANTHROPIC_BASE_URL
+              ? { baseURL: process.env.ANTHROPIC_BASE_URL.replace(/\/+$/, '') }
+              : {}),
+          })(id);
         break;
       }
       default:
@@ -293,9 +309,7 @@ export class LiteLLMClient {
     const params: Record<string, unknown> = {
       model,
       messages,
-      ...(resolved.provider === 'anthropic'
-        ? {}
-        : { temperature: request.temperature ?? resolved.temperature }),
+      temperature: request.temperature ?? resolved.temperature,
       maxOutputTokens: request.maxTokens ?? resolved.maxTokens,
     };
 
@@ -339,9 +353,7 @@ export class LiteLLMClient {
       model,
       messages,
       tools: toAiTools(schemas, handlers),
-      ...(resolved.provider === 'anthropic'
-        ? {}
-        : { temperature: request.temperature ?? resolved.temperature }),
+      temperature: request.temperature ?? resolved.temperature,
       maxOutputTokens: request.maxTokens ?? resolved.maxTokens,
       maxSteps: maxRounds,
     };
@@ -374,9 +386,7 @@ export class LiteLLMClient {
     const params: Record<string, unknown> = {
       model,
       messages,
-      ...(resolved.provider === 'anthropic'
-        ? {}
-        : { temperature: request.temperature ?? resolved.temperature }),
+      temperature: request.temperature ?? resolved.temperature,
       maxOutputTokens: request.maxTokens ?? resolved.maxTokens,
     };
 
@@ -405,9 +415,7 @@ export class LiteLLMClient {
       model,
       schema: jsonSchema(schema.schema as Record<string, unknown>),
       messages,
-      ...(resolved.provider === 'anthropic'
-        ? {}
-        : { temperature: request.temperature ?? resolved.temperature }),
+      temperature: request.temperature ?? resolved.temperature,
       maxOutputTokens: request.maxTokens ?? resolved.maxTokens,
     };
 

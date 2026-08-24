@@ -11,11 +11,16 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   createProductionBackendService,
   parseDriverEnv,
+  ProductionAgentToolCallingClient,
+  readAuctionEnabled,
+  readCouncilAuctionEnabled,
+  readCouncilProposerCount,
+  resolveProductionLlmRuntime,
   startBackendRpcServer,
 } from '../../src/app/backend-rpc-stdio';
 import type { NewideBackendService } from '../../src/app/newide-backend-service';
 import type { AppRunEvent } from '../../src/app/run-registry';
-import { TaskProcessor } from '../../src/app/task-processor';
+import { TaskProcessor } from '../../src/coordination';
 import {
   InMemoryBufferRepository,
   InMemoryRepository,
@@ -29,6 +34,192 @@ import {
   FileBMemoryMaintenanceEvidenceStore,
 } from '../../src/app/b-memory-maintenance-runner';
 import { writeFakeAcpRunnerBuild } from '../fixtures/fake-acp-runner-build';
+
+describe('readAuctionEnabled', () => {
+  it('defaults to true when unset', () => {
+    expect(readAuctionEnabled(undefined)).toBe(true);
+    expect(readAuctionEnabled('')).toBe(true);
+    expect(readAuctionEnabled('  ')).toBe(true);
+  });
+
+  it('parses disable and enable values', () => {
+    expect(readAuctionEnabled('0')).toBe(false);
+    expect(readAuctionEnabled('false')).toBe(false);
+    expect(readAuctionEnabled('FALSE')).toBe(false);
+    expect(readAuctionEnabled('1')).toBe(true);
+    expect(readAuctionEnabled('true')).toBe(true);
+  });
+
+  it('rejects invalid values', () => {
+    expect(() => readAuctionEnabled('maybe')).toThrow('NEWIDE_AUCTION_ENABLED');
+  });
+});
+
+describe('Council auction configuration', () => {
+  it('keeps dynamic Council selection opt-in and parses proposer count', () => {
+    expect(readCouncilAuctionEnabled(undefined)).toBe(false);
+    expect(readCouncilAuctionEnabled('1')).toBe(true);
+    expect(readCouncilAuctionEnabled('false')).toBe(false);
+    expect(readCouncilProposerCount(undefined)).toBe(2);
+    expect(readCouncilProposerCount('3')).toBe(3);
+    expect(() => readCouncilAuctionEnabled('maybe')).toThrow('NEWIDE_COUNCIL_AUCTION_ENABLED');
+    expect(() => readCouncilProposerCount('1')).toThrow('NEWIDE_COUNCIL_PROPOSERS');
+  });
+});
+
+describe('resolveProductionLlmRuntime', () => {
+  it('reuses ACP MiniMax settings through the OpenAI-compatible endpoint', () => {
+    expect(
+      resolveProductionLlmRuntime(
+        {},
+        {
+          ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+          ANTHROPIC_AUTH_TOKEN: 'acp-token',
+          ANTHROPIC_MODEL: 'MiniMax-M3',
+        },
+      ),
+    ).toEqual({
+      baseUrl: 'https://api.minimax.io',
+      apiKey: 'acp-token',
+      model: 'MiniMax-M3',
+    });
+  });
+
+  it('keeps an explicit local OpenAI-compatible configuration authoritative', () => {
+    expect(
+      resolveProductionLlmRuntime(
+        {
+          OPENAI_BASE_URL: 'https://local.example/v1',
+          OPENAI_API_KEY: 'local-token',
+          NEWIDE_AGENT_LLM_MODEL: 'local-model',
+        },
+        {
+          ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+          ANTHROPIC_AUTH_TOKEN: 'acp-token',
+          ANTHROPIC_MODEL: 'MiniMax-M3',
+        },
+      ),
+    ).toEqual({
+      baseUrl: 'https://local.example',
+      apiKey: 'local-token',
+      model: 'local-model',
+    });
+  });
+
+  it('does not let an inherited Anthropic environment override ACP configuration', () => {
+    expect(
+      resolveProductionLlmRuntime(
+        {
+          ANTHROPIC_BASE_URL: 'https://stale.example/anthropic',
+          ANTHROPIC_AUTH_TOKEN: 'stale-token',
+          ANTHROPIC_MODEL: 'stale-model',
+        },
+        {
+          ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic',
+          ANTHROPIC_AUTH_TOKEN: 'acp-token',
+          ANTHROPIC_MODEL: 'MiniMax-M3',
+        },
+      ),
+    ).toEqual({
+      baseUrl: 'https://api.minimax.io',
+      apiKey: 'acp-token',
+      model: 'MiniMax-M3',
+    });
+  });
+});
+
+describe('ProductionAgentToolCallingClient', () => {
+  it('retries one malformed MiniMax function-arguments response', async () => {
+    const completeWithTools = vi
+      .fn<
+        ToolCallingClient['completeWithTools']
+      >()
+      .mockRejectedValueOnce(
+        new Error('invalid params, invalid function arguments json string (2013)'),
+      )
+      .mockResolvedValueOnce({
+        content: null,
+        tool_calls: [
+          {
+            id: 'call_driver',
+            type: 'function',
+            function: { name: 'invoke_driver', arguments: '{}' },
+          },
+        ],
+      });
+    const client = new ProductionAgentToolCallingClient({ completeWithTools });
+
+    await expect(
+      client.completeWithTools({
+        messages: [{ role: 'user', content: 'delegate' }],
+        tools: [
+          {
+            type: 'function',
+            function: { name: 'invoke_driver', description: 'run', parameters: { type: 'object' } },
+          },
+        ],
+      }),
+    ).resolves.toMatchObject({ tool_calls: [{ function: { name: 'invoke_driver' } }] });
+    expect(completeWithTools).toHaveBeenCalledTimes(2);
+  });
+
+  it('falls back to the real Driver after repeated malformed MiniMax tool arguments', async () => {
+    const completeWithTools = vi
+      .fn<ToolCallingClient['completeWithTools']>()
+      .mockRejectedValue(new Error('invalid params, invalid function arguments json string (2013)'));
+    const client = new ProductionAgentToolCallingClient({ completeWithTools });
+
+    await expect(
+      client.completeWithTools({
+        messages: [{ role: 'user', content: 'Task: Review the submitted plan.' }],
+        tools: [
+          {
+            type: 'function',
+            function: { name: 'invoke_driver', description: 'Run the real Driver', parameters: {} },
+          },
+        ],
+      }),
+    ).resolves.toMatchObject({
+      tool_calls: [
+        {
+          function: {
+            name: 'invoke_driver',
+            arguments: JSON.stringify({ instruction: 'Review the submitted plan.' }),
+          },
+        },
+      ],
+    });
+    expect(completeWithTools).toHaveBeenCalledTimes(2);
+  });
+
+  it('forces one real Driver tool call after two text-only responses', async () => {
+    const completeWithTools = vi
+      .fn<ToolCallingClient['completeWithTools']>()
+      .mockResolvedValueOnce({ content: 'I will handle it.', tool_calls: undefined })
+      .mockResolvedValueOnce({ content: 'Still text only.', tool_calls: undefined });
+    const client = new ProductionAgentToolCallingClient({ completeWithTools });
+
+    const result = await client.completeWithTools({
+      messages: [{ role: 'user', content: 'Task: Implement the requested file.' }],
+      tools: [
+        {
+          type: 'function',
+          function: { name: 'invoke_driver', description: 'run', parameters: { type: 'object' } },
+        },
+      ],
+    });
+
+    expect(result.tool_calls).toMatchObject([
+      {
+        function: {
+          name: 'invoke_driver',
+          arguments: JSON.stringify({ instruction: 'Implement the requested file.' }),
+        },
+      },
+    ]);
+    expect(completeWithTools).toHaveBeenCalledTimes(2);
+  });
+});
 
 describe('backend RPC stdio entrypoint', () => {
   it('fails fast when the configured ACP runner directory does not exist', async () => {
@@ -465,6 +656,19 @@ describe('backend RPC stdio entrypoint', () => {
       unsubscribe();
       expect(councilSnapshot.status).toBe('completed');
       const externalCouncilSnapshot = service.getRunSnapshot(councilCreated.run_id);
+      expect(externalCouncilSnapshot.council).toMatchObject({
+        phase: 'completed',
+        subject: 'Exercise production council composition.',
+        strategy: 'classic',
+        artifact_mode: 'implementation',
+      });
+      expect(externalCouncilSnapshot.council?.auctions).toHaveLength(1);
+      expect(externalCouncilSnapshot.council?.auctions?.[0]).toMatchObject({
+        selection_scope: 'primary',
+        selection_mode: 'auction',
+        status: 'completed',
+        winner_role_id: 'role_ts_engineer',
+      });
       expect(externalCouncilSnapshot.council?.participants).toHaveLength(4);
       expect(
         externalCouncilSnapshot.council?.participants?.map(
@@ -478,6 +682,10 @@ describe('backend RPC stdio entrypoint', () => {
       ]);
       const councilEventTypes = councilSnapshot.events.map((event) => event.type);
       expect(councilEventTypes).toContain('market.selected');
+      expect(councilEventTypes).toContain('market.auction.started');
+      expect(councilEventTypes).toContain('market.auction.completed');
+      expect(councilEventTypes).toContain('council.participants.selected');
+      expect(councilEventTypes.filter((type) => type === 'council.phase.started')).toHaveLength(3);
       expect(
         councilEventTypes.filter((type) => type === 'council.proposal.completed'),
       ).toHaveLength(2);
@@ -487,14 +695,11 @@ describe('backend RPC stdio entrypoint', () => {
       expect(
         councilEventTypes.filter((type) => type === 'council.synthesis.completed'),
       ).toHaveLength(1);
-      expect(councilEventTypes.filter((type) => type === 'gate.result')).toHaveLength(1);
+      expect(councilEventTypes.filter((type) => type === 'gate.result')).toHaveLength(0);
       expect(councilEventTypes.indexOf('council.completed')).toBeLessThan(
         councilEventTypes.indexOf('artifact.selected'),
       );
       expect(councilEventTypes.indexOf('artifact.selected')).toBeLessThan(
-        councilEventTypes.lastIndexOf('gate.result'),
-      );
-      expect(councilEventTypes.lastIndexOf('gate.result')).toBeLessThan(
         councilEventTypes.indexOf('worktree.materialized'),
       );
       expect(externalCouncilSnapshot.delivery_report?.files_written.length).toBeGreaterThan(0);
@@ -506,6 +711,16 @@ describe('backend RPC stdio entrypoint', () => {
         final_artifact_sha256: createHash('sha256').update(deliveredCouncilFile).digest('hex'),
         decision_record_ref: expect.stringMatching(/^council_decision_/),
       });
+      const readableArtifact = await service.getArtifactContent(
+        councilCreated.run_id,
+        'artifact_fake_acp',
+      );
+      expect(readableArtifact).toMatchObject({
+        artifact_id: 'artifact_fake_acp',
+        target_path: 'council-output.txt',
+        content: 'COUNCIL_FINAL\n',
+        truncated: false,
+      });
       const audit = readFileSync(
         path.join('.newide', 'runs', councilCreated.run_id, 'audit.jsonl'),
         'utf8',
@@ -516,13 +731,11 @@ describe('backend RPC stdio entrypoint', () => {
       const keyTypes = [
         'council.completed',
         'artifact.selected',
-        'gate.result',
         'worktree.materialized',
       ];
       const expectedOrder = [
         'council.completed',
         'artifact.selected',
-        'gate.result',
         'worktree.materialized',
       ];
       const postCouncilSequence = (types: string[]) =>
@@ -532,9 +745,9 @@ describe('backend RPC stdio entrypoint', () => {
       expect(postCouncilSequence(councilEventTypes)).toEqual(expectedOrder);
       expect(
         readFileSync(path.join(runnerDir, 'invocations.log'), 'utf8').trim().split('\n'),
-      ).toHaveLength(6);
+      ).toHaveLength(10);
       expect(readFileSync(path.join(runnerDir, 'b-env.log'), 'utf8').trim().split('\n')).toEqual(
-        Array.from({ length: 6 }, () => 'absent'),
+        Array.from({ length: 10 }, () => 'absent'),
       );
       const driverPrompts = readFileSync(path.join(runnerDir, 'prompts.log'), 'utf8');
       expect(driverPrompts).toContain('Exercise production composition.');
@@ -559,15 +772,13 @@ describe('backend RPC stdio entrypoint', () => {
         council: {
           result: {
             quality: 'best_effort',
-            warnings: expect.arrayContaining([
-              'Council verification did not fully pass; delivering the best available artifact.',
-            ]),
           },
+          outcome: { status: 'completed' },
         },
         errors: [],
       });
       expect(failedNotifications.map((event) => event.type)).toEqual(
-        expect.arrayContaining(['council.failed', 'council.completed', 'run.completed']),
+        expect.arrayContaining(['council.role.failed', 'council.completed', 'run.completed']),
       );
       expect(failedSnapshot.events.map((event) => event.type)).toContain('council.completed');
       expect(failedSnapshot.events.map((event) => event.type)).toContain('worktree.materialized');
@@ -579,7 +790,7 @@ describe('backend RPC stdio entrypoint', () => {
         .split('\n')
         .map((line) => JSON.parse(line) as AppRunEvent);
       expect(failedAudit.map((event) => event.type)).toEqual(
-        expect.arrayContaining(['council.failed', 'council.completed', 'run.completed']),
+        expect.arrayContaining(['council.role.failed', 'council.completed', 'run.completed']),
       );
     } finally {
       await service?.close();
@@ -656,7 +867,9 @@ describe('backend RPC stdio entrypoint', () => {
       env: {
         ...process.env,
         ACP_DRIVER_RUNNER_DIR: runnerDir,
-        NEWIDE_B_DATABASE_URL: '   ',
+        // Unreachable host: embedded PGlite fallback is disabled by an explicit URL,
+        // so the PostgreSQL readiness gate fails and stdio must stay closed.
+        NEWIDE_B_DATABASE_URL: 'postgresql://nobody:wrong@127.0.0.1:1/newide',
         NEWIDE_COORDINATION_DB: path.join(runnerDir, 'coordination.sqlite'),
       },
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -670,7 +883,7 @@ describe('backend RPC stdio entrypoint', () => {
 
     expect(code).toBe(1);
     expect(stdout).toBe('');
-    expect(stderr).toContain('NEWIDE_B_DATABASE_URL is required for the production B runtime');
+    expect(stderr).toContain('PostgreSQL B memory storage readiness check failed');
     rmSync(runnerDir, { recursive: true, force: true });
   }, 15_000);
 
