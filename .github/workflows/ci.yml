@@ -1,42 +1,17 @@
 name: CI
-
 on:
   pull_request:
   push:
     branches: [main]
-
 jobs:
   verify:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: pgvector/pgvector:0.8.2-pg17-bookworm
-        env:
-          POSTGRES_DB: newide_b
-          POSTGRES_USER: newide
-          POSTGRES_PASSWORD: newide_ci
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U newide -d newide_b"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
-    env:
-      MEMORY_PG_TEST_URL: postgresql://newide:newide_ci@127.0.0.1:5432/newide_b
     steps:
       - uses: actions/checkout@v4
-      # pnpm 版本由 package.json 的 packageManager 字段决定（避免双重指定冲突）
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
-          # 版本只认 .nvmrc 一个源 —— 这里曾写死 20，而仓库升到 pnpm 11（要求 Node >= 22.13）后
-          # 忘了同步，CI 在 setup-node 阶段就挂（node:sqlite 不存在）。写死一次就会漂一次。
-          node-version-file: .nvmrc
-          cache: pnpm
+          node-version-file: '.nvmrc'
+          cache: 'pnpm'
       - run: pnpm install --frozen-lockfile
       - run: pnpm verify
-      - run: pnpm --filter newide-bcd verify
-      - run: pnpm --filter acp-client-prototype verify
-      - run: pnpm build
-      - run: pnpm build:backend

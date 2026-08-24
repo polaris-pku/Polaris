@@ -1,13 +1,5 @@
-packages:
-  - 'packages/*'
-
-# 允许跑安装期构建脚本的包（pnpm 11 起用 allowBuilds）。
-# node-pty 是 A（acp-client）的原生模块；@github/keytar 是 copilot adapter 的凭据存储。
 allowBuilds:
-  '@github/keytar': true
-  electron: true
-  electron-builder: true
-  electron-winstaller: true
   esbuild: true
-  node-pty: true
-  opencode-ai: true
+minimumReleaseAgeExclude:
+  - '@electric-sql/pglite-pgvector@0.0.6'
+  - '@electric-sql/pglite@0.5.5'

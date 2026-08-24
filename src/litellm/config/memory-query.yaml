@@ -1,0 +1,11 @@
+tasks:
+  memory-query:
+    models:
+      - provider: anthropic
+        model: deepseek-v4-flash
+        order: 1
+    strategy: order
+    timeoutMs: 60000
+    maxRetries: 2
+    temperature: 0.1
+    maxTokens: 4000

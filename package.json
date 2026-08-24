@@ -1,130 +1,52 @@
 {
-  "name": "polaris",
-  "private": true,
+  "name": "newide-bcd",
   "version": "0.1.0",
-  "description": "Polaris · 多 Agent 协作开发桌面工作台",
-  "author": "fangz and zhangyc",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/ExtraZhangYC/Polaris.git"
+  "private": true,
+  "bin": {
+    "newide": "dist/newide.mjs"
   },
+  "files": [
+    "dist/newide.mjs",
+    "dist/config/*.yaml",
+    "README.md",
+    "LICENSE"
+  ],
   "type": "module",
-  "main": "electron/main.cjs",
-  "packageManager": "pnpm@11.12.0",
+  "packageManager": "pnpm@11.5.1",
   "engines": {
     "node": ">=22.22.1",
     "pnpm": ">=9"
   },
   "scripts": {
-    "dev": "vite",
-    "build": "tsc -b && vite build",
-    "preview": "vite preview",
-    "electron:dev": "concurrently -k -n vite,electron -c cyan,magenta \"vite\" \"wait-on tcp:127.0.0.1:5173 && electron .\"",
-    "electron:build": "pnpm build:backend && vite build && electron-builder",
-    "electron:build:win": "pnpm build:backend --target-os=win32 --target-cpu=x64 && vite build && electron-builder --win",
-    "electron:build:mac": "vite build && electron-builder --mac",
-    "electron:build:dir": "pnpm build:backend && vite build && electron-builder --dir",
-    "typecheck": "tsc -b",
+    "build": "tsc -b && pnpm build:cli",
+    "build:cli": "node scripts/build-cli.mjs",
+    "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "format": "prettier --check .",
     "format:fix": "prettier --write .",
-    "test": "vitest run --passWithNoTests",
-    "test:electron": "node --test electron/*.test.cjs",
-    "verify": "pnpm lint && pnpm typecheck && pnpm test && pnpm test:electron && pnpm design-guard",
-    "prepare": "husky",
-    "build:backend": "node scripts/build-backend.mjs",
-    "web:bridge": "node scripts/local-web-bridge.mjs",
-    "design-guard": "node scripts/design-guard.mjs",
-    "smoke:python": "node scripts/smoke-python.mjs",
-    "refresh:python-catalog": "node scripts/refresh-python-catalog.mjs"
-  },
-  "build": {
-    "appId": "com.polaris.app",
-    "productName": "Polaris",
-    "directories": {
-      "output": "release"
-    },
-    "artifactName": "Polaris-${version}-${os}-${arch}.${ext}",
-    "files": [
-      "dist/**/*",
-      "electron/**/*"
-    ],
-    "publish": [
-      {
-        "provider": "github",
-        "owner": "ExtraZhangYC",
-        "repo": "Polaris",
-        "releaseType": "release"
-      }
-    ],
-    "win": {
-      "target": [
-        "nsis"
-      ]
-    },
-    "mac": {
-      "target": [
-        "dmg",
-        "zip"
-      ],
-      "category": "public.app-category.developer-tools"
-    },
-    "linux": {
-      "target": [
-        "AppImage"
-      ],
-      "category": "Development"
-    },
-    "extraResources": [
-      {
-        "from": "backend",
-        "to": "backend"
-      }
-    ],
-    "asarUnpack": []
-  },
-  "dependencies": {
-    "@xterm/addon-fit": "^0.11.0",
-    "@xterm/xterm": "^6.0.0",
-    "@xyflow/react": "^12.3.5",
-    "class-variance-authority": "^0.7.1",
-    "clsx": "^2.1.1",
-    "electron-updater": "^6.8.9",
-    "lucide-react": "^0.460.0",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "tailwind-merge": "^2.5.4",
-    "tar": "^7.5.1",
-    "zustand": "^5.0.1"
-  },
-  "devDependencies": {
-    "@commitlint/cli": "^19.5.0",
-    "@commitlint/config-conventional": "^19.5.0",
-    "@eslint/js": "^9.15.0",
-    "@types/node": "^25.9.3",
-    "@types/react": "^18.3.12",
-    "@types/react-dom": "^18.3.1",
-    "@vitejs/plugin-react": "^4.3.3",
-    "autoprefixer": "^10.4.20",
-    "concurrently": "^10.0.3",
-    "electron": "^43.0.0",
-    "electron-builder": "^26.15.3",
-    "esbuild": "0.24.0",
-    "eslint": "^9.15.0",
-    "eslint-config-prettier": "^9.1.0",
-    "eslint-plugin-react-hooks": "^5.0.0",
-    "eslint-plugin-react-refresh": "^0.4.14",
-    "globals": "^15.12.0",
-    "husky": "^9.1.6",
-    "lint-staged": "^15.2.10",
-    "postcss": "^8.4.49",
-    "prettier": "^3.3.3",
-    "tailwindcss": "^3.4.15",
-    "typescript": "^5.6.3",
-    "typescript-eslint": "^8.15.0",
-    "vite": "^5.4.11",
-    "vitest": "^2.1.5",
-    "wait-on": "^9.0.10"
+    "test": "vitest run",
+    "verify": "pnpm lint && pnpm typecheck && pnpm test",
+    "example:basic": "tsx src/examples/basic-flow.ts",
+    "example:integration-v0": "tsx src/examples/integration-v0.ts",
+    "example:driver-adapter": "tsx src/examples/driver-adapter-flow.ts",
+    "backend:rpc": "node --import tsx src/app/backend-rpc-entry.ts",
+    "rpc:smoke": "node --import tsx scripts/rpc-smoke.ts",
+    "acceptance:real": "node --import tsx scripts/real-acceptance.ts",
+    "task:run": "bash scripts/run-task.sh",
+    "eval:instance": "tsx eval/run-instance.ts",
+    "eval:smoke": "tsx eval/run-smoke.ts",
+    "eval:sweevo-harness": "tsx eval/run-sweevo-harness.ts",
+    "eval:record-harness": "tsx eval/record-harness-result.ts",
+    "eval:cooperbench-case": "tsx eval/cooperbench/run-case.ts",
+    "eval:cooperbench-smoke": "tsx eval/cooperbench/run-smoke.ts",
+    "eval:cooperbench-harness": "tsx eval/cooperbench/run-harness.ts",
+    "eval:cooperbench-record": "tsx eval/cooperbench/record-harness-result.ts",
+    "eval:verify-backend-contract": "tsx eval/scripts/verify-backend-contract.ts",
+    "eval:check-harness": "wsl --cd . -e bash eval/scripts/check-harness-env.sh",
+    "eval:ensure-mirrors": "tsx eval/scripts/ensure-sweevo-mirrors.ts",
+    "eval:build-pr-context": "tsx eval/scripts/build-sweevo-pr-context.ts",
+    "eval:sweevo-ablation": "tsx scripts/run-sweevo-memory-ablation.ts",
+    "prepare": "husky"
   },
   "lint-staged": {
     "*.{ts,tsx,js,json,md}": [
@@ -133,5 +55,36 @@
     "*.{ts,tsx}": [
       "eslint --fix"
     ]
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "4.0.9",
+    "@ai-sdk/openai": "4.0.8",
+    "@electric-sql/pglite": "^0.5.5",
+    "@electric-sql/pglite-pgvector": "0.0.6",
+    "ai": "7.0.17",
+    "expr-eval": "2.0.2",
+    "js-yaml": "5.2.1",
+    "pg": "8.22.0",
+    "yaml": "2.9.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@commitlint/cli": "^21.0.2",
+    "@commitlint/config-conventional": "^21.0.2",
+    "@eslint/js": "^9.29.0",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^24.0.1",
+    "@types/pg": "^8.20.0",
+    "esbuild": "^0.28.1",
+    "eslint": "^9.29.0",
+    "eslint-config-prettier": "^10.1.8",
+    "globals": "^16.2.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^17.0.7",
+    "prettier": "^3.5.3",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.34.0",
+    "vitest": "^4.1.9"
   }
 }

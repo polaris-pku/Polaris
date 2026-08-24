@@ -5,26 +5,36 @@ build/
 coverage/
 *.tsbuildinfo
 .vite/
-.node
-
-# BCD 后端的运行时产物（审计日志 / worktree / agent 工作区）
-.newide/
-
-# electron 打包产物
-release/
+.pnpm-store/
+.npm-tmp-cache/
 
 # env & secrets —— 永远不要进仓
 .env
 .env.*
 !.env.example
-*.local
+
+# 本地读码/Agent 交接笔记，不入仓
+agent_context.json
 
 # 本地状态 / 会话转储 / 归档
+.newide/
 *.session.json
 my-session.json
 *.zip
 *.tar.gz
 *.log
+
+# 本地评测/复现产物，不入仓
+evalResult/
+
+# memory 本地设计文档（Spec + 代码导读 + 模块导读），不入仓
+src/memory/docs/
+# memory API 面计划/评审提案（本地设计文档），不入仓
+src/memory/api-surface-review-proposal.md
+src/memory/memory-api-surface-plan.md
+
+# 本地架构、设计与执行计划文档，不入仓
+docs/
 
 # editor & OS
 .DS_Store
@@ -32,15 +42,22 @@ my-session.json
 .vscode/*
 !.vscode/extensions.json
 
-# 项目专属
-.claude
-design-comparison
-/api/
+# Claude Code 本地文件
+**/CLAUDE.md
+.claude/
 
-# 规划类文档：本地参考，不进仓
-polaris_plan.md
-merge_plan.md
-*_plan.md
+# ZCode 本地计划文件
+.zcode/
 
-# 打包后端产物（scripts/build-backend.mjs 生成）
-backend/
+/.npmrc
+
+# AI 驱动测试生成残留 — 脚手架 / 报告 / 子项目
+DL_RESULT.md
+jwt-auth-system/
+
+# 本地复现/调试脚本，不入仓
+scripts/repro-*.ts
+
+
+*[^ -~]*
+docs/
