@@ -40,6 +40,13 @@ describePostgres('backend RPC PostgreSQL acceptance', () => {
             ACP_DRIVER_ENV_FILE: path.join(runnerDir, '.env'),
             ACP_DRIVER_RUNNER_DIR: runnerDir,
             NEWIDE_B_DATABASE_URL: postgresUrl,
+            // This acceptance test validates the real PostgreSQL composition, not a paid
+            // embedding provider. Keep startup deterministic and offline; otherwise the
+            // production runtime performs its default LiteLLM readiness probe before ping.
+            NEWIDE_B_EMBEDDING_PROVIDER: 'hash',
+            NEWIDE_B_EMBEDDING_DIMENSIONS: '32',
+            // Isolate FileBufferRepository and every other runtime file from the checkout.
+            NEWIDE_STATE_ROOT: path.join(tempRoot, 'state'),
             NEWIDE_COORDINATION_DB: path.join(tempRoot, 'coordination.sqlite'),
           },
           stdio: ['pipe', 'pipe', 'pipe'],
