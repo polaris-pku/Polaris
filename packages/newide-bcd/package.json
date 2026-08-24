@@ -12,7 +12,6 @@
     "LICENSE"
   ],
   "type": "module",
-  "packageManager": "pnpm@11.5.1",
   "engines": {
     "node": ">=22.22.1",
     "pnpm": ">=9"
@@ -45,8 +44,7 @@
     "eval:check-harness": "wsl --cd . -e bash eval/scripts/check-harness-env.sh",
     "eval:ensure-mirrors": "tsx eval/scripts/ensure-sweevo-mirrors.ts",
     "eval:build-pr-context": "tsx eval/scripts/build-sweevo-pr-context.ts",
-    "eval:sweevo-ablation": "tsx scripts/run-sweevo-memory-ablation.ts",
-    "prepare": "husky"
+    "eval:sweevo-ablation": "tsx scripts/run-sweevo-memory-ablation.ts"
   },
   "lint-staged": {
     "*.{ts,tsx,js,json,md}": [
@@ -85,6 +83,7 @@
     "tsx": "^4.20.3",
     "typescript": "^5.8.3",
     "typescript-eslint": "^8.34.0",
+    "vite": "^7.0.0",
     "vitest": "^4.1.9"
   }
 }
