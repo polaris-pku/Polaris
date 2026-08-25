@@ -285,6 +285,89 @@ function readAuthEnv() {
   };
 }
 
+/**
+ * Embedding 配置的默认值：确定性哈希向量，32 维，不打任何外部服务。
+ *
+ * 这是**能离线跑通**的配置，不是好配置 —— HashEmbeddingProvider 产出的是哈希占位向量，
+ * 语义检索（memory.searchMemory / marketSearch）在它下面只是在比哈希碰撞。想要真正的
+ * 语义召回必须在设置里换成 openai 端点。默认留 hash 是因为它不需要任何 key 就能起后端。
+ */
+const EMBEDDING_DEFAULTS = { provider: 'hash', dimensions: 32 };
+
+/** 只认这两种 provider：hash（本地占位）与 openai（BCD 的 LiteLLM 只实现了 openai 嵌入）。 */
+const EMBEDDING_PROVIDERS = ['hash', 'openai'];
+
+/** 读出规范化后的 embedding 设置；任何非法值都退回默认，绝不让后端带着坏配置启动。 */
+function readEmbeddingSettings() {
+  const raw = readSettings().embedding ?? {};
+  const provider = EMBEDDING_PROVIDERS.includes(raw.provider)
+    ? raw.provider
+    : EMBEDDING_DEFAULTS.provider;
+  const dimensions =
+    Number.isInteger(raw.dimensions) && raw.dimensions > 0
+      ? raw.dimensions
+      : provider === 'hash'
+        ? EMBEDDING_DEFAULTS.dimensions
+        : 1536;
+  return {
+    provider,
+    dimensions,
+    model: typeof raw.model === 'string' ? raw.model.trim() : '',
+    baseUrl: typeof raw.baseUrl === 'string' ? raw.baseUrl.trim() : '',
+    apiKey: typeof raw.apiKey === 'string' ? raw.apiKey : '',
+  };
+}
+
+/**
+ * 生成后端实际读取的 LiteLLM 配置目录，并返回它的路径。
+ *
+ * 为什么要复制一份而不是就地改 `BACKEND_DIR/config`：那是**已安装的应用目录**。
+ * 按机器安装（Program Files）或 macOS 只读挂载下写它会 EPERM，而且每次自动更新都会被冲掉
+ * —— 跟当初把 cwd 挪到 userData 是同一个理由。
+ *
+ * 覆盖手法：config-loader 把目录下所有 .yaml 按**文件名排序**合并，同名 task 后写的赢
+ * （model-config.js 里是 Map.set）。所以只要落一个排序在最后的文件，就能盖掉包内
+ * embedding.yaml 里写死的 `openai/text-embedding-v3`，不必改上游任何一行。
+ */
+function prepareLitellmConfigDir(stateDir, embedding) {
+  const target = path.join(stateDir, 'litellm-config');
+  fs.mkdirSync(target, { recursive: true });
+
+  // 每次重建：包内配置可能随版本更新而变，残留的旧副本会悄悄盖住新默认值
+  for (const name of fs.readdirSync(target)) {
+    fs.rmSync(path.join(target, name), { force: true, recursive: true });
+  }
+  // 只复制文件：config-loader 只读顶层 .yaml，上游哪天塞进子目录也不该让这里抛
+  for (const entry of fs.readdirSync(LITELLM_CONFIG_DIR, { withFileTypes: true })) {
+    if (!entry.isFile()) continue;
+    fs.copyFileSync(path.join(LITELLM_CONFIG_DIR, entry.name), path.join(target, entry.name));
+  }
+
+  // hash provider 根本不走 LiteLLM（production-b-runtime 在解析路由之前就短路了），
+  // 不需要也不该写 embed 覆盖 —— 写了只会在用户切回 openai 时留下一个陈旧的模型名。
+  if (embedding.provider === 'openai' && embedding.model) {
+    // 文件名以 zz- 开头保证排序在最后（合并时后写的 task 赢）
+    fs.writeFileSync(
+      path.join(target, 'zz-polaris-embedding.yaml'),
+      [
+        '# 由 Polaris 设置生成，请勿手改 —— 每次启动后端都会重写。',
+        'tasks:',
+        '  embed:',
+        '    models:',
+        '      - provider: openai',
+        `        model: ${JSON.stringify(embedding.model)}`,
+        '        order: 1',
+        '    strategy: order',
+        '    timeoutMs: 30000',
+        '    maxRetries: 2',
+        '',
+      ].join('\n'),
+      { mode: 0o600 },
+    );
+  }
+  return target;
+}
+
 /** 还没选项目时的兜底工作区（与 fsBridge 的默认工作区同根）。 */
 function defaultWorkspace() {
   return path.join(app.getPath('documents'), 'polaris-workspace', 'default');
@@ -389,6 +472,15 @@ function start({ workspace, agentId } = {}, { force = false } = {}) {
     setStatus('error', '请先在设置中配置 B Memory PostgreSQL（需要 pgvector）。');
     return;
   }
+  const embedding = readEmbeddingSettings();
+  let litellmConfigDir;
+  try {
+    litellmConfigDir = prepareLitellmConfigDir(stateDir, embedding);
+  } catch (err) {
+    setStatus('error', `无法准备模型配置目录：${err.message}`);
+    return;
+  }
+
   const env = {
     ...process.env,
     POLARIS_NODE_BIN: NODE_BIN,
@@ -396,9 +488,11 @@ function start({ workspace, agentId } = {}, { force = false } = {}) {
     NEWIDE_STATE_ROOT: stateDir,
     NEWIDE_COORDINATION_DB: path.join(stateDir, 'coordination.sqlite'),
     NEWIDE_B_DATABASE_URL: bDatabaseUrl,
-    NEWIDE_B_EMBEDDING_PROVIDER: 'hash',
-    NEWIDE_B_EMBEDDING_DIMENSIONS: '32',
-    NEWIDE_LITELLM_CONFIG_DIR: LITELLM_CONFIG_DIR,
+    // provider=hash 时 production-b-runtime 直接短路成 HashEmbeddingProvider；
+    // 其它情况**必须不设这个变量**，否则走不到 LiteLLM 那条分支。
+    ...(embedding.provider === 'hash' ? { NEWIDE_B_EMBEDDING_PROVIDER: 'hash' } : {}),
+    NEWIDE_B_EMBEDDING_DIMENSIONS: String(embedding.dimensions),
+    NEWIDE_LITELLM_CONFIG_DIR: litellmConfigDir,
     NEWIDE_BUILD_COMMIT: process.env.NEWIDE_BUILD_COMMIT || 'dev',
     ACP_DRIVER_RUNNER_DIR: ACP_RUNNER_DIR,
     ACP_DRIVER_ENV_FILE: path.join(stateDir, 'driver.env'),
@@ -406,6 +500,17 @@ function start({ workspace, agentId } = {}, { force = false } = {}) {
     ACP_WORKSPACE: resolvedWorkspace,
     ...auth.set,
   };
+  // Embedding 的凭据与对话模型完全分开：litellm/client.ts 的 openai 嵌入分支只认
+  // EMBEDDING_API_KEY / EMBEDDING_BASE_URL 这两个名字。缺 key 时不要塞空串 ——
+  // @ai-sdk/openai 会退回读 OPENAI_API_KEY，塞空串反而把那条兜底路堵死。
+  if (embedding.provider === 'openai') {
+    if (embedding.apiKey) env.EMBEDDING_API_KEY = embedding.apiKey;
+    if (embedding.baseUrl) env.EMBEDDING_BASE_URL = embedding.baseUrl;
+  } else {
+    delete env.EMBEDDING_API_KEY;
+    delete env.EMBEDDING_BASE_URL;
+  }
+
   // 走第三方端点时必须**删掉** ANTHROPIC_API_KEY（而不是置空）——
   // 留着它 Claude Code 可能优先拿去打 Anthropic 官方，用户会看到一个莫名其妙的 401，
   // 而且完全想不到是「本机还留着旧凭据」。
@@ -562,9 +667,18 @@ function setupBackendBridge(windowGetter) {
   // 读设置：**绝不把 key 本身回给渲染层**，只回「填没填」+ baseUrl/模型这些非机密项。
   ipcMain.handle('backend:getSettings', () => {
     const s = readSettings();
+    const embedding = readEmbeddingSettings();
     return {
       provider: s.provider ?? 'anthropic',
       bMemory: { configured: !!s.bMemory?.databaseUrl },
+      // apiKey 与 provider key 同样只回布尔，明文不出主进程
+      embedding: {
+        provider: embedding.provider,
+        model: embedding.model,
+        baseUrl: embedding.baseUrl,
+        dimensions: embedding.dimensions,
+        hasKey: !!embedding.apiKey,
+      },
       // 每个服务商各自的配置（key 一律只回布尔）
       configured: Object.fromEntries(
         PROVIDERS.map((p) => {
@@ -614,9 +728,27 @@ function setupBackendBridge(windowGetter) {
       else bMemory.databaseUrl = next.bMemory.databaseUrl.trim();
     }
 
+    // Embedding：与 provider key 同一套「不传 = 保留原值，传空串 = 删除」语义。
+    // 维度是数字，非法值一律忽略而不是写坏 —— 它会被拼进 `vector(N)` 的建表语句。
+    const embedding = { ...(current.embedding ?? {}) };
+    if (next.embedding && typeof next.embedding === 'object') {
+      const patch = next.embedding;
+      if (EMBEDDING_PROVIDERS.includes(patch.provider)) embedding.provider = patch.provider;
+      if (typeof patch.model === 'string') embedding.model = patch.model.trim();
+      if (typeof patch.baseUrl === 'string') embedding.baseUrl = patch.baseUrl.trim();
+      if (Number.isInteger(patch.dimensions) && patch.dimensions > 0) {
+        embedding.dimensions = patch.dimensions;
+      }
+      if (typeof patch.apiKey === 'string') {
+        if (patch.apiKey === '') delete embedding.apiKey;
+        else embedding.apiKey = patch.apiKey;
+      }
+    }
+
     await writeSettings({
       providers,
       bMemory,
+      embedding,
       provider: next.provider ?? current.provider ?? 'anthropic',
     });
 

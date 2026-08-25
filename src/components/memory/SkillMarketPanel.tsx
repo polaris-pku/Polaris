@@ -40,9 +40,12 @@ import { ConfirmDialog } from '@/components/ConfirmDialog';
  *    就不给按钮，并把后端给的 reason 原样说出来 —— 摆一个点下去必然报错的按钮，比没有更糟。
  * 2. **审核是单向状态机。** 后端 `reviewSkill` 只接受 pending → approved / rejected，
  *    approved / rejected 之后再审直接抛错。所以「驳回」和「删除」一样要走确认。
- * 3. **上架不等于进市场。** 市场准入是「审核已通过 且 未被标记为已废弃」
- *    （`isMarketEligibleSkill`）—— 上架只是把状态显式写成已上架，也用来撤销已废弃。
- *    未过审的技能上架后依然搜不到，这一点必须当场讲清楚，不能让用户以为按钮没生效。
+ * 3. **上架不等于进市场 —— 上游 #114 之后更是如此。** `marketSearch` 现在
+ *    `WHERE role_id = '__market__'`（pg-memory-repository.ts），只搜市场池；而
+ *    `publishSkillToMarket` 在 memory-writer.ts 里就一行 `updateSkill({market_status:'available'})`,
+ *    技能仍挂在原 Agent 名下，**根本没进池子**。技能进入市场池的唯一途径是 Agent 退休时的
+ *    `disposeRetiredAssets`。所以按钮文案只说「已标记为上架」，绝不能说「别人现在能搜到了」。
+ *    审核通过 + 未废弃仍是必要条件，但已经不是充分条件。
  *
  * 还有一处「后端没给就别编」：`memory.marketSearch` 内部按余弦相似度排序并按下限过滤，
  * 但返回体里**不带每条的相似度分值**（仓库层 `.map(({ skill }) => skill)` 把它丢了）。
@@ -331,9 +334,12 @@ export function SkillMarketPanel({ roleId, capabilities, onError, onChanged }: M
   const publishSkill = (skill: RpcSkillView) => {
     runMutation(`publish:${skill.id}`, async () => {
       const result = await memoryApi.publishSkillToMarket(roleId, skill.id);
+      // 后端这个方法只把 market_status 置为 available（memory-writer.ts 里就一行 updateSkill），
+      // **不会**把技能迁进市场池 __market__，而 marketSearch 只搜市场池 —— 所以不能说
+      // 「其他 Agent 现在能搜到它」，那是句假话。
       return result.skill.review_status === 'approved'
-        ? '已上架，其他 Agent 现在可以在市场里搜到它。'
-        : '已标记为上架，但它还没通过审核，暂时不会出现在市场检索结果里。';
+        ? '已标记为上架。注意：市场检索只搜市场池，技能要等这个 Agent 退休时随资产处置迁入才会被别人搜到。'
+        : '已标记为上架，但它还没通过审核。';
     });
   };
 
@@ -354,7 +360,8 @@ export function SkillMarketPanel({ roleId, capabilities, onError, onChanged }: M
   const approveSkill = (skill: RpcSkillView) => {
     runMutation(`approve:${skill.id}`, async () => {
       await memoryApi.approveSkill(skill.agent_id, skill.id, reviewedBy || undefined);
-      return '已通过审核，这条技能从下一次任务开始进入检索。';
+      // 「进入检索」指的是这个 Agent 自己的 searchMemory，不是跨 Agent 的市场检索
+      return '已通过审核，这条技能从下一次任务开始进入本 Agent 的记忆检索。';
     });
   };
 
@@ -483,8 +490,10 @@ export function SkillMarketPanel({ roleId, capabilities, onError, onChanged }: M
         />
 
         <p className="text-body text-fg-muted">
-          进入市场检索的条件是「审核已通过」且「未被标记为已废弃」。上架只是把状态显式写成已上架，也用来撤销已废弃
-          —— 真正让技能出现在别人市场里的是审核通过。
+          上架只是把状态写成已上架（也用来撤销已废弃），它
+          <strong className="text-fg-secondary">不会</strong>
+          让技能出现在别人的市场检索里 —— 市场检索只搜市场池，而技能进入市场池的唯一途径是这个 Agent
+          退休时的资产处置。被引用过的技能迁入并保持在架，没被引用过的标记为独占保留。
         </p>
 
         {skillsLoading && !skills && <PendingLine text="正在读取技能…" />}
@@ -693,7 +702,9 @@ export function SkillMarketPanel({ roleId, capabilities, onError, onChanged }: M
             技能市场
           </h3>
           <p className="text-body text-fg-muted">
-            按语义检索其他 Agent 已过审的技能，引入后会在本 Agent 名下生成一份副本。
+            按语义检索<strong className="text-fg-secondary">市场池</strong>
+            里已过审的技能，引入后会在本 Agent 名下生成一份副本。市场池只装退休 Agent
+            交出来的技能，在职 Agent 的技能搜不到。
           </p>
         </div>
 

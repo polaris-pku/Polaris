@@ -46,6 +46,18 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
   const [editingDatabase, setEditingDatabase] = useState(false);
   const [revealDatabase, setRevealDatabase] = useState(false);
 
+  // ── Embedding ──
+  const [embProvider, setEmbProvider] = useState<'hash' | 'openai'>('hash');
+  const [embModel, setEmbModel] = useState('');
+  const [embBaseUrl, setEmbBaseUrl] = useState('');
+  const [embDimensions, setEmbDimensions] = useState('32');
+  const [embKey, setEmbKey] = useState('');
+  const [embHasKey, setEmbHasKey] = useState(false);
+  const [editingEmbKey, setEditingEmbKey] = useState(false);
+  const [revealEmbKey, setRevealEmbKey] = useState(false);
+  /** 打开弹窗时的维度，用来判断这次保存有没有改维度（改了要换表）。 */
+  const [savedDimensions, setSavedDimensions] = useState(32);
+
   useEffect(() => onBackendStatus(setStatus), []);
 
   /** 打开弹窗时从主进程拉一次已存配置（key 只回布尔，明文永不回传） */
@@ -60,6 +72,15 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
       setDatabaseUrl('');
       setEditingDatabase(!s.bMemory.configured);
       setRevealDatabase(false);
+      setEmbProvider(s.embedding.provider);
+      setEmbModel(s.embedding.model);
+      setEmbBaseUrl(s.embedding.baseUrl);
+      setEmbDimensions(String(s.embedding.dimensions));
+      setSavedDimensions(s.embedding.dimensions);
+      setEmbHasKey(s.embedding.hasKey);
+      setEmbKey('');
+      setEditingEmbKey(!s.embedding.hasKey);
+      setRevealEmbKey(false);
       setProviderId(id);
       setBaseUrl(cfg?.baseUrl ?? '');
       setModel(cfg?.model ?? '');
@@ -80,6 +101,15 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
   const hasSavedKey = !!saved?.hasKey;
   const needsEndpoint = provider ? provider.id !== 'anthropic' : false;
 
+  const embDimensionsValid = /^\d+$/.test(embDimensions.trim()) && Number(embDimensions) > 0;
+  /**
+   * 维度改了就必须换一张表。`ensurePgMemorySchema` 建表用的是
+   * `CREATE TABLE IF NOT EXISTS ... vector(N)` —— 表已存在时它**不会** ALTER 列，
+   * 于是新维度的向量在每次写入时都会被 pgvector 拒掉，reindex 也只会收获一堆 failures。
+   */
+  const dimensionsChanged = embDimensionsValid && Number(embDimensions) !== savedDimensions;
+  const embNeedsKey = embProvider === 'openai' && !embHasKey && !embKey.trim();
+
   const save = useCallback(async () => {
     if (!backend || !provider) return;
     setSaving(true);
@@ -87,6 +117,14 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
       const next = await backend.saveSettings({
         provider: providerId,
         ...(editingDatabase ? { bMemory: { databaseUrl: databaseUrl.trim() } } : {}),
+        embedding: {
+          provider: embProvider,
+          model: embModel.trim(),
+          baseUrl: embBaseUrl.trim(),
+          ...(embDimensionsValid ? { dimensions: Number(embDimensions) } : {}),
+          // 不传 apiKey = 保留原值；只有在编辑态才提交（空串就是删除）
+          ...(editingEmbKey ? { apiKey: embKey.trim() } : {}),
+        },
         providers: {
           [providerId]: {
             // 不传 key = 保留原值 —— 改模型/端点时不必重新粘一遍 key
@@ -115,6 +153,13 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
     needsEndpoint,
     editingDatabase,
     databaseUrl,
+    embProvider,
+    embModel,
+    embBaseUrl,
+    embDimensions,
+    embDimensionsValid,
+    editingEmbKey,
+    embKey,
     load,
   ]);
 
@@ -133,7 +178,9 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
   const auth = status?.auth;
   const canSave =
     (editingKey ? !!key.trim() : true) &&
-    (editingDatabase ? !!databaseUrl.trim() : databaseConfigured);
+    (editingDatabase ? !!databaseUrl.trim() : databaseConfigured) &&
+    embDimensionsValid &&
+    (embProvider === 'hash' || (!!embModel.trim() && !embNeedsKey));
 
   return (
     <Dialog open={open} onClose={onClose} className="max-w-lg">
@@ -357,6 +404,146 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
                     {revealDatabase ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
                   </button>
                 </div>
+              )}
+            </div>
+
+            <div className="mt-4 border-t border-edge pt-4">
+              <div className="flex items-center gap-2">
+                <span className="font-mono text-code text-brand-purple">E</span>
+                <div>
+                  <div className="text-body text-brand-silver">Embedding 模型</div>
+                  <div className="text-body text-fg-muted">
+                    技能与经验的语义检索用它，与上面的对话模型是两套凭据。
+                  </div>
+                </div>
+              </div>
+
+              <div className="mt-2 flex items-center gap-2">
+                {(
+                  [
+                    { id: 'hash', label: '本地哈希（无需 key）' },
+                    { id: 'openai', label: 'OpenAI 兼容端点' },
+                  ] as const
+                ).map((option) => (
+                  <button
+                    key={option.id}
+                    type="button"
+                    onClick={() => {
+                      setEmbProvider(option.id);
+                      // 两种 provider 的常用维度差两个数量级，切换时把默认值带过去，
+                      // 免得用户拿 32 维去连 text-embedding-3-small
+                      setEmbDimensions(option.id === 'hash' ? '32' : '1536');
+                    }}
+                    className={cn(
+                      'rounded-panel border px-3 py-1.5 text-body transition-colors',
+                      embProvider === option.id
+                        ? 'border-brand-purple bg-brand-purple/10 text-brand-silver'
+                        : 'border-edge-strong bg-brand-panel text-fg-muted hover:text-brand-silver',
+                    )}
+                  >
+                    {option.label}
+                  </button>
+                ))}
+              </div>
+
+              {embProvider === 'hash' ? (
+                <p className="mt-2 rounded-panel border border-human/30 bg-human/5 px-3 py-2 text-body text-human-soft">
+                  哈希向量是确定性占位值，不是语义嵌入。链路能跑通，但「找相似技能」实际上
+                  是在比哈希碰撞 —— 要真正的语义召回，切到 OpenAI 兼容端点。
+                </p>
+              ) : (
+                <div className="mt-2 space-y-2">
+                  <input
+                    value={embModel}
+                    onChange={(e) => setEmbModel(e.target.value)}
+                    placeholder="text-embedding-3-small"
+                    spellCheck={false}
+                    autoComplete="off"
+                    className="w-full rounded-panel border border-edge-strong bg-brand-panel px-3 py-2 font-mono text-code text-brand-silver outline-none placeholder:text-fg-faint focus:border-brand-purple"
+                  />
+                  <input
+                    value={embBaseUrl}
+                    onChange={(e) => setEmbBaseUrl(e.target.value)}
+                    placeholder="https://api.openai.com/v1（留空用官方默认）"
+                    spellCheck={false}
+                    autoComplete="off"
+                    className="w-full rounded-panel border border-edge-strong bg-brand-panel px-3 py-2 font-mono text-code text-brand-silver outline-none placeholder:text-fg-faint focus:border-brand-purple"
+                  />
+                  {embHasKey && !editingEmbKey ? (
+                    <div className="flex items-center gap-2 rounded-panel border border-ok/30 bg-ok/5 px-3 py-2">
+                      <CheckCircle2 className="h-4 w-4 text-ok" />
+                      <span className="text-body text-brand-silver">
+                        Embedding key 已保存（不回传界面）
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => setEditingEmbKey(true)}
+                        className="ml-auto text-body text-command-soft underline-offset-2 hover:underline"
+                      >
+                        更改
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="relative">
+                      <input
+                        type={revealEmbKey ? 'text' : 'password'}
+                        value={embKey}
+                        onChange={(e) => setEmbKey(e.target.value)}
+                        placeholder="Embedding API Key"
+                        spellCheck={false}
+                        autoComplete="off"
+                        className="w-full rounded-panel border border-edge-strong bg-brand-panel px-3 py-2 pr-10 font-mono text-code text-brand-silver outline-none placeholder:text-fg-faint focus:border-brand-purple"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setRevealEmbKey((value) => !value)}
+                        title={revealEmbKey ? '隐藏' : '显示'}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-fg-muted hover:text-brand-silver"
+                      >
+                        {revealEmbKey ? (
+                          <EyeOff className="h-4 w-4" />
+                        ) : (
+                          <Eye className="h-4 w-4" />
+                        )}
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <div className="mt-2 flex items-center gap-2">
+                <span className="shrink-0 text-body text-fg-muted">向量维度</span>
+                <input
+                  value={embDimensions}
+                  onChange={(e) => setEmbDimensions(e.target.value)}
+                  inputMode="numeric"
+                  spellCheck={false}
+                  autoComplete="off"
+                  className="w-28 rounded-panel border border-edge-strong bg-brand-panel px-3 py-1.5 font-mono text-code text-brand-silver outline-none focus:border-brand-purple"
+                />
+                {!embDimensionsValid && (
+                  <span className="text-body text-danger-soft">必须是正整数。</span>
+                )}
+              </div>
+
+              {dimensionsChanged && (
+                <p className="mt-2 rounded-panel border border-danger/30 bg-danger/5 px-3 py-2 text-body text-danger-soft">
+                  维度从 {savedDimensions} 改成了 {embDimensions.trim()}。建表语句里的
+                  <code className="mx-1 rounded-chip bg-brand-raised px-1 font-mono text-code">
+                    vector(N)
+                  </code>
+                  只在<strong className="text-danger">表不存在</strong>
+                  时才生效，已有的表不会自动改列 —— 直接保存的话，之后每次写入 都会被 pgvector
+                  拒绝，重建索引也只会得到一堆失败。先换一个空数据库，或者手动 ALTER 这两张表的
+                  description_embedding 列。
+                </p>
+              )}
+
+              {!dimensionsChanged && embProvider === 'openai' && (
+                <p className="mt-2 text-body text-fg-muted">
+                  换了模型但维度不变时，存量向量仍是旧模型算的。保存重启后到 Agent 控制台的
+                  「重建向量索引」跑一次，并勾上「强制重算」。
+                </p>
               )}
             </div>
 

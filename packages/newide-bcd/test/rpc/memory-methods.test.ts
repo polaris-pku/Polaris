@@ -10,6 +10,12 @@ describe('MemoryRpcMethods', () => {
       role_id: roleId,
       requested_by: requestedBy,
     }));
+    const promoteMemoryExperience = vi.fn(async (roleId: string, experienceId: string) => ({
+      id: 'skill_promoted',
+      review_status: 'pending',
+      promoted_from: experienceId,
+      agent_id: roleId,
+    }));
     const marketSearchMemorySkills = vi.fn(async () => [marketSkill()]);
     const marketImportMemorySkill = vi.fn(
       async (roleId: string, sourceSkillId: string) => ({
@@ -52,8 +58,10 @@ describe('MemoryRpcMethods', () => {
     }) as never);
     
     const deleteMemoryAgent = vi.fn(async () => undefined);
+    const reindexMemory = vi.fn(async () => reindexEvidence());
     const service = fakeService({
       promoteMemorySkills,
+      promoteMemoryExperience,
       marketSearchMemorySkills,
       marketImportMemorySkill,
       retireMemoryAgent,
@@ -61,6 +69,7 @@ describe('MemoryRpcMethods', () => {
       approveMemorySkill,
       rejectMemorySkill,
       deleteMemoryAgent,
+      reindexMemory,
     });
     const dispatcher = new JsonRpcDispatcher();
     new MemoryRpcMethods(service).register(dispatcher);
@@ -226,6 +235,19 @@ describe('MemoryRpcMethods', () => {
     await session.handleLine(
       '{"jsonrpc":"2.0","id":53,"method":"memory.listExperiencesBySourceTask","params":{"task_id":""}}',
     );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":54,"method":"memory.promoteExperience","params":{"role_id":"role_ts_engineer","experience_id":"experience_1"}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":55,"method":"memory.promoteExperience","params":{"role_id":"role_ts_engineer"}}',
+    );
+    await session.handleLine('{"jsonrpc":"2.0","id":56,"method":"memory.reindex","params":{}}');
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":57,"method":"memory.reindex","params":{"role_id":"role_ts_engineer","force":true}}',
+    );
+    await session.handleLine(
+      '{"jsonrpc":"2.0","id":58,"method":"memory.reindex","params":{"role_id":""}}',
+    );
 
     expect(output.map((line) => JSON.parse(line))).toMatchObject([
       {
@@ -343,8 +365,19 @@ describe('MemoryRpcMethods', () => {
       { id: 51, result: { skills: [{ id: 'skill_pending' }] } },
       { id: 52, result: { experiences: [{ id: 'experience_1' }] } },
       { id: 53, error: { code: -32602, message: 'Invalid params' } },
+      {
+        id: 54,
+        result: {
+          skill: { id: 'skill_promoted', review_status: 'pending', promoted_from: 'experience_1' },
+        },
+      },
+      { id: 55, error: { code: -32602, message: 'Invalid params' } },
+      { id: 56, result: { reindex: reindexEvidence() } },
+      { id: 57, result: { reindex: reindexEvidence() } },
+      { id: 58, error: { code: -32602, message: 'Invalid params' } },
     ]);
     expect(promoteMemorySkills).toHaveBeenCalledWith('role_ts_engineer', 'user');
+    expect(promoteMemoryExperience).toHaveBeenCalledWith('role_ts_engineer', 'experience_1');
     expect(approveMemorySkill).toHaveBeenCalledWith(
       'role_ts_engineer',
       'skill_1',
@@ -369,8 +402,25 @@ describe('MemoryRpcMethods', () => {
     expect(runRetirementScan).toHaveBeenLastCalledWith('role_ts_engineer');
     expect(deleteMemoryAgent).toHaveBeenCalledWith('role_ts_engineer', undefined);
     expect(deleteMemoryAgent).toHaveBeenCalledWith('role_ts_engineer', { force: true });
+    expect(reindexMemory).toHaveBeenCalledWith(undefined, {});
+    expect(reindexMemory).toHaveBeenLastCalledWith('role_ts_engineer', { force: true });
   });
 });
+
+function reindexEvidence() {
+  return {
+    scope: 'all' as const,
+    agents_processed: 1,
+    skills_reindexed: 1,
+    skills_skipped: 0,
+    experiences_reindexed: 1,
+    experiences_skipped: 0,
+    failures: [],
+    dimensions: 4,
+    started_at: '2026-07-21T00:00:00.000Z',
+    completed_at: '2026-07-21T00:00:01.000Z',
+  };
+}
 
 function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMethodsService {
   return {
@@ -390,6 +440,7 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
         list_skills: { status: 'available' },
         list_maintenance: { status: 'available' },
         promote_skills: { status: 'available' },
+        promote_experience: { status: 'available' },
         approve_skill: { status: 'available' },
         reject_skill: { status: 'available' },
         update_persona: { status: 'available' },
@@ -415,6 +466,7 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
         get_overview: { status: 'available' },
         list_pending_reviews: { status: 'available' },
         list_experiences_by_source_task: { status: 'available' },
+        reindex: { status: 'available' },
       },
     }),
     listMemoryAgents: async () => [
@@ -443,6 +495,7 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
     listMemoryExperiences: async () => [{ id: 'experience_1' } as never],
     listMemoryMaintenance: async () => [maintenance()],
     promoteMemorySkills: async () => maintenance(),
+    promoteMemoryExperience: async () => ({ id: 'skill_promoted' } as never),
     marketSearchMemorySkills: async () => [marketSkill()],
     marketImportMemorySkill: async () => ({
       imported: marketSkill(),
@@ -537,6 +590,7 @@ function fakeService(overrides: Partial<MemoryMethodsService> = {}): MemoryMetho
     }),
     listMemoryPendingReviews: async () => [{ id: 'skill_pending' } as never],
     listMemoryExperiencesBySourceTask: async () => [{ id: 'experience_1' } as never],
+    reindexMemory: async () => reindexEvidence(),
     ...overrides,
   };
 }

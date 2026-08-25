@@ -87,6 +87,25 @@ declare global {
     fastModel: string;
   };
 
+  /**
+   * Embedding 运行时配置（与对话模型完全分开：走 EMBEDDING_API_KEY / EMBEDDING_BASE_URL，
+   * 不共用 provider 的 key）。
+   *
+   * - `hash`：确定性哈希占位向量，不打任何外部服务，也不需要 key。语义检索在它下面
+   *   只是在比哈希碰撞 —— 能跑通链路，但召回没有意义。
+   * - `openai`：BCD 的 LiteLLM 只实现了 openai 形状的嵌入端点；任何 openai 兼容服务
+   *   都可以通过 baseUrl 接上。
+   *
+   * `dimensions` 会被拼进建表语句 `vector(N)`，**改它等于换一张表** —— 见设置里的提示。
+   */
+  type DesktopEmbeddingConfig = {
+    provider: 'hash' | 'openai';
+    model: string;
+    baseUrl: string;
+    dimensions: number;
+    hasKey: boolean;
+  };
+
   /** BCD 后端子进程的运行状态 */
   type DesktopBackendStatus = {
     state: 'stopped' | 'starting' | 'ready' | 'error';
@@ -247,6 +266,7 @@ declare global {
       getSettings: () => Promise<{
         provider: string;
         bMemory: { configured: boolean };
+        embedding: DesktopEmbeddingConfig;
         configured: Record<string, DesktopProviderConfig>;
       }>;
       /**
@@ -256,6 +276,13 @@ declare global {
       saveSettings: (next: {
         provider?: string;
         bMemory?: { databaseUrl?: string };
+        embedding?: {
+          provider?: 'hash' | 'openai';
+          model?: string;
+          baseUrl?: string;
+          dimensions?: number;
+          apiKey?: string;
+        };
         providers?: Record<
           string,
           { key?: string; baseUrl?: string; model?: string; fastModel?: string }

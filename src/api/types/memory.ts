@@ -135,7 +135,7 @@ export interface MemoryEmbeddingRuntime {
 }
 
 /**
- * 31 个受能力门控的记忆操作（`BMemoryCapabilities.operations`，键集逐字对齐后端接口声明）。
+ * 33 个受能力门控的记忆操作（`BMemoryCapabilities.operations`，键集逐字对齐后端接口声明）。
  *
  * ⚠️ 键名与 RPC 方法名并非一一对应：`get_agent_persona` 对应 `memory.getAgent`，
  * `publish_skill` 对应 `memory.publishSkillToMarket`；`memory.getCapabilities` 自身没有键。
@@ -143,7 +143,8 @@ export interface MemoryEmbeddingRuntime {
  * 可用性规则（b-memory-backend-service.ts `getCapabilities()`）：
  * - 无条件 available：list_agents / get_agent_persona / list_experiences / list_skills /
  *   list_maintenance / approve_skill / reject_skill / promote_skills
- * - 需 repository + embedding：search_memory / market_search
+ * - 需 repository + embedding：search_memory / market_search / reindex
+ *   （门控只看 EmbeddingProvider 在不在，hash provider 同样算数）
  * - 需生命周期端口：retire_agent / retirement_scan / create_agent / update_agent / delete_agent
  * - 其余需 repository
  */
@@ -155,6 +156,8 @@ export interface MemoryOperations {
   list_skills: MemoryOperationCapability;
   list_maintenance: MemoryOperationCapability;
   promote_skills: MemoryOperationCapability;
+  /** 对应 `memory.promoteExperience`（显式晋升单条经验，与批量 promote_skills 互补）。 */
+  promote_experience: MemoryOperationCapability;
   approve_skill: MemoryOperationCapability;
   reject_skill: MemoryOperationCapability;
   update_persona: MemoryOperationCapability;
@@ -181,6 +184,12 @@ export interface MemoryOperations {
   get_overview: MemoryOperationCapability;
   list_pending_reviews: MemoryOperationCapability;
   list_experiences_by_source_task: MemoryOperationCapability;
+  /**
+   * 对应 `memory.reindex`。后端的门控是「有 MemoryRepository 且有 EmbeddingProvider」，
+   * 只看 provider 在不在 —— HashEmbeddingProvider 同样报 available，重算出来的也还是
+   * 哈希向量。要判断重建是否真有意义，看 `MemoryCapabilities.embedding.provider`。
+   */
+  reindex: MemoryOperationCapability;
 }
 
 /** `MemoryOperations` 的键名联合，用于按名字做能力判定。 */
@@ -190,7 +199,8 @@ export type MemoryOperationName = keyof MemoryOperations;
  * `memory.getCapabilities` 的能力清单（`BMemoryCapabilities`）。
  *
  * `schema_version` 刻意钉死成字面量：后端升版时这里必须编译报错，而不是悄悄漏读新字段。
- * v1 → v2 的变化是新增了 `skill_review` 块，并把 operations 补齐到 31 个键。
+ * v1 → v2 的变化是新增了 `skill_review` 块，并把 operations 补齐到 31 个键；
+ * 上游随后又加了 `promote_experience` 与 `reindex`，现为 33 个键。
  */
 export interface MemoryCapabilities {
   schema_version: 'newide.b-memory-capabilities.v2';
@@ -597,15 +607,33 @@ export interface RpcRetireAssetDisposition {
   experiences_discarded: number;
 }
 
-/** `memory.retireAgent` 的 result.retire（`RetireResult`）。重复退休是幂等的，返回全 0 处置。 */
+/**
+ * `memory.retireAgent` 的 result.retire（`RetireResult`）。
+ *
+ * **退休是两阶段的，且终态会删掉 Agent 实体** —— 这两点都会咬到 UI：
+ *
+ * - `status='pre_retired'`：Agent 名下还有在跑任务，只置了 draining 标记（不再竞标 /
+ *   不再被派发），等任务收尾时由 `dispatchTask` 自动 finalize。此时**只有 `retired_reason`
+ *   和 `pending: true`**，`retired_at` 与 `asset_disposition` 都是 undefined ——
+ *   直接读 `asset_disposition.skills_retained` 会抛 TypeError。
+ * - `status='retired'`：finalize 完成，技能已迁入市场池，**Agent 实体已从库中删除**，
+ *   只留一条归档记录（归档没有 RPC 出口）。所以退休成功后必须刷新 Agent 列表并清空选中态，
+ *   否则接着调 `getAgent` 会报 `Agent not found`。
+ *
+ * 对已归档角色重复调用是幂等的：返回归档摘要（字段齐全）。
+ */
 export interface RpcRetireResult {
   role_id: string;
-  status: 'retired';
-  retired_at: string;
-  retired_reason: MemoryRetiredReason;
-  asset_disposition: RpcRetireAssetDisposition;
+  status: 'retired' | 'pre_retired';
+  /** 仅 `status='retired'` 时存在。 */
+  retired_at?: string;
+  retired_reason?: MemoryRetiredReason;
+  /** 仅 `status='retired'` 时存在。 */
+  asset_disposition?: RpcRetireAssetDisposition;
   /** 仅 replacement 为 clean_slate / seeded_slate 时出现，形如 `${role_id}__replacement`。 */
   replacement_role_id?: string;
+  /** `status='pre_retired'` 时为 true：仍有在跑任务，尚未真正退休。 */
+  pending?: boolean;
 }
 
 /** `memory.retireAgent` 的可选项（reason 默认 manual，replacement 默认 none）。 */
@@ -616,7 +644,13 @@ export interface MemoryRetireOptions {
 
 // ── 技能市场（memory.marketSearch / marketImport） ──
 
-/** `memory.marketSearch` 的检索参数（top_k 默认 10，由服务层兜底）。 */
+/**
+ * `memory.marketSearch` 的检索参数（top_k 默认 10，由服务层兜底）。
+ *
+ * **检索范围只有市场池 `__market__`**（上游 #114 收窄，此前是全库）：技能要么由
+ * `publishSkillToMarket` 主动上架，要么在 Agent 退休时随资产处置迁入，否则搜不到。
+ * 所以「刚 approve 的技能搜不着」不是索引坏了，是它还没上架。
+ */
 export interface MemoryMarketSearchQuery {
   query: string;
   top_k?: number;
@@ -766,4 +800,49 @@ export interface MemoryMaintenanceEvidence {
   completed_at: string;
   /** 这是 core 的 SCHEMA_VERSION，不是记忆模块自己的版本字面量。 */
   schema_version: string;
+}
+
+// ── 重建向量索引（memory.reindex） ──
+
+/** 单条记录重建失败的明细；后端不中断整体，把失败收集起来一起返回。 */
+export interface RpcReindexFailure {
+  agent_id: string;
+  kind: 'skill' | 'experience';
+  id: string;
+  error: string;
+}
+
+/**
+ * `memory.reindex` 的 result.reindex（`ReindexMemoryResult`）。
+ *
+ * 换 embedding 模型后存量 `description_embedding` 仍是旧模型算的，语义检索
+ * （`searchMemory` / `marketSearch`）的相似度会失真，必须全量重算。后端没有
+ * 自动重建，这个 RPC 是唯一入口。
+ *
+ * 默认只重算「为空或维度不匹配」的记录，所以重跑很便宜、天然幂等；
+ * **同维度换模型必须传 `force: true`**，否则一条都不会重算（维度看着是对的）。
+ */
+export interface RpcReindexResult {
+  /** all = 全量（含市场池）；role = 单 Agent。 */
+  scope: 'all' | 'role';
+  /** 仅 `scope='role'` 时存在。 */
+  role_id?: string;
+  agents_processed: number;
+  skills_reindexed: number;
+  skills_skipped: number;
+  experiences_reindexed: number;
+  experiences_skipped: number;
+  failures: RpcReindexFailure[];
+  /** 当前 EmbeddingProvider 的向量维度（重建后的目标维度）。 */
+  dimensions: number;
+  started_at: string;
+  completed_at: string;
+}
+
+/** `memory.reindex` 的可选项。 */
+export interface MemoryReindexOptions {
+  /** 缺省重建全部 Agent（含市场池）；给了就只重建这一个。 */
+  roleId?: string;
+  /** 无条件重算 —— 同维度换模型时必须打开。 */
+  force?: boolean;
 }

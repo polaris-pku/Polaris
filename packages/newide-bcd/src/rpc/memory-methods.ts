@@ -19,6 +19,7 @@ import type {
   RetireOptions,
   RetireResult,
   RetirementScanResult,
+  ReindexMemoryResult,
   SkillListFilter,
   SkillView,
   SkillWritePatch,
@@ -40,6 +41,8 @@ export interface MemoryMethodsService {
   listMemoryExperiences(roleId: string, filter?: ExperienceListFilter): Promise<ExperienceView[]>;
   listMemoryMaintenance(roleId?: string): Promise<BMemoryMaintenanceEvidence[]>;
   promoteMemorySkills(roleId: string, requestedBy: string): Promise<BMemoryMaintenanceEvidence>;
+  /** 手动晋升一条经验为 Skill（memory.promoteExperience），产出 pending Skill 待审核 */
+  promoteMemoryExperience(roleId: string, experienceId: string): Promise<SkillView>;
   /** 技能市场检索（Spec §6.2 skill.market_search） */
   marketSearchMemorySkills(query: MarketSearchQuery): Promise<SkillRecord[]>;
   /** 技能市场引入（Spec §6.2 skill.market_import） */
@@ -121,6 +124,14 @@ export interface MemoryMethodsService {
   listMemoryPendingReviews(): Promise<SkillView[]>;
   /** 按任务溯源经验（memory.listExperiencesBySourceTask） */
   listMemoryExperiencesBySourceTask(taskId: string): Promise<ExperienceView[]>;
+  /**
+   * 重建向量索引（memory.reindex）：切换 embedding 模型后重算存量
+   * description_embedding（Spec §7.2）。roleId 缺省全量，force=true 无条件重算。
+   */
+  reindexMemory(
+    roleId: string | undefined,
+    options: { force?: boolean },
+  ): Promise<ReindexMemoryResult>;
 }
 
 const emptyParamsSchema = z.object({}).strict();
@@ -167,6 +178,12 @@ const promoteParamsSchema = z
   .object({
     role_id: z.string().trim().min(1),
     requested_by: z.string().trim().min(1).default('user'),
+  })
+  .strict();
+const promoteExperienceParamsSchema = z
+  .object({
+    role_id: z.string().trim().min(1),
+    experience_id: z.string().trim().min(1),
   })
   .strict();
 const marketSearchParamsSchema = z
@@ -323,6 +340,12 @@ const taskIdParamsSchema = z
     task_id: z.string().trim().min(1),
   })
   .strict();
+const reindexParamsSchema = z
+  .object({
+    role_id: z.string().trim().min(1).optional(),
+    force: z.boolean().optional(),
+  })
+  .strict();
 
 export class MemoryRpcMethods {
   constructor(private readonly service: MemoryMethodsService) {}
@@ -405,6 +428,12 @@ export class MemoryRpcMethods {
       return this.service
         .promoteMemorySkills(parsed.role_id, parsed.requested_by)
         .then((maintenance) => ({ maintenance }));
+    });
+    dispatcher.register('memory.promoteExperience', (params) => {
+      const parsed = parseParams(promoteExperienceParamsSchema, params);
+      return this.service
+        .promoteMemoryExperience(parsed.role_id, parsed.experience_id)
+        .then((skill) => ({ skill }));
     });
     dispatcher.register('memory.marketSearch', (params) => {
       const parsed = parseParams(marketSearchParamsSchema, params ?? {});
@@ -591,6 +620,13 @@ export class MemoryRpcMethods {
       const parsed = parseParams(bufferSeqParamsSchema, params);
       const maintenance = await this.service.retryMemoryExtraction(parsed.role_id, parsed.seq);
       return { maintenance };
+    });
+    dispatcher.register('memory.reindex', async (params) => {
+      const parsed = parseParams(reindexParamsSchema, params ?? {});
+      const reindex = await this.service.reindexMemory(parsed.role_id, {
+        ...(parsed.force !== undefined ? { force: parsed.force } : {}),
+      });
+      return { reindex };
     });
   }
 }

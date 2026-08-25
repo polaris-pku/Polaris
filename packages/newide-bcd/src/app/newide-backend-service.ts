@@ -90,6 +90,7 @@ import type {
   UserRatingResult,
   MemoryOverview,
   DeadLetterEntry,
+  ReindexMemoryResult,
 } from '../memory';
 import type { SkillRecord, BufferMeta, BufferSnapshot, AgentContextSnapshot } from '../memory/schemas';
 import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
@@ -366,6 +367,10 @@ export class NewideBackendService {
     return this.requireBMemoryService().promoteSkills(roleId, requestedBy);
   }
 
+  promoteMemoryExperience(roleId: string, experienceId: string): Promise<SkillView> {
+    return this.requireBMemoryService().promoteExperience(roleId, experienceId);
+  }
+
   marketSearchMemorySkills(query: MarketSearchQuery): Promise<SkillRecord[]> {
     return this.requireBMemoryService().marketSearch(query);
   }
@@ -493,6 +498,13 @@ export class NewideBackendService {
 
   listMemoryExperiencesBySourceTask(taskId: string): Promise<ExperienceView[]> {
     return this.requireBMemoryService().listExperiencesBySourceTask(taskId);
+  }
+
+  reindexMemory(
+    roleId?: string,
+    options: { force?: boolean } = {},
+  ): Promise<ReindexMemoryResult> {
+    return this.requireBMemoryService().reindexMemory(roleId, options);
   }
 
   createRun(params: RunCreateParams): Promise<RunCreateResult> {
