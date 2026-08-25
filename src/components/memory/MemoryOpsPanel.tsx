@@ -1,7 +1,6 @@
-import { useCallback, useEffect, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   AlertTriangle,
-  Database,
   Inbox,
   Loader2,
   Pencil,
@@ -13,23 +12,28 @@ import {
   TrendingUp,
 } from 'lucide-react';
 import { memoryApi } from '@/api/memory';
+import {
+  can,
+  fixed3,
+  INPUT_CLASS,
+  intText,
+  parsePositiveInt,
+  parseUnitFloat,
+} from '@/components/memory/memoryShared';
+import { Gate, IdRow, Pending, SectionHeader, UnavailableNote } from '@/components/memory/shared';
 import type {
-  MemoryAgentStatus,
   MemoryCapabilities,
   MemoryEffectiveness,
   MemoryExperienceWritePatch,
   MemoryExtractionStatus,
-  MemoryOperationName,
   MemorySearchOptions,
   MemoryUserRating,
   MemoryMaintenanceEvidence,
   RpcBufferState,
   RpcDeadLetterEntry,
   RpcExperienceView,
-  RpcMemoryOverview,
   RpcMemorySearchResult,
   RpcPendingBuffer,
-  RpcReindexResult,
   RpcUserRatingResult,
 } from '@/api/types/memory';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
@@ -44,7 +48,10 @@ import { Panel } from '@/components/ui/Panel';
 import { Textarea } from '@/components/ui/Textarea';
 
 /**
- * 记忆运维面板 —— 总览 / 检索 / 经验 / 缓冲区四块，覆盖 9 条此前前端从没调过的 memory RPC。
+ * 记忆运维面板 —— 检索 / 经验 / 缓冲区三块，全部限定在当前选中的 Agent 名下。
+ *
+ * 全局总览（`getOverview`）与重建索引（`reindex`）已经搬去 `OrgConsolePanel`：两者都不吃
+ * role_id，摆在这里等于「要先选个 Agent 才看得到全局统计」。
  *
  * 三条约束，都是从后端契约倒推出来的，不是排版偏好：
  *  1. **入口按 capabilities 声明渲染。** `memory.getCapabilities` 会逐个操作告诉你
@@ -65,22 +72,6 @@ export interface MemoryPanelProps {
   onChanged: () => void;
 }
 
-const INPUT_CLASS =
-  'w-full rounded-panel border border-edge-strong bg-surface-void px-3 py-2 text-body text-fg-primary placeholder:text-fg-faint focus:border-command focus:outline-none focus:ring-1 focus:ring-command/40';
-
-/** Agent 生命周期状态的人话（`AgentStatusSchema`）。 */
-const AGENT_STATUS_LABEL: Record<MemoryAgentStatus, string> = {
-  created: '已创建',
-  active: '活跃',
-  idle: '空闲',
-  draining: '收尾中',
-  retired: '已退休',
-};
-
-/**
- * 评分档位的人话，括号里是后端 `CONFIDENCE_DELTA` 会施加到该任务派生经验上的置信度增量
- * （services/feedback.ts）。这不是提示语，是这次点击的真实后果。
- */
 const RATING_CHOICES: { value: MemoryUserRating; label: string; delta: string }[] = [
   { value: 'resolved', label: '已解决', delta: '置信度 +0.05' },
   { value: 'partially_resolved', label: '部分解决', delta: '置信度不变' },
@@ -117,129 +108,11 @@ const EXPERIENCE_TYPE_LABEL: Record<string, string> = {
   negative: '负经验',
 };
 
-const can = (capabilities: MemoryCapabilities | undefined, op: MemoryOperationName): boolean =>
-  capabilities?.operations[op].status === 'available';
-
-/** 正整数；空串 / 非法值一律当没填，交给后端默认值。 */
-function parsePositiveInt(raw: string): number | undefined {
-  if (raw.trim() === '') return undefined;
-  const value = Number.parseInt(raw, 10);
-  return Number.isInteger(value) && value > 0 ? value : undefined;
-}
-
-/** [0,1] 区间的小数；后端 zod 就是这个范围，越界的值不必送出去挨一次 -32602。 */
-function parseUnitFloat(raw: string): number | undefined {
-  if (raw.trim() === '') return undefined;
-  const value = Number.parseFloat(raw);
-  return Number.isFinite(value) && value >= 0 && value <= 1 ? value : undefined;
-}
-
-/**
- * RPC 边界是不可信 JSON —— `similarity` 是后端检索时附加的，`confidence` / `avg_confidence`
- * 在老数据与降级投影里都可能缺席。对可能不存在的值直接 `.toFixed()` 会当场抛异常白屏。
- */
-function fixed3(value: unknown): string {
-  return typeof value === 'number' && Number.isFinite(value) ? value.toFixed(3) : '—';
-}
-
-/** 同上：计数类字段缺席时 `String(undefined)` 会把「undefined」印到界面上。 */
-function intText(value: unknown): string {
-  return typeof value === 'number' && Number.isFinite(value) ? String(value) : '后端未给出';
-}
-
 function splitTags(raw: string): string[] {
   return raw
     .split(/[,，\s]+/)
     .map((tag) => tag.trim())
     .filter((tag) => tag.length > 0);
-}
-
-/** 能力未声明可用时的那一行灰字：说清是「后端不给」而不是「界面没做」。 */
-function UnavailableNote({
-  capabilities,
-  op,
-  what,
-}: {
-  capabilities: MemoryCapabilities | undefined;
-  op: MemoryOperationName;
-  what: string;
-}) {
-  if (!capabilities) {
-    return <p className="text-body text-fg-muted">{what}：能力清单尚未返回。</p>;
-  }
-  const capability = capabilities.operations[op];
-  if (capability.status === 'available') return null;
-  return (
-    <p className="text-body text-fg-muted">
-      {what}：后端声明不可用
-      {capability.reason ? ` · ${capability.reason}` : ''}
-      <span className="ml-2 font-mono text-code text-fg-faint">{op}</span>
-    </p>
-  );
-}
-
-function Gate({
-  capabilities,
-  op,
-  what,
-  children,
-}: {
-  capabilities: MemoryCapabilities | undefined;
-  op: MemoryOperationName;
-  what: string;
-  children: ReactNode;
-}) {
-  if (can(capabilities, op)) return <>{children}</>;
-  return <UnavailableNote capabilities={capabilities} op={op} what={what} />;
-}
-
-function SectionHeader({
-  icon: Icon,
-  title,
-  method,
-  right,
-}: {
-  icon: typeof Database;
-  title: string;
-  method: string;
-  right?: ReactNode;
-}) {
-  return (
-    <div className="mb-3 flex items-center gap-2">
-      <Icon className="h-4 w-4 shrink-0 text-fg-muted" aria-hidden />
-      <h3 className="shrink-0 text-title text-fg-primary">{title}</h3>
-      <span className="truncate font-mono text-code text-fg-faint">{method}</span>
-      {right && <div className="ml-auto flex shrink-0 items-center gap-2">{right}</div>}
-    </div>
-  );
-}
-
-/** KeyValue 的兄弟排版，值换成 IdChip —— 机器 ID 不裸奔。 */
-function IdRow({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="flex items-baseline gap-3 py-1">
-      <span className="w-20 shrink-0 text-body text-fg-muted">{label}</span>
-      <IdChip value={value} />
-    </div>
-  );
-}
-
-function Stat({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-panel border border-edge bg-surface-void px-3 py-2">
-      <div className="text-body text-fg-muted">{label}</div>
-      <div className="tabular text-title text-fg-primary">{value}</div>
-    </div>
-  );
-}
-
-function Pending({ text }: { text: string }) {
-  return (
-    <p className="flex items-center gap-2 text-body text-fg-muted">
-      <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
-      {text}
-    </p>
-  );
 }
 
 export function MemoryOpsPanel({ roleId, capabilities, onError, onChanged }: MemoryPanelProps) {
@@ -256,11 +129,6 @@ export function MemoryOpsPanel({ roleId, capabilities, onError, onChanged }: Mem
     setRevision((n) => n + 1);
     onChanged();
   }, [onChanged]);
-
-  // ── 总览 ──
-  const overviewAvailable = can(capabilities, 'get_overview');
-  const [overview, setOverview] = useState<RpcMemoryOverview>();
-  const [overviewLoading, setOverviewLoading] = useState(false);
 
   // ── 检索 ──
   const [query, setQuery] = useState('');
@@ -282,12 +150,6 @@ export function MemoryOpsPanel({ roleId, capabilities, onError, onChanged }: Mem
   const [deletingBusy, setDeletingBusy] = useState(false);
   /** 正在晋升的经验 id；同一时刻只允许一条，避免连点晋升出两条重复技能。 */
   const [promotingId, setPromotingId] = useState<string>();
-
-  // ── 重建索引 ──
-  const [reindexScope, setReindexScope] = useState<'role' | 'all'>('role');
-  const [reindexForce, setReindexForce] = useState(false);
-  const [reindexBusy, setReindexBusy] = useState(false);
-  const [reindexResult, setReindexResult] = useState<RpcReindexResult>();
 
   const [sourceTaskId, setSourceTaskId] = useState('');
   const [sourceExperiences, setSourceExperiences] = useState<RpcExperienceView[]>();
@@ -323,29 +185,6 @@ export function MemoryOpsPanel({ roleId, capabilities, onError, onChanged }: Mem
     setKeywordDraft('');
     setKeyword('');
   }, [roleId]);
-
-  useEffect(() => {
-    if (!overviewAvailable) {
-      setOverview(undefined);
-      return;
-    }
-    let active = true;
-    setOverviewLoading(true);
-    void memoryApi
-      .getOverview()
-      .then((result) => {
-        if (active) setOverview(result.overview);
-      })
-      .catch((reason: unknown) => {
-        if (active) fail(reason);
-      })
-      .finally(() => {
-        if (active) setOverviewLoading(false);
-      });
-    return () => {
-      active = false;
-    };
-  }, [overviewAvailable, revision, fail]);
 
   useEffect(() => {
     if (!roleId || !listExperiencesAvailable) {
@@ -491,28 +330,6 @@ export function MemoryOpsPanel({ roleId, capabilities, onError, onChanged }: Mem
     }
   };
 
-  /**
-   * 重建向量索引。这是**同步且可能很慢**的一次 RPC —— 后端顺序遍历每条记录逐个 embed，
-   * 没有进度事件，全量重建时按记录数线性耗时。所以按钮期间整段禁用，不做超时兜底。
-   */
-  const runReindex = async () => {
-    if (reindexBusy) return;
-    setReindexBusy(true);
-    setReindexResult(undefined);
-    try {
-      const result = await memoryApi.reindex({
-        ...(reindexScope === 'role' ? { roleId } : {}),
-        ...(reindexForce ? { force: true } : {}),
-      });
-      setReindexResult(result.reindex);
-      bump();
-    } catch (reason) {
-      fail(reason);
-    } finally {
-      setReindexBusy(false);
-    }
-  };
-
   const confirmDelete = async (experience: RpcExperienceView) => {
     if (deletingBusy) return;
     setDeletingBusy(true);
@@ -542,165 +359,7 @@ export function MemoryOpsPanel({ roleId, capabilities, onError, onChanged }: Mem
 
   return (
     <div className="space-y-4">
-      {/* ── 1 · 总览 ── */}
-      <Panel>
-        <SectionHeader
-          icon={Database}
-          title="记忆总览"
-          method="memory.getOverview"
-          right={
-            overviewAvailable ? (
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={() => {
-                  setRevision((n) => n + 1);
-                }}
-                disabled={overviewLoading}
-              >
-                <RefreshCw className="h-3.5 w-3.5" />
-                刷新
-              </Button>
-            ) : undefined
-          }
-        />
-        <Gate capabilities={capabilities} op="get_overview" what="记忆总览">
-          {overviewLoading && !overview ? (
-            <Pending text="正在统计全局记忆…" />
-          ) : overview ? (
-            <div className="space-y-3">
-              <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-                <Stat label="Agent 总数" value={String(overview.agents.total)} />
-                <Stat label="技能总数" value={String(overview.skills.total)} />
-                <Stat label="待审核技能" value={String(overview.skills.pending_review)} />
-                <Stat label="市场在架" value={String(overview.skills.in_market)} />
-                <Stat label="经验总数" value={String(overview.experiences.total)} />
-                <Stat label="缓冲区待提取" value={String(overview.buffer.pending)} />
-                <Stat label="缓冲区死信" value={String(overview.buffer.dead_letters)} />
-                <Stat label="平均置信度" value={fixed3(overview.quality.avg_confidence)} />
-              </div>
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="text-body text-fg-muted">状态分布</span>
-                {Object.entries(overview.agents.by_status).map(([status, count]) => (
-                  <Badge key={status}>
-                    {AGENT_STATUS_LABEL[status as MemoryAgentStatus] ?? status}
-                    <span className="tabular font-mono text-code text-fg-faint">{count ?? 0}</span>
-                  </Badge>
-                ))}
-                {Object.keys(overview.agents.by_status).length === 0 && (
-                  <span className="text-body text-fg-muted">后端未给出任何状态计数。</span>
-                )}
-              </div>
-              <p className="text-body text-fg-muted">
-                总览是全局口径，跨所有 Agent 聚合，不随左侧选中的角色变化。
-              </p>
-            </div>
-          ) : (
-            <p className="text-body text-fg-muted">总览尚未取回。</p>
-          )}
-        </Gate>
-      </Panel>
-
-      {/* ── 1.5 · 重建向量索引 ── */}
-      <Panel>
-        <SectionHeader icon={RefreshCw} title="重建向量索引" method="memory.reindex" />
-        <Gate capabilities={capabilities} op="reindex" what="重建向量索引">
-          <div className="space-y-3">
-            <p className="text-body text-fg-muted">
-              换了 embedding 模型之后，库里存量的向量还是旧模型算的，拿它跟新模型的 query
-              比相似度没有意义。后端不会自动重建，这里是唯一入口。
-            </p>
-            {capabilities && (
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="text-body text-fg-muted">当前 provider</span>
-                <Badge
-                  variant={
-                    capabilities.embedding.provider === 'HashEmbeddingProvider' ? 'human' : 'ok'
-                  }
-                >
-                  {capabilities.embedding.provider}
-                </Badge>
-                {capabilities.embedding.model && (
-                  <span className="font-mono text-code text-fg-faint">
-                    {capabilities.embedding.model}
-                  </span>
-                )}
-                <span className="text-body text-fg-muted">
-                  维度 <span className="tabular">{intText(capabilities.embedding.dimensions)}</span>
-                </span>
-              </div>
-            )}
-            {capabilities?.embedding.provider === 'HashEmbeddingProvider' && (
-              <p className="text-body text-human-soft">
-                当前跑的是哈希向量（确定性占位，不是语义嵌入），重建出来的仍然是哈希向量。
-                要拿到真正的语义检索，先在设置里配好 Embedding 模型并重启后端，再回来重建。
-              </p>
-            )}
-            <div className="flex flex-wrap items-center gap-3">
-              <label className="flex items-center gap-2 text-body text-fg-secondary">
-                <input
-                  type="radio"
-                  name="reindex-scope"
-                  checked={reindexScope === 'role'}
-                  onChange={() => {
-                    setReindexScope('role');
-                  }}
-                />
-                只重建当前 Agent
-              </label>
-              <label className="flex items-center gap-2 text-body text-fg-secondary">
-                <input
-                  type="radio"
-                  name="reindex-scope"
-                  checked={reindexScope === 'all'}
-                  onChange={() => {
-                    setReindexScope('all');
-                  }}
-                />
-                全量（含市场池）
-              </label>
-              <label className="flex items-center gap-2 text-body text-fg-secondary">
-                <input
-                  type="checkbox"
-                  checked={reindexForce}
-                  onChange={(e) => {
-                    setReindexForce(e.target.checked);
-                  }}
-                />
-                强制重算
-              </label>
-            </div>
-            <p className="text-body text-fg-muted">
-              不勾「强制重算」时只补为空或维度对不上的记录，重跑很便宜。
-              <strong className="text-fg-secondary">
-                新旧模型维度相同时（比如都降到 1536）必须勾上
-              </strong>
-              ，否则维度看着是对的，一条都不会重算。
-            </p>
-            <Button
-              size="sm"
-              variant="secondary"
-              disabled={reindexBusy}
-              onClick={() => void runReindex()}
-            >
-              {reindexBusy ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <RefreshCw className="h-3.5 w-3.5" />
-              )}
-              {reindexBusy ? '重建中…（不要关闭）' : '开始重建'}
-            </Button>
-            {reindexBusy && (
-              <p className="text-body text-fg-muted">
-                后端逐条重算并写回，没有进度事件；记录多时会持续几分钟。
-              </p>
-            )}
-            {reindexResult && <ReindexResultCard result={reindexResult} />}
-          </div>
-        </Gate>
-      </Panel>
-
-      {/* ── 2 · 检索 ── */}
+      {/* ── 1 · 检索 ── */}
       <Panel>
         <SectionHeader icon={Search} title="记忆检索" method="memory.searchMemory" />
         <Gate capabilities={capabilities} op="search_memory" what="记忆检索">
@@ -872,7 +531,7 @@ export function MemoryOpsPanel({ roleId, capabilities, onError, onChanged }: Mem
         </Gate>
       </Panel>
 
-      {/* ── 3 · 经验 ── */}
+      {/* ── 2 · 经验 ── */}
       <Panel>
         <SectionHeader icon={Star} title="经验维护" method="memory.updateExperience" />
         <div className="space-y-4">
@@ -1130,7 +789,7 @@ export function MemoryOpsPanel({ roleId, capabilities, onError, onChanged }: Mem
         </div>
       </Panel>
 
-      {/* ── 4 · 缓冲区与维护 ── */}
+      {/* ── 3 · 缓冲区与维护 ── */}
       <Panel>
         <SectionHeader
           icon={Inbox}
@@ -1395,61 +1054,6 @@ export function MemoryOpsPanel({ roleId, capabilities, onError, onChanged }: Mem
 }
 
 /** 一条待提取快照的全部事实。Driver 的 6 字段报告分块折叠，默认只露摘要。 */
-/**
- * 重建索引的结果卡。
- *
- * `failures` 是逐条收集的：后端不因单条失败中断整体，所以「成功」和「有失败」会同时出现 ——
- * 只报重建条数而不摆失败，等于把一半的漏网记录藏起来。
- */
-function ReindexResultCard({ result }: { result: RpcReindexResult }) {
-  return (
-    <Panel density="compact" className="bg-surface-void">
-      <div className="flex flex-wrap items-center gap-2">
-        <Badge variant={result.failures.length === 0 ? 'ok' : 'human'}>
-          {result.failures.length === 0 ? '重建完成' : '部分失败'}
-        </Badge>
-        <Badge>{result.scope === 'all' ? '全量' : '单 Agent'}</Badge>
-        {result.role_id && <IdChip value={result.role_id} label="角色" />}
-        <span className="text-body text-fg-muted">
-          目标维度 <span className="tabular">{intText(result.dimensions)}</span>
-        </span>
-      </div>
-      <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-3">
-        <Stat label="扫描 Agent" value={intText(result.agents_processed)} />
-        <Stat label="技能重建" value={intText(result.skills_reindexed)} />
-        <Stat label="技能跳过" value={intText(result.skills_skipped)} />
-        <Stat label="经验重建" value={intText(result.experiences_reindexed)} />
-        <Stat label="经验跳过" value={intText(result.experiences_skipped)} />
-        <Stat label="失败" value={intText(result.failures.length)} />
-      </div>
-      {result.skills_reindexed === 0 && result.experiences_reindexed === 0 && (
-        <p className="mt-2 text-body text-fg-muted">
-          一条都没重算。若刚换过同维度的模型，勾上「强制重算」再跑一次 ——
-          不勾时后端只看维度对不对，看不出模型换没换。
-        </p>
-      )}
-      {result.failures.length > 0 && (
-        <div className="mt-2 space-y-1">
-          {result.failures.map((failure) => (
-            <div
-              key={`${failure.kind}:${failure.id}`}
-              className="flex flex-wrap items-center gap-2"
-            >
-              <Badge variant="danger">{failure.kind === 'skill' ? '技能' : '经验'}</Badge>
-              <IdChip value={failure.id} />
-              <IdChip value={failure.agent_id} label="归属" />
-              <span className="min-w-0 text-body text-danger-soft">{failure.error}</span>
-            </div>
-          ))}
-        </div>
-      )}
-      <p className="mt-2 text-body text-fg-faint">
-        {result.started_at} → {result.completed_at}
-      </p>
-    </Panel>
-  );
-}
-
 function PendingBufferDetail({ seq, buffer }: { seq: number; buffer: RpcPendingBuffer }) {
   const { snapshot, agentContext } = buffer;
   const report = snapshot.driver_return;

@@ -193,7 +193,8 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
     void startTerminalRun({ ...writeTargetOf(project), relPath });
   };
 
-  // Agent Board 已从侧栏收起：通过点任务的团队跳转过去（并切到该任务，展示其团队）。
+  // 点任务的团队跳到 Agent 控制台，并切到该任务、展示其团队。
+  // （控制台还有一个全局入口在侧栏页脚，那条不预选任何 Agent。）
   const openTaskTeam = (taskId: string) => {
     selectTask(taskId);
     setPage('agents');

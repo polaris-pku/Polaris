@@ -1,28 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import {
-  CheckCircle2,
-  ClipboardList,
-  Download,
-  Loader2,
-  Pencil,
-  Plus,
-  Search,
-  Store,
-  Tags,
-  Trash2,
-  Upload,
-  XCircle,
-} from 'lucide-react';
+import { Download, Loader2, Pencil, Plus, Search, Store, Tags, Trash2, Upload } from 'lucide-react';
 import { memoryApi } from '@/api/memory';
+import {
+  INPUT_CLASS,
+  MARKET_LABEL,
+  MARKET_POOL_ROLE_ID,
+  MARKET_TONE,
+  parseTags,
+  REVIEW_LABEL,
+  REVIEW_TONE,
+} from '@/components/memory/memoryShared';
+import { CapabilityNotice, TagRow, WireBadge } from '@/components/memory/shared';
 import type {
   MemoryCapabilities,
   MemoryMarketStatusPatch,
-  MemoryOperationName,
   MemorySkillWritePatch,
   RpcSkillRecord,
   RpcSkillView,
 } from '@/api/types/memory';
-import { Badge, type BadgeProps } from '@/components/ui/Badge';
+import { Badge } from '@/components/ui/Badge';
 import { Button } from '@/components/ui/Button';
 import { Dialog } from '@/components/ui/Dialog';
 import { EmptyState } from '@/components/ui/EmptyState';
@@ -32,7 +28,10 @@ import { Textarea } from '@/components/ui/Textarea';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
 
 /**
- * 技能写入口 · 审核队列 · 技能市场 —— 覆盖 9 个 `memory.*` 写／读方法。
+ * 技能写入口 · 技能市场 —— 单个 Agent 名下的技能读写，加上从市场池引入。
+ *
+ * 跨 Agent 的**待审队列**已经搬去 `OrgConsolePanel`：`listPendingReviews()` 不吃 role_id，
+ * 审批也走技能自己的 `agent_id`，本来就跟这里选中的是谁无关。
  *
  * 三条贯穿本文件的约束，都来自后端代码而不是审美：
  *
@@ -59,56 +58,10 @@ export interface MemoryPanelProps {
   onChanged: () => void;
 }
 
-const INPUT_CLASS =
-  'w-full rounded-panel border border-edge-strong bg-surface-void px-3 py-2 text-body text-fg-primary placeholder:text-fg-faint focus:border-command focus:outline-none focus:ring-1 focus:ring-command/40';
-
-/** 线上 `review_status` 声明为宽 string，这里只做翻译，认不出来的原样透出（见 WireBadge）。 */
-const REVIEW_LABEL: Record<string, string> = {
-  pending: '待审核',
-  approved: '已通过',
-  rejected: '已驳回',
-};
-
-const REVIEW_TONE: Record<string, BadgeProps['variant']> = {
-  pending: 'human',
-  approved: 'ok',
-  rejected: 'danger',
-};
-
-/** `retired_unique` 只由退休流程写入，手工 PATCH 写不进，但读得到。 */
-const MARKET_LABEL: Record<string, string> = {
-  available: '已上架',
-  superseded: '已废弃',
-  retired_unique: '退休独有',
-};
-
-const MARKET_TONE: Record<string, BadgeProps['variant']> = {
-  available: 'ok',
-  superseded: 'default',
-  retired_unique: 'human',
-};
-
-/** 编辑态允许写入的两个 market_status（RPC 层 zod 收窄，不含 retired_unique）。 */
 const MARKET_STATUS_CHOICES: { value: MemoryMarketStatusPatch; label: string }[] = [
   { value: 'available', label: '已上架' },
   { value: 'superseded', label: '已废弃' },
 ];
-
-/** 退休资产池的固定 role_id：技能在这里表示原主人已退休。 */
-const MARKET_POOL_ROLE_ID = '__market__';
-
-const OPERATION_LABEL: Partial<Record<MemoryOperationName, string>> = {
-  list_skills: '技能列表',
-  create_skill: '新建技能',
-  update_skill: '编辑技能',
-  delete_skill: '删除技能',
-  publish_skill: '上架市场',
-  list_pending_reviews: '待审队列',
-  approve_skill: '通过审核',
-  reject_skill: '驳回技能',
-  market_search: '市场检索',
-  market_import: '引入技能',
-};
 
 type SkillSubmitPayload =
   | {
@@ -126,75 +79,6 @@ type PendingConfirm = {
 
 const message = (reason: unknown): string =>
   reason instanceof Error ? reason.message : String(reason);
-
-const parseTags = (raw: string): string[] =>
-  raw
-    .split(/[,，]/)
-    .map((tag) => tag.trim())
-    .filter((tag) => tag.length > 0);
-
-/** 词表命中就只显示中文；没命中才把协议原值作为灰色注解挂在中文标签旁（F2）。 */
-function WireBadge({
-  dict,
-  tone,
-  value,
-  fallbackLabel,
-}: {
-  dict: Record<string, string>;
-  tone: Record<string, BadgeProps['variant']>;
-  value: string;
-  fallbackLabel: string;
-}) {
-  const label = dict[value];
-  if (label) return <Badge variant={tone[value] ?? 'default'}>{label}</Badge>;
-  return (
-    <span className="inline-flex items-center gap-1.5">
-      <Badge>{fallbackLabel}</Badge>
-      <span className="font-mono text-code text-fg-faint">{value}</span>
-    </span>
-  );
-}
-
-/** 后端声明为 unavailable 的操作：不给按钮，改说一句「为什么没有」。 */
-function CapabilityNotice({
-  capabilities,
-  names,
-}: {
-  capabilities: MemoryCapabilities | undefined;
-  names: MemoryOperationName[];
-}) {
-  if (!capabilities) {
-    return <p className="text-body text-fg-muted">正在读取后端能力清单…</p>;
-  }
-  const blocked = names
-    .map((name) => ({ name, capability: capabilities.operations[name] }))
-    .filter((item) => item.capability?.status !== 'available');
-  if (blocked.length === 0) return null;
-  return (
-    <ul className="space-y-1">
-      {blocked.map(({ name, capability }) => (
-        <li key={name} className="text-body text-fg-muted">
-          {OPERATION_LABEL[name] ?? '该操作'}后端未开放
-          <span className="ml-1.5 font-mono text-code text-fg-faint">{name}</span>
-          {capability?.reason ? <span> · {capability.reason}</span> : null}
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-function TagRow({ tags }: { tags: string[] }) {
-  if (tags.length === 0) return null;
-  return (
-    <div className="flex flex-wrap gap-1.5">
-      {tags.map((tag) => (
-        <span key={tag} className="rounded-chip border border-edge px-1.5 font-mono text-code">
-          {tag}
-        </span>
-      ))}
-    </div>
-  );
-}
 
 function PendingLine({ text }: { text: string }) {
   return (
@@ -216,14 +100,11 @@ export function SkillMarketPanel({ roleId, capabilities, onError, onChanged }: M
 
   const [skills, setSkills] = useState<RpcSkillView[]>();
   const [skillsLoading, setSkillsLoading] = useState(false);
-  const [reviews, setReviews] = useState<RpcSkillView[]>();
-  const [reviewsLoading, setReviewsLoading] = useState(false);
   const [reloadToken, setReloadToken] = useState(0);
   const [busy, setBusy] = useState<string>();
   const [notice, setNotice] = useState<string>();
   const [editing, setEditing] = useState<{ skill: RpcSkillView | null }>();
   const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm>();
-  const [reviewer, setReviewer] = useState('');
   const [marketQuery, setMarketQuery] = useState('');
   const [marketTopK, setMarketTopK] = useState('');
   const [marketMinSimilarity, setMarketMinSimilarity] = useState('');
@@ -238,9 +119,6 @@ export function SkillMarketPanel({ roleId, capabilities, onError, onChanged }: M
   const canUpdateSkill = operations?.update_skill?.status === 'available';
   const canDeleteSkill = operations?.delete_skill?.status === 'available';
   const canPublishSkill = operations?.publish_skill?.status === 'available';
-  const canListReviews = operations?.list_pending_reviews?.status === 'available';
-  const canApproveSkill = operations?.approve_skill?.status === 'available';
-  const canRejectSkill = operations?.reject_skill?.status === 'available';
   const canMarketSearch = operations?.market_search?.status === 'available';
   const canMarketImport = operations?.market_import?.status === 'available';
 
@@ -267,30 +145,6 @@ export function SkillMarketPanel({ roleId, capabilities, onError, onChanged }: M
     };
   }, [roleId, canListSkills, reloadToken]);
 
-  // 待审队列是**跨 Agent** 的：它不随选中的 Agent 变化，只随审核动作刷新。
-  useEffect(() => {
-    if (!canListReviews) {
-      setReviews(undefined);
-      return;
-    }
-    let active = true;
-    setReviewsLoading(true);
-    void memoryApi
-      .listPendingReviews()
-      .then((result) => {
-        if (active) setReviews(result.skills);
-      })
-      .catch((reason: unknown) => {
-        if (active) onErrorRef.current(message(reason));
-      })
-      .finally(() => {
-        if (active) setReviewsLoading(false);
-      });
-    return () => {
-      active = false;
-    };
-  }, [canListReviews, reloadToken]);
-
   const runMutation = useCallback((key: string, action: () => Promise<string>) => {
     setBusy(key);
     setNotice(undefined);
@@ -307,8 +161,6 @@ export function SkillMarketPanel({ roleId, capabilities, onError, onChanged }: M
         setBusy(undefined);
       });
   }, []);
-
-  const reviewedBy = reviewer.trim();
 
   const submitSkillForm = (payload: SkillSubmitPayload) => {
     if (payload.kind === 'create') {
@@ -352,29 +204,6 @@ export function SkillMarketPanel({ roleId, capabilities, onError, onChanged }: M
         runMutation(`delete:${skill.id}`, async () => {
           await memoryApi.deleteSkill(roleId, skill.id);
           return '已删除技能。';
-        });
-      },
-    });
-  };
-
-  const approveSkill = (skill: RpcSkillView) => {
-    runMutation(`approve:${skill.id}`, async () => {
-      await memoryApi.approveSkill(skill.agent_id, skill.id, reviewedBy || undefined);
-      // 「进入检索」指的是这个 Agent 自己的 searchMemory，不是跨 Agent 的市场检索
-      return '已通过审核，这条技能从下一次任务开始进入本 Agent 的记忆检索。';
-    });
-  };
-
-  const requestRejectSkill = (skill: RpcSkillView) => {
-    setPendingConfirm({
-      title: '驳回这条技能？',
-      description:
-        '审核是单向的：驳回之后不能再改回待审核。驳回还会解除它与来源经验的晋升绑定，那条经验之后可以被重新晋升。',
-      confirmLabel: '驳回',
-      run: () => {
-        runMutation(`reject:${skill.id}`, async () => {
-          await memoryApi.rejectSkill(skill.agent_id, skill.id, reviewedBy || undefined);
-          return '已驳回这条技能。';
         });
       },
     });
@@ -589,112 +418,7 @@ export function SkillMarketPanel({ roleId, capabilities, onError, onChanged }: M
         )}
       </section>
 
-      {/* ── 二、待审技能（跨 Agent） ── */}
-      <section className="space-y-3">
-        <div className="flex flex-wrap items-end justify-between gap-2">
-          <div>
-            <h3 className="flex items-center gap-2 text-title text-fg-primary">
-              <ClipboardList className="h-4 w-4 text-fg-muted" />
-              待审技能
-            </h3>
-            <p className="text-body text-fg-muted">
-              这是全部 Agent
-              的待审队列，不只是当前选中的这个。审核单向：通过或驳回之后改不回待审核。
-            </p>
-          </div>
-          <div className="min-w-0">
-            <label className="mb-1 block text-body text-fg-secondary" htmlFor="skill-reviewer">
-              审核人（可选 · 留空后端记为 user）
-            </label>
-            <input
-              id="skill-reviewer"
-              value={reviewer}
-              onChange={(event) => {
-                setReviewer(event.target.value);
-              }}
-              placeholder="例如：fangz"
-              className={INPUT_CLASS}
-            />
-          </div>
-        </div>
-
-        <CapabilityNotice
-          capabilities={capabilities}
-          names={['list_pending_reviews', 'approve_skill', 'reject_skill']}
-        />
-
-        {reviewsLoading && !reviews && <PendingLine text="正在读取待审队列…" />}
-
-        {reviews && reviews.length === 0 && (
-          <EmptyState
-            icon={CheckCircle2}
-            title="没有待审技能"
-            hint="晋升出来的技能会自动排进这条队列。"
-          />
-        )}
-
-        {reviews && reviews.length > 0 && (
-          <div className="space-y-2">
-            {reviews.map((skill) => (
-              <Panel key={skill.id} density="compact" className="space-y-2">
-                <div className="flex items-start justify-between gap-3">
-                  <div className="min-w-0 space-y-1">
-                    <p className="text-body text-fg-primary">{skill.description}</p>
-                    <div className="flex flex-wrap items-center gap-2">
-                      {skill.agent_id === roleId && <Badge variant="command">本 Agent</Badge>}
-                      <IdChip value={skill.agent_id} label="所属" />
-                      <IdChip value={skill.id} label="技能" />
-                      <span className="text-body text-fg-muted">
-                        版本 <span className="tabular font-mono text-code">{skill.version}</span>
-                      </span>
-                    </div>
-                  </div>
-                  <div className="flex shrink-0 items-center gap-2">
-                    {canApproveSkill && (
-                      <Button
-                        size="sm"
-                        variant="secondary"
-                        onClick={() => {
-                          approveSkill(skill);
-                        }}
-                        disabled={busy !== undefined}
-                      >
-                        <CheckCircle2 className="h-3.5 w-3.5" />
-                        通过
-                      </Button>
-                    )}
-                    {canRejectSkill && (
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        className="text-danger-soft hover:text-danger"
-                        onClick={() => {
-                          requestRejectSkill(skill);
-                        }}
-                        disabled={busy !== undefined}
-                      >
-                        <XCircle className="h-3.5 w-3.5" />
-                        驳回
-                      </Button>
-                    )}
-                  </div>
-                </div>
-                {skill.content && (
-                  <p className="line-clamp-3 text-body text-fg-muted">{skill.content}</p>
-                )}
-                <TagRow tags={skill.tags} />
-                {skill.promoted_from && (
-                  <p className="text-body text-fg-muted">
-                    这条技能由一条经验晋升而来，驳回会解除那条绑定。
-                  </p>
-                )}
-              </Panel>
-            ))}
-          </div>
-        )}
-      </section>
-
-      {/* ── 三、技能市场 ── */}
+      {/* ── 二、技能市场 ── */}
       <section className="space-y-3">
         <div>
           <h3 className="flex items-center gap-2 text-title text-fg-primary">
