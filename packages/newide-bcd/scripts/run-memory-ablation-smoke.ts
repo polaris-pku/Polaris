@@ -2,7 +2,7 @@
  * §1 memory ablation smoke: B0 / B1 / B2 × 3 sequential related tasks.
  *
  * Uses production backend (real ACP driver + Postgres B memory).
- * Artifacts default to D:\Code\NewIDE\.newide-experiments\memory-ablation\<ts>\.
+ * Artifacts default to .newide/eval-runs/memory-ablation/<ts>/.
  *
  * Usage:
  *   pnpm exec tsx scripts/run-memory-ablation-smoke.ts
@@ -12,6 +12,10 @@ import { promises as fs } from 'node:fs';
 import { existsSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
+import {
+  prepareAblationArmIsolation,
+  waitForRunMaintenance,
+} from './ablation-arm-isolation';
 
 type MemoryAblation = 'B0' | 'B1' | 'B2';
 
@@ -27,18 +31,36 @@ interface JsonRpcMessage {
 interface BackendClient {
   request<T>(method: string, params: unknown): Promise<T>;
   waitForTerminal(runId: string, timeoutMs: number): Promise<Record<string, unknown>>;
+  waitForTaskTerminal(taskId: string, timeoutMs: number): Promise<TaskTerminalSnapshot>;
   close(): Promise<void>;
 }
 
+interface TaskTerminalSnapshot {
+  task: { task_id: string; status: string };
+  run_history: Array<{ run_id: string; status: string }>;
+}
+
 const repoRoot = process.cwd();
+const configuredEnv = {
+  ...loadEnvFile(path.join(repoRoot, '.env')),
+  ...loadEnvFile(path.join(repoRoot, '.env.local')),
+};
 const startedAt = new Date();
 const stamp = startedAt.toISOString().replace(/[:.]/g, '-');
 const experimentRoot = path.resolve(
-  process.env.NEWIDE_ABLATION_ROOT ?? 'D:\\Code\\NewIDE\\.newide-experiments\\memory-ablation',
+  process.env.NEWIDE_ABLATION_ROOT ??
+    configuredEnv.NEWIDE_ABLATION_ROOT ??
+    path.join(repoRoot, '.newide', 'eval-runs', 'memory-ablation'),
   stamp,
 );
-const runTimeoutMs = readPositiveInt(process.env.ACCEPTANCE_RUN_TIMEOUT_MS, 600_000);
-const maintenanceWaitMs = readPositiveInt(process.env.ABLATION_MAINTENANCE_WAIT_MS, 45_000);
+const runTimeoutMs = readPositiveInt(
+  process.env.ACCEPTANCE_RUN_TIMEOUT_MS ?? configuredEnv.ACCEPTANCE_RUN_TIMEOUT_MS,
+  600_000,
+);
+const maintenanceWaitMs = readPositiveInt(
+  process.env.ABLATION_MAINTENANCE_WAIT_MS ?? configuredEnv.ABLATION_MAINTENANCE_WAIT_MS,
+  45_000,
+);
 
 const TASKS = [
   {
@@ -68,13 +90,19 @@ const TASKS = [
 const ABLATIONS: MemoryAblation[] = ['B0', 'B1', 'B2'];
 
 await fs.mkdir(experimentRoot, { recursive: true });
+const databaseUrlTemplate =
+  process.env.NEWIDE_ABLATION_DATABASE_URL_TEMPLATE ??
+  configuredEnv.NEWIDE_ABLATION_DATABASE_URL_TEMPLATE ??
+  'postgresql://newide:newide_local@127.0.0.1:55432/newide_{ablation}';
 const baseEnv = {
+  ...configuredEnv,
   ...process.env,
-  ...loadEnvFile(path.join(repoRoot, '.env')),
-  ...loadEnvFile(path.join(repoRoot, '.env.local')),
   ACP_DRIVER_RUNNER_DIR:
-    process.env.ACP_DRIVER_RUNNER_DIR ?? path.resolve(repoRoot, '..', 'acp-client-prototype'),
-  ACP_DRIVER_TIMEOUT_MS: process.env.ACP_DRIVER_TIMEOUT_MS ?? '300000',
+    process.env.ACP_DRIVER_RUNNER_DIR ??
+    configuredEnv.ACP_DRIVER_RUNNER_DIR ??
+    path.resolve(repoRoot, '..', 'acp-client-prototype'),
+  ACP_DRIVER_TIMEOUT_MS:
+    process.env.ACP_DRIVER_TIMEOUT_MS ?? configuredEnv.ACP_DRIVER_TIMEOUT_MS ?? '300000',
 };
 
 log(`experiment root: ${experimentRoot}`);
@@ -85,15 +113,22 @@ for (const ablation of ABLATIONS) {
   const armDir = path.join(experimentRoot, ablation);
   const workspace = path.join(armDir, 'workspace');
   await fs.mkdir(workspace, { recursive: true });
-  const dbUrl = `postgresql://newide:newide_local@127.0.0.1:55432/newide_${ablation.toLowerCase()}`;
+  const dbUrl = resolveAblationDatabaseUrl(databaseUrlTemplate, ablation);
+  const isolation = await prepareAblationArmIsolation({
+    experiment_root: experimentRoot,
+    arm: ablation,
+    database_url: dbUrl,
+  });
+  await fs.mkdir(isolation.state_root, { recursive: true });
   log('');
   log(`=== arm ${ablation} db=${dbUrl.replace(/:[^:@]+@/, ':***@')} ===`);
+  log(`state root: ${isolation.state_root}`);
+  log(`database schema: ${isolation.database_schema}`);
 
   const backend = await startBackend(ablation, {
     ...baseEnv,
-    NEWIDE_B_DATABASE_URL: dbUrl,
-    // Keep runs under the arm directory when possible.
-    NEWIDE_RUNS_ROOT: path.join(armDir, 'runs'),
+    NEWIDE_B_DATABASE_URL: isolation.database_url,
+    NEWIDE_STATE_ROOT: isolation.state_root,
   });
 
   const taskResults: unknown[] = [];
@@ -109,24 +144,57 @@ for (const ablation of ABLATIONS) {
         title: `${ablation}-${task.id}`,
       });
       await backend.request('run.subscribe', { run_id: created.run_id });
-      const snapshot = await backend.waitForTerminal(created.run_id, runTimeoutMs);
+      const taskSnapshot = await backend.waitForTaskTerminal(created.task_id, runTimeoutMs);
+      const finalRunId = latestTerminalRunId(taskSnapshot);
+      const snapshot = await backend.waitForTerminal(finalRunId, runTimeoutMs);
+      let maintenance:
+        | {
+            maintenance_ref: string;
+            status: string;
+          }
+        | undefined;
       if (ablation !== 'B0') {
-        await sleep(maintenanceWaitMs);
+        maintenance = await waitForRunMaintenance(
+          backend.request,
+          finalRunId,
+          maintenanceWaitMs,
+        );
+        if (maintenance.status !== 'completed') {
+          throw new Error(
+            `Memory maintenance ${maintenance.maintenance_ref} ended as ${maintenance.status}`,
+          );
+        }
       }
       const afterFiles = await listWorkspaceFiles(workspace);
       const memory = await captureMemory(backend);
-      const summaryPath = path.join(repoRoot, '.newide', 'runs', created.run_id, 'summary.json');
+      const summaryPath = path.join(isolation.state_root, 'runs', finalRunId, 'summary.json');
       const summary = await readJsonIfExists(summaryPath);
+      const summaryAblation =
+        summary && typeof summary === 'object'
+          ? (summary as { memory_ablation?: unknown }).memory_ablation
+          : undefined;
+      if (summaryAblation !== ablation) {
+        throw new Error(
+          `Backend summary ablation mismatch: expected ${ablation}, got ${String(summaryAblation)}`,
+        );
+      }
       const row = {
         ablation,
         task_id: task.id,
         run_id: created.run_id,
+        final_run_id: finalRunId,
         backend_task_id: created.task_id,
         snapshot_status: snapshot.status,
         memory_ablation_in_summary:
           summary && typeof summary === 'object'
             ? (summary as { memory_ablation?: string }).memory_ablation
             : undefined,
+        ...(maintenance
+          ? {
+              maintenance_ref: maintenance.maintenance_ref,
+              maintenance_status: maintenance.status,
+            }
+          : {}),
         files_changed: diffFiles(beforeFiles, afterFiles),
         memory,
         snapshot_diagnostics: extractDiagnostics(snapshot),
@@ -145,7 +213,12 @@ for (const ablation of ABLATIONS) {
     await backend.close();
   }
 
-  const armSummary = { ablation, tasks: taskResults };
+  const armSummary = {
+    ablation,
+    state_root: isolation.state_root,
+    database_schema: isolation.database_schema,
+    tasks: taskResults,
+  };
   armReports.push(armSummary);
   await fs.writeFile(path.join(armDir, 'arm-summary.json'), JSON.stringify(armSummary, null, 2));
 }
@@ -244,7 +317,40 @@ async function startBackend(
         if (snapshot.status !== 'running') return snapshot;
         await sleep(1_000);
       }
+
+      // Timeout must cancel the live run; otherwise the shared backend keeps the
+      // ACP driver busy and the next instance starves with zero tool events.
+      log(`[${label}] run ${runId} timed out after ${String(timeoutMs)}ms; cancelling`);
+      try {
+        await request('run.cancel', { run_id: runId });
+      } catch (error) {
+        log(
+          `[${label}] warn: run.cancel failed for ${runId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+      const cancelDeadline = Date.now() + 60_000;
+      while (Date.now() < cancelDeadline) {
+        const snapshot = await request<Record<string, unknown>>('run.getSnapshot', {
+          run_id: runId,
+        });
+        if (snapshot.status !== 'running') break;
+        await sleep(500);
+      }
+
       throw new Error(`[${label}] run ${runId} did not finish within ${String(timeoutMs)}ms`);
+    },
+    waitForTaskTerminal: async (taskId, timeoutMs) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const snapshot = await request<TaskTerminalSnapshot>('task.get', { task_id: taskId });
+        if (['completed', 'failed', 'cancelled', 'blocked'].includes(snapshot.task.status)) {
+          return snapshot;
+        }
+        await sleep(1_000);
+      }
+      throw new Error(`[${label}] task ${taskId} did not finish within ${String(timeoutMs)}ms`);
     },
     close: async () => {
       child.stdin?.end();
@@ -259,6 +365,12 @@ async function startBackend(
       }
     },
   };
+}
+
+function latestTerminalRunId(snapshot: TaskTerminalSnapshot): string {
+  const latest = snapshot.run_history[0];
+  if (!latest) throw new Error(`Task ${snapshot.task.task_id} has no terminal Run`);
+  return latest.run_id;
 }
 
 async function captureMemory(backend: BackendClient): Promise<{
@@ -366,6 +478,13 @@ async function readJsonIfExists(filePath: string): Promise<unknown> {
   } catch {
     return undefined;
   }
+}
+
+function resolveAblationDatabaseUrl(template: string, ablation: MemoryAblation): string {
+  if (!template.includes('{ablation}')) {
+    throw new Error('NEWIDE_ABLATION_DATABASE_URL_TEMPLATE must contain {ablation}');
+  }
+  return template.replaceAll('{ablation}', ablation.toLowerCase());
 }
 
 function readPositiveInt(raw: string | undefined, fallback: number): number {

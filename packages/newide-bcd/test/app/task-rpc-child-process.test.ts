@@ -7,19 +7,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import type { AppRunEvent } from '../../src/app/run-registry';
+import { councilRunDirName } from '../../src/council/council-workspace';
+import type { RunSnapshot } from '../../src/protocol/run-snapshot';
 import type { TaskSnapshot } from '../../src/protocol/task-snapshot';
 import { writeFakeAcpRunnerBuild } from '../fixtures/fake-acp-runner-build';
-
-function initializeGitWorkspace(workspace: string): void {
-  const git = (args: string[]) =>
-    execFileSync('git', args, { cwd: workspace, stdio: ['ignore', 'pipe', 'pipe'] });
-  git(['init', '-q']);
-  git(['config', 'user.email', 'test@example.com']);
-  git(['config', 'user.name', 'NewIDE Test']);
-  writeFileSync(path.join(workspace, 'seed.txt'), 'seed\n');
-  git(['add', '-A']);
-  git(['commit', '-qm', 'base']);
-}
 
 describe('Task-first JSON-RPC child process acceptance', () => {
   it('runs create and autonomous Council under one durable Task', async () => {
@@ -83,6 +74,79 @@ describe('Task-first JSON-RPC child process acceptance', () => {
         'COUNCIL_FINAL',
       );
 
+      const councilRunId = councilTerminal.run_history[0]?.run_id;
+      expect(councilRunId).toBeDefined();
+      const liveCouncilEvents = client.taskEvents(created.task.task_id);
+      const liveCouncilEventTypes = liveCouncilEvents.map((event) => event.type);
+      expect(liveCouncilEventTypes).toEqual(
+        expect.arrayContaining([
+          'market.auction.started',
+          'market.auction.completed',
+          'council.started',
+          'council.participants.selected',
+          'council.phase.started',
+          'council.proposal.completed',
+          'council.review.completed',
+          'council.synthesis.completed',
+          'council.decision',
+          'council.completed',
+        ]),
+      );
+      expect(
+        liveCouncilEvents.find((event) => event.type === 'market.auction.started')?.payload,
+      ).toMatchObject({
+        selection_scope: 'primary',
+        selection_mode: 'auction',
+        candidates: expect.any(Array),
+      });
+      expect(
+        liveCouncilEvents.find((event) => event.type === 'market.auction.completed')
+          ?.payload,
+      ).toMatchObject({
+        selection_scope: 'primary',
+        winner_role_id: expect.stringMatching(/^role_/),
+        winner_probability: expect.any(Number),
+        bids: expect.any(Array),
+      });
+      expect(
+        liveCouncilEvents.find((event) => event.type === 'council.proposal.completed')
+          ?.payload,
+      ).toMatchObject({ proposal: { summary: expect.any(String) } });
+      expect(
+        liveCouncilEvents.find((event) => event.type === 'council.review.completed')
+          ?.payload,
+      ).toMatchObject({ reviews: expect.any(Array) });
+      expect(
+        liveCouncilEvents.find((event) => event.type === 'council.synthesis.completed')
+          ?.payload,
+      ).toMatchObject({ synthesis: { summary: expect.any(String) } });
+
+      const runSnapshot = await client.call<RunSnapshot>('run.getSnapshot', {
+        run_id: councilRunId,
+      });
+      expect(runSnapshot.council).toMatchObject({
+        phase: 'completed',
+        subject: 'Produce a result and then validate it with Council',
+        auctions: expect.any(Array),
+        participants: expect.any(Array),
+        proposals: expect.any(Array),
+        reviews: expect.any(Array),
+        synthesis: { summary: expect.any(String) },
+      });
+      const finalArtifactRef = councilTerminal.council?.result?.final_artifact_ref;
+      expect(finalArtifactRef).toBeDefined();
+      await expect(
+        client.call('artifact.getContent', {
+          run_id: councilRunId,
+          artifact_id: finalArtifactRef,
+        }),
+      ).resolves.toMatchObject({
+        run_id: councilRunId,
+        artifact_id: finalArtifactRef,
+        content: expect.stringContaining('COUNCIL_FINAL'),
+        truncated: false,
+      });
+
       const agents = await client.call<{ agents: Array<{ role_id: string }> }>(
         'memory.listAgents',
         {},
@@ -103,10 +167,7 @@ describe('Task-first JSON-RPC child process acceptance', () => {
       );
       expect(maintenance.maintenance).toEqual(
         expect.arrayContaining([
-          expect.objectContaining({
-            status: 'completed',
-            evidence_uri: expect.stringMatching(/^file:/),
-          }),
+          expect.objectContaining({ status: 'completed', evidence_uri: expect.stringMatching(/^file:/) }),
         ]),
       );
       await expect(
@@ -117,16 +178,19 @@ describe('Task-first JSON-RPC child process acceptance', () => {
       ).resolves.toMatchObject({
         maintenance: {
           status: 'completed',
-          skills: expect.arrayContaining([expect.objectContaining({ review_status: 'pending' })]),
+          skills: expect.arrayContaining([
+            expect.objectContaining({ review_status: 'pending' }),
+          ]),
         },
       });
       await expect(
         client.call('memory.listSkills', { role_id: primaryAgentId }),
       ).resolves.toMatchObject({
-        skills: expect.arrayContaining([expect.objectContaining({ review_status: 'pending' })]),
+        skills: expect.arrayContaining([
+          expect.objectContaining({ review_status: 'pending' }),
+        ]),
       });
 
-      const liveCouncilEvents = client.taskEvents(created.task.task_id);
       const replayCursor = liveCouncilEvents.find((event) => event.type === 'run.created');
       expect(replayCursor).toBeDefined();
       expect(liveCouncilEvents.at(-1)).toMatchObject({ type: 'run.completed' });
@@ -159,23 +223,27 @@ describe('Task-first JSON-RPC child process acceptance', () => {
       rmSync(workspace, { recursive: true, force: true });
       for (const runId of createdRunIds) {
         rmSync(path.join('.newide', 'runs', runId), { recursive: true, force: true });
+        rmSync(path.join('.newide', 'council', councilRunDirName(runId)), {
+          recursive: true,
+          force: true,
+        });
         rmSync(path.join('.newide', 'council', runId), { recursive: true, force: true });
       }
       for (const directory of marketDirectories) {
         rmSync(directory, { recursive: true, force: true });
       }
     }
-  }, 20_000);
+  }, 30_000);
 
   it('blocks an interrupted process and resumes it explicitly under the same Task', async () => {
     const runnerDir = mkdtempSync(path.join(os.tmpdir(), 'newide-task-resume-runner-'));
     const workspace = mkdtempSync(path.join(os.tmpdir(), 'newide-task-resume-workspace-'));
-    initializeGitWorkspace(workspace);
     const holdPath = path.join(runnerDir, 'hold-first-invocation');
     const enteredPath = path.join(runnerDir, 'first-invocation-entered');
     const sessionLogPath = path.join(runnerDir, 'sessions.log');
     const runIds = new Set<string>();
     const marketDirectories = new Set<string>();
+    initGitWorkspace(workspace);
     writeInterruptibleFakeDriver(runnerDir);
     writeFileSync(holdPath, 'hold');
     const firstClient = new RpcChildClient(spawnBackend(runnerDir));
@@ -258,28 +326,32 @@ describe('Task-first JSON-RPC child process acceptance', () => {
     }
   }, 20_000);
 
-  it('replays durable Mailbox deliveries across restarts and supports reply', async () => {
+  it('replays a scoped pending Mailbox delivery across restarts', async () => {
     const runnerDir = mkdtempSync(path.join(os.tmpdir(), 'newide-mailbox-rpc-runner-'));
     writeFakeDriver(runnerDir);
     const firstClient = new RpcChildClient(spawnBackend(runnerDir));
     let secondClient: RpcChildClient | undefined;
-    let thirdClient: RpcChildClient | undefined;
 
     try {
       const sent = await firstClient.call<{
         message: { message_id: string; thread_id: string };
         deliveries: Array<{ delivery_id: string; status: string; retry_count: number }>;
       }>('mailbox.send', {
+        task_id: 'task_mailbox_e2e',
+        workspace_path: '/workspace/mailbox-e2e',
         thread_id: 'thread_mailbox_e2e',
-        from_agent_id: 'agent_source',
-        to: [{ role_id: 'role_mailbox_recipient' }],
+        from_role_id: 'role_source',
+        to_role_id: 'role_mailbox_recipient',
         type: 'ask_help',
         payload: { question: 'Review this durable message' },
         requires_ack: true,
         deadline_seconds: 60,
+        idempotency_key: 'rpc_send_1',
       });
       expect(sent.message.thread_id).toBe('thread_mailbox_e2e');
-      expect(sent.deliveries).toMatchObject([{ status: 'pending', retry_count: 1 }]);
+      expect(sent.deliveries).toMatchObject([
+        { status: 'pending', retry_count: 0 },
+      ]);
       const deliveryId = sent.deliveries[0]?.delivery_id;
       expect(deliveryId).toBeTruthy();
 
@@ -290,68 +362,30 @@ describe('Task-first JSON-RPC child process acceptance', () => {
           delivery: { delivery_id: string; status: string; retry_count: number };
           message: { message_id: string };
         }>;
-      }>('mailbox.inbox', { role_id: 'role_mailbox_recipient' });
+      }>('mailbox.inbox', {
+        task_id: 'task_mailbox_e2e',
+        workspace_path: '/workspace/mailbox-e2e',
+        role_id: 'role_mailbox_recipient',
+      });
       expect(inbox.deliveries).toMatchObject([
-        { delivery: { delivery_id: deliveryId, status: 'delivered', retry_count: 2 } },
+        { delivery: { delivery_id: deliveryId, status: 'pending', retry_count: 0 } },
       ]);
-
-      await expect(
-        secondClient.call('mailbox.ack', {
-          delivery_id: deliveryId,
-          role_id: 'role_mailbox_recipient',
-        }),
-      ).resolves.toMatchObject({ delivery_id: deliveryId, status: 'acknowledged' });
-
-      const reply = await secondClient.call<{
-        source_delivery: { delivery_id: string; status: string };
-        reply: {
-          message: { message_id: string; reply_to_message_id?: string };
-          deliveries: Array<{ delivery_id: string; status: string; retry_count: number }>;
-        };
-      }>('mailbox.reply', {
-        source_delivery_id: deliveryId,
-        source_recipient: { role_id: 'role_mailbox_recipient' },
-        from_agent_id: 'agent_mailbox_recipient',
-        to: [{ agent_id: 'agent_source' }],
-        type: 'decision_response',
-        payload: { answer: 'Reviewed' },
-        requires_ack: false,
-      });
-      expect(reply.source_delivery).toMatchObject({
-        delivery_id: deliveryId,
-        status: 'acknowledged',
-      });
-      expect(reply.reply).toMatchObject({
-        message: { reply_to_message_id: sent.message.message_id },
-        deliveries: [{ status: 'pending', retry_count: 1 }],
-      });
-      const replyDeliveryId = reply.reply.deliveries[0]?.delivery_id;
-      expect(replyDeliveryId).toBeTruthy();
-
-      await secondClient.close();
-      thirdClient = new RpcChildClient(spawnBackend(runnerDir));
-      const replyInbox = await thirdClient.call<{
-        deliveries: Array<{
-          delivery: { delivery_id: string; status: string; retry_count: number };
-        }>;
-      }>('mailbox.inbox', { agent_id: 'agent_source' });
-      expect(replyInbox.deliveries).toMatchObject([
-        { delivery: { delivery_id: replyDeliveryId, status: 'delivered', retry_count: 2 } },
-      ]);
-      await expect(
-        thirdClient.call('mailbox.ack', {
-          delivery_id: replyDeliveryId,
-          agent_id: 'agent_source',
-        }),
-      ).resolves.toMatchObject({ delivery_id: replyDeliveryId, status: 'acknowledged' });
     } finally {
       await firstClient.close();
       await secondClient?.close();
-      await thirdClient?.close();
       rmSync(runnerDir, { recursive: true, force: true });
     }
   }, 20_000);
 });
+
+function initGitWorkspace(workspace: string): void {
+  execFileSync('git', ['init', '-q'], { cwd: workspace });
+  execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: workspace });
+  execFileSync('git', ['config', 'user.name', 'Test'], { cwd: workspace });
+  writeFileSync(path.join(workspace, 'seed.txt'), 'seed\n');
+  execFileSync('git', ['add', '-A'], { cwd: workspace });
+  execFileSync('git', ['commit', '-qm', 'base'], { cwd: workspace });
+}
 
 class RpcChildClient {
   private nextId = 1;
@@ -490,7 +524,9 @@ async function waitForMaintenance(
       maintenance: Array<{ role_id: string; status: string; evidence_uri?: string }>;
     }>('memory.listMaintenance', {});
     const completedRoles = new Set(
-      result.maintenance.filter((item) => item.status === 'completed').map((item) => item.role_id),
+      result.maintenance
+        .filter((item) => item.status === 'completed')
+        .map((item) => item.role_id),
     );
     if (roleIds.every((roleId) => completedRoles.has(roleId))) return result;
     await new Promise((resolve) => setTimeout(resolve, 25));

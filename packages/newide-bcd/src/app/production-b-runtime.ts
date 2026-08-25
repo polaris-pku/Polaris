@@ -6,6 +6,7 @@ import {
   HashEmbeddingProvider,
   LiteLLMEmbeddingProvider,
   PgMemoryRepository,
+  createPGlitePool,
   type BufferRepository,
   type EmbeddingProvider,
   type MemoryRepository,
@@ -26,6 +27,19 @@ const MARKET_AGENT_CATALOG = [
     name: 'TypeScript Engineer',
     tags: ['market_eligible', 'typescript'],
     persona_seed: 'Build reliable TypeScript services with explicit contracts and tests.',
+  },
+  {
+    role_id: 'role_code_reviewer',
+    name: 'Code Reviewer',
+    tags: ['market_eligible', 'reviewer'],
+    persona_seed:
+      'Critically review proposed solutions for correctness, edge cases, and test coverage.',
+  },
+  {
+    role_id: 'role_synthesis_engineer',
+    name: 'Synthesis Engineer',
+    tags: ['market_eligible', 'synthesis'],
+    persona_seed: 'Synthesize the strongest final answer from proposals and reviews.',
   },
 ] as const;
 
@@ -76,12 +90,8 @@ export async function createProductionBRuntime(
   const appStateRoot = path.resolve(repoRoot, options.appStateRoot ?? '.newide');
   let storage: BMemoryStorage | undefined;
 
-  if (!options.storage && !env.NEWIDE_B_DATABASE_URL?.trim()) {
-    throw new Error('NEWIDE_B_DATABASE_URL is required for the production B runtime');
-  }
-
   try {
-    storage = options.storage ?? (await createPostgresStorage(env, options));
+    storage = options.storage ?? (await createDefaultStorage(env, options, appStateRoot));
     const bufferRepository = new FileBufferRepository({
       agentStateRoot: path.join(appStateRoot, 'b', 'agent-state'),
     });
@@ -91,7 +101,9 @@ export async function createProductionBRuntime(
       bufferRepository,
       ...(storage.embedding ? { embedding: storage.embedding } : {}),
       app_state_root: appStateRoot,
-      market_agent_ids: MARKET_AGENT_CATALOG.map((agent) => agent.role_id),
+      // 目录以 DB 当前注册的 Agent 为准（含历史运行创建的 Agent），而非硬编码种子；
+      // 排序保证确定性（InMemory 仓库不排序，Pg 仓库按 role_id 排序）
+      market_agent_ids: [...(await storage.repository.listAgentIds())].sort(compareCodeUnits),
       embedding_info: storage.embedding_info ?? {
         provider: 'host-managed repository',
         readiness: 'host_managed',
@@ -104,15 +116,27 @@ export async function createProductionBRuntime(
   }
 }
 
+/**
+ * 存储选型：NEWIDE_B_DATABASE_URL 存在时使用外部 PostgreSQL；
+ * 否则使用嵌入式 PGlite（WASM PostgreSQL + pgvector），无需 Docker 或外部服务。
+ */
+async function createDefaultStorage(
+  env: NodeJS.ProcessEnv,
+  options: ProductionBRuntimeFactoryOptions,
+  appStateRoot: string,
+): Promise<BMemoryStorage> {
+  const databaseUrl = env.NEWIDE_B_DATABASE_URL?.trim();
+  if (databaseUrl) {
+    return createPostgresStorage(env, options, databaseUrl);
+  }
+  return createPGliteStorage(env, options, appStateRoot);
+}
+
 async function createPostgresStorage(
   env: NodeJS.ProcessEnv,
   options: ProductionBRuntimeFactoryOptions,
+  databaseUrl: string,
 ): Promise<BMemoryStorage> {
-  const databaseUrl = env.NEWIDE_B_DATABASE_URL?.trim();
-  if (!databaseUrl) {
-    throw new Error('NEWIDE_B_DATABASE_URL is required for the production B runtime');
-  }
-
   const pool =
     options.createPool?.(databaseUrl) ??
     new Pool({ connectionString: databaseUrl, connectionTimeoutMillis: 10_000 });
@@ -135,6 +159,35 @@ async function createPostgresStorage(
       error,
       databaseUrl,
     );
+  }
+}
+
+async function createPGliteStorage(
+  env: NodeJS.ProcessEnv,
+  options: ProductionBRuntimeFactoryOptions,
+  appStateRoot: string,
+): Promise<BMemoryStorage> {
+  const configuredDir = env.NEWIDE_B_PGLITE_DATA_DIR?.trim();
+  const dataDir =
+    configuredDir === ':memory:'
+      ? undefined
+      : path.resolve(options.repoRoot ?? process.cwd(), configuredDir ?? path.join(appStateRoot, 'b', 'pglite'));
+  const pool = await createPGlitePool(dataDir ? { dataDir } : {});
+  const close = onceAsync(() => pool.end());
+  try {
+    const embedding = resolveProductionEmbedding(env, options);
+    await verifyEmbeddingReadiness(embedding.provider);
+    const repository = new PgMemoryRepository({ pool, embedding: embedding.provider });
+    await repository.listAgentIds();
+    return {
+      repository,
+      embedding: embedding.provider,
+      close,
+      embedding_info: embedding.info,
+    };
+  } catch (error) {
+    await close().catch(() => undefined);
+    throw operationalError('Embedded PGlite B memory storage readiness check failed', error);
   }
 }
 

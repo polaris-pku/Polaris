@@ -33,6 +33,7 @@ import { fileURLToPath } from 'node:url';
 import { generateText, jsonSchema, type LanguageModel } from 'ai';
 import { LiteLLMClient } from '../../litellm';
 import type { Tool, ToolCall } from '../../litellm';
+import { recordProxyLlmUsage } from '../../telemetry/llm-usage-ledger';
 import type {
   ToolCallingClient,
   ToolCallMessage,
@@ -64,7 +65,6 @@ function loadEnvFile(filePath: string): void {
 }
 
 function loadLocalEnv(): void {
-  if (process.env.NEWIDE_LITELLM_CONFIG_DIR?.trim()) return;
   const moduleDir = dirname(fileURLToPath(import.meta.url));
   const projectRoot = resolve(moduleDir, '..', '..', '..');
   const memoryDir = resolve(moduleDir, '..');
@@ -90,22 +90,25 @@ async function resolveProviderModel(provider: string, modelId: string): Promise<
   switch (provider) {
     case 'openai': {
       const { createOpenAI } = await import('@ai-sdk/openai');
-      const apiKey = process.env.NEWIDE_LLM_API_KEY || process.env.OPENAI_API_KEY;
-      const baseURL = process.env.NEWIDE_LLM_BASE_URL || process.env.OPENAI_BASE_URL;
+      // 显式按当前 env 创建 provider：模块级默认 `openai` 实例在模块加载时
+      // 读取 OPENAI_BASE_URL，若当时未设置会被钉死在 api.openai.com。
       return createOpenAI({
-        ...(apiKey ? { apiKey } : {}),
-        ...(baseURL ? { baseURL } : {}),
+        ...(process.env.OPENAI_API_KEY ? { apiKey: process.env.OPENAI_API_KEY } : {}),
+        ...(process.env.OPENAI_BASE_URL ? { baseURL: process.env.OPENAI_BASE_URL } : {}),
       }).chat(modelId) as LanguageModel;
     }
     case 'anthropic': {
       const { createAnthropic } = await import('@ai-sdk/anthropic');
-      const apiKey = process.env.NEWIDE_LLM_API_KEY || process.env.ANTHROPIC_API_KEY;
-      const authToken = process.env.ANTHROPIC_AUTH_TOKEN;
-      const baseURL = process.env.NEWIDE_LLM_BASE_URL || process.env.ANTHROPIC_BASE_URL;
+      const apiKey =
+        process.env.ANTHROPIC_AUTH_TOKEN ||
+        process.env.ANTHROPIC_API_KEY ||
+        process.env.DEEPSEEK_API_KEY;
       return createAnthropic({
-        ...(apiKey ? { apiKey } : authToken ? { authToken } : {}),
-        ...(baseURL ? { baseURL } : {}),
-      }).messages(modelId) as LanguageModel;
+        ...(apiKey ? { apiKey } : {}),
+        ...(process.env.ANTHROPIC_BASE_URL
+          ? { baseURL: process.env.ANTHROPIC_BASE_URL.replace(/\/+$/, '') }
+          : {}),
+      })(modelId) as LanguageModel;
     }
     default:
       throw new Error(
@@ -113,6 +116,11 @@ async function resolveProviderModel(provider: string, modelId: string): Promise<
           `Supported: openai, anthropic.`,
       );
   }
+}
+
+function preferAnthropicCompat(): boolean {
+  const base = process.env.ANTHROPIC_BASE_URL?.trim() ?? '';
+  return base.length > 0 && /deepseek|anthropic/i.test(base);
 }
 
 // ──────────────────────────────────────────────
@@ -158,8 +166,9 @@ export interface LiteLLMToolCallingClientOptions {
   loadEnv?: boolean;
 
   /**
-   * 模型名称覆盖（如 'deepseek-chat'、'deepseek-reasoner'）。
+   * 模型名称覆盖（如 'deepseek-v4-flash'）。
    * 设此值后忽略 YAML 配置中的 model，但温度/超时等仍从 YAML 读取。
+   * 未传时回退 DEEPSEEK_MODEL，避免 eval 仍打已下线的 deepseek-chat。
    */
   model?: string;
   /**
@@ -183,9 +192,8 @@ export class LiteLLMToolCallingClient implements ToolCallingClient {
 
   constructor(options: LiteLLMToolCallingClientOptions = {}) {
     this.taskName = options.taskName ?? 'memory-query';
-    this.modelOverride = options.model;
 
-    // 构造参数覆盖环境变量（按老版 DeepSeekToolCallingClient 的语义）
+    // 构造参数覆盖环境变量
     if (options.apiKey) {
       process.env.OPENAI_API_KEY = options.apiKey;
     }
@@ -198,8 +206,14 @@ export class LiteLLMToolCallingClient implements ToolCallingClient {
       loadLocalEnv();
     }
 
+    this.modelOverride = options.model?.trim() || process.env.DEEPSEEK_MODEL?.trim() || undefined;
+
     this.client = new LiteLLMClient();
-    this.client.loadConfig(process.env.NEWIDE_LITELLM_CONFIG_DIR?.trim() || undefined);
+    this.client.registerProvider('openai', async (modelId: string) => {
+      const { openai } = await import('@ai-sdk/openai');
+      return openai.chat(modelId);
+    });
+    this.client.loadConfig();
   }
 
   async completeWithTools(input: {
@@ -216,16 +230,19 @@ export class LiteLLMToolCallingClient implements ToolCallingClient {
     let maxTokens: number;
 
     if (this.modelOverride) {
-      providerName = process.env.NEWIDE_LLM_PROVIDER?.trim() || 'openai';
+      providerName = preferAnthropicCompat() ? 'anthropic' : 'openai';
       modelId = this.modelOverride;
       temperature = 0.3;
       maxTokens = 2000;
     } else {
       const resolved = this.client.modelPool.resolve(this.taskName);
-      providerName = process.env.NEWIDE_LLM_PROVIDER?.trim() || resolved.provider;
-      modelId = process.env.NEWIDE_LLM_MODEL?.trim() || resolved.model;
+      providerName = resolved.provider;
+      modelId = resolved.model;
       temperature = resolved.temperature;
       maxTokens = resolved.maxTokens;
+      if (preferAnthropicCompat() && providerName === 'openai') {
+        providerName = 'anthropic';
+      }
     }
 
     // 2. 解析 provider 得到 AI SDK model 实例
@@ -316,13 +333,20 @@ export class LiteLLMToolCallingClient implements ToolCallingClient {
       model,
       ...(systemParts.length > 0 ? { system: systemParts.join('\n\n') } : {}),
       messages: aiMessages,
-      ...(providerName === 'anthropic' ? {} : { temperature }),
+      temperature,
       maxOutputTokens: maxTokens,
     };
     if (liteTools.length > 0) {
       generateParams.tools = tools;
     }
     const result = await generateText(generateParams as Parameters<typeof generateText>[0]);
+    await recordProxyLlmUsage({
+      input_tokens: result.usage?.inputTokens ?? 0,
+      output_tokens: result.usage?.outputTokens ?? 0,
+      model: modelId,
+      temperature,
+      source: 'proxy',
+    });
     return {
       content: result.text ?? null,
       tool_calls:

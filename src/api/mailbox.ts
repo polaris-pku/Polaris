@@ -1,14 +1,14 @@
 import { getTransport } from './transport';
-import type { MailboxRecipient, MailboxReplyParams, MailboxSendParams } from './types/mailbox';
+import type {
+  MailboxAckParams,
+  MailboxInboxParams,
+  MailboxReplyParams,
+  MailboxSendParams,
+} from './types/mailbox';
 
 export const mailboxApi = {
   send: (params: MailboxSendParams) => getTransport().call('mailbox.send', params),
-  inbox: (recipient: MailboxRecipient, afterDeliveryId?: string) =>
-    getTransport().call('mailbox.inbox', {
-      ...recipient,
-      ...(afterDeliveryId ? { after_delivery_id: afterDeliveryId } : {}),
-    }),
-  acknowledge: (deliveryId: string, recipient: MailboxRecipient) =>
-    getTransport().call('mailbox.ack', { delivery_id: deliveryId, ...recipient }),
+  inbox: (params: MailboxInboxParams) => getTransport().call('mailbox.inbox', params),
+  acknowledge: (params: MailboxAckParams) => getTransport().call('mailbox.ack', params),
   reply: (params: MailboxReplyParams) => getTransport().call('mailbox.reply', params),
 };

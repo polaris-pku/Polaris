@@ -9,10 +9,15 @@ import path from 'node:path';
 import type { Readable } from 'node:stream';
 import { IntegrationV0CoordinatorRunner } from '../coordinator/coordinator-runner';
 import { SelectAgentHandler } from '../coordinator/handlers/select-agent-handler';
-import { AgentBoardCouncilParticipantResolver, SynthesisAgentCouncilProvider } from '../council';
+import {
+  AgentBoardCouncilParticipantResolver,
+  createCouncilStrategyProvider,
+  readCouncilSeatAssignments,
+  readCouncilStrategy,
+  SynthesisAgentCouncilProvider,
+} from '../council';
 import { CommandDriverTransport, ExternalDriverRuntime } from '../driver';
 import {
-  LiteLLMClientAdapter,
   LiteLLMToolCallingClient,
   type LlmClient,
   type ToolCallingClient,
@@ -34,8 +39,12 @@ import { ProductionGateExecutor } from './production-gate-executor';
 import type { IntegrationV0GateExecutor } from '../coordinator/gate-executor';
 import { FileRunRequestStore } from './run-request-store';
 import { FileRunTerminalOutputWriter } from './run-terminal-output-writer';
-import { TaskProcessor } from './task-processor';
-import { PersistentMailboxService } from './persistent-mailbox-service';
+import {
+  PersistentParticipantSessionRegistry,
+  TaskExecutionLoop,
+  TaskProcessor,
+} from '../coordination';
+import { MailboxDeliveryWorker, PersistentMailboxService } from '../mailbox';
 import { createProductionBRuntime, type BackendBRuntime } from './production-b-runtime';
 import {
   BMemoryMaintenanceRunner,
@@ -43,10 +52,17 @@ import {
 } from './b-memory-maintenance-runner';
 import { BMemoryBackendService } from './b-memory-backend-service';
 import { createBPublicCapabilities } from './b-public-capabilities';
+import { createAgentCatalogProvider } from './agent-catalog';
 import { createProductionStageExecutors } from './production-stage-executors';
-import { TaskExecutionLoop } from './task-execution-loop';
+import {
+  marketAuctionCompletedPayload,
+  marketAuctionStartedPayload,
+  type MarketEventContext,
+} from './market-event-payload';
 import { SystemRpcMethods } from '../rpc/system-methods';
+import { ArtifactRpcMethods } from '../rpc/artifact-methods';
 import { createProductionSystemStatusService } from './system-status-service';
+import { FileRunArtifactContentReader } from './run-artifact-content-reader';
 
 export interface BackendRpcServerOptions {
   input: Readable;
@@ -102,8 +118,11 @@ export async function createProductionBackendService(
     );
   }
 
-  const driverEnv = loadEnvFile(env.ACP_DRIVER_ENV_FILE ?? path.join(runnerDir, '.env'));
-  const driverTimeout = readDriverTimeout(env.ACP_DRIVER_TIMEOUT_MS);
+  const driverEnvFile = env.ACP_DRIVER_ENV_FILE
+    ? path.resolve(repoRoot, env.ACP_DRIVER_ENV_FILE)
+    : path.join(runnerDir, '.env');
+  const driverEnv = loadEnvFile(driverEnvFile);
+  const productionLlm = resolveProductionLlmRuntime(env, driverEnv);
   const driver = new ExternalDriverRuntime({
     driver_id: 'acp-external',
     capabilities: {
@@ -124,12 +143,55 @@ export async function createProductionBackendService(
         ACP_WORKSPACE: env.ACP_WORKSPACE ?? path.join(stateRoot, 'test-workspace'),
         // Non-interactive eval / batch runs must not block on ACP permission prompts.
         AUTO_APPROVE: env.AUTO_APPROVE ?? '1',
+        // NewIDE owns benchmark policy; ACP receives only generic enforcement settings.
+        ...(env.ACP_DENY_NETWORK_TOOLS !== undefined
+          ? { ACP_DENY_NETWORK_TOOLS: env.ACP_DENY_NETWORK_TOOLS }
+          : {}),
+        ...(env.ACP_DENY_PATH_SUBSTRINGS_JSON !== undefined
+          ? { ACP_DENY_PATH_SUBSTRINGS_JSON: env.ACP_DENY_PATH_SUBSTRINGS_JSON }
+          : {}),
+        ...(env.ACP_PROCESS_SANDBOX !== undefined
+          ? { ACP_PROCESS_SANDBOX: env.ACP_PROCESS_SANDBOX }
+          : {}),
+        ...(env.ACP_PROCESS_SANDBOX_BWRAP !== undefined
+          ? { ACP_PROCESS_SANDBOX_BWRAP: env.ACP_PROCESS_SANDBOX_BWRAP }
+          : {}),
+        ...(env.ACP_PROCESS_SANDBOX_NPM_CACHE !== undefined
+          ? { ACP_PROCESS_SANDBOX_NPM_CACHE: env.ACP_PROCESS_SANDBOX_NPM_CACHE }
+          : {}),
+        ...(env.ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON !== undefined
+          ? {
+              ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON:
+                env.ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON,
+            }
+          : {}),
+        ...(env.ACP_PROCESS_SANDBOX_RO_PATHS_JSON !== undefined
+          ? { ACP_PROCESS_SANDBOX_RO_PATHS_JSON: env.ACP_PROCESS_SANDBOX_RO_PATHS_JSON }
+          : {}),
+        ...(env.ACP_PROCESS_SANDBOX_HIDE_PYTHON_PACKAGES !== undefined
+          ? {
+              ACP_PROCESS_SANDBOX_HIDE_PYTHON_PACKAGES:
+                env.ACP_PROCESS_SANDBOX_HIDE_PYTHON_PACKAGES,
+            }
+          : {}),
       },
       unsetEnv: [
         'NEWIDE_B_DATABASE_URL',
-        ...MODEL_OVERRIDE_ENV.filter((key) => driverEnv[key] === undefined),
+        ...MODEL_OVERRIDE_ENV.filter(
+          (key) => driverEnv[key] === undefined && env[key] === undefined,
+        ),
       ],
-      ...(driverTimeout !== undefined ? { timeoutMs: driverTimeout } : {}),
+      // 不设 ACP_DRIVER_TIMEOUT_MS 就不传 timeoutMs —— 这是本仓库既有的行为，上游把
+      // readDriverTimeout 改成恒返回 120_000 后被动翻转了，这里恢复回来。
+      // 原因：CommandDriverTransport 在非 Windows 下把 detached 跟 timeoutMs 绑在一起
+      // （command-driver-transport.ts 里 `options.detached = true`），而清理 agent 依赖
+      // 进程组（backendBridge 以组长身份启动后端，再 kill(-pid)）。driver 一旦 detached
+      // 就脱离该组，切项目 / 重绑工作区时会留下孤儿 agent 继续往旧工作区写文件。
+      // 等上游把 detached 从 timeoutMs 解绑后再考虑恢复默认超时。
+      ...(() => {
+        const timeoutMs = readDriverTimeout(env.ACP_DRIVER_TIMEOUT_MS);
+        return timeoutMs === undefined ? {} : { timeoutMs };
+      })(),
     }),
   });
   let bRuntime: BackendBRuntime | undefined;
@@ -160,15 +222,20 @@ export async function createProductionBackendService(
       dependencies.bRuntime ??
       (await createProductionBRuntime(env, { repoRoot, appStateRoot: stateRoot }));
     assertValidMarketAgentIds(bRuntime.market_agent_ids);
+    // B 侧文本 LLM：memoryMaintenance 与 BMemoryBackendService（persona 重生成）共享
+    const memoryLlm =
+      dependencies.memoryLlm ??
+      new ProductionTextLlmAdapter(createProductionToolCallingClient(productionLlm, env));
     memoryMaintenance =
       dependencies.memoryMaintenance ??
       new BMemoryMaintenanceRunner({
         repository: bRuntime.repository,
         bufferRepository: bRuntime.bufferRepository,
-        llm: dependencies.memoryLlm ?? new LiteLLMClientAdapter('memory-query'),
+        llm: memoryLlm,
         evidenceStore: new FileBMemoryMaintenanceEvidenceStore(
           path.join(bRuntime.app_state_root ?? path.join(repoRoot, '.newide'), 'b', 'maintenance'),
         ),
+        runsRoot,
       });
     try {
       await memoryMaintenance.replayPending();
@@ -176,38 +243,116 @@ export async function createProductionBackendService(
       throw new Error('Production B Agent manager readiness check failed');
     }
     const bCapabilities = createBPublicCapabilities(bRuntime, memoryMaintenance);
+    // 动态 Agent 目录：选人 / 议会 / 邮箱协作每次使用时查询当前注册 Agent，
+    // 使 memory.createAgent 新增的 Agent 无需重启即可进入协作流程。
+    const agentCatalogProvider = createAgentCatalogProvider(
+      bCapabilities.boardQuery,
+      bRuntime.market_agent_ids,
+    );
+    const configuredDatabasePath =
+      env.NEWIDE_COORDINATION_DB ?? path.join(stateRoot, 'coordination.sqlite');
+    const databasePath =
+      configuredDatabasePath === ':memory:'
+        ? configuredDatabasePath
+        : path.resolve(configuredDatabasePath);
+    coordinationStore = new SqliteCoordinationStore(databasePath);
+    const mailboxService = new PersistentMailboxService(coordinationStore);
+    const participantSessions = new PersistentParticipantSessionRegistry(coordinationStore);
     const agentExecutionFacade = new DriverRuntimeAgentExecutionFacade({
       driver,
       repository: bCapabilities.repository,
       bufferRepository: bCapabilities.bufferRepository,
       ...(bRuntime.embedding ? { embedding: bRuntime.embedding } : {}),
-      llm: dependencies.agentLlm ?? new LiteLLMToolCallingClient(),
+      llm:
+        dependencies.agentLlm ??
+        new ProductionAgentToolCallingClient(
+          createProductionToolCallingClient(productionLlm, env),
+        ),
       memoryMaintenance: bCapabilities.maintenance,
       evidenceStore: new FileAgentExecutionEvidenceStore({
         root: path.join(stateRoot, 'b', 'context-packs'),
       }),
+      mailbox: {
+        service: mailboxService,
+        allowedRoleIds: agentCatalogProvider,
+        sessionRegistry: participantSessions,
+      },
     });
     const selectAgentHandler = new SelectAgentHandler({
       projectionSource: new BAgentProjectionAdapter({
         competitionQuery: agentExecutionFacade,
         boardQuery: bCapabilities.boardQuery,
         ensureAgent: (agentId) => agentExecutionFacade.ensureAgent(agentId),
-        allowedAgentIds: bRuntime.market_agent_ids,
         candidateSource: 'allowed_catalog',
       }),
       evidenceStore: new FileMarketEvidenceStore({
         root: path.join(stateRoot, 'market'),
       }),
     });
-    const councilProvider = new SynthesisAgentCouncilProvider({
+    const councilSeatAssignments = readCouncilSeatAssignments(env.NEWIDE_COUNCIL_SEATS);
+    const councilAuctionEnabled = readCouncilAuctionEnabled(env.NEWIDE_COUNCIL_AUCTION_ENABLED);
+    const councilProposerCount = readCouncilProposerCount(env.NEWIDE_COUNCIL_PROPOSERS);
+    const baseCouncilProvider = new SynthesisAgentCouncilProvider({
       agentExecutionFacade,
       councilRoot: path.join(stateRoot, 'council'),
       participantResolver: new AgentBoardCouncilParticipantResolver({
         boardQuery: bCapabilities.boardQuery,
-        allowedAgentIds: bRuntime.market_agent_ids,
+        resolveAllowedAgentIds: agentCatalogProvider,
         ensureAgent: (agentId) => agentExecutionFacade.ensureAgent(agentId),
+        ...(councilSeatAssignments ? { seatAssignments: councilSeatAssignments } : {}),
+        ...(!councilSeatAssignments && councilAuctionEnabled
+          ? {
+              auctionEnabled: true,
+              proposerCount: councilProposerCount,
+              auctionSelector: async (input) => {
+                const marketContext: MarketEventContext = {
+                  selection_scope: 'council_seat',
+                  selection_mode: 'auction',
+                  seat: input.seat,
+                  seat_index: input.seat_index,
+                };
+                const result = await selectAgentHandler.execute(
+                  {
+                    task_id: input.task_id,
+                    task_description: input.question,
+                    bootstrap_agent_ids: input.candidate_agent_ids,
+                    seed: `${input.run_id}:${input.seat}:${input.seat_index}`,
+                  },
+                  {
+                    onCandidatesCollected: async (collected) => {
+                      await input.on_lifecycle_event?.({
+                        type: 'market.auction.started',
+                        payload: marketAuctionStartedPayload({
+                          context: marketContext,
+                          auction_id: collected.auction_id,
+                          task_description: collected.market_task.task_description,
+                          requirement_profile: collected.market_task.requirement_profile,
+                          candidates: collected.candidates,
+                        }),
+                      });
+                    },
+                  },
+                );
+                await input.on_lifecycle_event?.({
+                  type: 'market.auction.completed',
+                  payload: marketAuctionCompletedPayload({
+                    context: marketContext,
+                    result,
+                  }),
+                });
+                return {
+                  agent_id: result.winner_agent_id,
+                  selection_refs: [result.ledger_ref, result.audit_ref],
+                };
+              },
+            }
+          : {}),
       }),
     });
+    const councilProvider = createCouncilStrategyProvider(
+      baseCouncilProvider,
+      readCouncilStrategy(env.NEWIDE_COUNCIL_STRATEGY),
+    );
     const gateExecutor =
       dependencies.gateExecutor ??
       new ProductionGateExecutor({
@@ -221,7 +366,21 @@ export async function createProductionBackendService(
       councilProvider,
       gateExecutor,
     });
-    const bMemoryService = new BMemoryBackendService(bCapabilities, bRuntime.embedding_info);
+    const bMemoryService = new BMemoryBackendService(
+      bCapabilities,
+      bRuntime.embedding_info,
+      { autoApprovePromotedSkills: env.NEWIDE_B_SKILL_AUTO_APPROVE === '1' },
+      bRuntime.repository,
+      {
+        retireAgent: (roleId, options) => agentExecutionFacade.retireAgent(roleId, options),
+        runRetirementScan: (roleId) => agentExecutionFacade.runRetirementScan(roleId),
+        createAgent: (spec) => agentExecutionFacade.createAgent(spec),
+        updateAgent: (roleId, patch) => agentExecutionFacade.updateAgent(roleId, patch),
+        deleteAgent: (roleId, options) => agentExecutionFacade.deleteAgent(roleId, options),
+      },
+      bRuntime.embedding,
+      memoryLlm,
+    );
 
     try {
       await agentExecutionFacade.ready();
@@ -229,17 +388,10 @@ export async function createProductionBackendService(
       throw new Error('Production B Agent manager readiness check failed');
     }
 
-    const configuredDatabasePath =
-      env.NEWIDE_COORDINATION_DB ?? path.join(stateRoot, 'coordination.sqlite');
-    const databasePath =
-      configuredDatabasePath === ':memory:'
-        ? configuredDatabasePath
-        : path.resolve(configuredDatabasePath);
-    coordinationStore = new SqliteCoordinationStore(databasePath);
-    const mailboxService = new PersistentMailboxService(coordinationStore, agentExecutionFacade);
     const taskProcessor = new TaskProcessor(coordinationStore, {
       runsRoot,
       mailboxStore: coordinationStore,
+      participantSessions,
     });
     taskProcessor.recoverInterruptedTasks();
     const taskExecutionLoop = new TaskExecutionLoop({
@@ -250,7 +402,11 @@ export async function createProductionBackendService(
         agentExecutionFacade,
         councilProvider,
         gateExecutor,
-        bootstrapAgentIds: bRuntime.market_agent_ids,
+        bootstrapAgentIds: agentCatalogProvider,
+        auctionEnabled: readAuctionEnabled(env.NEWIDE_AUCTION_ENABLED),
+        ...(env.NEWIDE_PRIMARY_AGENT_ID?.trim()
+          ? { primaryAgentId: env.NEWIDE_PRIMARY_AGENT_ID.trim() }
+          : {}),
         runsRoot,
         councilRoot: path.join(stateRoot, 'council'),
         worktreesRoot: path.join(stateRoot, 'worktrees'),
@@ -280,7 +436,7 @@ export async function createProductionBackendService(
         readiness: 'host_managed',
       },
     });
-    return new NewideBackendService(
+    const service = new NewideBackendService(
       runner,
       new InMemoryRunRegistry(),
       new FileRunAuditWriter(runsRoot),
@@ -294,7 +450,16 @@ export async function createProductionBackendService(
       new FileDriverStreamAuditWriter(runsRoot),
       taskExecutionLoop,
       systemStatusService,
+      new MailboxDeliveryWorker(
+        mailboxService,
+        agentExecutionFacade,
+        participantSessions,
+      ),
+      (input) => agentExecutionFacade.provisionParticipantSession(input),
+      new FileRunArtifactContentReader(runsRoot),
     );
+    await service.recoverMailboxWaits();
+    return service;
   } catch (error) {
     await closeRuntime().catch(() => undefined);
     throw error;
@@ -308,6 +473,69 @@ const MODEL_OVERRIDE_ENV = [
   'ANTHROPIC_DEFAULT_HAIKU_MODEL',
   'CLAUDE_CODE_SUBAGENT_MODEL',
 ];
+
+export interface ProductionLlmRuntime {
+  readonly model: string;
+  readonly apiKey: string;
+  /** OpenAI-compatible base URL without the trailing `/v1`. */
+  readonly baseUrl: string;
+}
+
+/**
+ * The ACP runner is the local source of truth for the coding model. Reuse its
+ * MiniMax credentials for B's text/tool calls so one Council does not silently
+ * split between MiniMax for Driver work and a stale DeepSeek configuration for
+ * planning or maintenance.
+ */
+export function resolveProductionLlmRuntime(
+  env: NodeJS.ProcessEnv,
+  driverEnv: NodeJS.ProcessEnv,
+): ProductionLlmRuntime | undefined {
+  const model = firstNonBlank(
+    env.NEWIDE_AGENT_LLM_MODEL,
+    driverEnv.ANTHROPIC_MODEL,
+  );
+  const apiKey = firstNonBlank(
+    env.OPENAI_API_KEY,
+    driverEnv.ANTHROPIC_AUTH_TOKEN,
+    driverEnv.ANTHROPIC_API_KEY,
+  );
+  const baseUrl = firstNonBlank(
+    toOpenAiCompatibleBaseUrl(env.OPENAI_BASE_URL),
+    toOpenAiCompatibleBaseUrl(driverEnv.ANTHROPIC_BASE_URL),
+  );
+
+  if (!model || !apiKey || !baseUrl) return undefined;
+  return { model, apiKey, baseUrl };
+}
+
+function createProductionToolCallingClient(
+  runtime: ProductionLlmRuntime | undefined,
+  env: NodeJS.ProcessEnv,
+): LiteLLMToolCallingClient {
+  if (runtime) {
+    return new LiteLLMToolCallingClient({
+      model: runtime.model,
+      apiKey: runtime.apiKey,
+      baseUrl: runtime.baseUrl,
+    });
+  }
+  return new LiteLLMToolCallingClient({
+    ...(env.NEWIDE_AGENT_LLM_MODEL?.trim()
+      ? { model: env.NEWIDE_AGENT_LLM_MODEL.trim() }
+      : {}),
+  });
+}
+
+function firstNonBlank(...values: Array<string | undefined>): string | undefined {
+  return values.find((value): value is string => Boolean(value?.trim()))?.trim();
+}
+
+function toOpenAiCompatibleBaseUrl(value: string | undefined): string | undefined {
+  const normalized = value?.trim().replace(/\/+$/, '');
+  if (!normalized) return undefined;
+  return normalized.replace(/\/(?:anthropic|v1)$/i, '');
+}
 
 function readDriverTimeout(value: string | undefined): number | undefined {
   if (value === undefined || value.trim() === '') return undefined;
@@ -345,7 +573,10 @@ function readPackageIdentity(
   const rawName = Reflect.get(value, 'name');
   const rawVersion = Reflect.get(value, 'version');
   return {
-    name: typeof rawName === 'string' && rawName.trim().length > 0 ? rawName.trim() : fallbackName,
+    name:
+      typeof rawName === 'string' && rawName.trim().length > 0
+        ? rawName.trim()
+        : fallbackName,
     version:
       typeof rawVersion === 'string' && rawVersion.trim().length > 0
         ? rawVersion.trim()
@@ -366,11 +597,13 @@ export function startBackendRpcServer(options: BackendRpcServerOptions): Backend
   const mailboxMethods = new MailboxRpcMethods(service);
   const memoryMethods = new MemoryRpcMethods(service);
   const systemMethods = new SystemRpcMethods(service);
+  const artifactMethods = new ArtifactRpcMethods(service);
   systemMethods.register(dispatcher);
   runMethods.register(dispatcher);
   taskMethods.register(dispatcher);
   mailboxMethods.register(dispatcher);
   memoryMethods.register(dispatcher);
+  artifactMethods.register(dispatcher);
 
   const lines = createInterface({ input: options.input, crlfDelay: Infinity });
   let pending = Promise.resolve();
@@ -442,7 +675,9 @@ export function parseDriverEnv(content: string): NodeJS.ProcessEnv {
   );
 }
 
-export async function runBackendRpcMain(env: NodeJS.ProcessEnv = process.env): Promise<void> {
+export async function runBackendRpcMain(
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
   let service: NewideBackendService | undefined;
   let server: BackendRpcServer | undefined;
   let shutdownRequested = false;
@@ -496,4 +731,154 @@ function assertValidMarketAgentIds(value: unknown): asserts value is readonly st
   if (!valid) {
     throw new Error('Production B runtime must provide non-empty, unique market_agent_ids');
   }
+}
+
+export class ProductionAgentToolCallingClient implements ToolCallingClient {
+  constructor(private readonly delegate: ToolCallingClient) {}
+
+  async completeWithTools(
+    input: Parameters<ToolCallingClient['completeWithTools']>[0],
+  ): Promise<Awaited<ReturnType<ToolCallingClient['completeWithTools']>>> {
+    const exposesDriver = input.tools.some((tool) => tool.function.name === 'invoke_driver');
+    const driverAlreadyInvoked = input.messages.some((message) =>
+      message.tool_calls?.some((toolCall) => toolCall.function.name === 'invoke_driver'),
+    );
+    let result: Awaited<ReturnType<ToolCallingClient['completeWithTools']>>;
+    try {
+      result = await this.completeWithRetry(input);
+    } catch (error) {
+      if (exposesDriver && !driverAlreadyInvoked && isMalformedToolArgumentsError(error)) {
+        return forcedDriverToolCall(input);
+      }
+      throw error;
+    }
+    if (!exposesDriver || driverAlreadyInvoked || result.tool_calls?.length) return result;
+
+    let prompted: Awaited<ReturnType<ToolCallingClient['completeWithTools']>>;
+    try {
+      prompted = await this.completeWithRetry({
+        ...input,
+        messages: [
+          ...input.messages,
+          {
+            role: 'user',
+            content:
+              'The production task is not complete. Call invoke_driver now and delegate the concrete task.',
+          },
+        ],
+      });
+    } catch (error) {
+      if (isMalformedToolArgumentsError(error)) return forcedDriverToolCall(input);
+      throw error;
+    }
+    if (prompted.tool_calls?.length) return prompted;
+
+    // A text-only response cannot satisfy the production execution contract.
+    // Keep the fallback inside the Agent tool loop so it still invokes the
+    // real Driver and produces the ordinary B buffer evidence.
+    return forcedDriverToolCall(input, prompted.content);
+  }
+
+  private async completeWithRetry(
+    input: Parameters<ToolCallingClient['completeWithTools']>[0],
+  ): Promise<Awaited<ReturnType<ToolCallingClient['completeWithTools']>>> {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        return await this.delegate.completeWithTools(input);
+      } catch (error) {
+        if (attempt === 0 && isMalformedToolArgumentsError(error)) continue;
+        throw error;
+      }
+    }
+    throw new Error('Unreachable ToolCallingClient retry state');
+  }
+}
+
+function isMalformedToolArgumentsError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /invalid function arguments json string/i.test(message);
+}
+
+function fallbackDriverInstruction(
+  input: Parameters<ToolCallingClient['completeWithTools']>[0],
+): string {
+  const message = input.messages.find(
+    (candidate) => candidate.role === 'user' && typeof candidate.content === 'string',
+  )?.content;
+  const match = message?.match(/(?:^|\n)Task:\s*([\s\S]*?)(?:\n\n(?:Retrieved memory|Collaboration brief):|$)/);
+  return match?.[1]?.trim() || 'Execute the assigned production task.';
+}
+
+function forcedDriverToolCall(
+  input: Parameters<ToolCallingClient['completeWithTools']>[0],
+  content?: string | null,
+): Awaited<ReturnType<ToolCallingClient['completeWithTools']>> {
+  return {
+    content: content ?? null,
+    tool_calls: [
+      {
+        id: `production_forced_driver_${String(input.messages.length)}`,
+        type: 'function',
+        function: {
+          name: 'invoke_driver',
+          arguments: JSON.stringify({ instruction: fallbackDriverInstruction(input) }),
+        },
+      },
+    ],
+  };
+}
+
+/**
+ * B maintenance only needs text completion. Keeping this adapter in the
+ * composition layer lets it share the production MiniMax tool client without
+ * changing B's own memory implementation.
+ */
+class ProductionTextLlmAdapter implements LlmClient {
+  constructor(private readonly delegate: ToolCallingClient) {}
+
+  async complete(input: Parameters<LlmClient['complete']>[0]): Promise<string> {
+    const result = await this.delegate.completeWithTools({
+      messages: input.messages,
+      tools: [],
+      tool_choice: 'none',
+    });
+    if (!result.content?.trim()) {
+      throw new Error('Production LLM returned an empty maintenance response');
+    }
+    return result.content;
+  }
+}
+
+/**
+ * NEWIDE_AUCTION_ENABLED 解析：默认 true；"0"/"false" 关闭竞标。
+ */
+export function readAuctionEnabled(value: string | undefined): boolean {
+  const raw = value?.trim();
+  if (!raw) return true;
+  if (raw === '0' || raw.toLowerCase() === 'false') return false;
+  if (raw === '1' || raw.toLowerCase() === 'true') return true;
+  throw new Error(`Invalid NEWIDE_AUCTION_ENABLED: ${value}. Expected 0/1/true/false.`);
+}
+
+export function readCouncilAuctionEnabled(value: string | undefined): boolean {
+  const raw = value?.trim();
+  if (!raw) return false;
+  if (raw === '0' || raw.toLowerCase() === 'false') return false;
+  if (raw === '1' || raw.toLowerCase() === 'true') return true;
+  throw new Error(
+    `Invalid NEWIDE_COUNCIL_AUCTION_ENABLED: ${value}. Expected 0/1/true/false.`,
+  );
+}
+
+export function readCouncilProposerCount(value: string | undefined): number {
+  const raw = value?.trim();
+  if (!raw) return 2;
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`Invalid NEWIDE_COUNCIL_PROPOSERS: ${value}. Expected an integer >= 2.`);
+  }
+  const count = Number(raw);
+  if (!Number.isSafeInteger(count) || count < 2) {
+    throw new Error(`Invalid NEWIDE_COUNCIL_PROPOSERS: ${value}. Expected an integer >= 2.`);
+  }
+  return count;
 }

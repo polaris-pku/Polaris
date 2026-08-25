@@ -52,6 +52,82 @@ describe('FileRunTerminalOutputWriter', () => {
     });
   });
 
+  it('aggregates proxy.llm_usage_recorded into summary.token_usage', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'terminal-output-'));
+    tempDirs.push(runsRoot);
+    const snapshot = failedSnapshot();
+    snapshot.events = [
+      {
+        event_id: 'run_event_proxy_1',
+        sequence: 1,
+        run_id: 'run_failed',
+        task_id: 'task_failed',
+        type: 'proxy.llm_usage_recorded',
+        source: 'proxy',
+        created_at: '2026-07-11T08:00:00.000Z',
+        payload: { case_id: 'task_failed', input_tokens: 120, output_tokens: 30 },
+        schema_version: 'v0',
+      },
+      {
+        event_id: 'run_event_proxy_2',
+        sequence: 2,
+        run_id: 'run_failed',
+        task_id: 'task_failed',
+        type: 'proxy.llm_usage_recorded',
+        source: 'proxy',
+        created_at: '2026-07-11T08:00:01.000Z',
+        payload: { case_id: 'task_failed', input_tokens: 10, output_tokens: 5 },
+        schema_version: 'v0',
+      },
+      ...snapshot.events,
+    ];
+
+    await new FileRunTerminalOutputWriter(runsRoot).finalize(snapshot);
+
+    await expect(
+      readJson(path.join(runsRoot, 'run_failed', 'summary.json')),
+    ).resolves.toMatchObject({
+      token_usage: {
+        schema_version: 'newide.token_usage.v1',
+        source: 'proxy',
+        input_tokens: 130,
+        output_tokens: 35,
+        total_tokens: 165,
+        call_count: 2,
+      },
+    });
+  });
+
+  it('writes memory_ablation from agent.execution_requested when context_pack is missing', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'terminal-output-'));
+    tempDirs.push(runsRoot);
+    const snapshot = failedSnapshot();
+    snapshot.events = [
+      {
+        event_id: 'run_event_req',
+        sequence: 1,
+        run_id: 'run_failed',
+        task_id: 'task_failed',
+        type: 'agent.execution_requested',
+        source: 'agent',
+        created_at: '2026-07-11T08:00:00.000Z',
+        payload: { role_id: 'role_ts_engineer', ablation: 'B2' },
+        schema_version: 'v0',
+      },
+      ...snapshot.events,
+    ];
+
+    await new FileRunTerminalOutputWriter(runsRoot).finalize(snapshot);
+
+    await expect(
+      readJson(path.join(runsRoot, 'run_failed', 'summary.json')),
+    ).resolves.toMatchObject({
+      run_id: 'run_failed',
+      status: 'failed',
+      memory_ablation: 'B2',
+    });
+  });
+
   it('does not overwrite richer integration outputs', async () => {
     const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'terminal-output-'));
     tempDirs.push(runsRoot);
@@ -62,6 +138,122 @@ describe('FileRunTerminalOutputWriter', () => {
     await new FileRunTerminalOutputWriter(runsRoot).finalize(failedSnapshot());
 
     await expect(readJson(path.join(runDir, 'result.json'))).resolves.toEqual({ rich: true });
+  });
+
+  it('includes the Task Driver usage aggregate in summary.json', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'terminal-output-'));
+    tempDirs.push(runsRoot);
+    const runDir = path.join(runsRoot, 'run_failed');
+    await mkdir(runDir, { recursive: true });
+    await writeFile(
+      path.join(runDir, 'driver-stream.jsonl'),
+      `${JSON.stringify({
+        task_id: 'task_failed',
+        recorded_at: '2026-08-14T00:00:00Z',
+        event: {
+          event_type: 'usage_update',
+          session_id: 'session_usage',
+          role_id: 'role_usage',
+          payload: { update: { used: 321, size: 200_000 } },
+        },
+      })}\n`,
+      'utf8',
+    );
+
+    await new FileRunTerminalOutputWriter(runsRoot).finalize(failedSnapshot());
+
+    const summary = await readJson(path.join(runDir, 'summary.json'));
+    expect(summary).toMatchObject({
+      driver_usage: {
+        available: true,
+        source: 'driver_stream_usage_update',
+        context_tokens_used: 321,
+        sessions: [{ session_id: 'session_usage', role_id: 'role_usage' }],
+      },
+    });
+    expect(summary).not.toHaveProperty('token_usage');
+  });
+
+  it('merges driver_usage into an existing v1 summary without replacing billed tokens', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'terminal-output-'));
+    tempDirs.push(runsRoot);
+    const runDir = path.join(runsRoot, 'run_failed');
+    await mkdir(runDir, { recursive: true });
+    await writeFile(
+      path.join(runDir, 'summary.json'),
+      `${JSON.stringify({
+        run_id: 'run_failed',
+        task_id: 'task_failed',
+        token_usage: {
+          schema_version: 'newide.token_usage.v1',
+          source: 'proxy',
+          input_tokens: 12,
+          output_tokens: 3,
+          cache_creation_input_tokens: 0,
+          cache_read_input_tokens: 0,
+          total_input_tokens: 12,
+          total_tokens: 15,
+          call_count: 1,
+          sources: ['proxy'],
+          by_source: {},
+        },
+      }, null, 2)}\n`,
+      'utf8',
+    );
+    await writeFile(
+      path.join(runDir, 'driver-stream.jsonl'),
+      `${JSON.stringify({
+        task_id: 'task_failed',
+        recorded_at: '2026-08-14T00:00:00Z',
+        event: {
+          event_type: 'usage_update',
+          session_id: 'session_usage',
+          role_id: 'role_usage',
+          payload: { update: { used: 321, size: 200_000 } },
+        },
+      })}\n`,
+      'utf8',
+    );
+
+    await new FileRunTerminalOutputWriter(runsRoot).finalize(failedSnapshot());
+
+    await expect(readJson(path.join(runDir, 'summary.json'))).resolves.toMatchObject({
+      token_usage: {
+        schema_version: 'newide.token_usage.v1',
+        source: 'proxy',
+        total_tokens: 15,
+        call_count: 1,
+      },
+      driver_usage: {
+        available: true,
+        source: 'driver_stream_usage_update',
+        context_tokens_used: 321,
+        sessions: [{ session_id: 'session_usage', role_id: 'role_usage' }],
+      },
+    });
+  });
+
+  it('preserves memory ablation in summary when execution fails before context build', async () => {
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'terminal-output-'));
+    tempDirs.push(runsRoot);
+    const snapshot = failedSnapshot();
+    snapshot.events.unshift({
+      event_id: 'run_event_created',
+      sequence: 0,
+      run_id: snapshot.run_id,
+      task_id: snapshot.task_id,
+      type: 'run.created',
+      source: 'coordinator',
+      created_at: '2026-07-11T07:59:59.000Z',
+      payload: { mode: 'council', memory_ablation: 'B0' },
+      schema_version: 'v0',
+    });
+
+    await new FileRunTerminalOutputWriter(runsRoot).finalize(snapshot);
+
+    await expect(readJson(path.join(runsRoot, 'run_failed', 'summary.json'))).resolves.toMatchObject({
+      memory_ablation: 'B0',
+    });
   });
 
   it('replaces a completed legacy frontend snapshot without replacing its result manifest', async () => {

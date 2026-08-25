@@ -30,8 +30,12 @@ export interface AgentExecutionRequest {
   council_seat?: 'proposer' | 'reviewer' | 'synthesizer';
   council_seat_index?: number;
   instruction: string;
+  /** Clean task instruction forwarded to the delegated Driver, without Host-only guidance. */
+  driver_instruction?: string;
   workspace_path?: string;
   session_id?: string;
+  /** Pending Mailbox Delivery injected into this role's task-scoped turn. */
+  mailbox_delivery_id?: string;
   input_artifact_refs: ArtifactId[];
   context_policy: string;
   /** RFC §1.2 memory ablation; applied by production Agent execution facade. */

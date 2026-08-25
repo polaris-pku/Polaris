@@ -55,6 +55,7 @@ export interface Review {
 }
 
 export interface CouncilResult {
+  /** @deprecated Audit metadata only; Task completion is based on final artifact convergence. */
   quality: 'verified' | 'best_effort';
   final_artifact_ref: ArtifactId;
   final_artifact_sha256: string;
@@ -62,6 +63,24 @@ export interface CouncilResult {
   unmet_criteria: string[];
   verification_refs: string[];
   decision_record_ref: string;
+}
+
+export type CouncilOutcomeStatus = 'completed' | 'needs_human' | 'failed';
+
+/**
+ * Stable result envelope for callers that do not need to know the Council
+ * strategy's internal proposal/review topology.
+ */
+export interface CouncilOutcome {
+  status: CouncilOutcomeStatus;
+  participant_role_ids: string[];
+  selected_artifact_refs: ArtifactId[];
+  decision_summary: string;
+  /** @deprecated Audit metadata only; it never controls Council or Task status. */
+  quality: 'verified' | 'best_effort';
+  unresolved_issues: string[];
+  warnings: string[];
+  audit_refs: string[];
 }
 
 export interface EvidencePack {
@@ -146,10 +165,21 @@ export interface CouncilRunResult {
   generated_artifact_refs: ArtifactRef[];
   selected_artifact_refs: ArtifactId[];
   result?: CouncilResult;
+  outcome?: CouncilOutcome;
+  plan_execution?: CouncilPlanExecution;
   diagnostic_refs?: string[];
   comparison_refs?: string[];
   created_at: Timestamp;
   schema_version: SchemaVersion;
+}
+
+export interface CouncilPlanExecution {
+  executor_role_id: string;
+  session_id: string;
+  agent_run_id: string;
+  driver_run_result_id: string;
+  final_plan_artifact_refs: ArtifactId[];
+  implementation_artifact_refs: ArtifactId[];
 }
 
 export interface CouncilRunRequest {
@@ -159,9 +189,13 @@ export interface CouncilRunRequest {
   decision_mode: CouncilDecisionMode;
   question: string;
   workspace_path?: string;
+  /** Propagate F-eval memory ablation into council seat agent runs. */
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
   candidate_artifacts?: ArtifactRef[];
   context_pack_ref?: string;
   participant_profile_refs?: string[];
+  /** Initial select_agent winner; used as proposer seat 0 in auction mode. */
+  primary_agent_id?: string;
   participants?: CouncilParticipantBinding[];
   proposals: Proposal[];
   reviews?: Review[];
@@ -182,9 +216,15 @@ export type CouncilRoundInput = CouncilRunRequest;
 
 export interface CouncilLifecycleEvent {
   type:
+    | 'market.auction.started'
+    | 'market.auction.completed'
+    | 'council.participants.selected'
+    | 'council.phase.started'
     | 'council.proposal.completed'
     | 'council.review.completed'
     | 'council.synthesis.completed'
+    | 'council.implementation.completed'
+    | 'council.role.failed'
     | 'council.failed';
   payload: Record<string, unknown>;
 }
@@ -193,7 +233,11 @@ export interface CouncilExecutionOptions {
   signal?: AbortSignal;
   onDriverEvent?: DriverStreamEventListener;
   onLifecycleEvent?: (event: CouncilLifecycleEvent) => void | Promise<void>;
+  /** Internal strategy hint; it is not part of the public Task/Run RPC. */
+  artifact_mode?: CouncilArtifactMode;
 }
+
+export type CouncilArtifactMode = 'implementation' | 'plan';
 
 export interface CouncilProvider {
   runCouncilRound(

@@ -3,12 +3,12 @@ import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import type { IntegrationV0Result } from '../../src/coordinator/integration-v0-flow';
-import { NewideBackendService } from '../../src/app/newide-backend-service';
+import { NewideBackendService, readDefaultRunMode } from '../../src/app/newide-backend-service';
 import { InMemoryRunRegistry, type AppRunEvent } from '../../src/app/run-registry';
 import { FileRunAuditWriter } from '../../src/app/run-audit-writer';
 import { FileRunTerminalOutputWriter } from '../../src/app/run-terminal-output-writer';
 import { FileRunRequestStore } from '../../src/app/run-request-store';
-import type { TaskProcessor } from '../../src/app/task-processor';
+import type { TaskProcessor } from '../../src/coordination';
 import { IntegrationV0CoordinatorRunner } from '../../src/coordinator/coordinator-runner';
 import { runSnapshotSchema } from '../../src/protocol/run-snapshot';
 
@@ -95,6 +95,7 @@ describe('NewideBackendService', () => {
         prompt: 'Build RPC',
         workspace_path: process.cwd(),
         session_id: 'session_existing',
+        memory_ablation: 'B0',
       }),
     ).resolves.toEqual({
       run_id: 'run_1',
@@ -104,6 +105,7 @@ describe('NewideBackendService', () => {
     expect(receivedRequest).toMatchObject({
       workspace_path: process.cwd(),
       session_id: 'session_existing',
+      memoryAblation: 'B0',
     });
     expect(service.getSnapshot('run_1')).toMatchObject({
       status: 'running',
@@ -650,7 +652,6 @@ describe('NewideBackendService', () => {
           'driver.session_started',
           'driver.run_result',
           'artifact.registered',
-          'gate.result',
           'council.started',
           'council.decision',
           'council.completed',
@@ -658,6 +659,7 @@ describe('NewideBackendService', () => {
           'run.completed',
         ]),
       );
+      expect(types).not.toContain('gate.result');
       expect(types.filter((type) => type === 'run.completed')).toHaveLength(1);
 
       const externalSnapshot = service.getRunSnapshot(created.run_id);
@@ -673,7 +675,8 @@ describe('NewideBackendService', () => {
         final_output: { status: 'completed' },
       });
       expect(externalSnapshot.artifacts.length).toBeGreaterThan(0);
-      expect(externalSnapshot.gates.length).toBeGreaterThan(0);
+      expect(externalSnapshot.gates).toEqual([]);
+      expect(externalSnapshot.quality?.status).toBe('completed');
       expect(externalSnapshot.checkpoint).toBeDefined();
       expect(service.getSnapshot(created.run_id).snapshot?.links.result_path).toBe(
         path.join(tempRoot, 'runs', created.run_id, 'result.json'),
@@ -836,3 +839,23 @@ function completedResult(runId: string, taskId: string): IntegrationV0Result {
 async function readJson(filePath: string): Promise<unknown> {
   return JSON.parse(await readFile(filePath, 'utf-8'));
 }
+
+describe('readDefaultRunMode', () => {
+  it('defaults to single_agent when unset', () => {
+    expect(readDefaultRunMode({})).toBe('single_agent');
+    expect(readDefaultRunMode({ NEWIDE_DEFAULT_RUN_MODE: '  ' })).toBe('single_agent');
+  });
+
+  it('parses council and single_agent', () => {
+    expect(readDefaultRunMode({ NEWIDE_DEFAULT_RUN_MODE: 'council' })).toBe('council');
+    expect(readDefaultRunMode({ NEWIDE_DEFAULT_RUN_MODE: 'single_agent' })).toBe(
+      'single_agent',
+    );
+  });
+
+  it('rejects invalid values', () => {
+    expect(() =>
+      readDefaultRunMode({ NEWIDE_DEFAULT_RUN_MODE: 'council_mode' }),
+    ).toThrow('NEWIDE_DEFAULT_RUN_MODE');
+  });
+});

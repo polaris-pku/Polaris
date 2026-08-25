@@ -11,7 +11,6 @@ import {
   SCHEMA_VERSION,
   createId,
   type Event,
-  type MessageRecipient,
   type TaskCreateRequest,
 } from '../core';
 import {
@@ -53,28 +52,53 @@ import {
   TaskProcessorRunNotFoundError,
   TaskProcessorTaskNotFoundError,
   type BeginTaskRunIntent,
+  type ParticipantSessionProvisioner,
   type TaskProcessor,
-} from './task-processor';
+  type TaskExecutionLoop,
+} from '../coordination';
 import type {
+  MailboxDeliveryWorker,
   PersistentMailboxService,
   MailboxReplyInput,
   MailboxSendInput,
   MailboxSendResult,
-} from './persistent-mailbox-service';
-import type { DriverStreamEvent } from '../driver/contract';
-import type {
   PersistedMailboxDelivery,
   PersistedMailboxEnvelope,
   SaveMailboxReplyResult,
-} from '../persistence';
-import type { AgentBoardAgentView, AgentBoardListItem, ExperienceView, SkillView } from '../memory';
+} from '../mailbox';
+import type { DriverStreamEvent } from '../driver/contract';
+import type {
+  AgentBoardAgentView,
+  AgentBoardListItem,
+  AgentHandle,
+  CreateAgentSpec,
+  CreateSkillInput,
+  ExperienceView,
+  ExperienceWritePatch,
+  MarketImportResult,
+  MarketSearchQuery,
+  PersonaDef,
+  PersonaPatch,
+  RetireOptions,
+  RetireResult,
+  RetirementScanResult,
+  ExperienceListFilter,
+  SkillListFilter,
+  SkillView,
+  SkillWritePatch,
+  UserRating,
+  UserRatingResult,
+  MemoryOverview,
+  DeadLetterEntry,
+} from '../memory';
+import type { SkillRecord, BufferMeta, BufferSnapshot, AgentContextSnapshot } from '../memory/schemas';
 import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
-import type { BMemoryBackendService } from './b-memory-backend-service';
+import type { AgentMetaPatch, BMemoryBackendService } from './b-memory-backend-service';
+import type { ReviewedSkill } from './b-public-capabilities';
 import {
   NoopDriverStreamAuditWriter,
   type DriverStreamAuditWriter,
 } from './driver-stream-audit-writer';
-import type { TaskExecutionLoop } from './task-execution-loop';
 import {
   createUnavailableSystemStatusService,
   type SystemStatusService,
@@ -86,6 +110,10 @@ import type {
   SystemSchemaManifestV1,
   SystemVersionV1,
 } from '../protocol/system-status';
+import type {
+  RunArtifactContent,
+  RunArtifactContentReader,
+} from './run-artifact-content-reader';
 
 export interface RunCreateParams {
   prompt: string;
@@ -222,7 +250,29 @@ export class NewideBackendService {
     private readonly driverStreamAuditWriter: DriverStreamAuditWriter = new NoopDriverStreamAuditWriter(),
     private readonly taskExecutionLoop?: TaskExecutionLoop,
     private readonly systemStatusService: SystemStatusService = createUnavailableSystemStatusService(),
+    private readonly mailboxDeliveryWorker?: MailboxDeliveryWorker,
+    private readonly participantSessionProvisioner?: ParticipantSessionProvisioner,
+    private readonly artifactContentReader?: RunArtifactContentReader,
   ) {}
+
+  async getArtifactContent(runId: string, artifactId: string): Promise<RunArtifactContent> {
+    if (!this.artifactContentReader) {
+      throw new Error('Artifact content reader is not configured');
+    }
+    return this.artifactContentReader.read(runId, artifactId);
+  }
+
+  async recoverMailboxWaits(): Promise<void> {
+    await this.mailboxRecovery;
+    if (!this.taskProcessor || !this.mailboxDeliveryWorker || !this.mailboxService) return;
+    for (const context of this.taskProcessor.listMailboxWaitContexts()) {
+      await this.continueMailboxWait(context.task_id).catch((error: unknown) => {
+        process.stderr.write(
+          `[mailbox] recovery failed for ${context.task_id}: ${toError(error).message}\n`,
+        );
+      });
+    }
+  }
 
   getSystemLiveness(): SystemLivenessV1 {
     return this.systemStatusService.liveness();
@@ -258,19 +308,26 @@ export class NewideBackendService {
   }
 
   async listMailboxInbox(
-    recipient: MessageRecipient,
+    taskId: string,
+    workspacePath: string,
+    recipientRoleId: string,
     afterDeliveryId?: string,
   ): Promise<PersistedMailboxEnvelope[]> {
     await this.mailboxRecovery;
-    return this.requireMailboxService().inbox(recipient, afterDeliveryId);
+    return this.requireMailboxService().inbox(
+      taskId,
+      workspacePath,
+      recipientRoleId,
+      afterDeliveryId,
+    );
   }
 
   async acknowledgeMailboxDelivery(
     deliveryId: string,
-    recipient: MessageRecipient,
+    recipientRoleId: string,
   ): Promise<PersistedMailboxDelivery> {
     await this.mailboxRecovery;
-    return this.requireMailboxService().ack(deliveryId, recipient);
+    return this.requireMailboxService().ack(deliveryId, recipientRoleId);
   }
 
   async replyMailboxMessage(input: MailboxReplyInput): Promise<SaveMailboxReplyResult> {
@@ -278,8 +335,8 @@ export class NewideBackendService {
     return this.requireMailboxService().reply(input);
   }
 
-  listMemoryAgents(): Promise<AgentBoardListItem[]> {
-    return this.requireBMemoryService().listAgents();
+  listMemoryAgents(status?: string): Promise<AgentBoardListItem[]> {
+    return this.requireBMemoryService().listAgents(status);
   }
 
   getMemoryCapabilities() {
@@ -290,12 +347,15 @@ export class NewideBackendService {
     return this.requireBMemoryService().getAgent(roleId);
   }
 
-  listMemorySkills(roleId: string): Promise<SkillView[]> {
-    return this.requireBMemoryService().listSkills(roleId);
+  listMemorySkills(roleId: string, filter?: SkillListFilter): Promise<SkillView[]> {
+    return this.requireBMemoryService().listSkills(roleId, filter);
   }
 
-  listMemoryExperiences(roleId: string): Promise<ExperienceView[]> {
-    return this.requireBMemoryService().listExperiences(roleId);
+  listMemoryExperiences(
+    roleId: string,
+    filter?: ExperienceListFilter,
+  ): Promise<ExperienceView[]> {
+    return this.requireBMemoryService().listExperiences(roleId, filter);
   }
 
   listMemoryMaintenance(roleId?: string): Promise<BMemoryMaintenanceEvidence[]> {
@@ -304,6 +364,135 @@ export class NewideBackendService {
 
   promoteMemorySkills(roleId: string, requestedBy: string): Promise<BMemoryMaintenanceEvidence> {
     return this.requireBMemoryService().promoteSkills(roleId, requestedBy);
+  }
+
+  marketSearchMemorySkills(query: MarketSearchQuery): Promise<SkillRecord[]> {
+    return this.requireBMemoryService().marketSearch(query);
+  }
+
+  marketImportMemorySkill(roleId: string, sourceSkillId: string): Promise<MarketImportResult> {
+    return this.requireBMemoryService().marketImport(roleId, sourceSkillId);
+  }
+
+  retireMemoryAgent(roleId: string, options: RetireOptions): Promise<RetireResult> {
+    return this.requireBMemoryService().retireAgent(roleId, options);
+  }
+
+  runRetirementScan(roleId?: string): Promise<RetirementScanResult[]> {
+    return this.requireBMemoryService().runRetirementScan(roleId);
+  }
+
+  createMemoryAgent(spec: CreateAgentSpec): Promise<AgentHandle> {
+    return this.requireBMemoryService().createAgent(spec);
+  }
+
+  updateMemoryAgent(roleId: string, patch: AgentMetaPatch): Promise<AgentHandle> {
+    return this.requireBMemoryService().updateAgent(roleId, patch);
+  }
+
+  deleteMemoryAgent(roleId: string, options?: { force?: boolean }): Promise<void> {
+    return this.requireBMemoryService().deleteAgent(roleId, options);
+  }
+
+  approveMemorySkill(roleId: string, skillId: string, reviewedBy: string): Promise<ReviewedSkill> {
+    return this.requireBMemoryService().approveSkill(roleId, skillId, reviewedBy);
+  }
+
+  rejectMemorySkill(roleId: string, skillId: string, reviewedBy: string): Promise<ReviewedSkill> {
+    return this.requireBMemoryService().rejectSkill(roleId, skillId, reviewedBy);
+  }
+
+  createMemorySkill(input: CreateSkillInput): Promise<SkillView> {
+    return this.requireBMemoryService().createSkill(input);
+  }
+
+  updateMemorySkill(roleId: string, skillId: string, patch: SkillWritePatch): Promise<SkillView> {
+    return this.requireBMemoryService().updateSkill(roleId, skillId, patch);
+  }
+
+  deleteMemorySkill(roleId: string, skillId: string): Promise<void> {
+    return this.requireBMemoryService().deleteSkill(roleId, skillId);
+  }
+
+  publishMemorySkillToMarket(roleId: string, skillId: string): Promise<SkillView> {
+    return this.requireBMemoryService().publishSkillToMarket(roleId, skillId);
+  }
+
+  updateMemoryExperience(
+    roleId: string,
+    experienceId: string,
+    patch: ExperienceWritePatch,
+  ): Promise<ExperienceView> {
+    return this.requireBMemoryService().updateExperience(roleId, experienceId, patch);
+  }
+
+  deleteMemoryExperience(roleId: string, experienceId: string): Promise<void> {
+    return this.requireBMemoryService().deleteExperience(roleId, experienceId);
+  }
+
+  updateMemoryPersona(roleId: string, patch: PersonaPatch): Promise<PersonaDef> {
+    return this.requireBMemoryService().updatePersona(roleId, patch);
+  }
+
+  regenerateMemoryPersona(roleId: string): Promise<PersonaDef> {
+    return this.requireBMemoryService().regeneratePersona(roleId);
+  }
+
+  rateMemoryTask(
+    roleId: string,
+    taskId: string,
+    rating: UserRating,
+    note?: string,
+  ): Promise<UserRatingResult> {
+    return this.requireBMemoryService().rateTask(roleId, taskId, rating, note);
+  }
+
+  getMemoryBufferState(roleId: string): Promise<{
+    meta: BufferMeta;
+    pending_seqs: number[];
+    dead_letter_seqs: number[];
+    dead_letters: DeadLetterEntry[];
+  }> {
+    return this.requireBMemoryService().getBufferState(roleId);
+  }
+
+  getMemoryPendingBuffer(
+    roleId: string,
+    seq: number,
+  ): Promise<{ snapshot: BufferSnapshot; agent_context?: AgentContextSnapshot } | undefined> {
+    return this.requireBMemoryService().getPendingBuffer(roleId, seq);
+  }
+
+  retryMemoryExtraction(roleId: string, seq: number): Promise<BMemoryMaintenanceEvidence> {
+    return this.requireBMemoryService().retryExtraction(roleId, seq);
+  }
+
+  searchAgentMemory(
+    roleId: string,
+    query: string,
+    options: {
+      top_k?: number;
+      min_similarity?: number;
+      include_skills?: boolean;
+      include_experiences?: boolean;
+    } = {},
+  ): Promise<{
+    skills: Array<SkillView & { similarity: number }>;
+    experiences: Array<ExperienceView & { similarity: number }>;
+  }> {
+    return this.requireBMemoryService().searchMemory(roleId, query, options);
+  }
+
+  getMemoryOverview(): Promise<MemoryOverview> {
+    return this.requireBMemoryService().getOverview();
+  }
+
+  listMemoryPendingReviews(): Promise<SkillView[]> {
+    return this.requireBMemoryService().listPendingReviews();
+  }
+
+  listMemoryExperiencesBySourceTask(taskId: string): Promise<ExperienceView[]> {
+    return this.requireBMemoryService().listExperiencesBySourceTask(taskId);
   }
 
   createRun(params: RunCreateParams): Promise<RunCreateResult> {
@@ -375,6 +564,9 @@ export class NewideBackendService {
           workspace_path: durableLaunch.workspace_path,
           mode: 'council',
           ...(durableLaunch.session_id ? { session_id: durableLaunch.session_id } : {}),
+          ...(durableLaunch.memory_ablation
+            ? { memory_ablation: durableLaunch.memory_ablation }
+            : {}),
         },
         { run_intent: { type: 'council_refinement' } },
       );
@@ -393,6 +585,7 @@ export class NewideBackendService {
         workspace_path: launch.workspace_path,
         mode: 'council',
         ...(launch.session_id ? { session_id: launch.session_id } : {}),
+        ...(launch.memory_ablation ? { memory_ablation: launch.memory_ablation } : {}),
       },
       { run_intent: { type: 'create' } },
     );
@@ -424,6 +617,7 @@ export class NewideBackendService {
         workspace_path: resume.workspace_path,
         mode: resume.mode,
         ...(resume.session_id ? { session_id: resume.session_id } : {}),
+        ...(resume.memory_ablation ? { memory_ablation: resume.memory_ablation } : {}),
       },
       {
         run_intent: { type: 'checkpoint_resume', strategy: 'from_checkpoint' },
@@ -544,6 +738,7 @@ export class NewideBackendService {
         ...(request.project_id ? { project_id: request.project_id } : {}),
         ...(request.client_task_id ? { client_task_id: request.client_task_id } : {}),
         ...(request.title ? { title: request.title } : {}),
+        ...(request.memory_ablation ? { memory_ablation: request.memory_ablation } : {}),
       },
       {
         run_intent: { type: 'create' },
@@ -568,7 +763,7 @@ export class NewideBackendService {
     if (this.closing) throw new Error('Backend service is closing');
     const processor = this.taskProcessor!;
     const loop = this.taskExecutionLoop!;
-    const mode = params.mode ?? 'single_agent';
+    const mode = params.mode ?? readDefaultRunMode(process.env);
     const workspacePath = normalizeWorkspacePath(params.workspace_path ?? process.cwd());
     const taskRequest = params.task_request ?? createDefaultTaskRequest(params.prompt);
     const identity = {
@@ -588,6 +783,7 @@ export class NewideBackendService {
         task_request: taskRequest,
         workspace_path: workspacePath,
         mode,
+        ...(params.memory_ablation ? { memory_ablation: params.memory_ablation } : {}),
         run_intent: lineage?.run_intent ?? { type: 'create' },
         ...(params.session_id ? { session_id: params.session_id } : {}),
         ...(lineage?.restarted_from_run_id &&
@@ -611,10 +807,14 @@ export class NewideBackendService {
         workspace_path: workspacePath,
         mode,
         task_request: taskRequest,
+        ...(params.memory_ablation ? { memory_ablation: params.memory_ablation } : {}),
         ...(params.session_id ? { session_id: params.session_id } : {}),
         ...(params.project_id ? { project_id: params.project_id } : {}),
         ...(params.client_task_id ? { client_task_id: params.client_task_id } : {}),
         ...(params.title ? { title: params.title } : {}),
+        ...(params.memory_ablation
+          ? { memory_ablation: params.memory_ablation }
+          : {}),
         ...(lineage?.restarted_from_run_id
           ? { restarted_from_run_id: lineage.restarted_from_run_id }
           : {}),
@@ -643,6 +843,9 @@ export class NewideBackendService {
       loop,
       controller,
       ...(params.session_id ? { session_id: params.session_id } : {}),
+      ...(params.memory_ablation
+        ? { memory_ablation: params.memory_ablation }
+        : {}),
     });
     this.terminalRuns.set(identity.run_id, terminalRun);
     void terminalRun.finally(() => {
@@ -656,12 +859,16 @@ export class NewideBackendService {
     identity: { run_id: string; task_id: string };
     loop: TaskExecutionLoop;
     controller: AbortController;
+    memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
     session_id?: string;
   }): Promise<void> {
     const processor = this.taskProcessor!;
     try {
       const taskSnapshot = await input.loop.run({
         ...input.identity,
+        ...(input.memory_ablation
+          ? { memory_ablation: input.memory_ablation }
+          : {}),
         ...(input.session_id ? { session_id: input.session_id } : {}),
         signal: input.controller.signal,
         on_driver_event: (event) => this.appendDriverStreamEvent(input.identity, event),
@@ -697,6 +904,38 @@ export class NewideBackendService {
       });
       const projected = processor.getRunSnapshot(input.identity.run_id);
       if (!projected) throw new Error(`Run ${input.identity.run_id} has no persistent projection`);
+      const executionState = processor.getRunExecutionState(input.identity.run_id);
+      if (executionState.resume_cursor === 'mailbox_wait') {
+        const waiting = processor.completeRunForMailboxWait(input.identity.run_id);
+        for (const event of waiting.committed_events) {
+          this.mirrorTaskAuthorityEvent({
+            event_id: event.event_id,
+            sequence: event.sequence,
+            run_id: input.identity.run_id,
+            task_id: input.identity.task_id,
+            type: event.event_type,
+            source: 'coordinator',
+            created_at: event.created_at,
+            payload: event.payload,
+            schema_version: event.schema_version,
+          });
+        }
+        const waitingProjection = processor.getRunSnapshot(input.identity.run_id);
+        if (waitingProjection) {
+          this.registry.setProjectedSnapshot(input.identity.run_id, waitingProjection);
+        }
+        this.registry.complete(input.identity.run_id);
+        await this.driverStreamAuditWriter.flush(input.identity.run_id);
+        await this.auditWriter.flush(input.identity.run_id);
+        await this.terminalWriter.finalize(this.registry.getSnapshot(input.identity.run_id));
+        await this.auditWriter.flush(input.identity.run_id).catch(() => undefined);
+        await this.continueMailboxWait(input.identity.task_id).catch((error: unknown) => {
+          process.stderr.write(
+            `[mailbox] continuation failed for ${input.identity.task_id}: ${toError(error).message}\n`,
+          );
+        });
+        return;
+      }
       if (taskSnapshot.task.status === 'completed') {
         this.registry.complete(input.identity.run_id);
       } else if (taskSnapshot.task.status === 'cancelled') {
@@ -752,6 +991,111 @@ export class NewideBackendService {
     }
   }
 
+  private async continueMailboxWait(taskId: string): Promise<void> {
+    const processor = this.taskProcessor;
+    const mailbox = this.mailboxService;
+    const worker = this.mailboxDeliveryWorker;
+    if (!processor || !mailbox || !worker) return;
+    const deadlock = (reason: string): void => {
+      processor.blockMailboxDeadlock(taskId, `COLLABORATION_DEADLOCK: ${reason}`);
+    };
+    try {
+      let context = processor
+        .listMailboxWaitContexts()
+        .find((candidate) => candidate.task_id === taskId);
+      if (!context || context.delivery_ids.length !== 1) {
+        deadlock('MAILBOX_WAIT_CONTEXT_MISSING');
+        return;
+      }
+      const current = processor.getTaskSnapshot(taskId);
+      if (current.current_run?.run_id === context.run_id) {
+        processor.completeRunForMailboxWait(context.run_id);
+        context = processor
+          .listMailboxWaitContexts()
+          .find((candidate) => candidate.task_id === taskId);
+        if (!context) {
+          deadlock('MAILBOX_WAIT_CONTEXT_MISSING');
+          return;
+        }
+      }
+
+      const sourceDeliveryId = context.delivery_ids[0]!;
+      const source = mailbox.getEnvelope(sourceDeliveryId);
+      // Council plan_first writes Mailbox messages from the council workspace,
+      // which can differ from the Task worktree. Continuation must resume in
+      // the same workspace the request was sent from, or startRun fails and
+      // the Task stays waiting_help forever.
+      const continuationWorkspace = source.message.workspace_path;
+      let reply = mailbox.findReplyDelivery(sourceDeliveryId, context.sender_role_id);
+      if (!reply) {
+        if (this.participantSessionProvisioner) {
+          try {
+            await this.participantSessionProvisioner({
+              task_id: source.message.task_id,
+              workspace_path: continuationWorkspace,
+              role_id: source.delivery.recipient_role_id,
+              run_id: context.run_id,
+            });
+          } catch (cause) {
+            const message = cause instanceof Error ? cause.message : String(cause);
+            deadlock(`SESSION_PROVISION_FAILED: ${message}`);
+            return;
+          }
+        }
+        const handled = await worker.process({
+          delivery_id: sourceDeliveryId,
+          run_id: context.run_id,
+        });
+        if (
+          handled.status === 'retryable_failure' &&
+          handled.error?.startsWith('COLLABORATION_DEADLOCK')
+        ) {
+          processor.blockMailboxDeadlock(taskId, handled.error);
+          return;
+        }
+        reply =
+          handled.status === 'replied' && handled.reply
+            ? mailbox.getEnvelope(handled.reply.delivery_id)
+            : mailbox.findReplyDelivery(sourceDeliveryId, context.sender_role_id);
+        if (!reply) {
+          deadlock('MAILBOX_REPLY_MISSING');
+          return;
+        }
+      }
+      await this.startRun(
+        {
+          prompt: context.task_request.spec,
+          task_id: taskId,
+          task_request: context.task_request,
+          workspace_path: continuationWorkspace,
+          mode: context.mode,
+          ...(context.session_id ? { session_id: context.session_id } : {}),
+          ...(context.memory_ablation ? { memory_ablation: context.memory_ablation } : {}),
+        },
+        {
+          run_intent: { type: 'mailbox_continuation', source_delivery_id: sourceDeliveryId },
+          restarted_from_run_id: context.run_id,
+          cursor_input: {
+            cursor: 'execute_agent',
+            winner_agent_id: context.sender_role_id,
+            mailbox_delivery_id: reply.delivery.delivery_id,
+          },
+        },
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      try {
+        const snapshot = processor.getTaskSnapshot(taskId);
+        if (snapshot.task.status === 'waiting_help' || snapshot.task.status === 'blocked') {
+          deadlock(`CONTINUATION_FAILED: ${message}`);
+        }
+      } catch {
+        // Best-effort: still surface the original continuation failure.
+      }
+      throw error;
+    }
+  }
+
   private mirrorTaskAuthorityEvent(event: AppRunEvent): void {
     const snapshot = this.registry.getSnapshot(event.run_id);
     if (snapshot.events.some((candidate) => candidate.event_id === event.event_id)) return;
@@ -765,7 +1109,7 @@ export class NewideBackendService {
     if (this.closing) {
       return Promise.reject(new Error('Backend service is closing'));
     }
-    const mode = params.mode ?? 'single_agent';
+    const mode = params.mode ?? readDefaultRunMode(process.env);
     const workspacePath = normalizeWorkspacePath(params.workspace_path ?? process.cwd());
     const taskRequest = params.task_request ?? createDefaultTaskRequest(params.prompt);
     const controller = new AbortController();
@@ -902,10 +1246,14 @@ export class NewideBackendService {
                 workspace_path: workspacePath,
                 mode,
                 task_request: taskRequest,
+                ...(params.memory_ablation ? { memory_ablation: params.memory_ablation } : {}),
                 ...(params.session_id ? { session_id: params.session_id } : {}),
                 ...(params.project_id ? { project_id: params.project_id } : {}),
                 ...(params.client_task_id ? { client_task_id: params.client_task_id } : {}),
                 ...(params.title ? { title: params.title } : {}),
+                ...(params.memory_ablation
+                  ? { memory_ablation: params.memory_ablation }
+                  : {}),
                 ...(lineage?.restarted_from_run_id
                   ? { restarted_from_run_id: lineage.restarted_from_run_id }
                   : {}),
@@ -1075,6 +1423,20 @@ export class NewideBackendService {
     }
     if (before.status === 'running' && snapshot.status === 'running') {
       throw new Error(`Run ${runId} did not reach a terminal state`);
+    }
+  }
+
+  /**
+   * Wait through Mailbox continuation Runs until the long-lived Task itself is terminal.
+   * A Run completed with outcome=mailbox_wait is intentionally not a terminal Task result.
+   */
+  async waitForTaskTerminal(taskId: string): Promise<TaskSnapshot> {
+    for (;;) {
+      const snapshot = await this.getTask(taskId);
+      if (['completed', 'failed', 'cancelled', 'blocked'].includes(snapshot.task.status)) {
+        return snapshot;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
     }
   }
 
@@ -1496,4 +1858,15 @@ function normalizeWorkspacePath(input: string): string {
 
 function toError(error: unknown): Error {
   return error instanceof Error ? error : new Error(String(error));
+}
+
+/**
+ * NEWIDE_DEFAULT_RUN_MODE 解析：run.create 未显式传 mode 时用该值决定
+ * single_agent / council。默认 single_agent。
+ */
+export function readDefaultRunMode(env: NodeJS.ProcessEnv): AppRunMode {
+  const raw = env.NEWIDE_DEFAULT_RUN_MODE?.trim();
+  if (!raw) return 'single_agent';
+  if (raw === 'council' || raw === 'single_agent') return raw;
+  throw new Error(`Invalid NEWIDE_DEFAULT_RUN_MODE: ${raw}. Expected council or single_agent.`);
 }

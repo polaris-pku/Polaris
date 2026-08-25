@@ -152,14 +152,6 @@ export class Agent {
     }
   }
 
-  /**
-   * @deprecated 请使用 createCompetitionClaim() 替代。
-   * 旧竞标接口，始终返回 0.5（向后兼容占位）。
-   */
-  async bid(_task: AgentTaskRequest): Promise<number> {
-    return 0.5;
-  }
-
   // ────────────────────────────────────────────
   // 自驱循环（内部自循环，不可外部逐 tick 驱动）
   // ────────────────────────────────────────────
@@ -334,8 +326,10 @@ export class Agent {
    */
   async executeTask(task: AgentTaskRequest): Promise<MemoryCycleResult> {
     this.state = 'running';
+    let assigned = false;
     try {
       await this.assignTask(task);
+      assigned = true;
       await this.runLoop();
 
       const result = this.lastCycleResult;
@@ -346,6 +340,12 @@ export class Agent {
       return result;
     } finally {
       this.state = 'sleeping';
+      // Failure / throw paths skip finalizeLoop; without this, currentTask
+      // stays set, hasPendingTask() remains true, and a shared backend
+      // reports B_BLOCKED for every later instance.
+      if (assigned) {
+        this.clearLoopState();
+      }
     }
   }
 

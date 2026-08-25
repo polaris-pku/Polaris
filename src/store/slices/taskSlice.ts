@@ -9,7 +9,7 @@ import { buildLiveProgressReplay, buildLiveRunReplay, liveProducedFiles } from '
 import { projectLiveBoard } from '@/lib/liveBoard';
 import { resetTimelineSeq } from '@/lib/snapshot';
 import { isFrontendWorkflowV01 } from '@/api/types/rpc';
-import type { PartialExecState, SliceCreator, TaskSlice } from '@/store/types';
+import type { DemoState, PartialExecState, SliceCreator, TaskSlice } from '@/store/types';
 import { uid } from '@/store/lib/ids';
 import { canBindWorkspace, dropRun } from '@/store/lib/liveRuns';
 import { insertFileNode } from '@/store/lib/fileTree';
@@ -41,8 +41,23 @@ function workspaceBlockedMessage(projects: Project[], blocker: DemoTask): string
   );
 }
 
+/**
+ * 合议动作的类型声明。
+ *
+ * 它本该长在 `store/types.ts` 的 `TaskSlice` 上，但那个文件不在本次改动范围内，
+ * 所以先在这里声明、再交叉进切片类型。等 `TaskSlice` 补上同名同签名的成员之后，
+ * 这段和下面的 `selectStartCouncil` 可以直接删掉（签名一致，交叉不会打架）。
+ */
+export type TaskCouncilSlice = {
+  startCouncil: (taskId: string) => Promise<{ ok: true } | { ok: false; error: string }>;
+};
+
+/** 组件取「转入合议」动作的选择器：`useDemoStore(selectStartCouncil)`。 */
+export const selectStartCouncil = (state: DemoState): TaskCouncilSlice['startCouncil'] =>
+  (state as DemoState & TaskCouncilSlice).startCouncil;
+
 /** 任务域：任务生命周期（新建/开始/切换/删除）与页面导航。 */
-export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
+export const createTaskSlice: SliceCreator<TaskSlice & TaskCouncilSlice> = (set, get) => ({
   setPage: (page) => set({ currentPage: page }),
 
   setTaskText: (text) =>
@@ -213,6 +228,53 @@ export const createTaskSlice: SliceCreator<TaskSlice> = (set, get) => ({
         }));
         await watchRun(restarted.run_id);
       }
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  },
+
+  /**
+   * 把一个已被后端受理的任务转入**合议**执行（`task.startCouncil`）。
+   *
+   * 后端两种走法，返回的都是同一份权威 `TaskSnapshot`（`newide-backend-service.startCouncil`）：
+   * - 任务还有 current_run → `setCouncilOverride(run_id)`，**原地**把这次执行切成合议，run_id 不变；
+   * - 任务已经没有在跑的 run → 以 `mode: 'council'` 起一次**新的 run**，current_run.run_id 是新的。
+   * 所以这里不能假设 run_id 不变：拿快照里的 current_run 回填 contractRunId 并关注它。
+   *
+   * 能不能转（任务状态是否允许、有没有已经在跑的 council）由后端判，
+   * 前端不预判、不本地伪造状态：后端拒绝就把它的原话交回调用方显示。
+   */
+  startCouncil: async (taskId) => {
+    const state = get();
+    const task = state.tasks.find((item) => item.id === taskId);
+    const backendTaskId = task?.contractTaskId;
+    if (!task || !backendTaskId) return { ok: false, error: '任务尚未被后端受理。' };
+
+    try {
+      const snapshot = await taskApi.startCouncil(backendTaskId);
+      const runId = snapshot.current_run?.run_id;
+      set((current) => ({
+        liveTasks: {
+          ...current.liveTasks,
+          [backendTaskId]: {
+            ...(current.liveTasks[backendTaskId] ?? { events: [] }),
+            snapshot,
+            status: 'live',
+          },
+        },
+        tasks: current.tasks.map((item) =>
+          item.id === task.id
+            ? {
+                ...item,
+                ...(runId ? { contractRunId: runId } : {}),
+                mode: 'council' as const,
+                submitError: undefined,
+              }
+            : item,
+        ),
+      }));
+      if (runId) await watchRun(runId);
       return { ok: true };
     } catch (err) {
       return { ok: false, error: err instanceof Error ? err.message : String(err) };

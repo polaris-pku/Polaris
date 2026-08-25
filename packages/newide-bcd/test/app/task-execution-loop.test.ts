@@ -3,8 +3,8 @@ import { SCHEMA_VERSION, type TaskCreateRequest } from '../../src/core';
 import {
   TaskExecutionLoop,
   type TaskExecutionLoopExecutors,
-} from '../../src/app/task-execution-loop';
-import { TaskProcessor } from '../../src/app/task-processor';
+} from '../../src/coordination';
+import { TaskProcessor } from '../../src/coordination';
 import {
   SqliteCoordinationStore,
   type CoordinationStateCommit,
@@ -42,6 +42,38 @@ describe('TaskExecutionLoop', () => {
     expect(fixture.store.getTaskAggregate('task_loop')?.runtime_state).not.toHaveProperty(
       'current_run_id',
     );
+  });
+
+  it('propagates memory ablation to every production stage context', async () => {
+    const fixture = createFixture();
+    begin(fixture.processor, selectInput, 'single_agent');
+
+    await fixture.loop.run({
+      task_id: 'task_loop',
+      run_id: 'run_loop',
+      memory_ablation: 'B0',
+    });
+
+    expect(fixture.memoryAblations).toEqual(['B0', 'B0', 'B0', 'B0']);
+  });
+
+  it('stops at mailbox_wait without inventing a changeset', async () => {
+    const fixture = createFixture({ mailboxWait: true });
+    begin(fixture.processor, selectInput, 'single_agent');
+
+    const waiting = await fixture.loop.run({ task_id: 'task_loop', run_id: 'run_loop' });
+
+    expect(fixture.calls).toEqual(['select_agent', 'execute_agent']);
+    expect(waiting).toMatchObject({
+      task: { status: 'running', owner_agent_id: 'agent_a' },
+    });
+    expect(fixture.store.getTaskAggregate('task_loop')?.runtime_state).toMatchObject({
+      resume_cursor: 'mailbox_wait',
+      cursor_input: {
+        cursor: 'mailbox_wait',
+        delivery_ids: ['delivery_review'],
+      },
+    });
   });
 
   it('refuses a legacy cursor projection that has no matching typed input', async () => {
@@ -293,6 +325,7 @@ describe('TaskExecutionLoop', () => {
 });
 
 interface FixtureOptions {
+  mailboxWait?: boolean;
   requestCouncil?: boolean;
   failAt?: TaskCursorInput['cursor'];
   evidenceFailureAt?: TaskCursorInput['cursor'];
@@ -310,6 +343,7 @@ function createFixture(options: FixtureOptions = {}): {
   evidenceStore: MemoryEvidenceStore;
   calls: string[];
   inputs: Partial<Record<TaskCursorInput['cursor'], TaskCursorInput>>;
+  memoryAblations: Array<string | undefined>;
 } {
   const store = new SqliteCoordinationStore(':memory:');
   let conflictInjected = false;
@@ -326,13 +360,19 @@ function createFixture(options: FixtureOptions = {}): {
   const processor = new TaskProcessor(interceptingStore, deterministicClock());
   const calls: string[] = [];
   const inputs: Partial<Record<TaskCursorInput['cursor'], TaskCursorInput>> = {};
+  const memoryAblations: Array<string | undefined> = [];
   const execute = <TInput extends TaskCursorInput, TResult>(
     cursor: TInput['cursor'],
     result: TResult,
   ) =>
-    vi.fn(async (context: { cursor_input: TInput }): Promise<TResult> => {
+    vi.fn(
+      async (context: {
+        cursor_input: TInput;
+        memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+      }): Promise<TResult> => {
       calls.push(cursor);
       inputs[cursor] = context.cursor_input;
+      memoryAblations.push(context.memory_ablation);
       if (cursor === 'execute_agent' && options.overrideDuringExecute) {
         processor.setCouncilOverride('run_loop');
       }
@@ -347,16 +387,34 @@ function createFixture(options: FixtureOptions = {}): {
       }),
     },
     execute_agent: {
-      execute: execute('execute_agent', {
-        changeset_ref: 'artifact_primary_changeset',
-        expected_sha256: 'd'.repeat(64),
-        agent_id: 'agent_a',
-        session_id: 'session_primary',
-        evidence: { response: 'implementation complete' },
-        ...(options.requestCouncil
-          ? { escalation_request: { type: 'request_council' as const, reason: 'review needed' } }
-          : {}),
-      }),
+      execute: execute(
+        'execute_agent',
+        options.mailboxWait
+          ? {
+              agent_id: 'agent_a',
+              session_id: 'session_primary',
+              mailbox_wait: {
+                delivery_ids: ['delivery_review'],
+                waiting_reason: 'Waiting for reviewer',
+              },
+              evidence: { status: 'waiting' },
+            }
+          : {
+              changeset_ref: 'artifact_primary_changeset',
+              expected_sha256: 'd'.repeat(64),
+              agent_id: 'agent_a',
+              session_id: 'session_primary',
+              evidence: { response: 'implementation complete' },
+              ...(options.requestCouncil
+                ? {
+                    escalation_request: {
+                      type: 'request_council' as const,
+                      reason: 'review needed',
+                    },
+                  }
+                : {}),
+            },
+      ),
     },
     council: {
       execute: execute('council', {
@@ -377,6 +435,7 @@ function createFixture(options: FixtureOptions = {}): {
       execute: vi.fn(async (context) => {
         calls.push('deliver');
         inputs.deliver = context.cursor_input;
+        memoryAblations.push(context.memory_ablation);
         return {
           final_output: {
             artifact_ref: context.cursor_input.changeset_ref,
@@ -401,6 +460,7 @@ function createFixture(options: FixtureOptions = {}): {
     }),
     calls,
     inputs,
+    memoryAblations,
   };
 }
 

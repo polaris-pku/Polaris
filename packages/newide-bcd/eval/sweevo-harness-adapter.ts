@@ -1,10 +1,17 @@
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { basename, dirname, join, resolve } from 'node:path';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { loadManifest, resolveDatasetJsonl, resolveRunDir, resolveSweEvoRoot } from './paths';
+import {
+  getScaffoldRoot,
+  loadManifest,
+  resolveDatasetJsonl,
+  resolveRunDir,
+  resolveSweEvoRoot,
+} from './paths';
 import { getInstanceOrThrow, indexDatasetById, loadDataset } from './load-dataset';
 import { writeJson } from './run-summary';
 import type { SweBenchHarnessReport, SweBenchPrediction, SweEvoInstance } from './types';
+import { assertSafeCandidatePatch } from './patch-policy';
 
 export interface SweEvoHarnessAdapterOptions {
   predictionsPath: string;
@@ -73,24 +80,42 @@ export function toWslPath(pathLike: string): string {
   return rest ? `/mnt/${drive}/${rest}` : `/mnt/${drive}`;
 }
 
-function resolveSweEvoPython(sweEvoRoot?: string): string {
-  const configured = process.env.NEWIDE_SWE_EVO_PYTHON?.trim();
-  if (configured) return configured;
-  if (sweEvoRoot) {
-    const venvRoot = join(sweEvoRoot, 'SWE-bench', '.venv-swebench');
-    const candidates = [join(venvRoot, 'bin', 'python'), join(venvRoot, 'Scripts', 'python.exe')];
-    const localPython = candidates.find((candidate) => existsSync(candidate));
-    if (localPython) return localPython;
-  }
-  return 'python';
+export function resolveSweEvoPython(): string {
+  return process.env.NEWIDE_SWE_EVO_PYTHON?.trim() || 'python';
+}
+
+export function assertSweEvoPythonCanImportSwebench(python: string, viaWsl: boolean): void {
+  if (viaWsl) return;
+  const probe = spawnSync(python, ['-c', 'import swebench'], {
+    encoding: 'utf-8',
+  });
+  if (probe.status === 0) return;
+  const detail = `${probe.stderr ?? ''}${probe.stdout ?? ''}`.trim().slice(0, 400);
+  throw new Error(
+    [
+      `SWE-EVO harness interpreter "${python}" cannot import swebench.`,
+      'Set NEWIDE_SWE_EVO_PYTHON to the SWE-bench venv python',
+      '(example: /data/shiyangziran/SWE-EVO/SWE-bench/.venv-swebench/bin/python).',
+      detail ? `Probe output: ${detail}` : `Probe exited ${probe.status ?? 'unknown'}.`,
+    ].join(' '),
+  );
 }
 
 function resolveSweEvoWslDistro(): string {
   return process.env.NEWIDE_SWE_EVO_WSL_DISTRO?.trim() || 'Ubuntu-22.04';
 }
 
-function resolveSweEvoWslPython(): string {
-  return process.env.NEWIDE_SWE_EVO_WSL_PYTHON?.trim() || 'python3';
+function resolveSweEvoWslPython(sweEvoRoot?: string): string {
+  const raw = process.env.NEWIDE_SWE_EVO_WSL_PYTHON?.trim();
+  if (!raw || raw === 'python3' || raw === 'python') {
+    return raw || 'python3';
+  }
+  // Already a WSL/POSIX absolute interpreter path.
+  if (raw.startsWith('/mnt/') || (raw.startsWith('/') && !/^[A-Za-z]:/.test(raw))) {
+    return raw;
+  }
+  const root = sweEvoRoot ?? resolveSweEvoRoot() ?? process.cwd();
+  return toWslPath(resolve(root, raw));
 }
 
 export function buildSweEvoHarnessCommand(input: {
@@ -99,8 +124,14 @@ export function buildSweEvoHarnessCommand(input: {
   trajectoryDir: string;
   maxWorkers: number;
 }): SweEvoHarnessAdapterResult['command'] {
-  const python = resolveSweEvoPython(input.sweEvoRoot);
-  const scriptPath = join(input.sweEvoRoot, 'SWE-bench', 'evaluate_instance.py');
+  const python = resolveSweEvoPython();
+  const officialScriptPath = join(input.sweEvoRoot, 'SWE-bench', 'evaluate_instance.py');
+  const wrapperPath = join(
+    getScaffoldRoot(),
+    'eval',
+    'harness',
+    'secure-sweevo-evaluate.py',
+  );
   const viaWsl = python.toLowerCase() === 'wsl';
   const trajectoriesPath = viaWsl
     ? toWslPath(input.trajectoryDir)
@@ -124,8 +155,10 @@ export function buildSweEvoHarnessCommand(input: {
         '--cd',
         toWslPath(input.workDir),
         '--',
-        resolveSweEvoWslPython(),
-        toWslPath(scriptPath),
+        resolveSweEvoWslPython(input.sweEvoRoot),
+        toWslPath(wrapperPath),
+        '--official-script',
+        toWslPath(officialScriptPath),
         ...scriptArgs,
       ],
     };
@@ -134,7 +167,7 @@ export function buildSweEvoHarnessCommand(input: {
   return {
     cwd: input.workDir,
     command: python,
-    args: [scriptPath, ...scriptArgs],
+    args: [wrapperPath, '--official-script', officialScriptPath, ...scriptArgs],
   };
 }
 
@@ -158,36 +191,66 @@ export function writeHarnessReport(path: string, report: SweBenchHarnessReport):
   writeJson(path, report);
 }
 
-function collectHarnessReport(
-  workDir: string,
-  trajectoryDir: string,
-  predictions: SweBenchPrediction[],
-): SweBenchHarnessReport {
-  const runName = basename(trajectoryDir);
+/**
+ * Collect per-instance `report.json` files written by SWE-EVO's
+ * `evaluate_instance.py` under `<workDir>/logs/run_evaluation/<run>/<run>/<instance_id>/`.
+ * Returns a merged harness report keyed by instance_id.
+ */
+export function collectSweEvoInstanceReports(input: {
+  workDir: string;
+  trajectoryDir: string;
+  instanceIds: string[];
+}): { report: SweBenchHarnessReport; missing: string[] } {
+  const runName = basename(input.trajectoryDir);
+  const primaryDir = join(input.workDir, 'logs', 'run_evaluation', runName, runName);
+  const searchRoot = join(input.workDir, 'logs', 'run_evaluation');
   const report: SweBenchHarnessReport = {};
-  for (const prediction of predictions) {
-    const reportPath = join(
-      workDir,
-      'logs',
-      'run_evaluation',
-      runName,
-      runName,
-      prediction.instance_id,
-      'report.json',
-    );
-    if (!existsSync(reportPath)) continue;
-    Object.assign(
-      report,
-      JSON.parse(readFileSync(reportPath, 'utf-8')) as SweBenchHarnessReport,
-    );
+  const missing: string[] = [];
+
+  for (const instanceId of input.instanceIds) {
+    let reportPath: string | undefined = join(primaryDir, instanceId, 'report.json');
+    if (!existsSync(reportPath)) {
+      reportPath = findInstanceReport(searchRoot, instanceId);
+    }
+    if (!reportPath) {
+      missing.push(instanceId);
+      continue;
+    }
+    const parsed = JSON.parse(readFileSync(reportPath, 'utf-8')) as SweBenchHarnessReport;
+    const entry = parsed[instanceId] ?? Object.values(parsed)[0];
+    if (entry) {
+      report[instanceId] = entry;
+    } else {
+      missing.push(instanceId);
+    }
   }
-  return report;
+  return { report, missing };
+}
+
+function findInstanceReport(searchRoot: string, instanceId: string): string | undefined {
+  if (!existsSync(searchRoot)) return undefined;
+  const wanted = `${sep}${instanceId}${sep}report.json`;
+  try {
+    const entries = readdirSync(searchRoot, { recursive: true }) as string[];
+    for (const entry of entries) {
+      const candidate = String(entry);
+      if (candidate.endsWith('report.json') && `${sep}${candidate}`.includes(wanted)) {
+        return join(searchRoot, candidate);
+      }
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
 }
 
 export async function runSweEvoHarnessAdapter(
   options: SweEvoHarnessAdapterOptions,
 ): Promise<SweEvoHarnessAdapterResult> {
   const predictions = readPredictionsJsonl(options.predictionsPath);
+  for (const prediction of predictions) {
+    assertSafeCandidatePatch(prediction.model_patch);
+  }
   const runDir = resolveRunDir(options.runId, options.outRoot);
   const trajectoryDir = join(runDir, 'sweevo-openhands');
   const trajectoryPath = join(trajectoryDir, 'output.jsonl');
@@ -218,19 +281,19 @@ export async function runSweEvoHarnessAdapter(
     predictions_path: options.predictionsPath,
     trajectory_path: trajectoryPath,
     output_final_dir: outputFinalDir,
-    swe_evo_python: resolveSweEvoPython(sweEvoRoot),
+    swe_evo_python: resolveSweEvoPython(),
     note: 'Run this command in the SWE-EVO environment. On Windows, set NEWIDE_SWE_EVO_PYTHON=wsl to invoke via WSL. Pass --report-source when a harness report is available to normalize it into harness-report.json.',
   });
 
+  let report: SweBenchHarnessReport = {};
   if (options.reportSource) {
-    const report = JSON.parse(readFileSync(options.reportSource, 'utf-8')) as SweBenchHarnessReport;
-    writeHarnessReport(harnessReportPath, report);
-  } else {
-    writeHarnessReport(harnessReportPath, {});
+    report = JSON.parse(readFileSync(options.reportSource, 'utf-8')) as SweBenchHarnessReport;
   }
+  writeHarnessReport(harnessReportPath, report);
 
   if (!options.dryRun) {
     const viaWsl = command.command === 'wsl';
+    assertSweEvoPythonCanImportSwebench(resolveSweEvoPython(), viaWsl);
     const completed = spawnSync(command.command, command.args, {
       // WSL uses `--cd`; Node cwd is only for native python.
       ...(viaWsl ? {} : { cwd: command.cwd }),
@@ -241,9 +304,27 @@ export async function runSweEvoHarnessAdapter(
     if (completed.status !== 0) {
       throw new Error(`SWE-EVO harness exited with status ${completed.status ?? 'unknown'}`);
     }
-    const collectedReport = collectHarnessReport(workDir, trajectoryDir, predictions);
-    if (Object.keys(collectedReport).length > 0) {
-      writeHarnessReport(harnessReportPath, collectedReport);
+
+    // Fold the per-instance report.json files the harness just produced into
+    // harness-report.json; otherwise downstream resolved/applied counts stay 0.
+    const collected = collectSweEvoInstanceReports({
+      workDir,
+      trajectoryDir,
+      instanceIds: predictions.map((prediction) => prediction.instance_id),
+    });
+    report = { ...report, ...collected.report };
+    writeHarnessReport(harnessReportPath, report);
+    if (Object.keys(report).length === 0 && predictions.length > 0) {
+      throw new Error(
+        `SWE-EVO harness completed but no per-instance report.json was found under ` +
+          `${join(workDir, 'logs', 'run_evaluation')} (missing: ${collected.missing.join(', ')}). ` +
+          'Refusing to score this run as all-unresolved; inspect harness logs.',
+      );
+    }
+    if (collected.missing.length > 0) {
+      console.warn(
+        `[sweevo-harness] missing report.json for: ${collected.missing.join(', ')}`,
+      );
     }
   }
 

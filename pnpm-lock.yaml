@@ -216,6 +216,12 @@ importers:
       '@ai-sdk/openai':
         specifier: 4.0.8
         version: 4.0.8(zod@4.4.3)
+      '@electric-sql/pglite':
+        specifier: ^0.5.5
+        version: 0.5.6
+      '@electric-sql/pglite-pgvector':
+        specifier: 0.0.6
+        version: 0.0.6(@electric-sql/pglite@0.5.6)
       ai:
         specifier: 7.0.17
         version: 7.0.17(zod@4.4.3)
@@ -863,6 +869,20 @@ packages:
         integrity: sha512-TzlTVpKPjaqW6qOYjQcYUDuGsLCNsvFHVBXkYGTAnf5V37jCWrE5haKNXzz0WZUtVHjrpV76L1buANjwXMfT8w==,
       }
     engines: { node: '>=22' }
+
+  '@electric-sql/pglite-pgvector@0.0.6':
+    resolution:
+      {
+        integrity: sha512-KiPeiS/BMmjO71igzgexJAu5aPb3Y2yUjNTSMdti4ZL3zlqZFl4eLgbzLBGyG5Cxr9xFwYFmHh61ZTq6w6hUJA==,
+      }
+    peerDependencies:
+      '@electric-sql/pglite': 0.5.5
+
+  '@electric-sql/pglite@0.5.6':
+    resolution:
+      {
+        integrity: sha512-ipn6AOHouIRwNSVL+0hIRuM3yDwAWgRmvZuj+45sudzKpmdPbG8hQuQDZ4A8l7U8E0l7u6pJ/VtMEW42w+vEKQ==,
+      }
 
   '@electron-internal/extract-zip@1.0.4':
     resolution:
@@ -4347,6 +4367,7 @@ packages:
         integrity: sha512-XoMjdBOwe/esVgEvLmNsD3IRHkm7fbKIUGvrleloJXUZgDHig2IPWNniv+GwjyJXzuNqVjlr5+4yVUZjycJwfQ==,
       }
     engines: { node: ^18.18.0 || ^20.9.0 || >=21.1.0 }
+    deprecated: This version is no longer supported. Please see https://eslint.org/version-support for other options.
     hasBin: true
     peerDependencies:
       jiti: '*'
@@ -8203,6 +8224,12 @@ snapshots:
       conventional-commits-parser: 7.1.0
 
   '@conventional-changelog/template@1.2.1': {}
+
+  '@electric-sql/pglite-pgvector@0.0.6(@electric-sql/pglite@0.5.6)':
+    dependencies:
+      '@electric-sql/pglite': 0.5.6
+
+  '@electric-sql/pglite@0.5.6': {}
 
   '@electron-internal/extract-zip@1.0.4': {}
 
