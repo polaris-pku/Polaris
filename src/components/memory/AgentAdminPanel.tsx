@@ -1,14 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
-import {
-  AlertTriangle,
-  Loader2,
-  RefreshCw,
-  Save,
-  ScanSearch,
-  Trash2,
-  UserMinus,
-  UserPlus,
-} from 'lucide-react';
+import { Loader2, RefreshCw, Save, ScanSearch, Trash2, UserMinus } from 'lucide-react';
 import { memoryApi } from '@/api/memory';
 import { BackendError } from '@/api/transport';
 import type {
@@ -24,18 +15,22 @@ import type {
   RpcRetirementScanResult,
 } from '@/api/types/memory';
 import { ConfirmDialog } from '@/components/ConfirmDialog';
+import { INPUT_CLASS, parseTags } from '@/components/memory/memoryShared';
+import { ScanCard } from '@/components/memory/shared';
 import { Badge } from '@/components/ui/Badge';
 import { Button } from '@/components/ui/Button';
-import { Dialog } from '@/components/ui/Dialog';
 import { IdChip } from '@/components/ui/IdChip';
 import { Panel } from '@/components/ui/Panel';
 import { Textarea } from '@/components/ui/Textarea';
 import { cn } from '@/lib/utils';
 
 /**
- * Agent 生命周期面板 —— 创建 / 改名 / 画像 / 退休扫描 / 退休 / 删除。
+ * Agent 生命周期面板 —— 改名 / 画像 / 退休扫描 / 退休 / 删除，全部作用在选中的这一个 Agent 上。
  *
- * 三条约束，都来自后端契约而不是审美：
+ * 新建 Agent 与**全量**退休扫描已经搬去 `OrgConsolePanel`：前者建的是另一个 Agent、后者不吃
+ * role_id，都跟这里选中的是谁无关。这里留下的 `retirementScan(roleId)` 只扫这一个。
+ *
+ * 四条约束，都来自后端契约而不是审美：
  *
  * 1. **按声明渲染入口。** 每个分区先读 `memory.getCapabilities` 里对应的
  *    `operations.<name>`：`available` 才给控件，`unavailable` 就把后端给的 `reason`
@@ -52,8 +47,7 @@ import { cn } from '@/lib/utils';
  *    删除**，只留一条没有 RPC 出口的归档。所以 `status='retired'` 之后这个面板必须像删除
  *    一样收起来，否则后续任何 `getAgent` 都会 `Agent not found`。
  *
- * 错误口径：分区内的操作失败一律交给 `onError` 由父组件统一展示；只有弹窗里的表单
- * （新建 Agent）把错误留在弹窗内 —— 弹窗盖住了父组件的错误条，扔上去用户看不见。
+ * 错误口径：分区内的操作失败一律交给 `onError` 由父组件统一展示。
  */
 export interface MemoryPanelProps {
   roleId: string;
@@ -84,18 +78,6 @@ const REPLACEMENTS: { value: MemoryReplacementStrategy; label: string }[] = [
   { value: 'clean_slate', label: '空白替代' },
   { value: 'seeded_slate', label: '带种子替代' },
 ];
-
-const SCAN_ACTION_LABEL: Record<string, string> = {
-  retire: '建议退休',
-  warn: '需要关注',
-  keep: '建议保留',
-};
-
-const LAYER_LABEL: Record<string, string> = {
-  statistical: '统计门控',
-  persona_drift: '画像漂移',
-  llm: '模型评估',
-};
 
 const PERSONA_FIELDS: { key: keyof MemoryPersonaPatch; label: string; rows: number }[] = [
   { key: 'summary', label: '角色摘要', rows: 3 },
@@ -134,27 +116,10 @@ function personaPatch(persona: RpcPersonaView, draft: PersonaDraft): MemoryPerso
   return patch;
 }
 
-const parseTags = (raw: string): string[] =>
-  raw
-    .split(/[,，\n]/)
-    .map((item) => item.trim())
-    .filter((item) => item.length > 0);
-
-const parseLines = (raw: string): string[] =>
-  raw
-    .split('\n')
-    .map((item) => item.trim())
-    .filter((item) => item.length > 0);
-
 const sameList = (a: string[], b: string[]): boolean =>
   a.length === b.length && a.every((item, index) => item === b[index]);
 
-const ratio = (value: number): string => (Number.isFinite(value) ? value.toFixed(2) : '—');
-
 type Busy = 'meta' | 'persona' | 'regenerate' | 'scan' | 'retire' | 'delete' | null;
-
-const INPUT_CLASS =
-  'w-full rounded-panel border border-edge-strong bg-surface-void px-3 py-2 text-body text-fg-primary placeholder:text-fg-faint focus:border-command focus:outline-none focus:ring-1 focus:ring-command/40';
 
 export function AgentAdminPanel({ roleId, capabilities, onError, onChanged }: MemoryPanelProps) {
   const [agent, setAgent] = useState<RpcAgentBoardAgentView>();
@@ -177,8 +142,6 @@ export function AgentAdminPanel({ roleId, capabilities, onError, onChanged }: Me
   const [confirming, setConfirming] = useState<'retire' | 'delete' | null>(null);
   /** 后端拒绝删除时的原话；非 null 即弹出第二次（强制删除）确认。 */
   const [forceMessage, setForceMessage] = useState<string | null>(null);
-
-  const [createOpen, setCreateOpen] = useState(false);
 
   // 父组件多半会传一个每次渲染都新建的箭头函数；放进依赖数组会让读取 Agent 变成死循环。
   const onErrorRef = useRef(onError);
@@ -348,8 +311,6 @@ export function AgentAdminPanel({ roleId, capabilities, onError, onChanged }: Me
     }
   };
 
-  const createState = operationState(capabilities, 'create_agent');
-
   return (
     <div className="space-y-3">
       <AgentHeader
@@ -358,23 +319,6 @@ export function AgentAdminPanel({ roleId, capabilities, onError, onChanged }: Me
         gone={deleted ? 'deleted' : retired ? 'retired' : undefined}
         roleId={roleId}
       />
-
-      <OperationSection title="新建 Agent" method="memory.createAgent" state={createState}>
-        <p className="text-body text-fg-muted">
-          新建的是另一个 Agent，不会改变当前选中的这个；创建成功后左侧列表会重新拉取。
-        </p>
-        <Button
-          className="mt-3"
-          variant="secondary"
-          size="sm"
-          onClick={() => {
-            setCreateOpen(true);
-          }}
-        >
-          <UserPlus className="h-3.5 w-3.5" />
-          新建 Agent
-        </Button>
-      </OperationSection>
 
       {!deleted && !retired && (
         <>
@@ -593,14 +537,6 @@ export function AgentAdminPanel({ roleId, capabilities, onError, onChanged }: Me
       {/* 退休成功会收起上面整块，但处置结果只在这里出现过一次 —— 收起后补摆在外层 */}
       {retired && retireResult && <RetireResultCard result={retireResult} />}
 
-      <CreateAgentDialog
-        open={createOpen}
-        onClose={() => {
-          setCreateOpen(false);
-        }}
-        onCreated={onChanged}
-      />
-
       <ConfirmDialog
         open={confirming === 'retire'}
         title="确认退休这个 Agent？"
@@ -645,7 +581,7 @@ type OperationState =
   | { kind: 'available' }
   | { kind: 'unavailable'; reason: string };
 
-/** 能力清单还没回来时不预设可用；`unavailable` 时把后端给的 reason 原样交出去。 */
+/** 把能力清单压成三态；与 shared 里的 `operationState` 同名不同物 —— 那个返回原始 capability。 */
 function operationState(
   capabilities: MemoryCapabilities | undefined,
   name: MemoryOperationName,
@@ -788,107 +724,6 @@ function AgentHeader({
   );
 }
 
-function ScanCard({
-  scan,
-  onUseReason,
-}: {
-  scan: RpcRetirementScanResult;
-  onUseReason: (reason: MemoryRetiredReason) => void;
-}) {
-  const suggested = scan.suggested_reason;
-  return (
-    <Panel className="bg-surface-void">
-      <div className="flex flex-wrap items-center gap-2">
-        <Badge
-          variant={scan.action === 'retire' ? 'danger' : scan.action === 'warn' ? 'human' : 'ok'}
-        >
-          {SCAN_ACTION_LABEL[scan.action] || '未知结论'}
-        </Badge>
-        <span className="font-mono text-code text-fg-faint">{scan.action}</span>
-        <span className="text-body text-fg-muted">
-          置信度 <span className="tabular font-mono text-code">{ratio(scan.confidence)}</span>
-        </span>
-        <span className="ml-auto">
-          <IdChip value={scan.scan_id} label="扫描" />
-        </span>
-      </div>
-      <p className="mt-1 text-body text-fg-muted">{scan.scanned_at || '—'}</p>
-
-      {scan.error && (
-        <p className="mt-2 flex items-start gap-2 text-body text-danger-soft">
-          <AlertTriangle className="mt-1 h-3.5 w-3.5 shrink-0" />
-          {scan.error}
-        </p>
-      )}
-
-      {scan.reasons.length > 0 && (
-        <ul className="mt-2 space-y-1">
-          {scan.reasons.map((reason, index) => (
-            <li key={`${scan.scan_id}-${String(index)}`} className="text-body text-fg-secondary">
-              · {reason}
-            </li>
-          ))}
-        </ul>
-      )}
-
-      {scan.layers.length > 0 && (
-        <div className="mt-2 space-y-1">
-          {scan.layers.map((layer) => (
-            <div
-              key={`${scan.scan_id}-${layer.layer}`}
-              className="flex flex-wrap items-baseline gap-2 border-t border-edge pt-1 text-body text-fg-muted"
-            >
-              <span className="text-fg-secondary">{LAYER_LABEL[layer.layer] || layer.layer}</span>
-              <span className="font-mono text-code text-fg-faint">{layer.layer}</span>
-              <span>{SCAN_ACTION_LABEL[layer.action] || layer.action}</span>
-              <span className="tabular font-mono text-code">{ratio(layer.confidence)}</span>
-              {layer.skipped && <span className="text-human-soft">冷却期内跳过</span>}
-              {typeof layer.persona_drift === 'number' && (
-                <span>
-                  漂移{' '}
-                  <span className="tabular font-mono text-code">{ratio(layer.persona_drift)}</span>
-                </span>
-              )}
-              {typeof layer.market_replaceability === 'number' && (
-                <span>
-                  可替代{' '}
-                  <span className="tabular font-mono text-code">
-                    {ratio(layer.market_replaceability)}
-                  </span>
-                </span>
-              )}
-              {typeof layer.experience_recoverability === 'number' && (
-                <span>
-                  可恢复{' '}
-                  <span className="tabular font-mono text-code">
-                    {ratio(layer.experience_recoverability)}
-                  </span>
-                </span>
-              )}
-            </div>
-          ))}
-        </div>
-      )}
-
-      {suggested && (
-        <div className="mt-2 flex flex-wrap items-center gap-2">
-          <span className="text-body text-fg-muted">建议原因</span>
-          <span className="font-mono text-code text-fg-faint">{suggested}</span>
-          <Button
-            size="sm"
-            variant="ghost"
-            onClick={() => {
-              onUseReason(suggested);
-            }}
-          >
-            填入退休表单
-          </Button>
-        </div>
-      )}
-    </Panel>
-  );
-}
-
 /**
  * 退休结果卡。两种终局要分开画：
  * - `pre_retired`：只置了 draining，`asset_disposition` 是 undefined —— 旧版直接解构它，
@@ -933,152 +768,5 @@ function RetireResultCard({ result }: { result: RpcRetireResult }) {
         </div>
       )}
     </Panel>
-  );
-}
-
-// ── 新建 Agent 弹窗 ──
-
-function CreateAgentDialog({
-  open,
-  onClose,
-  onCreated,
-}: {
-  open: boolean;
-  onClose: () => void;
-  onCreated: () => void;
-}) {
-  const [roleId, setRoleId] = useState('');
-  const [name, setName] = useState('');
-  const [tags, setTags] = useState('');
-  const [seed, setSeed] = useState('');
-  const [constraints, setConstraints] = useState('');
-  const [creating, setCreating] = useState(false);
-  const [error, setError] = useState<string>();
-
-  const reset = () => {
-    setRoleId('');
-    setName('');
-    setTags('');
-    setSeed('');
-    setConstraints('');
-    setError(undefined);
-  };
-
-  const close = () => {
-    reset();
-    onClose();
-  };
-
-  const canSubmit = roleId.trim().length > 0 && name.trim().length > 0;
-
-  const submit = async () => {
-    if (!canSubmit || creating) return;
-    setCreating(true);
-    setError(undefined);
-    const tagList = parseTags(tags);
-    const constraintList = parseLines(constraints);
-    const seedText = seed.trim();
-    try {
-      await memoryApi.createAgent({
-        role_id: roleId.trim(),
-        name: name.trim(),
-        ...(tagList.length > 0 ? { tags: tagList } : {}),
-        ...(seedText ? { persona_seed: seedText } : {}),
-        ...(constraintList.length > 0 ? { constraints: constraintList } : {}),
-      });
-      onCreated();
-      reset();
-      onClose();
-    } catch (reason) {
-      // 留在弹窗里：弹窗盖住了父组件的错误条，扔上去用户看不见，也没法就地改。
-      setError(errorMessage(reason));
-    } finally {
-      setCreating(false);
-    }
-  };
-
-  return (
-    <Dialog open={open} onClose={close} className="max-w-xl">
-      <div className="p-6">
-        <div className="flex items-center gap-2">
-          <div className="flex h-9 w-9 items-center justify-center rounded-panel bg-command/15 text-command-soft">
-            <UserPlus className="h-5 w-5" />
-          </div>
-          <div>
-            <h2 className="text-title text-fg-primary">新建 Agent</h2>
-            <p className="text-body text-fg-muted">角色标识一旦占用就不能再建同名的。</p>
-          </div>
-        </div>
-
-        <div className="mt-4 space-y-3">
-          <Field label="角色标识" hint="后端主键，创建后不可改。">
-            <input
-              value={roleId}
-              onChange={(e) => {
-                setRoleId(e.target.value);
-              }}
-              placeholder="backend-dev"
-              className={INPUT_CLASS}
-            />
-          </Field>
-          <Field label="名称">
-            <input
-              value={name}
-              onChange={(e) => {
-                setName(e.target.value);
-              }}
-              placeholder="后端开发"
-              className={INPUT_CLASS}
-            />
-          </Field>
-          <Field label="标签（可选）" hint="逗号或换行分隔。">
-            <input
-              value={tags}
-              onChange={(e) => {
-                setTags(e.target.value);
-              }}
-              placeholder="backend, api"
-              className={INPUT_CLASS}
-            />
-          </Field>
-          <Field label="画像种子（可选）" hint="生成初始画像摘要的种子文本。">
-            <Textarea
-              rows={3}
-              value={seed}
-              onChange={(e) => {
-                setSeed(e.target.value);
-              }}
-              placeholder="擅长服务端接口设计与数据库改造…"
-            />
-          </Field>
-          <Field label="约束条目（可选 · 每行一条）">
-            <Textarea
-              rows={3}
-              value={constraints}
-              onChange={(e) => {
-                setConstraints(e.target.value);
-              }}
-              placeholder={'不改动数据库迁移脚本\n只在 packages/api 下工作'}
-            />
-          </Field>
-        </div>
-
-        {error && (
-          <div className="mt-4 flex items-start gap-2 rounded-panel border border-danger/30 bg-danger/10 px-3 py-2">
-            <AlertTriangle className="mt-1 h-4 w-4 shrink-0 text-danger-soft" />
-            <p className="min-w-0 text-body text-fg-secondary">{error}</p>
-          </div>
-        )}
-
-        <div className="mt-6 flex justify-end gap-2">
-          <Button variant="ghost" onClick={close}>
-            取消
-          </Button>
-          <Button variant="primary" disabled={!canSubmit || creating} onClick={() => void submit()}>
-            {creating ? '正在创建…' : '创建'}
-          </Button>
-        </div>
-      </div>
-    </Dialog>
   );
 }
