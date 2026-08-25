@@ -108,8 +108,10 @@ export {
   publishSkillToMarket,
   updateExperience,
   deleteExperience,
+  promoteExperienceToSkill,
   type CreateSkillInput,
   type CreateSkillOptions,
+  type PromoteExperienceInput,
   type SkillWritePatch,
   type ExperienceWritePatch,
 } from './services/memory-writer';
@@ -232,6 +234,35 @@ export {
   type RetirementScanResult,
   type RetirementDetectorOptions,
 } from './services/retirement-detection';
+
+// ════════════════════════════════════════════════════════
+//  8.8 市场自学习（存活 Agent 扫描市场引入技能）
+//     决策 = tag 相似度 + persona 相似度加权
+// ════════════════════════════════════════════════════════
+
+export {
+  learnSkillsForAgent,
+  buildLearningQuery,
+  computeTagSimilarity,
+  evaluateSkillLearning,
+  DEFAULT_SKILL_LEARNING_OPTIONS,
+} from './services/skill-learning';
+export type {
+  SkillLearningOptions,
+  SkillLearningDecision,
+  SkillLearningOutcome,
+} from './services/skill-learning';
+
+// ════════════════════════════════════════════════════════
+//  8.9 向量索引维护（memory.reindex：切换 embedding 模型后全量重建索引）
+// ════════════════════════════════════════════════════════
+
+export {
+  reindexMemory,
+  type ReindexMemoryOptions,
+  type ReindexMemoryResult,
+  type ReindexFailure,
+} from './services/memory-reindex';
 
 // ════════════════════════════════════════════════════════
 //  9. MemoryProvider（给 Coordinator 用）
@@ -358,6 +389,7 @@ export type {
 export type { AgentTaskRequest, AgentLoopState } from './agent-types';
 export type { AgentToolConfig } from './runtime/agent';
 export type {
+  AgentArchiveRecord,
   AgentHandle,
   CreateAgentSpec,
   PersonaDef,

@@ -41,6 +41,9 @@ import {
   type MemoryOverview,
   cosineSimilarity,
   type DeadLetterEntry,
+  promoteExperienceToSkill,
+  reindexMemory,
+  type ReindexMemoryResult,
 } from '../memory';
 import type {
   AgentContextSnapshot,
@@ -74,6 +77,7 @@ export interface BMemoryCapabilities {
     list_skills: BMemoryOperationCapability;
     list_maintenance: BMemoryOperationCapability;
     promote_skills: BMemoryOperationCapability;
+    promote_experience: BMemoryOperationCapability;
     approve_skill: BMemoryOperationCapability;
     reject_skill: BMemoryOperationCapability;
     update_persona: BMemoryOperationCapability;
@@ -99,6 +103,7 @@ export interface BMemoryCapabilities {
     get_overview: BMemoryOperationCapability;
     list_pending_reviews: BMemoryOperationCapability;
     list_experiences_by_source_task: BMemoryOperationCapability;
+    reindex: BMemoryOperationCapability;
   };
 }
 
@@ -161,6 +166,12 @@ export class BMemoryBackendService {
           reason: this.options.autoApprovePromotedSkills
             ? 'Promoted Skills are approved automatically.'
             : 'Promotion creates pending Skills for explicit review.',
+        },
+        promote_experience: {
+          status: this.repository ? 'available' : 'unavailable',
+          ...(this.repository
+            ? {}
+            : { reason: 'B runtime has no MemoryRepository configured.' }),
         },
         approve_skill: { status: 'available' },
         reject_skill: { status: 'available' },
@@ -302,6 +313,15 @@ export class BMemoryBackendService {
             ? {}
             : { reason: 'B runtime has no MemoryRepository configured.' }),
         },
+        reindex: {
+          status: this.repository && this.embedding ? 'available' : 'unavailable',
+          ...(this.repository && this.embedding
+            ? {}
+            : {
+                reason:
+                  'B runtime has no MemoryRepository or semantic embedding provider configured.',
+              }),
+        },
       },
     };
   }
@@ -345,7 +365,22 @@ export class BMemoryBackendService {
     return { ...promotion, skills };
   }
 
-  /** 技能市场检索：query 文本 → embedding → 全库 top-K 召回（Spec §6.2）。 */
+  /**
+   * 手动晋升一条经验为 Skill（memory.promoteExperience）。
+   * 显式指定经验晋升，产出 review_status='pending' 的技能进入待审核队列，
+   * 审核走 approveSkill / rejectSkill。校验（仅正经验、未晋升过）在 memory 服务内完成。
+   */
+  async promoteExperience(roleId: string, experienceId: string): Promise<SkillView> {
+    const repository = this.requireRepository('Experience promotion');
+    return toSkillView(
+      await promoteExperienceToSkill(repository, {
+        role_id: roleId,
+        experience_id: experienceId,
+      }),
+    );
+  }
+
+  /** 技能市场检索：query 文本 → embedding → 市场池（__market__）内 top-K 召回（Spec §6.2）。 */
   async marketSearch(query: MarketSearchQuery): Promise<SkillRecord[]> {
     if (!this.repository) {
       throw new Error('Market search requires a MemoryRepository');
@@ -637,6 +672,25 @@ export class BMemoryBackendService {
       }),
     );
     return batches.flat().map(toExperienceView);
+  }
+
+  /**
+   * 重建向量索引（memory.reindex）：切换 embedding 模型后重算存量
+   * Skills / Experiences 的 description_embedding（Spec §7.2）。
+   * roleId 缺省全量；force=true 无条件重算（同维度换模型场景）。
+   */
+  async reindexMemory(
+    roleId?: string,
+    options: { force?: boolean } = {},
+  ): Promise<ReindexMemoryResult> {
+    const repository = this.requireRepository('Memory reindex');
+    if (!this.embedding) {
+      throw new Error('Memory reindex requires a semantic embedding provider');
+    }
+    return reindexMemory(repository, this.embedding, {
+      ...(roleId !== undefined ? { role_id: roleId } : {}),
+      ...(options.force !== undefined ? { force: options.force } : {}),
+    });
   }
 
   /** 构造 Persona 归纳器：有 LLM 注入则 LLM 归纳（自动降级规则版），否则纯规则版 */
