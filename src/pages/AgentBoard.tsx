@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { AlertTriangle, Brain, Loader2, Sparkles, X } from 'lucide-react';
+import { AlertTriangle, Brain, Globe, Loader2, Sparkles, X } from 'lucide-react';
 import { memoryApi } from '@/api/memory';
 import type {
   MemoryCapabilities,
@@ -12,6 +12,7 @@ import type {
 } from '@/api/types/memory';
 import { AgentAdminPanel } from '@/components/memory/AgentAdminPanel';
 import { MemoryOpsPanel } from '@/components/memory/MemoryOpsPanel';
+import { OrgConsolePanel } from '@/components/memory/OrgConsolePanel';
 import { SkillMarketPanel } from '@/components/memory/SkillMarketPanel';
 import { SidePanel } from '@/components/SidePanel';
 import { Badge, type BadgeProps } from '@/components/ui/Badge';
@@ -26,7 +27,7 @@ import { cn } from '@/lib/utils';
 /**
  * Agent Memory —— 左侧名册 + 右侧分标签的记忆工作台。
  *
- * 为什么改成标签页：B 记忆的可写面已经铺开到 30 个 `memory.*` 方法，三块面板
+ * 为什么改成标签页：B 记忆的可写面已经铺开到 34 个 `memory.*` 方法，三块面板
  * （技能与市场 / 记忆运维 / 生命周期）任何一块单独展开都比原来整页还长。标签页每次只挂当前
  * 那一块，切页即重挂 —— 三块面板各自拉自己的数据、各自带取消标志，本页不替它们缓存，
  * 也不给它们喂数据。
@@ -35,7 +36,17 @@ import { cn } from '@/lib/utils';
  * 技能与经验的只读清单（memory.listSkills / listExperiences）、维护证据与技能晋升
  * （memory.listMaintenance / promoteSkills）。其余读写入口全在面板里，本页不重复实现。
  *
- * 能力门控读 v2 的 `capabilities.operations`（31 个键，键名与 RPC 方法名并非一一对应：
+ * ## 两级作用域
+ *
+ * 名册顶上钉着一行「全局」。选中它 = 组织级视图（`OrgConsolePanel`），装的是那些**不吃
+ * role_id** 的调用：总览、跨 Agent 待审队列、全量退休扫描、重建索引、新建 Agent。选中某个
+ * 具体 Agent 才出四个标签页。
+ *
+ * 这条轴是后补的：这些调用原先散在三块单 Agent 面板里，于是「看全局总览」「建新 Agent」都得
+ * 先随便选中一个 Agent 才点得到 —— 旧的空状态提示里那句「新建 Agent 的入口在生命周期标签页，
+ * 而那一页要先选中一个 Agent 才打得开」就是这个毛病的自白。
+ *
+ * 能力门控读 v2 的 `capabilities.operations`（33 个键，键名与 RPC 方法名并非一一对应：
  * 晋升是 `promote_skills`，详情是 `get_agent_persona`，上架是 `publish_skill`）。清单没回来
  * 之前不预设可用；后端说 unavailable 就把它给的 reason 原样摆出来，不画一个按下去必然报错的按钮。
  */
@@ -138,6 +149,7 @@ const percent = (value: unknown): string =>
 export function AgentBoard() {
   const [capabilities, setCapabilities] = useState<MemoryCapabilities>();
   const [agents, setAgents] = useState<RpcAgentBoardListItem[]>([]);
+  /** undefined = 全局档（组织级视图）；有值 = 选中了某个 Agent。 */
   const [selectedRoleId, setSelectedRoleId] = useState<string>();
   const [detail, setDetail] = useState<AgentDetail>();
   const [tab, setTab] = useState<MemoryTab>('overview');
@@ -190,7 +202,6 @@ export function AgentBoard() {
         if (!active) return;
         setCapabilities(caps.capabilities);
         setAgents(listed.agents);
-        setSelectedRoleId((current) => current ?? listed.agents[0]?.role_id);
       })
       .catch((reason: unknown) => {
         if (active) setError(errorMessage(reason));
@@ -289,6 +300,29 @@ export function AgentBoard() {
             <span className="tabular text-meta text-fg-muted">{agents.length}</span>
           </div>
           <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-2">
+            {/*
+              全局档钉在最上面。它不是「没选中」的占位 —— 组织级的那几个调用本来就不吃
+              role_id，硬塞进某个 Agent 的标签页才是错的。
+            */}
+            <button
+              type="button"
+              onClick={() => {
+                setSelectedRoleId(undefined);
+              }}
+              className={cn(
+                'w-full rounded-panel border bg-surface-panel p-3 text-left transition-colors hover:border-edge-strong',
+                selectedRoleId === undefined ? 'border-command/60' : 'border-edge',
+              )}
+            >
+              <div className="flex items-center gap-2">
+                <Globe className="h-3.5 w-3.5 shrink-0 text-fg-muted" aria-hidden />
+                <span className="min-w-0 flex-1 truncate text-body text-fg-primary">全局</span>
+              </div>
+              <p className="mt-1 text-body text-fg-secondary">
+                总览 · 待审队列 · 全量扫描 · 重建索引 · 新建 Agent
+              </p>
+            </button>
+
             {agents.map((agent) => (
               <button
                 key={agent.role_id}
@@ -445,17 +479,32 @@ export function AgentBoard() {
             </div>
           </>
         ) : (
-          <div className="flex min-h-0 flex-1 items-center justify-center p-6">
-            {agents.length === 0 ? (
-              <EmptyState
-                icon={Brain}
-                title="后端还没有任何 Agent"
-                hint="新建 Agent 的入口在「生命周期」标签页，而那一页要先选中一个 Agent 才打得开。"
+          <>
+            <div className="flex shrink-0 items-center gap-2 border-b border-edge px-4 py-1">
+              <Globe className="h-3.5 w-3.5 shrink-0 text-fg-muted" aria-hidden />
+              <span className="text-body text-fg-primary">全局</span>
+              <span className="min-w-0 flex-1 truncate text-body text-fg-muted">
+                不属于任何单个 Agent 的操作
+              </span>
+              <span className="tabular text-meta text-fg-muted">Agent {agents.length}</span>
+            </div>
+            <div className="min-h-0 flex-1 overflow-y-auto p-6">
+              {agents.length === 0 && (
+                <div className="mb-4">
+                  <EmptyState
+                    icon={Brain}
+                    title="后端还没有任何 Agent"
+                    hint="用下面的「新建 Agent」建第一个，或者等系统在派发任务时自动衍生。"
+                  />
+                </div>
+              )}
+              <OrgConsolePanel
+                capabilities={capabilities}
+                onError={handleError}
+                onChanged={handleChanged}
               />
-            ) : (
-              <EmptyState icon={Brain} title="选择一个 Agent" hint="详情与记忆会按需从后端加载。" />
-            )}
-          </div>
+            </div>
+          </>
         )}
       </div>
     </div>

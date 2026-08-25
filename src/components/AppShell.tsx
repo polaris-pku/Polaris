@@ -15,7 +15,7 @@
  * 在全屏唯一还活着的答案。
  */
 import { type ReactNode, useState } from 'react';
-import { ChevronLeft, ChevronRight, CircleHelp, LayoutGrid, Settings } from 'lucide-react';
+import { Bot, ChevronLeft, ChevronRight, CircleHelp, LayoutGrid, Settings } from 'lucide-react';
 import { Dock } from '@/components/dock/Dock';
 import { Logo } from '@/components/Logo';
 import { ProjectTree } from '@/components/ProjectTree';
@@ -30,6 +30,8 @@ export function AppShell({ children }: { children: ReactNode }) {
   const assignedAgentIds = useDemoStore((s) => s.assignedAgentIds);
   const closeProject = useDemoStore((s) => s.closeProject);
   const openHelp = useDemoStore((s) => s.openHelp);
+  const setPage = useDemoStore((s) => s.setPage);
+  const currentPage = useDemoStore((s) => s.currentPage);
 
   const {
     size: navWidth,
@@ -101,6 +103,21 @@ export function AppShell({ children }: { children: ReactNode }) {
               </div>
             )}
 
+            {/*
+              Agent 控制台的**唯一全局入口**。在这之前进 Agent Board 只能点某个任务的团队
+              （见 ProjectTree 里 openTaskTeam），可它承载的技能市场、审核队列、生命周期
+              大半与任务无关 —— 没有任务就没有门。落点是全局档，不预选任何 Agent。
+            */}
+            <SideAction
+              icon={Bot}
+              label="Agent 控制台"
+              collapsed={navCollapsed}
+              active={currentPage === 'agents'}
+              onClick={() => {
+                setPage('agents');
+              }}
+            />
+
             {/* 帮助的**主入口** —— Windows 上原生菜单不可见，这是唯一一个每屏都在的锚点 */}
             <SideAction
               icon={CircleHelp}
@@ -169,6 +186,7 @@ function SideAction({
   collapsed,
   title,
   trailing,
+  active,
   onClick,
 }: {
   icon: typeof Settings;
@@ -176,6 +194,8 @@ function SideAction({
   collapsed: boolean;
   title?: string;
   trailing?: ReactNode;
+  /** 导航类的项才传：它指向一个页面，用户需要知道现在是不是在那一页。 */
+  active?: boolean;
   onClick: () => void;
 }) {
   return (
@@ -184,7 +204,8 @@ function SideAction({
       onClick={onClick}
       title={title ?? (collapsed ? label : undefined)}
       className={cn(
-        'flex w-full items-center gap-3 rounded-panel py-2 text-body text-fg-secondary transition-colors hover:bg-brand-raised hover:text-brand-silver',
+        'flex w-full items-center gap-3 rounded-panel py-2 text-body transition-colors hover:bg-brand-raised hover:text-brand-silver',
+        active ? 'bg-brand-raised text-brand-silver' : 'text-fg-secondary',
         collapsed ? 'justify-center px-0' : 'px-3',
       )}
     >
