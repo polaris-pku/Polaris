@@ -53,6 +53,7 @@ import type {
   RpcMemorySearchResult,
   RpcPendingBuffer,
   RpcPersonaView,
+  RpcReindexResult,
   RpcRetireResult,
   RpcRetirementScanResult,
   RpcSkillRecord,
@@ -411,6 +412,14 @@ export interface RpcMethodMap {
     params: { task_id: string };
     result: { experiences: RpcExperienceView[] };
   };
+  /**
+   * 重算存量 `description_embedding`。不传 `role_id` 是全量（含市场池）；
+   * `force` 不传时只补「为空或维度不匹配」的记录，同维度换模型必须显式传 true。
+   */
+  'memory.reindex': {
+    params: { role_id?: string; force?: boolean };
+    result: { reindex: RpcReindexResult };
+  };
   'memory.listMaintenance': {
     params: { role_id?: string };
     result: { maintenance: MemoryMaintenanceEvidence[] };
@@ -419,6 +428,16 @@ export interface RpcMethodMap {
     params: { role_id: string; requested_by?: string };
     result: { maintenance: MemoryMaintenanceEvidence };
   };
+  /**
+   * 显式晋升一条经验为待审核技能。后端只接受 **positive 且尚未晋升** 的经验，
+   * 其余情况抛错（`Only positive experiences can be promoted` /
+   * `Experience already promoted to skill`）。
+   */
+  'memory.promoteExperience': {
+    params: { role_id: string; experience_id: string };
+    result: { skill: RpcSkillView };
+  };
+  /** 检索范围仅市场池 `__market__`；未上架的技能搜不到。 */
   'memory.marketSearch': {
     params: MemoryMarketSearchQuery;
     result: { skills: RpcSkillRecord[] };

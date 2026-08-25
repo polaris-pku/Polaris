@@ -46,6 +46,11 @@ import { cn } from '@/lib/utils';
  *    市场池 Agent、角色不存在这类错误不会走到强删那一步 —— 它们不该被引导去强删。
  * 3. **退休扫描只是建议。** 后端 `runRetirementScan` 从不真的退休任何 Agent，
  *    所以扫描结果里的「建议退休」旁边不放一键退休，只放「用作退休原因」的表单预填。
+ * 4. **退休是两阶段的，终态会删掉实体。** 上游 #114 之后：名下还有在跑任务时只置
+ *    draining 并返回 `status='pre_retired'`（`asset_disposition` 是 undefined —— 直接读
+ *    它的字段会抛 TypeError），等任务收尾自动 finalize；finalize 完成后 **Agent 实体从库里
+ *    删除**，只留一条没有 RPC 出口的归档。所以 `status='retired'` 之后这个面板必须像删除
+ *    一样收起来，否则后续任何 `getAgent` 都会 `Agent not found`。
  *
  * 错误口径：分区内的操作失败一律交给 `onError` 由父组件统一展示；只有弹窗里的表单
  * （新建 Agent）把错误留在弹窗内 —— 弹窗盖住了父组件的错误条，扔上去用户看不见。
@@ -156,6 +161,8 @@ export function AgentAdminPanel({ roleId, capabilities, onError, onChanged }: Me
   const [agentLoading, setAgentLoading] = useState(false);
   const [reloadToken, setReloadToken] = useState(0);
   const [deleted, setDeleted] = useState(false);
+  /** 退休 finalize 完成 —— 与 deleted 同样意味着实体已不在库里。 */
+  const [retired, setRetired] = useState(false);
   const [busy, setBusy] = useState<Busy>(null);
 
   const [nameDraft, setNameDraft] = useState('');
@@ -182,6 +189,7 @@ export function AgentAdminPanel({ roleId, capabilities, onError, onChanged }: Me
     setScans(undefined);
     setRetireResult(undefined);
     setDeleted(false);
+    setRetired(false);
     setRetireReason('manual');
     setReplacement('none');
   }, [roleId]);
@@ -299,7 +307,14 @@ export function AgentAdminPanel({ roleId, capabilities, onError, onChanged }: Me
         replacement,
       });
       setRetireResult(result.retire);
-      setReloadToken((token) => token + 1);
+      // status='retired' 表示 finalize 完成、实体已删；再去 getAgent 只会拿到
+      // `Agent not found`，所以这里跟删除走同一条收尾路径（收起面板 + 让父组件重拉列表）。
+      if (result.retire.status === 'retired') {
+        setAgent(undefined);
+        setRetired(true);
+      } else {
+        setReloadToken((token) => token + 1);
+      }
       onChanged();
     } catch (reason) {
       onError(errorMessage(reason));
@@ -337,7 +352,12 @@ export function AgentAdminPanel({ roleId, capabilities, onError, onChanged }: Me
 
   return (
     <div className="space-y-3">
-      <AgentHeader agent={agent} loading={agentLoading} deleted={deleted} roleId={roleId} />
+      <AgentHeader
+        agent={agent}
+        loading={agentLoading}
+        gone={deleted ? 'deleted' : retired ? 'retired' : undefined}
+        roleId={roleId}
+      />
 
       <OperationSection title="新建 Agent" method="memory.createAgent" state={createState}>
         <p className="text-body text-fg-muted">
@@ -356,7 +376,7 @@ export function AgentAdminPanel({ roleId, capabilities, onError, onChanged }: Me
         </Button>
       </OperationSection>
 
-      {!deleted && (
+      {!deleted && !retired && (
         <>
           <OperationSection
             title="基本信息"
@@ -515,7 +535,10 @@ export function AgentAdminPanel({ roleId, capabilities, onError, onChanged }: Me
           >
             <p className="text-body text-fg-muted">
               退休会把被引用过的技能迁入技能市场，未被引用的技能标记为独占保留；置信度低于 0.7
-              的经验会被丢弃。已退休的 Agent 重复退休是幂等的。
+              的经验会被丢弃。
+              <strong className="text-fg-secondary">退休完成后 Agent 实体会从库中移除</strong>
+              ，只保留一条归档记录。名下还有在跑任务时先进入「预退休」（停止竞标与派发），
+              等任务收尾时后端自动完成。对已归档的角色重复退休是幂等的。
             </p>
             <div className="mt-3 space-y-3">
               <Field label="退休原因">
@@ -540,7 +563,7 @@ export function AgentAdminPanel({ roleId, capabilities, onError, onChanged }: Me
                 {busy === 'retire' ? '退休中…' : '退休这个 Agent'}
               </Button>
             </div>
-            {retireResult && <RetireResultCard result={retireResult} />}
+            {retireResult && !retired && <RetireResultCard result={retireResult} />}
           </OperationSection>
 
           <OperationSection
@@ -567,6 +590,9 @@ export function AgentAdminPanel({ roleId, capabilities, onError, onChanged }: Me
         </>
       )}
 
+      {/* 退休成功会收起上面整块，但处置结果只在这里出现过一次 —— 收起后补摆在外层 */}
+      {retired && retireResult && <RetireResultCard result={retireResult} />}
+
       <CreateAgentDialog
         open={createOpen}
         onClose={() => {
@@ -578,7 +604,7 @@ export function AgentAdminPanel({ roleId, capabilities, onError, onChanged }: Me
       <ConfirmDialog
         open={confirming === 'retire'}
         title="确认退休这个 Agent？"
-        description="退休后它不再参与竞标；技能迁入市场，低置信度经验会被丢弃。这一步不删除任何 Agent。"
+        description="退休后它不再参与竞标；技能迁入市场，低置信度经验会被丢弃。退休完成时 Agent 实体会被移除，只留归档记录，不可撤销。"
         confirmLabel="退休"
         onConfirm={() => void runRetire()}
         onClose={() => {
@@ -721,19 +747,22 @@ function PendingLine({ text, loading }: { text: string; loading?: boolean }) {
 function AgentHeader({
   agent,
   loading,
-  deleted,
+  gone,
   roleId,
 }: {
   agent: RpcAgentBoardAgentView | undefined;
   loading: boolean;
-  deleted: boolean;
+  /** 实体已不在库里的两种原因；两者都要收起下面所有按角色取数的分区。 */
+  gone: 'deleted' | 'retired' | undefined;
   roleId: string;
 }) {
-  if (deleted) {
+  if (gone) {
     return (
       <Panel className="border-danger/30">
         <p className="text-body text-danger-soft">
-          这个 Agent 已被删除。左侧列表刷新后请另选一个。
+          {gone === 'deleted'
+            ? '这个 Agent 已被删除。左侧列表刷新后请另选一个。'
+            : '这个 Agent 已退休完成，实体已从库中移除（技能已迁入市场池）。左侧列表刷新后请另选一个。'}
         </p>
       </Panel>
     );
@@ -860,24 +889,43 @@ function ScanCard({
   );
 }
 
+/**
+ * 退休结果卡。两种终局要分开画：
+ * - `pre_retired`：只置了 draining，`asset_disposition` 是 undefined —— 旧版直接解构它，
+ *   一遇到「名下还有在跑任务」就白屏。这里既不解构也不说「已退休」。
+ * - `retired`：finalize 完成，处置计数齐全，实体已删。
+ */
 function RetireResultCard({ result }: { result: RpcRetireResult }) {
   const disposition = result.asset_disposition;
+  const pending = result.status === 'pre_retired';
   return (
     <Panel className="mt-3 bg-surface-void">
       <div className="flex flex-wrap items-center gap-2">
-        <Badge variant="ok">已退休</Badge>
-        <span className="font-mono text-code text-fg-faint">{result.retired_reason}</span>
+        <Badge variant={pending ? 'human' : 'ok'}>{pending ? '预退休' : '已退休'}</Badge>
+        {result.retired_reason && (
+          <span className="font-mono text-code text-fg-faint">{result.retired_reason}</span>
+        )}
         <span className="text-body text-fg-muted">{result.retired_at || '—'}</span>
       </div>
-      <p className="mt-2 text-body text-fg-secondary">
-        技能迁入市场{' '}
-        <span className="tabular font-mono text-code">{disposition.skills_retained}</span> ·
-        技能丢弃 <span className="tabular font-mono text-code">{disposition.skills_discarded}</span>{' '}
-        · 经验保留{' '}
-        <span className="tabular font-mono text-code">{disposition.experiences_retained}</span> ·
-        经验丢弃{' '}
-        <span className="tabular font-mono text-code">{disposition.experiences_discarded}</span>
-      </p>
+      {pending ? (
+        <p className="mt-2 text-body text-fg-secondary">
+          名下还有在跑的任务，已停止竞标与派发。等任务收尾时后端会自动完成退休并处置资产，
+          此刻还没有处置结果。
+        </p>
+      ) : disposition ? (
+        <p className="mt-2 text-body text-fg-secondary">
+          技能迁入市场{' '}
+          <span className="tabular font-mono text-code">{disposition.skills_retained}</span> ·
+          技能丢弃{' '}
+          <span className="tabular font-mono text-code">{disposition.skills_discarded}</span> ·
+          经验保留{' '}
+          <span className="tabular font-mono text-code">{disposition.experiences_retained}</span> ·
+          经验丢弃{' '}
+          <span className="tabular font-mono text-code">{disposition.experiences_discarded}</span>
+        </p>
+      ) : (
+        <p className="mt-2 text-body text-fg-muted">后端没有返回资产处置结果。</p>
+      )}
       {result.replacement_role_id && (
         <div className="mt-2 flex flex-wrap items-center gap-2">
           <span className="text-body text-fg-muted">已创建替代 Agent</span>

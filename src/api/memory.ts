@@ -8,6 +8,7 @@ import type {
   MemoryExperienceWritePatch,
   MemoryMarketSearchQuery,
   MemoryPersonaPatch,
+  MemoryReindexOptions,
   MemoryRetireOptions,
   MemorySearchOptions,
   MemorySkillListFilter,
@@ -35,6 +36,17 @@ export const memoryApi = {
     getTransport().call('memory.promoteSkills', {
       role_id: roleId,
       ...(requestedBy ? { requested_by: requestedBy } : {}),
+    }),
+
+  /**
+   * 显式晋升一条经验为待审核技能（与批量 promoteSkills 互补）。
+   * 后端只收 **positive 且尚未晋升** 的经验，其余抛错；产出 review_status='pending'，
+   * 仍要走 approveSkill / rejectSkill。
+   */
+  promoteExperience: (roleId: string, experienceId: string) =>
+    getTransport().call('memory.promoteExperience', {
+      role_id: roleId,
+      experience_id: experienceId,
     }),
 
   // ── agent 生命周期 ──
@@ -140,4 +152,19 @@ export const memoryApi = {
       ...(options ?? {}),
     }),
   getOverview: () => getTransport().call('memory.getOverview', {}),
+
+  // ── 向量索引 ──
+  /**
+   * 重算存量 `description_embedding`。换 embedding 模型后必须跑一次，否则
+   * 语义检索拿旧模型的向量比新模型的 query，相似度是没有意义的。
+   *
+   * 不传 `roleId` 是全量（含市场池）。`force` 不传时只补「为空或维度不匹配」的记录——
+   * **同维度换模型（比如 3-small → 3-large 都降到 1536）必须显式传 `force: true`**，
+   * 否则维度看着是对的，一条都不会重算。
+   */
+  reindex: (options?: MemoryReindexOptions) =>
+    getTransport().call('memory.reindex', {
+      ...(options?.roleId !== undefined ? { role_id: options.roleId } : {}),
+      ...(options?.force !== undefined ? { force: options.force } : {}),
+    }),
 };
