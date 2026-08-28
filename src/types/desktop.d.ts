@@ -265,7 +265,11 @@ declare global {
       /** 读设置（key 只回布尔，绝不回明文） */
       getSettings: () => Promise<{
         provider: string;
-        bMemory: { configured: boolean };
+        bMemory: {
+          configured: boolean;
+          source?: 'pglite' | 'settings' | 'environment';
+          environmentConfigured?: boolean;
+        };
         embedding: DesktopEmbeddingConfig;
         configured: Record<string, DesktopProviderConfig>;
       }>;

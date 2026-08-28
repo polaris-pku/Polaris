@@ -42,7 +42,10 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
   const [saving, setSaving] = useState(false);
   const [savedConfig, setSavedConfig] = useState<Record<string, DesktopProviderConfig>>({});
   const [databaseUrl, setDatabaseUrl] = useState('');
-  const [databaseConfigured, setDatabaseConfigured] = useState(false);
+  const [databaseSource, setDatabaseSource] = useState<'pglite' | 'settings' | 'environment'>(
+    'pglite',
+  );
+  const [databaseEnvironmentConfigured, setDatabaseEnvironmentConfigured] = useState(false);
   const [editingDatabase, setEditingDatabase] = useState(false);
   const [revealDatabase, setRevealDatabase] = useState(false);
 
@@ -68,9 +71,10 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
       const id = pickProvider ?? s.provider;
       const cfg = s.configured[id];
       setSavedConfig(s.configured);
-      setDatabaseConfigured(s.bMemory.configured);
+      setDatabaseSource(s.bMemory.source ?? (s.bMemory.configured ? 'settings' : 'pglite'));
+      setDatabaseEnvironmentConfigured(s.bMemory.environmentConfigured ?? false);
       setDatabaseUrl('');
-      setEditingDatabase(!s.bMemory.configured);
+      setEditingDatabase(false);
       setRevealDatabase(false);
       setEmbProvider(s.embedding.provider);
       setEmbModel(s.embedding.model);
@@ -178,7 +182,6 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
   const auth = status?.auth;
   const canSave =
     (editingKey ? !!key.trim() : true) &&
-    (editingDatabase ? !!databaseUrl.trim() : databaseConfigured) &&
     embDimensionsValid &&
     (embProvider === 'hash' || (!!embModel.trim() && !embNeedsKey));
 
@@ -369,40 +372,65 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
                 <span className="font-mono text-code text-brand-purple">B</span>
                 <div>
                   <div className="text-body text-brand-silver">B Memory 数据库</div>
-                  <div className="text-body text-fg-muted">PostgreSQL 需要安装 pgvector 扩展。</div>
+                  <div className="text-body text-fg-muted">
+                    默认使用嵌入式 PGlite，无需安装数据库或填写连接地址。
+                  </div>
                 </div>
               </div>
-              {databaseConfigured && !editingDatabase ? (
+              {!editingDatabase ? (
                 <div className="mt-2 flex items-center gap-2 rounded-panel border border-ok/30 bg-ok/5 px-3 py-2">
                   <CheckCircle2 className="h-4 w-4 text-ok" />
-                  <span className="text-body text-brand-silver">连接已保存（地址不回传界面）</span>
+                  <span className="text-body text-brand-silver">
+                    {databaseSource === 'settings'
+                      ? '外部 PostgreSQL 连接已保存'
+                      : databaseSource === 'environment'
+                        ? '外部 PostgreSQL（由环境变量配置）'
+                        : '嵌入式 PGlite'}
+                  </span>
                   <button
                     type="button"
                     onClick={() => setEditingDatabase(true)}
                     className="ml-auto text-body text-command-soft underline-offset-2 hover:underline"
                   >
-                    更改
+                    {databaseSource === 'environment'
+                      ? '使用设置覆盖'
+                      : databaseSource === 'settings'
+                        ? databaseEnvironmentConfigured
+                          ? '更改连接'
+                          : '更改或改回 PGlite'
+                        : '使用外部 PostgreSQL'}
                   </button>
                 </div>
               ) : (
-                <div className="relative mt-2">
-                  <input
-                    type={revealDatabase ? 'text' : 'password'}
-                    value={databaseUrl}
-                    onChange={(e) => setDatabaseUrl(e.target.value)}
-                    placeholder="postgresql://user:password@host:5432/database"
-                    spellCheck={false}
-                    autoComplete="off"
-                    className="w-full rounded-panel border border-edge-strong bg-brand-panel px-3 py-2 pr-10 font-mono text-code text-brand-silver outline-none placeholder:text-fg-faint focus:border-brand-purple"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setRevealDatabase((value) => !value)}
-                    title={revealDatabase ? '隐藏' : '显示'}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 text-fg-muted hover:text-brand-silver"
-                  >
-                    {revealDatabase ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
-                  </button>
+                <div className="mt-2">
+                  <div className="relative">
+                    <input
+                      type={revealDatabase ? 'text' : 'password'}
+                      value={databaseUrl}
+                      onChange={(e) => setDatabaseUrl(e.target.value)}
+                      placeholder="postgresql://user:password@host:5432/database"
+                      spellCheck={false}
+                      autoComplete="off"
+                      className="w-full rounded-panel border border-edge-strong bg-brand-panel px-3 py-2 pr-10 font-mono text-code text-brand-silver outline-none placeholder:text-fg-faint focus:border-brand-purple"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setRevealDatabase((value) => !value)}
+                      title={revealDatabase ? '隐藏' : '显示'}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-fg-muted hover:text-brand-silver"
+                    >
+                      {revealDatabase ? (
+                        <EyeOff className="h-4 w-4" />
+                      ) : (
+                        <Eye className="h-4 w-4" />
+                      )}
+                    </button>
+                  </div>
+                  <p className="mt-1 text-body text-fg-muted">
+                    {databaseEnvironmentConfigured
+                      ? '留空保存会改用 NEWIDE_B_DATABASE_URL；要启用 PGlite，请先移除该环境变量。'
+                      : '仅在需要外部 PostgreSQL + pgvector 时填写；留空保存会改回 PGlite。'}
+                  </p>
                 </div>
               )}
             </div>

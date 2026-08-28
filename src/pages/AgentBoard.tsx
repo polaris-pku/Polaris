@@ -374,9 +374,7 @@ export function AgentBoard() {
         <header className="flex shrink-0 items-end justify-between gap-4 border-b border-edge px-6 py-4">
           <div className="min-w-0">
             <h1 className="text-title text-fg-primary">Agent Memory</h1>
-            <p className="mt-0.5 text-body text-fg-muted">
-              来自 PostgreSQL 的长期角色、技能与经验。
-            </p>
+            <p className="mt-0.5 text-body text-fg-muted">来自 B Memory 的长期角色、技能与经验。</p>
           </div>
           <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
             <SkillReviewBadge capabilities={capabilities} />
