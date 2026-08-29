@@ -10,6 +10,7 @@
  *     config/               B Agent / Memory 的 LiteLLM 路由配置
  *     runtime/node[.exe]    Node 运行时（agent 的 JS 外壳要用；agent 本体是原生二进制）
  *     agent/                claude-agent-acp + Claude Code 原生二进制（npm 扁平安装）
+ *     pglite/node_modules/  PGlite + pgvector 的 WASM 运行时
  *
  * node-pty 被替换成桩：A 静态 import 了 PtyConnection，但 ACP 路径一次都不会用到它。
  * 为一个从不执行的 import 去做原生模块的跨平台编译不值得（见 scripts/stub-node-pty.cjs）。
@@ -28,7 +29,6 @@ import {
   writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -77,8 +77,8 @@ const common = {
   // PGlite（嵌入式 WASM PostgreSQL，B 的默认存储）必须外置：它在运行时用
   // `new URL('./pglite.wasm', import.meta.url)` 这类相对 URL 去取 .wasm 与扩展的 .tar.gz。
   // 一旦被打进单文件 CJS，esbuild 会把 import.meta.url 换成 shim，URL 构造直接抛
-  // 「Invalid URL」，后端在 B 运行时就绪检查那一步就起不来。外置后由下面第 5 步
-  // 装进 backend/node_modules，运行时从磁盘解析（两个包都提供 CJS 入口）。
+  // 「Invalid URL」，后端在 B 运行时就绪检查那一步就起不来。外置后由下面第 4 步
+  // 装进 backend/pglite/node_modules，运行时从磁盘解析（两个包都提供 CJS 入口）。
   external: ['pg-native', ...PGLITE_PACKAGES],
   // esbuild 把 ESM 的 import.meta 编成空对象（产物里就是 `var import_meta = {}`），
   // 于是任何 `fileURLToPath(import.meta.url)` 都拿到 undefined 并抛 ERR_INVALID_ARG_TYPE。
@@ -159,68 +159,7 @@ if (targetOs === process.platform && targetCpu === process.arch) {
   rmSync(tmp, { recursive: true, force: true });
 }
 
-// ── 3. Windows 便携 PostgreSQL ──
-if (targetOs === 'win32' && targetCpu === 'x64') {
-  const catalog = JSON.parse(
-    readFileSync(path.join(root, 'scripts/postgres-runtime.json'), 'utf8'),
-  );
-  const pgOut = path.join(out, 'runtime', 'postgres', catalog.major);
-  const tmp = path.join(out, '.postgres-dl');
-  mkdirSync(tmp, { recursive: true });
-  const archive = path.join(tmp, 'postgres.zip');
-  console.log(`[backend] 下载 PostgreSQL ${catalog.version} Windows x64…`);
-  execFileSync('curl', ['-fsSL', '-o', archive, catalog.windowsX64.url], { stdio: 'inherit' });
-  const digest = createHash('sha256').update(readFileSync(archive)).digest('hex');
-  if (digest !== catalog.windowsX64.sha256) {
-    throw new Error(`PostgreSQL archive SHA-256 mismatch: ${digest}`);
-  }
-  execFileSync(
-    'unzip',
-    [
-      '-q',
-      archive,
-      'pgsql/bin/*',
-      'pgsql/lib/*',
-      'pgsql/share/*',
-      'pgsql/server_license.txt',
-      'pgsql/commandlinetools_3rd_party_licenses.txt',
-      '-d',
-      tmp,
-    ],
-    { stdio: 'inherit' },
-  );
-  mkdirSync(pgOut, { recursive: true });
-  for (const name of ['bin', 'lib', 'share']) {
-    cpSync(path.join(tmp, 'pgsql', name), path.join(pgOut, name), { recursive: true });
-  }
-  mkdirSync(path.join(pgOut, 'licenses'), { recursive: true });
-  for (const name of ['server_license.txt', 'commandlinetools_3rd_party_licenses.txt']) {
-    copyFileSync(path.join(tmp, 'pgsql', name), path.join(pgOut, 'licenses', name));
-  }
-  const required = [
-    'postgres.exe',
-    'initdb.exe',
-    'pg_ctl.exe',
-    'pg_isready.exe',
-    'createdb.exe',
-    'psql.exe',
-  ];
-  for (const name of required) {
-    if (!existsSync(path.join(pgOut, 'bin', name)))
-      throw new Error(`PostgreSQL runtime missing ${name}`);
-  }
-  writeFileSync(
-    path.join(pgOut, 'manifest.json'),
-    JSON.stringify(
-      { version: catalog.version, major: catalog.major, archiveSha256: digest },
-      null,
-      2,
-    ),
-  );
-  rmSync(tmp, { recursive: true, force: true });
-}
-
-// ── 4. agent 运行时（claude-agent-acp + Claude Code 原生二进制）──
+// ── 3. agent 运行时（claude-agent-acp + Claude Code 原生二进制）──
 //
 // 不能直接从 pnpm 的 node_modules 拷 —— 那是符号链接 + 内容寻址的 store，拷不成自包含的树。
 // 用 npm 扁平安装到一个干净目录：它会按 --os/--cpu 拉正确的平台专属二进制
@@ -258,21 +197,28 @@ if (!existsSync(claudePath)) {
   );
 }
 console.log(`[backend] ✅ agent 二进制就位：${path.relative(root, claudePath)}`);
-// ── 5. PGlite 运行时（B 的默认嵌入式存储）──
+// ── 4. PGlite 运行时（B 的默认嵌入式存储）──
 //
 // 和 agent 同理：不能从 pnpm 的 node_modules 拷（符号链接 + 内容寻址 store）。
-// 装到 backend/ 自己的 node_modules，backend-host.cjs 就在这一层，require 能直接解析到。
+// electron-builder 会把 extraResources 根目录下的 node_modules 当成应用依赖重写并漏掉，
+// 所以装进独立的 pglite/ 子目录；Electron 启动 BCD 时通过 NODE_PATH 暴露给 Node。
 
 console.log(`[backend] 安装 PGlite 运行时（${pgliteSpecs.join(', ')}）…`);
+const pgliteDir = path.join(out, 'pglite');
+mkdirSync(pgliteDir, { recursive: true });
+writeFileSync(
+  path.join(pgliteDir, 'package.json'),
+  JSON.stringify({ name: 'polaris-pglite-runtime', private: true, version: '0.0.0' }, null, 2),
+);
 execFileSync('npm', ['install', '--omit=dev', '--no-audit', '--no-fund', ...pgliteSpecs], {
-  cwd: out,
+  cwd: pgliteDir,
   stdio: 'inherit',
   shell: true,
 });
 
 // 校验：WASM 必须真的落盘，否则后端会在 B 就绪检查处以「Invalid URL」失败
 for (const asset of ['pglite.wasm', 'pglite.data']) {
-  const assetPath = path.join(out, 'node_modules/@electric-sql/pglite/dist', asset);
+  const assetPath = path.join(pgliteDir, 'node_modules/@electric-sql/pglite/dist', asset);
   if (!existsSync(assetPath)) {
     throw new Error(`PGlite 资源缺失：${assetPath}`);
   }
