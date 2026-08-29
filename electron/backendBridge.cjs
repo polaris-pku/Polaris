@@ -43,9 +43,11 @@ const AGENT_DIR = path.join(BACKEND_DIR, 'agent');
 const RPC_METHODS = require('./backend-rpc-methods.json');
 const RPC_METHOD_SET = new Set(RPC_METHODS);
 const RPC_NOTIFICATIONS = new Set(['task.event', 'run.event']);
+const BACKEND_STOP_TIMEOUT_MS = 10_000;
 
 /** @type {import('child_process').ChildProcess | null} */
 let child = null;
+let lifecycle = Promise.resolve();
 let nextId = 1;
 /** @type {Map<number, {resolve: Function, reject: Function}>} */
 const pending = new Map();
@@ -398,7 +400,7 @@ function preflight() {
 /** 当前子进程实际生效的配置 —— 用于同配置去重（见 start）。 */
 let currentConfig = null;
 
-function start({ workspace, agentId } = {}, { force = false } = {}) {
+async function startNow({ workspace, agentId } = {}, { force = false } = {}) {
   const problem = preflight();
   if (problem) {
     setStatus('error', problem);
@@ -430,11 +432,19 @@ function start({ workspace, agentId } = {}, { force = false } = {}) {
     return;
   }
 
-  stop();
+  const stopping = stopChild();
   // 先记下目标配置，再置 starting —— setStatus 会把 workspace 一起播给渲染层，
   // 早一步记下，界面在「启动中」阶段就能显示 agent 即将写入哪个目录。
   currentConfig = { workspace: resolvedWorkspace, agentId: resolvedAgentId };
   setStatus('starting');
+  try {
+    // PGlite 不允许两个进程同时打开同一数据目录。必须等旧 BCD 完成资源关闭后再启动，
+    // 不能只发出终止信号就立刻 spawn 新进程。
+    await stopping;
+  } catch (err) {
+    setStatus('error', `无法停止旧 BCD 后端：${err.message}`);
+    return;
+  }
 
   // agent 的写工具（ACP fs/write_text_file）不会 mkdir 工作区本身 —— 目录不存在时
   // 它的 edit 调用直接失败，最终表现为一个语焉不详的 DRIVER_FAILED。这里先建好。
@@ -467,11 +477,9 @@ function start({ workspace, agentId } = {}, { force = false } = {}) {
     setStatus('error', '请先在设置中完成模型与认证配置。');
     return;
   }
-  const bDatabaseUrl = readSettings().bMemory?.databaseUrl || process.env.NEWIDE_B_DATABASE_URL;
-  if (!bDatabaseUrl) {
-    setStatus('error', '请先在设置中配置 B Memory PostgreSQL（需要 pgvector）。');
-    return;
-  }
+  // BCD 在没有显式 URL 时使用嵌入式 PGlite；设置或环境变量只作为外部 PostgreSQL 覆盖。
+  const bDatabaseUrl =
+    readSettings().bMemory?.databaseUrl?.trim() || process.env.NEWIDE_B_DATABASE_URL?.trim();
   const embedding = readEmbeddingSettings();
   let litellmConfigDir;
   try {
@@ -485,9 +493,12 @@ function start({ workspace, agentId } = {}, { force = false } = {}) {
     ...process.env,
     POLARIS_NODE_BIN: NODE_BIN,
     POLARIS_AGENT_DIR: AGENT_DIR,
+    NODE_PATH: [path.join(BACKEND_DIR, 'pglite', 'node_modules'), process.env.NODE_PATH]
+      .filter(Boolean)
+      .join(path.delimiter),
     NEWIDE_STATE_ROOT: stateDir,
     NEWIDE_COORDINATION_DB: path.join(stateDir, 'coordination.sqlite'),
-    NEWIDE_B_DATABASE_URL: bDatabaseUrl,
+    ...(bDatabaseUrl ? { NEWIDE_B_DATABASE_URL: bDatabaseUrl } : {}),
     // provider=hash 时 production-b-runtime 直接短路成 HashEmbeddingProvider；
     // 其它情况**必须不设这个变量**，否则走不到 LiteLLM 那条分支。
     ...(embedding.provider === 'hash' ? { NEWIDE_B_EMBEDDING_PROVIDER: 'hash' } : {}),
@@ -518,7 +529,7 @@ function start({ workspace, agentId } = {}, { force = false } = {}) {
 
   // 直接用包内的 Node 跑编译好的后端 —— 不再经过 pnpm（打包后的机器上没有 pnpm）。
   // cwd 落在 stateDir（见上）：BCD 所有相对路径的产物都写在那里，不碰安装目录。
-  // detached：后端还会 spawn agent 子进程，按进程组杀才不留孤儿（见 stop）。
+  // detached：后端还会 spawn agent 子进程，按进程组杀才不留孤儿（见 stopChild）。
   const proc = spawn(NODE_BIN, [BACKEND_HOST], {
     cwd: stateDir,
     env,
@@ -583,14 +594,47 @@ function start({ workspace, agentId } = {}, { force = false } = {}) {
   // 健康检查：ping 通了才算 ready，避免渲染层对着一个死后端发请求。
   // 这里必须用 send（裸发），不能用 call —— call 会等 ready，而 ready 正由这次 ping 决定。
   send('system.ping')
-    .then((res) => setStatus('ready', `protocol ${res?.protocol_version ?? '?'}`))
-    .catch((err) =>
-      setStatus('error', `BCD 无响应：${err.message}${stderrTail ? `\n${stderrTail}` : ''}`),
-    );
+    .then((res) => {
+      if (isCurrent()) setStatus('ready', `protocol ${res?.protocol_version ?? '?'}`);
+    })
+    .catch((err) => {
+      if (isCurrent()) {
+        setStatus('error', `BCD 无响应：${err.message}${stderrTail ? `\n${stderrTail}` : ''}`);
+      }
+    });
 }
 
-function stop() {
-  if (!child) return;
+function start(options = {}, control = {}) {
+  const operation = lifecycle.then(() => startNow(options, control));
+  lifecycle = operation.catch(() => {});
+  return operation;
+}
+
+function forceStopProcessTree(dying) {
+  try {
+    if (process.platform === 'win32' && dying.pid) {
+      const killer = spawn('taskkill', ['/T', '/F', '/PID', String(dying.pid)], {
+        stdio: 'ignore',
+      });
+      killer.on('error', () => dying.kill());
+      killer.on('exit', (code) => {
+        if (code && dying.exitCode === null) dying.kill();
+      });
+    } else if (dying.pid) {
+      process.kill(-dying.pid, 'SIGKILL');
+    } else {
+      dying.kill('SIGKILL');
+    }
+  } catch {
+    dying.kill('SIGKILL');
+  }
+}
+
+function stopChild() {
+  if (!child) {
+    currentConfig = null;
+    return Promise.resolve();
+  }
   const dying = child;
   child = null;
   currentConfig = null;
@@ -598,7 +642,7 @@ function stop() {
   // 未响应的调用必须当场拒绝。
   //
   // 不能指望子进程的 exit handler 来做这件事：那个 handler 一开头就是 `if (!isCurrent()) return`，
-  // 而 stop() 已经把 child 置空、start() 随后又同步把 child 指向新进程 —— 等旧进程的 exit
+  // 而 stopChild() 已经把 child 置空、start() 随后又把 child 指向新进程 —— 等旧进程的 exit
   // 真正到达时 isCurrent() 早就是 false 了，拒绝逻辑被整段跳过。
   // 结果是调用方挂满 60 秒，最后拿到一句驴唇不对马嘴的「RPC 超时」，而真相是「后端被重启了」。
   for (const { reject } of pending.values()) {
@@ -606,24 +650,47 @@ function stop() {
   }
   pending.clear();
 
-  // 杀掉整棵进程树：BCD 底下还挂着 A（ACP runner）和真实 agent CLI，只杀 BCD 会留下孤儿 ——
-  // 孤儿 agent 会继续往**旧工作区**写文件，而用户已经切到别的项目了。
-  try {
-    if (process.platform === 'win32' && dying.pid) {
-      // Windows 没有进程组信号。dying.kill() 只结束 BCD 自己，claude.exe 会活下来继续写盘。
-      // taskkill /T 才是杀整棵树（A 自己的 terminal-handler 也是这么干的）。
-      spawn('taskkill', ['/T', '/F', '/PID', String(dying.pid)], { stdio: 'ignore' }).on(
-        'error',
-        () => dying.kill(),
-      );
-    } else if (dying.pid) {
-      process.kill(-dying.pid, 'SIGTERM'); // 按进程组杀（spawn 时 detached，BCD 即组长）
-    } else {
-      dying.kill();
+  return new Promise((resolve, reject) => {
+    let forceTimer;
+    let failureTimer;
+    let settled = false;
+    const finish = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(forceTimer);
+      clearTimeout(failureTimer);
+      dying.off('exit', onExit);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onExit = () => finish();
+    dying.once('exit', onExit);
+
+    // 关闭 stdin 会让 BCD 的 readline 收到 EOF，依次关闭 driver、PGlite 和 SQLite。
+    // 若清理卡住，再强制杀整棵进程树，避免留下仍向旧工作区写入的 agent。
+    try {
+      if (dying.stdin?.writable) dying.stdin.end();
+      else forceStopProcessTree(dying);
+    } catch {
+      forceStopProcessTree(dying);
     }
-  } catch {
-    dying.kill(); // 进程组已消失（ESRCH）时回落到直接 kill
-  }
+
+    forceTimer = setTimeout(() => {
+      forceStopProcessTree(dying);
+      failureTimer = setTimeout(
+        () => finish(new Error(`等待进程退出超过 ${BACKEND_STOP_TIMEOUT_MS + 2_000}ms`)),
+        2_000,
+      );
+    }, BACKEND_STOP_TIMEOUT_MS);
+
+    if (dying.exitCode !== null || dying.signalCode !== null) finish();
+  });
+}
+
+function stopBackend() {
+  const operation = lifecycle.then(() => stopChild());
+  lifecycle = operation.catch(() => {});
+  return operation;
 }
 
 /** 裸发一条 JSON-RPC 请求（不等就绪；仅供健康检查与 call 内部使用）。 */
@@ -668,9 +735,20 @@ function setupBackendBridge(windowGetter) {
   ipcMain.handle('backend:getSettings', () => {
     const s = readSettings();
     const embedding = readEmbeddingSettings();
+    const savedDatabaseUrl = s.bMemory?.databaseUrl?.trim();
+    const environmentDatabaseUrl = process.env.NEWIDE_B_DATABASE_URL?.trim();
+    const databaseSource = savedDatabaseUrl
+      ? 'settings'
+      : environmentDatabaseUrl
+        ? 'environment'
+        : 'pglite';
     return {
       provider: s.provider ?? 'anthropic',
-      bMemory: { configured: !!s.bMemory?.databaseUrl },
+      bMemory: {
+        configured: databaseSource !== 'pglite',
+        source: databaseSource,
+        environmentConfigured: !!environmentDatabaseUrl,
+      },
       // apiKey 与 provider key 同样只回布尔，明文不出主进程
       embedding: {
         provider: embedding.provider,
@@ -752,13 +830,13 @@ function setupBackendBridge(windowGetter) {
       provider: next.provider ?? current.provider ?? 'anthropic',
     });
 
-    start(currentConfig ?? {}, { force: true });
+    await start(currentConfig ?? {}, { force: true });
     return status;
   });
 
   // 用户打开项目后把 agent 工作区绑到该项目根目录（BCD 只在启动时读 ACP_WORKSPACE，故需重启）。
   // 复用 fsBridge 的落点解析：agent 写进哪里 = E 观测面板读哪里。
-  ipcMain.handle('backend:configure', (_event, options = {}) => {
+  ipcMain.handle('backend:configure', async (_event, options = {}) => {
     const { projectName, rootPath, agentId } = options;
     if (isDev) console.log('[backend] configure', JSON.stringify(options));
     let workspace;
@@ -770,20 +848,32 @@ function setupBackendBridge(windowGetter) {
       }
       workspace = resolved.root;
     }
-    start({ workspace, agentId });
+    await start({ workspace, agentId });
     return status;
   });
 
   // 手动重启：绕过同配置去重（用户点重启就是要真重启，比如刚补了 .env）。
-  ipcMain.handle('backend:restart', () => {
-    start(currentConfig || {}, { force: true });
+  ipcMain.handle('backend:restart', async () => {
+    await start(currentConfig || {}, { force: true });
     return status;
   });
 
-  app.on('before-quit', stop);
-  app.on('will-quit', stop);
+  let quitAfterBackendStops = false;
+  let quitInProgress = false;
+  app.on('before-quit', (event) => {
+    if (quitAfterBackendStops) return;
+    event.preventDefault();
+    if (quitInProgress) return;
+    quitInProgress = true;
+    void stopBackend()
+      .catch((err) => console.error(`[backend] 关闭失败：${err.message}`))
+      .finally(() => {
+        quitAfterBackendStops = true;
+        app.quit();
+      });
+  });
 
-  start({});
+  void start({});
 }
 
-module.exports = { setupBackendBridge, stopBackend: stop };
+module.exports = { setupBackendBridge, stopBackend };
