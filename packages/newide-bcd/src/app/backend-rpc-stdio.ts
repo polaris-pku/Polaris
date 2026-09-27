@@ -30,6 +30,7 @@ import { MailboxRpcMethods } from '../rpc/mailbox-methods';
 import { MemoryRpcMethods } from '../rpc/memory-methods';
 import { FileRunEvidenceStore, SqliteCoordinationStore } from '../persistence';
 import { DriverRuntimeAgentExecutionFacade } from './driver-runtime-agent-execution-facade';
+import { ProtocolCallJournal } from './protocol-call-journal';
 import { FileAgentExecutionEvidenceStore } from './agent-execution-evidence-store';
 import { NewideBackendService } from './newide-backend-service';
 import { InMemoryRunRegistry } from './run-registry';
@@ -64,6 +65,13 @@ import { ArtifactRpcMethods } from '../rpc/artifact-methods';
 import { createProductionSystemStatusService } from './system-status-service';
 import { AgentMaintenanceScheduler } from './agent-maintenance-scheduler';
 import { FileRunArtifactContentReader } from './run-artifact-content-reader';
+import {
+  createRunLatency,
+  FileRunEventConsumptionSink,
+  FileRunTelemetryJsonlSink,
+  NoopTelemetrySink,
+  type TelemetrySink,
+} from '../telemetry';
 
 export interface BackendRpcServerOptions {
   input: Readable;
@@ -124,11 +132,14 @@ export async function createProductionBackendService(
     : path.join(runnerDir, '.env');
   const driverEnv = loadEnvFile(driverEnvFile);
   const productionLlm = resolveProductionLlmRuntime(env, driverEnv);
+  const ephemeralAcpSessions =
+    env.NEWIDE_EPHEMERAL_ACP_SESSIONS === '1' ||
+    env.NEWIDE_EPHEMERAL_ACP_SESSIONS?.toLowerCase() === 'true';
   const driver = new ExternalDriverRuntime({
     driver_id: 'acp-external',
     capabilities: {
       supports_acp_extension: true,
-      supports_session_load: true,
+      supports_session_load: !ephemeralAcpSessions,
       supports_tool_events: true,
     },
     transport: new CommandDriverTransport({
@@ -142,6 +153,12 @@ export async function createProductionBackendService(
         PNPM_CONFIG_PM_ON_FAIL: env.PNPM_CONFIG_PM_ON_FAIL ?? 'ignore',
         ACP_AGENT_ID: env.ACP_AGENT_ID ?? 'claude',
         ACP_WORKSPACE: env.ACP_WORKSPACE ?? path.join(stateRoot, 'test-workspace'),
+        // Offline evals execute the already-installed ACP adapter entrypoint
+        // instead of letting npx resolve/download a package inside the jail.
+        ...(env.CLAUDE_CLI_COMMAND !== undefined
+          ? { CLAUDE_CLI_COMMAND: env.CLAUDE_CLI_COMMAND }
+          : {}),
+        ...(env.CLAUDE_CLI_ARGS !== undefined ? { CLAUDE_CLI_ARGS: env.CLAUDE_CLI_ARGS } : {}),
         // Non-interactive eval / batch runs must not block on ACP permission prompts.
         AUTO_APPROVE: env.AUTO_APPROVE ?? '1',
         // NewIDE owns benchmark policy; ACP receives only generic enforcement settings.
@@ -182,17 +199,9 @@ export async function createProductionBackendService(
           (key) => driverEnv[key] === undefined && env[key] === undefined,
         ),
       ],
-      // 不设 ACP_DRIVER_TIMEOUT_MS 就不传 timeoutMs —— 这是本仓库既有的行为，上游把
-      // readDriverTimeout 改成恒返回 120_000 后被动翻转了，这里恢复回来。
-      // 原因：CommandDriverTransport 在非 Windows 下把 detached 跟 timeoutMs 绑在一起
-      // （command-driver-transport.ts 里 `options.detached = true`），而清理 agent 依赖
-      // 进程组（backendBridge 以组长身份启动后端，再 kill(-pid)）。driver 一旦 detached
-      // 就脱离该组，切项目 / 重绑工作区时会留下孤儿 agent 继续往旧工作区写文件。
-      // 等上游把 detached 从 timeoutMs 解绑后再考虑恢复默认超时。
-      ...(() => {
-        const timeoutMs = readDriverTimeout(env.ACP_DRIVER_TIMEOUT_MS);
-        return timeoutMs === undefined ? {} : { timeoutMs };
-      })(),
+      inactivityTimeoutMs: readDriverTimeout(
+        env.ACP_DRIVER_INACTIVITY_TIMEOUT_MS ?? env.ACP_DRIVER_TIMEOUT_MS,
+      ),
     }),
   });
   let bRuntime: BackendBRuntime | undefined;
@@ -229,6 +238,21 @@ export async function createProductionBackendService(
     const memoryLlm =
       dependencies.memoryLlm ??
       new ProductionTextLlmAdapter(createProductionToolCallingClient(productionLlm, env));
+    // 协议存储先于 B 侧装配创建：CallJournal（B1 调用留档）与 facade 都要用
+    // coordinationStore / participantSessions。
+    const configuredDatabasePath =
+      env.NEWIDE_COORDINATION_DB ?? path.join(stateRoot, 'coordination.sqlite');
+    const databasePath =
+      configuredDatabasePath === ':memory:'
+        ? configuredDatabasePath
+        : path.resolve(configuredDatabasePath);
+    coordinationStore = new SqliteCoordinationStore(databasePath);
+    const mailboxService = new PersistentMailboxService(coordinationStore);
+    const participantSessions = new PersistentParticipantSessionRegistry(coordinationStore);
+    const protocolCallJournal = new ProtocolCallJournal({
+      store: coordinationStore,
+      sessionRegistry: participantSessions,
+    });
     memoryMaintenance =
       dependencies.memoryMaintenance ??
       new BMemoryMaintenanceRunner({
@@ -239,6 +263,15 @@ export async function createProductionBackendService(
           path.join(bRuntime.app_state_root ?? path.join(repoRoot, '.newide'), 'b', 'maintenance'),
         ),
         runsRoot,
+        // dependencies.memoryMaintenance 覆盖路径会绕过留档（测试缝，接受）
+        callJournal: protocolCallJournal,
+        promotion: {
+          confidenceThreshold: readNumberEnv(
+            env.NEWIDE_B_PROMOTION_CONFIDENCE_THRESHOLD,
+            0.95,
+          ),
+          autoApprove: env.NEWIDE_B_SKILL_AUTO_APPROVE === '1',
+        },
       });
     try {
       await memoryMaintenance.replayPending();
@@ -252,15 +285,6 @@ export async function createProductionBackendService(
       bCapabilities.boardQuery,
       bRuntime.market_agent_ids,
     );
-    const configuredDatabasePath =
-      env.NEWIDE_COORDINATION_DB ?? path.join(stateRoot, 'coordination.sqlite');
-    const databasePath =
-      configuredDatabasePath === ':memory:'
-        ? configuredDatabasePath
-        : path.resolve(configuredDatabasePath);
-    coordinationStore = new SqliteCoordinationStore(databasePath);
-    const mailboxService = new PersistentMailboxService(coordinationStore);
-    const participantSessions = new PersistentParticipantSessionRegistry(coordinationStore);
     const agentExecutionFacade = new DriverRuntimeAgentExecutionFacade({
       driver,
       repository: bCapabilities.repository,
@@ -272,13 +296,16 @@ export async function createProductionBackendService(
           createProductionToolCallingClient(productionLlm, env),
         ),
       memoryMaintenance: bCapabilities.maintenance,
+      // B1 调用留档与 mailbox.sessionRegistry 无关：journal 用自己持有的注册表引用，
+      // ephemeral 会话下注册表为空 → session_id 记 null（规定回退）。
+      callJournal: protocolCallJournal,
       evidenceStore: new FileAgentExecutionEvidenceStore({
         root: path.join(stateRoot, 'b', 'context-packs'),
       }),
       mailbox: {
         service: mailboxService,
-        allowedRoleIds: agentCatalogProvider,
-        sessionRegistry: participantSessions,
+        allowedRoleIds: bRuntime.market_agent_ids,
+        ...(ephemeralAcpSessions ? {} : { sessionRegistry: participantSessions }),
       },
     });
     const selectAgentHandler = new SelectAgentHandler({
@@ -298,6 +325,9 @@ export async function createProductionBackendService(
     const baseCouncilProvider = new SynthesisAgentCouncilProvider({
       agentExecutionFacade,
       councilRoot: path.join(stateRoot, 'council'),
+      roleInactivityTimeoutMs: readDriverTimeout(
+        env.NEWIDE_COUNCIL_ROLE_INACTIVITY_TIMEOUT_MS,
+      ),
       participantResolver: new AgentBoardCouncilParticipantResolver({
         boardQuery: bCapabilities.boardQuery,
         resolveAllowedAgentIds: agentCatalogProvider,
@@ -422,9 +452,13 @@ export async function createProductionBackendService(
       participantSessions,
     });
     taskProcessor.recoverInterruptedTasks();
+    // 工厂必须活到 run 结束：`snapshot(runId)` 要拿内存缓冲算聚合，写进 summary 的
+    // consumption 块。以前这里直接取 `.createRecorder` 把工厂丢掉，聚合因此不可达。
+    const runLatency = createRunLatency({ root: runsRoot });
     const taskExecutionLoop = new TaskExecutionLoop({
       processor: taskProcessor,
       evidence_store: new FileRunEvidenceStore({ root: runsRoot }),
+      create_latency_recorder: runLatency.createRecorder,
       executors: createProductionStageExecutors({
         selectAgentHandler,
         agentExecutionFacade,
@@ -464,11 +498,18 @@ export async function createProductionBackendService(
         readiness: 'host_managed',
       },
     });
+    // 一次 run 一份 telemetry.jsonl（该 run 收到的全部 telemetry 记录）。关掉开关时换成
+    // 空转 sink，生产行为与接线前逐位一致：不建文件、不写盘，其余路径一行未改。
+    const runTelemetryJsonlSink: TelemetrySink = readTelemetryJsonlEnabled(
+      env.NEWIDE_TELEMETRY_JSONL,
+    )
+      ? new FileRunTelemetryJsonlSink(runsRoot)
+      : new NoopTelemetrySink();
     const service = new NewideBackendService(
       runner,
       new InMemoryRunRegistry(),
       new FileRunAuditWriter(runsRoot),
-      new FileRunTerminalOutputWriter(runsRoot),
+      new FileRunTerminalOutputWriter(runsRoot, runLatency),
       new FileRunRequestStore(runsRoot),
       taskProcessor,
       mailboxService,
@@ -485,6 +526,8 @@ export async function createProductionBackendService(
       ),
       (input) => agentExecutionFacade.provisionParticipantSession(input),
       new FileRunArtifactContentReader(runsRoot),
+      new FileRunEventConsumptionSink(runsRoot),
+      runTelemetryJsonlSink,
     );
     await service.recoverMailboxWaits();
     return service;
@@ -565,8 +608,8 @@ function toOpenAiCompatibleBaseUrl(value: string | undefined): string | undefine
   return normalized.replace(/\/(?:anthropic|v1)$/i, '');
 }
 
-function readDriverTimeout(value: string | undefined): number | undefined {
-  if (value === undefined || value.trim() === '') return undefined;
+function readDriverTimeout(value: string | undefined): number {
+  if (value === undefined) return 120_000;
   const timeout = Number(value);
   if (!Number.isInteger(timeout) || timeout <= 0) {
     throw new Error('ACP_DRIVER_TIMEOUT_MS must be a positive integer');
@@ -905,6 +948,20 @@ export function readAuctionEnabled(value: string | undefined): boolean {
   if (raw === '0' || raw.toLowerCase() === 'false') return false;
   if (raw === '1' || raw.toLowerCase() === 'true') return true;
   throw new Error(`Invalid NEWIDE_AUCTION_ENABLED: ${value}. Expected 0/1/true/false.`);
+}
+
+/**
+ * NEWIDE_TELEMETRY_JSONL 解析：默认 true；"0"/"false" 关闭。
+ *
+ * 关掉是「怀疑埋点本身在干扰生产」时的对照手段，所以关闭路径必须干净：换空转 sink，
+ * 不建文件、不写盘。
+ */
+export function readTelemetryJsonlEnabled(value: string | undefined): boolean {
+  const raw = value?.trim();
+  if (!raw) return true;
+  if (raw === '0' || raw.toLowerCase() === 'false') return false;
+  if (raw === '1' || raw.toLowerCase() === 'true') return true;
+  throw new Error(`Invalid NEWIDE_TELEMETRY_JSONL: ${value}. Expected 0/1/true/false.`);
 }
 
 export function readCouncilAuctionEnabled(value: string | undefined): boolean {

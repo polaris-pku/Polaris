@@ -11,11 +11,12 @@ import { runEvalInstance, runEvalSmoke } from '../../eval/run-instance-core';
 import {
   runSweEvoHarnessAdapter,
   buildSweEvoHarnessCommand,
+  resolveHarnessTimeoutSeconds,
   toWslPath,
   assertSweEvoPythonCanImportSwebench,
 } from '../../eval/sweevo-harness-adapter';
 import type { SweEvoInstance } from '../../eval/types';
-import { parsePredictionMode } from '../../eval/validation';
+import { parseMemoryAblation, parsePredictionMode } from '../../eval/validation';
 import {
   assertSafeCandidatePatch,
   extractPatchPaths,
@@ -40,6 +41,7 @@ describe('F eval utilities', () => {
     delete process.env.NEWIDE_SWE_EVO_PYTHON;
     delete process.env.NEWIDE_SWE_EVO_WSL_DISTRO;
     delete process.env.NEWIDE_SWE_EVO_WSL_PYTHON;
+    delete process.env.NEWIDE_SWE_EVO_HARNESS_TIMEOUT;
     for (const dir of tempDirs.splice(0)) {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -109,6 +111,24 @@ describe('F eval utilities', () => {
     expect(command.args).toContain(join(sweEvoRoot, 'SWE-bench', 'evaluate_instance.py'));
   });
 
+  it('passes a harness timeout override to the evaluator wrapper', () => {
+    const command = buildSweEvoHarnessCommand({
+      sweEvoRoot: '/tmp/SWE-EVO',
+      workDir: '/tmp/work',
+      trajectoryDir: '/tmp/traj',
+      maxWorkers: 1,
+      timeoutSeconds: 10_800,
+    });
+    expect(command.args).toContain('--timeout');
+    expect(command.args).toContain('10800');
+  });
+
+  it('raises harness timeout for previously always-timing-out instances', () => {
+    delete process.env.NEWIDE_SWE_EVO_HARNESS_TIMEOUT;
+    expect(resolveHarnessTimeoutSeconds('dask__dask_2024.1.0_2024.1.1')).toBe(10_800);
+    expect(resolveHarnessTimeoutSeconds('psf__requests_v2.12.2_v2.12.3')).toBeUndefined();
+  });
+
   it('loads dataset jsonl and builds oracle SWE-bench predictions', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'f-eval-dataset-'));
     tempDirs.push(dir);
@@ -151,6 +171,12 @@ describe('F eval utilities', () => {
 
   it('rejects invalid prediction modes', () => {
     expect(() => parsePredictionMode('glod')).toThrow(/Invalid --mode/);
+  });
+
+  it('accepts the accumulation-frozen memory ablation and rejects unknown levels', () => {
+    expect(parseMemoryAblation('B4')).toBe('B4');
+    expect(parseMemoryAblation(undefined)).toBe('B2');
+    expect(() => parseMemoryAblation('B5')).toThrow(/Invalid --ablation/);
   });
 
   it('rejects candidate patches that modify tests or test-runner configuration', () => {

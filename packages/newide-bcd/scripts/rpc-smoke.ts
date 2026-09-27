@@ -129,8 +129,9 @@ try {
   if (cancelled) await waitForCancellationEffects();
   const driverInvocations = usesTemporaryRunner ? await countDriverInvocations() : undefined;
   if (driverInvocations !== undefined) {
-    // Plan-first reuses Primary's initial plan as proposer 0 instead of invoking it twice.
-    const expectedInvocations = smokeMode === 'all' ? 10 : smokeMode === 'single_agent' ? 2 : 8;
+    // Plan-first reuses Primary's initial plan as proposer 0 and each Council
+    // role creates its ACP Session on the real task turn instead of a warm-up.
+    const expectedInvocations = smokeMode === 'all' ? 7 : smokeMode === 'single_agent' ? 2 : 5;
     assert(
       driverInvocations === expectedInvocations,
       `Expected ${expectedInvocations} driver invocations, received ${driverInvocations}`,
@@ -476,8 +477,9 @@ async function createFakeAcpRunner(): Promise<string> {
     );
     await fs.writeFile(
       path.join(directory, 'fake-driver.mjs'),
-      `import { appendFileSync } from 'node:fs';
+      `import { appendFileSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
+import { join } from 'node:path';
 let body = '';
 process.stdin.on('data', chunk => body += chunk);
 process.stdin.on('end', () => {
@@ -499,8 +501,14 @@ process.stdin.on('end', () => {
     }
   };
   appendFileSync(new URL('./invocations.log', import.meta.url), 'invoke\\n');
+  // 评审的契约产物是角色工作区根目录里的 reviews.json：只出现在回复里不算交付
+  // （议会取不到评审会让这次 run 失败）。
+  if (input.prompt.includes('Review the isolated proposal inputs') && input.workspace_path) {
+    writeFileSync(join(input.workspace_path, 'reviews.json'), JSON.stringify({ reviews: [...new Set(input.prompt.match(/proposal_[a-z0-9-]+/g) || [])].map(id => ({ proposal_id: id, verdict: 'approve', reason: 'Reviewed staged evidence.', unmet_criteria: [], evidence_refs: [] })) }));
+  }
   const writeResult = () => process.stdout.write(JSON.stringify({
     driver_run_result_id: 'driver_result_' + suffix,
+    response: 'Done.',
     session_id: 'session_' + suffix,
     status: 'succeeded',
     artifacts: [artifact],
