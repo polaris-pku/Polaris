@@ -76,10 +76,14 @@ curl.exe -L -o ..\SWE-EVO\hf_out\hf_jsonl\test.jsonl `
 
 注意：`oracle` 是“拿标准答案去判卷”，不能当作 NewIDE 能力指标。真正看能力时应使用 `real`，并显式传 `--model <name>`（默认 `unspecified` 仅作占位）。
 
-`--ablation B0|B1|B2|B3` 写入 eval run 元数据与 telemetry 标签；后端可通过
+`--ablation B0|B1|B2|B3|B4` 写入 eval run 元数据与 telemetry 标签；后端可通过
 `memory_ablation` / CLI `--ablation` 把同一标签写入 `summary.json`（见
 [BACKEND_CONTRACT.md](./BACKEND_CONTRACT.md)）。MockMemory 不切换检索行为；真实 B Memory
 实现须自行解释该字段。
+
+档位语义见 `src/memory/ablation-policy.ts`：B0 不检索技能也不检索经验；B1 只检索经验；
+B2/B3 全开（=生产）；**B4 与 B2 的检索一致但不积累**（不抽取新经验、不晋升技能），
+用于需要稳定读取面的实验——同一 state root 内后续 run 的输入不会因前一个 run 而改变。
 
 ## Worktree 复用规则（重要）
 
@@ -220,7 +224,7 @@ pnpm eval:sweevo-ablation -- --subset v0-smoke --run-harness
 pnpm eval:sweevo-ablation -- --subset v0-repo-full --ablations "B0,B1,B2" --run-harness
 ```
 
-方向一批跑默认开启 `NEWIDE_SWE_EVO_BLOCK_INTERNET=1`（对齐 SWE-EVO 论文：生成阶段禁止外网检索）。NewIDE 将该 benchmark 策略翻译成 ACP 通用的 `ACP_DENY_NETWORK_TOOLS` / `ACP_DENY_PATH_SUBSTRINGS_JSON`，由 ACP 权限门执行，并在 ephemeral worktree 写入 `.claude/settings.json` deny 列表。工作区是只含 `base_commit` 的单提交浅克隆，不共享 mirror 的 tags、refs 或对象库，并在启动 Agent 前删除 remote，避免通过目标 release tag 提取 gold delta。数据集 `PRs[].patch_without_test` **不会**注入 prompt（避免泄漏金标 patch）。另默认开启 `NEWIDE_EVAL_FS_JAIL=1`，并翻译为 ACP 通用 process sandbox 配置：用 bubblewrap 把 agent 进程限制在当前 workspace，宿主机 sibling worktree / `eval-mirrors` / gold jsonl / site-packages 均不可见（需安装 `bubblewrap`；调试可设 `NEWIDE_EVAL_FS_JAIL=0`）。SWE-EVO 具体路径与只读文件列表只存在于 NewIDE，ACP 不包含 benchmark 语义。注意：PowerShell 下逗号参数需加引号 `"B0,B1,B2"`。
+方向一批跑默认开启 `NEWIDE_SWE_EVO_BLOCK_INTERNET=1`（对齐 SWE-EVO 论文：生成阶段禁止外网检索）。NewIDE 将该 benchmark 策略翻译成 ACP 通用的 `ACP_DENY_NETWORK_TOOLS` / `ACP_DENY_PATH_SUBSTRINGS_JSON`，由 ACP 权限门执行，并在 ephemeral worktree 写入 `.claude/settings.json` deny 列表。工作区是只含 `base_commit` 的单提交浅克隆，不共享 mirror 的 tags、refs 或对象库，并在启动 Agent 前删除 remote，避免通过目标 release tag 提取 gold delta。数据集 `PRs[].patch_without_test` **不会**注入 prompt（避免泄漏金标 patch）。另默认开启 `NEWIDE_EVAL_FS_JAIL=1`，并翻译为 ACP 通用 process sandbox 配置：用 bubblewrap 把 agent 进程限制在当前 workspace，宿主机 sibling worktree / `eval-mirrors` / gold jsonl / site-packages 均不可见（需安装 `bubblewrap`；调试可设 `NEWIDE_EVAL_FS_JAIL=0`）。Jail 仍 `--share-net`（模型 API 要出网），但 `ACP_DENY_NETWORK_TOOLS=1` 会把 jail 内 DNS 改成默认拒绝（`hosts: files` + 空 resolv.conf），只把 `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` 预解析进 `/etc/hosts`；PyPI、GitHub、国内镜像、HuggingFace 都无法解析。同时拒绝 `pip download` / `python -mpip` / `urllib.request`，设置 `PIP_NO_INDEX=1`，并把 `$HOME` 做成进程级 tmpfs，避免官方 wheel 当金标或跨题复用。B 记忆、embedding、Postgres 仍在 jail 外的 NewIDE 后端，不受影响。SWE-EVO 具体路径与只读文件列表只存在于 NewIDE，ACP 不包含 benchmark 语义。注意：PowerShell 下逗号参数需加引号 `"B0,B1,B2"`。
 
 提交边界还会拒绝任何测试或测试运行器配置改动，包括 `tests/`、`test/`、
 `test_*.py`、`*_test.py`、`conftest.py`、pytest/tox/nox/Jest/Vitest 配置。

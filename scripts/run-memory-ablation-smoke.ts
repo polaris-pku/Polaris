@@ -90,10 +90,6 @@ const TASKS = [
 const ABLATIONS: MemoryAblation[] = ['B0', 'B1', 'B2'];
 
 await fs.mkdir(experimentRoot, { recursive: true });
-const databaseUrlTemplate =
-  process.env.NEWIDE_ABLATION_DATABASE_URL_TEMPLATE ??
-  configuredEnv.NEWIDE_ABLATION_DATABASE_URL_TEMPLATE ??
-  'postgresql://newide:newide_local@127.0.0.1:55432/newide_{ablation}';
 const baseEnv = {
   ...configuredEnv,
   ...process.env,
@@ -104,6 +100,11 @@ const baseEnv = {
   ACP_DRIVER_TIMEOUT_MS:
     process.env.ACP_DRIVER_TIMEOUT_MS ?? configuredEnv.ACP_DRIVER_TIMEOUT_MS ?? '300000',
 };
+// 全自动化测评：无人审核 → 晋升即批准（替代人工 reviewSkill）。
+// 晋升置信度门槛保持默认 0.95：用后验证回写（usage-feedback）会在任务间
+// 把 driver 上报的引用效果累计为经验置信度，真正常被复用且有效的经验
+// 会自然跨过 0.95；无需（也不应）调低阈值——调低会让所有经验都晋升。
+baseEnv.NEWIDE_B_SKILL_AUTO_APPROVE ??= '1';
 
 log(`experiment root: ${experimentRoot}`);
 log(`ACP_DRIVER_RUNNER_DIR: ${baseEnv.ACP_DRIVER_RUNNER_DIR}`);
@@ -113,23 +114,24 @@ for (const ablation of ABLATIONS) {
   const armDir = path.join(experimentRoot, ablation);
   const workspace = path.join(armDir, 'workspace');
   await fs.mkdir(workspace, { recursive: true });
-  const dbUrl = resolveAblationDatabaseUrl(databaseUrlTemplate, ablation);
   const isolation = await prepareAblationArmIsolation({
     experiment_root: experimentRoot,
     arm: ablation,
-    database_url: dbUrl,
   });
   await fs.mkdir(isolation.state_root, { recursive: true });
   log('');
-  log(`=== arm ${ablation} db=${dbUrl.replace(/:[^:@]+@/, ':***@')} ===`);
+  log(`=== arm ${ablation} ===`);
   log(`state root: ${isolation.state_root}`);
-  log(`database schema: ${isolation.database_schema}`);
+  log(`pglite data dir: ${isolation.pglite_data_dir}`);
 
-  const backend = await startBackend(ablation, {
+  const backendEnv: NodeJS.ProcessEnv = {
     ...baseEnv,
-    NEWIDE_B_DATABASE_URL: isolation.database_url,
+    NEWIDE_B_PGLITE_DATA_DIR: isolation.pglite_data_dir,
     NEWIDE_STATE_ROOT: isolation.state_root,
-  });
+  };
+  // 臂隔离靠每臂独立的数据目录：外部 Postgres 不参与。
+  delete backendEnv.NEWIDE_B_DATABASE_URL;
+  const backend = await startBackend(ablation, backendEnv);
 
   const taskResults: unknown[] = [];
   try {
@@ -216,7 +218,7 @@ for (const ablation of ABLATIONS) {
   const armSummary = {
     ablation,
     state_root: isolation.state_root,
-    database_schema: isolation.database_schema,
+    pglite_data_dir: isolation.pglite_data_dir,
     tasks: taskResults,
   };
   armReports.push(armSummary);
@@ -478,13 +480,6 @@ async function readJsonIfExists(filePath: string): Promise<unknown> {
   } catch {
     return undefined;
   }
-}
-
-function resolveAblationDatabaseUrl(template: string, ablation: MemoryAblation): string {
-  if (!template.includes('{ablation}')) {
-    throw new Error('NEWIDE_ABLATION_DATABASE_URL_TEMPLATE must contain {ablation}');
-  }
-  return template.replaceAll('{ablation}', ablation.toLowerCase());
 }
 
 function readPositiveInt(raw: string | undefined, fallback: number): number {

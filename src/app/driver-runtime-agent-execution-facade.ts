@@ -1,8 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash } from 'node:crypto';
-import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
 import {
   SCHEMA_VERSION,
   createId,
@@ -11,11 +9,11 @@ import {
   type ArtifactRef,
 } from '../core';
 import {
-  diffWorkspaceFiles,
-  isDeliverableWorkspacePath,
+  collectWorkspaceArtifacts,
+  mergeArtifacts,
   snapshotWorkspaceFiles,
-  type WorkspaceFileSnapshot,
 } from '../coordinator/workspace-change-detector';
+export { mergeArtifacts, normalizeArtifactTargetPath } from '../coordinator/workspace-change-detector';
 import {
   AgentManager,
   InvokeDriverTool,
@@ -27,6 +25,7 @@ import {
   type AgentTaskRequest,
   type AgentHandle,
   type BufferRepository,
+  type CallJournalPort,
   type CollectCompetitionClaimsOptions,
   type CompetitionClaimBatch,
   type CreateAgentSpec,
@@ -67,11 +66,14 @@ import type {
   DriverRunStatus,
   DriverRuntimeHandle,
   DriverStreamEvent,
+  DriverStreamEventListener,
 } from '../driver/contract';
+import { runDriverPromptWithSignal } from '../driver/abortable-driver-run';
 import {
   createDriverRuntimeInvoker,
   type DriverRuntimeInvokerInput,
 } from '../driver/driver-runtime-invoker';
+import { runWithLlmUsageAttribution } from '../telemetry';
 import type {
   AgentContextPackEvidence,
   AgentExecutionEvidenceStore,
@@ -89,6 +91,8 @@ export interface DriverRuntimeAgentExecutionFacadeOptions {
   embedding?: EmbeddingProvider;
   evidenceStore?: AgentExecutionEvidenceStore;
   memoryMaintenance?: BMemoryMaintenancePort;
+  /** 进程内调用留档（B1）：注入后 memory_query 调用收尾写 P1 journal；缺省不留档 */
+  callJournal?: CallJournalPort;
   mailbox?: {
     service: PersistentMailboxService;
     /** 协作名册：静态数组或动态提供者（每次使用时查询，支持运行时新增 Agent） */
@@ -124,10 +128,8 @@ interface InvocationContext {
 }
 
 const AGENT_RUNTIME_POLICY_ID = 'b-persona-tools-v1';
-const TOP_LEVEL_MEMORY_ITEM_LIMIT = 5;
-const TOP_LEVEL_MEMORY_ID_LIMIT = 120;
-const TOP_LEVEL_MEMORY_DESCRIPTION_LIMIT = 240;
-const TOP_LEVEL_MEMORY_CONTENT_LIMIT = 1_000;
+/** 协作名册里每个角色 persona 摘要的截断长度。 */
+const TOP_LEVEL_DESCRIPTION_LIMIT = 240;
 const DEFAULT_MAILBOX_DEADLINE_SECONDS = 300;
 const PRODUCTION_EXECUTION_CONTRACT =
   'Production execution contract: call invoke_driver for task work; a text-only answer is not task completion.';
@@ -164,6 +166,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         },
         tools,
         maxToolCalls: this.options.mailbox ? 6 : 4,
+        ...(this.options.callJournal ? { callJournal: this.options.callJournal } : {}),
       },
       ...(this.options.embedding ? { embedding: this.options.embedding } : {}),
       // 三重门控退休检测的 LLM 层：把 ToolCallingClient 适配为 LlmClient
@@ -175,7 +178,11 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     await this.ensureRole(agentId);
   }
 
-  async provisionParticipantSession(input: ParticipantSessionProvisionRequest): Promise<string> {
+  async provisionParticipantSession(
+    input: ParticipantSessionProvisionRequest,
+    options?: AgentExecutionOptions,
+  ): Promise<string> {
+    throwIfAborted(options?.signal);
     const workspacePath = path.resolve(input.workspace_path);
     const existing = this.options.mailbox?.sessionRegistry?.get(
       input.task_id,
@@ -185,20 +192,22 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     if (existing) return existing;
     const key = `${input.task_id}\u0000${workspacePath}\u0000${input.role_id}`;
     const pending = this.sessionProvisioning.get(key);
-    if (pending) return pending;
-    const provisioning = this.createParticipantSession({
-      ...input,
-      workspace_path: workspacePath,
-    }).finally(() => this.sessionProvisioning.delete(key));
+    if (pending) return withAbort(pending, options?.signal);
+    const provisioning = this.createParticipantSession(
+      { ...input, workspace_path: workspacePath },
+      options,
+    ).finally(() => this.sessionProvisioning.delete(key));
     this.sessionProvisioning.set(key, provisioning);
     return provisioning;
   }
 
   private async createParticipantSession(
     input: ParticipantSessionProvisionRequest,
+    options?: AgentExecutionOptions,
   ): Promise<string> {
     await this.ensureRole(input.role_id);
-    const result = await this.options.driver.sendPrompt({
+    throwIfAborted(options?.signal);
+    const prompt = {
       task_id: input.task_id,
       run_id: `${input.run_id}:session-provision:${input.role_id}`,
       prompt: [
@@ -210,7 +219,23 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       workspace_path: input.workspace_path,
       created_at: nowTimestamp(),
       schema_version: SCHEMA_VERSION,
-    });
+    };
+    const onDriverEvent: DriverStreamEventListener | undefined = options?.onDriverEvent
+      ? (event) => options.onDriverEvent?.({ ...event, run_id: input.run_id, role_id: input.role_id })
+      : undefined;
+    let result = await runDriverPromptWithSignal(
+      this.options.driver, prompt, options?.signal, onDriverEvent,
+    );
+    if (isArtifactFreeRetryableFailure(result) && !/\bSESSION_READY\b/.test(result.response ?? '')) {
+      const sessionId = result.session_id && result.session_id !== this.options.driver.session_id && result.session_id !== 'session-unavailable'
+        ? result.session_id : undefined;
+      result = await runDriverPromptWithSignal(
+        this.options.driver,
+        { ...prompt, run_id: `${prompt.run_id}:retry`, ...(sessionId ? { session_id: sessionId } : {}) },
+        options?.signal,
+        onDriverEvent,
+      );
+    }
     const usableSession =
       Boolean(result.session_id) &&
       result.session_id !== this.options.driver.session_id &&
@@ -313,14 +338,18 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       !normalizedInput.session_id &&
       !boundSession &&
       normalizedInput.workspace_path &&
-      this.options.mailbox?.sessionRegistry
+      this.options.mailbox?.sessionRegistry &&
+      !normalizedInput.context_policy.startsWith('council_')
     ) {
-      boundSession = await this.provisionParticipantSession({
-        task_id: normalizedInput.task_id,
-        workspace_path: normalizedInput.workspace_path,
-        role_id: normalizedInput.role_id,
-        run_id: normalizedInput.run_id,
-      });
+      boundSession = await this.provisionParticipantSession(
+        {
+          task_id: normalizedInput.task_id,
+          workspace_path: normalizedInput.workspace_path,
+          role_id: normalizedInput.role_id,
+          run_id: normalizedInput.run_id,
+        },
+        options,
+      );
     }
     const scopedInput =
       normalizedInput.session_id || !boundSession
@@ -343,7 +372,12 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         }
         let result: AgentExecutionResult;
         try {
-          result = await this.execute(manager, scopedInput, runtimeRoleId, options);
+          // role 归属在这里一处收敛：execute_agent、council 各席位、plan_first 重试都
+          // 从这个入口进，调用方不必各自记得叠一层。归属必须包在 enqueue 回调内部——
+          // 队列可能延后执行，包在外面时回调不保证继承到这个 ALS 作用域。
+          result = await runWithLlmUsageAttribution({ role_id: runtimeRoleId }, () =>
+            this.execute(manager, scopedInput, runtimeRoleId, options),
+          );
         } catch (error) {
           await this.recoverRole(runtimeRoleId);
           throw error;
@@ -385,6 +419,10 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     const task: AgentTaskRequest = {
       spec: input.instruction,
       task_id: input.task_id,
+      // 进程内调用留档（B1）的 journal 外键与 Session 绑定键：与 invocationContext
+      // 同源（workspace_path 已在上面 path.resolve 归一化）。
+      run_id: input.run_id,
+      ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
       call_id: createId('call'),
       source_driver: this.options.driver.driver_id,
     };
@@ -456,7 +494,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       const workspaceArtifacts = await collectWorkspaceArtifacts(
         input,
         workspaceBefore,
-        invocation.execution,
+        invocation.execution?.diagnostics.driver_id,
       );
 
       if (invocation.abortObserved || (invocation.signal?.aborted && !invocation.execution)) {
@@ -560,11 +598,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       invocation.collaboration_brief ??= await this.buildCollaborationBrief(invocation);
       return await withAbort(
         this.options.llm.completeWithTools(
-          withTopLevelExecutionContext(
-            input,
-            invocation.retrieval,
-            invocation.collaboration_brief,
-          ),
+          withTopLevelExecutionContext(input, invocation.collaboration_brief),
         ),
         invocation.signal,
       );
@@ -623,9 +657,9 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       throw new Error(`Mailbox recipient ${input.to_role_id} is not in the collaboration roster`);
     }
     const waitForReply = expectsMailboxReply(kind);
-    if (waitForReply && invocation.context_policy === 'council_primary_plan') {
+    if (waitForReply && invocation.context_policy?.startsWith('council_')) {
       throw new Error(
-        'Council primary planning is independent: write council-plan.md instead of waiting for a Mailbox reply',
+        'Council phases cannot wait for a Mailbox reply: continue the assigned role with the staged evidence and record any missing information in the report',
       );
     }
     invocation.mailbox_sequence += 1;
@@ -772,7 +806,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       '- Available teammate roles:',
       ...members.map(
         (member) =>
-          `  - ${member.role_id} (${member.name}, ${member.status}): ${truncate(member.persona.summary, TOP_LEVEL_MEMORY_DESCRIPTION_LIMIT)}`,
+          `  - ${member.role_id} (${member.name}, ${member.status}): ${truncate(member.persona.summary, TOP_LEVEL_DESCRIPTION_LIMIT)}`,
       ),
       '- Communication: use mailbox_send(to_role_id, kind, content, artifact_refs?).',
       ...(inbound
@@ -964,6 +998,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         ...execution.diagnostics,
         driver_status: execution.status,
         driver_attempts: driverAttempts,
+        driver_report: dispatched.cycle.buffer_snapshot.driver_return,
         dispatch_status: dispatched.status,
         context_policy: input.context_policy,
         input_artifact_refs: [...input.input_artifact_refs],
@@ -1095,6 +1130,8 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         run_id: input.run_id,
         role_id: runtimeRoleId,
         buffer_seq: bufferSeq,
+        // Session 绑定键之一：extract 留档（B1）要靠它解析真实 Session
+        ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
         ...(input.memory_ablation ? { memory_ablation: input.memory_ablation } : {}),
       });
     } catch (error) {
@@ -1334,14 +1371,18 @@ function withRetrievedMemory(
   };
 }
 
+/**
+ * 顶层 Agent 的每一轮只带执行契约和协作名册，不带记忆。
+ *
+ * 记忆经 driver_context 直达 Driver。若同一批记忆也预先出现在顶层上下文里，
+ * Agent 就没有理由再调 query_memory，工具轨迹随之失去"它自己认为需要什么"的
+ * 记录——而那是经验提取与技能晋升唯一的信号来源。
+ */
 function withTopLevelExecutionContext(
   input: Parameters<ToolCallingClient['completeWithTools']>[0],
-  retrieval: MemoryRetrievalResult,
   collaborationBrief: string,
 ): Parameters<ToolCallingClient['completeWithTools']>[0] {
-  const memoryContext = renderTopLevelMemoryContext(retrieval);
-  const context = [memoryContext, collaborationBrief].filter(Boolean).join('\n\n');
-  if (!context) return input;
+  if (!collaborationBrief) return input;
 
   let injected = false;
   return {
@@ -1351,48 +1392,10 @@ function withTopLevelExecutionContext(
       injected = true;
       return {
         ...message,
-        content: `${PRODUCTION_EXECUTION_CONTRACT}\n\n${message.content}\n\n${context}`,
+        content: `${PRODUCTION_EXECUTION_CONTRACT}\n\n${message.content}\n\n${collaborationBrief}`,
       };
     }),
   };
-}
-
-function renderTopLevelMemoryContext(retrieval: MemoryRetrievalResult): string {
-  if (retrieval.skills.length === 0 && retrieval.experiences.length === 0) return '';
-
-  const visibleSkills = retrieval.skills.slice(0, TOP_LEVEL_MEMORY_ITEM_LIMIT);
-  const visibleExperiences = retrieval.experiences.slice(
-    0,
-    TOP_LEVEL_MEMORY_ITEM_LIMIT - visibleSkills.length,
-  );
-  const visibleCount = visibleSkills.length + visibleExperiences.length;
-  const totalCount = retrieval.skills.length + retrieval.experiences.length;
-  const sections = [
-    renderMemorySection('Approved skills', visibleSkills, retrieval.skills.length),
-    renderMemorySection('Eligible experiences', visibleExperiences, retrieval.experiences.length),
-  ].filter((section) => section.length > 0);
-  return [
-    'Retrieved memory selected by B before execution:',
-    ...sections,
-    ...(visibleCount < totalCount
-      ? [`Omitted memory records: ${String(totalCount - visibleCount)}.`]
-      : []),
-  ].join('\n');
-}
-
-function renderMemorySection(
-  heading: string,
-  records: Array<{ id: string; description: string; content: string }>,
-  totalCount: number,
-): string {
-  if (records.length === 0) return '';
-  return [
-    `${heading} (shown ${String(records.length)} of ${String(totalCount)}):`,
-    ...records.map(
-      (record) =>
-        `- ${truncate(record.id, TOP_LEVEL_MEMORY_ID_LIMIT)}: ${truncate(record.description, TOP_LEVEL_MEMORY_DESCRIPTION_LIMIT)}\n  ${truncate(record.content, TOP_LEVEL_MEMORY_CONTENT_LIMIT)}`,
-    ),
-  ].join('\n');
 }
 
 function truncate(value: string, limit: number): string {
@@ -1403,50 +1406,6 @@ function truncate(value: string, limit: number): string {
 function delegationContext(original: string, delegated: string) {
   if (delegated.trim() === original.trim()) return [];
   return [{ id: 'b_delegation', description: 'B runtime delegation guidance', content: delegated }];
-}
-
-async function collectWorkspaceArtifacts(
-  input: AgentExecutionRequest,
-  before: WorkspaceFileSnapshot | undefined,
-  execution: DriverRunResult | undefined,
-): Promise<ArtifactRef[]> {
-  if (!input.workspace_path || !before) return [];
-  const after = await snapshotWorkspaceFiles(input.workspace_path);
-  const changedFiles = diffWorkspaceFiles(before, after).filter(isDeliverableWorkspacePath);
-  const producerId = execution?.diagnostics.driver_id ?? 'agent-execution-facade';
-  const artifacts: ArtifactRef[] = [];
-
-  for (const relativePath of changedFiles) {
-    const absolutePath = path.resolve(input.workspace_path, relativePath);
-    const stat = await fs.stat(absolutePath).catch(() => undefined);
-    if (!stat?.isFile() || stat.size > 5 * 1024 * 1024) continue;
-    const bytes = await fs.readFile(absolutePath).catch(() => undefined);
-    if (!bytes) continue;
-    const fileUrl = pathToFileURL(absolutePath).href;
-    const createdAt = nowTimestamp();
-    artifacts.push({
-      artifact_id: createId('artifact'),
-      type: 'patch',
-      uri: `artifact://workspace-file/${encodeURIComponent(input.task_id)}/${encodeURIComponent(relativePath)}`,
-      sha256: createHash('sha256').update(bytes).digest('hex'),
-      producer_id: producerId,
-      task_id: input.task_id,
-      metadata: {
-        source: 'workspace-change',
-        workspace_path: input.workspace_path,
-        target_path: relativePath,
-      },
-      content: {
-        kind: 'file',
-        content_ref: fileUrl,
-        target_path: relativePath,
-        media_type: mediaTypeFor(relativePath),
-      },
-      created_at: createdAt,
-      schema_version: SCHEMA_VERSION,
-    });
-  }
-  return artifacts;
 }
 
 /**
@@ -1471,40 +1430,6 @@ export function createToolRetirementEvaluator(llm: ToolCallingClient): Retiremen
     },
   };
   return new LlmRetirementEvaluator(adapter);
-}
-
-/** Normalize artifact target paths so Windows `\` and POSIX `/` compare equal. */
-export function normalizeArtifactTargetPath(value: string): string {
-  return value.replace(/\\/g, '/');
-}
-
-export function mergeArtifacts(
-  driverArtifacts: readonly ArtifactRef[],
-  workspaceArtifacts: readonly ArtifactRef[],
-): ArtifactRef[] {
-  const result: ArtifactRef[] = [];
-  const seenTargets = new Set<string>();
-  // Workspace snapshots contain the complete post-run file. Prefer them over
-  // Driver edit snippets when both artifacts target the same path.
-  for (const artifact of [...workspaceArtifacts, ...driverArtifacts]) {
-    const target = artifact.content?.target_path;
-    const key = target ? normalizeArtifactTargetPath(target) : undefined;
-    if (key && seenTargets.has(key)) continue;
-    if (key) seenTargets.add(key);
-    result.push(artifact);
-  }
-  return result;
-}
-
-function mediaTypeFor(relativePath: string): string {
-  const extension = path.extname(relativePath).toLowerCase();
-  if (extension === '.ts') return 'text/typescript';
-  if (extension === '.tsx') return 'text/tsx';
-  if (extension === '.js' || extension === '.jsx') return 'text/javascript';
-  if (extension === '.json') return 'application/json';
-  if (extension === '.css') return 'text/css';
-  if (extension === '.html') return 'text/html';
-  return 'text/plain';
 }
 
 function isArtifactFreeRetryableFailure(execution: DriverRunResult): boolean {

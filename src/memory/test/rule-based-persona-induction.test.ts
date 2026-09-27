@@ -78,7 +78,13 @@ describe('ruleBasedPersonaInduction', () => {
   it('空数据时生成 v2 Persona 且字段为占位文案', async () => {
     const { memory, role_id } = await createTestInfra('role_persona_empty');
 
-    const current = await memory.getPersona();
+    // 种子 persona 与诱导出的新 persona 都盖 nowTimestamp()（毫秒精度），两次调用很可能
+    // 落在同一毫秒，`generated_at > current.generated_at` 就成了掷硬币。把当前 persona 的
+    // 时间戳钉到一个过去的常量，断言仍然验证「新 persona 会重新盖时间戳」，但不再依赖
+    // 「两次调用刚好跨过毫秒边界」。
+    const seeded = await memory.getPersona();
+    const current = { ...seeded, generated_at: '2020-01-01T00:00:00.000Z' };
+    await memory.savePersona(current);
     expect(current.version).toBe(1);
 
     const outcome = await ruleBasedPersonaInduction(memory, {
@@ -91,8 +97,8 @@ describe('ruleBasedPersonaInduction', () => {
     expect(outcome.check.eligible).toBe(true);
     expect(outcome.persona).toBeDefined();
     expect(outcome.persona!.version).toBe(2);
-    expect(outcome.persona!.skills_overview).toBe('No skills yet.');
-    expect(outcome.persona!.experience_coverage).toBe('No experiences yet.');
+    expect(outcome.persona!.skills_overview).toBe('Retrieve with query_memory.');
+    expect(outcome.persona!.experience_coverage).toBe('Retrieve with query_memory.');
     expect(outcome.persona!.recent_performance).toBe(current.recent_performance);
     expect(outcome.persona!.generated_at > current.generated_at).toBe(true);
 

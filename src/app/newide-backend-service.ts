@@ -24,7 +24,15 @@ import {
   type ResumePackage,
   type RestoreFileAnchorResult,
 } from '../checkpoint';
-import type { TelemetryRecord, TelemetrySink } from '../telemetry/telemetry-sink';
+import {
+  NoopTelemetrySink,
+  releaseRunLlmUsageLedger,
+  runWithLlmUsageLedger,
+  runWithRunEventConsumption,
+  RunEventConsumptionRecorder,
+  type TelemetryRecord,
+  type TelemetrySink,
+} from '../telemetry';
 import {
   InMemoryRunRegistry,
   type AppRunEvent,
@@ -127,7 +135,7 @@ export interface RunCreateParams {
   client_task_id?: string;
   title?: string;
   /** F-eval memory ablation B0–B3; recorded on summary for --backend-summary. */
-  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
   /** Optional override for materializer base / eval worktree root. */
   worktree_path?: string;
 }
@@ -254,6 +262,14 @@ export class NewideBackendService {
     private readonly mailboxDeliveryWorker?: MailboxDeliveryWorker,
     private readonly participantSessionProvisioner?: ParticipantSessionProvisioner,
     private readonly artifactContentReader?: RunArtifactContentReader,
+    /** 事件消耗汇总的去处，生产注入按 run 落文件的 sink；不注入则整体空转。 */
+    private readonly runEventConsumptionSink: TelemetrySink = new NoopTelemetrySink(),
+    /**
+     * 该 run 收到的 telemetry 记录的去处——与进入事件流的那批同源同过滤，生产注入
+     * 按 run 落文件的 sink。与 `runEventConsumptionSink` 同为文件 sink 但收集面不同，
+     * 别接反。
+     */
+    private readonly runTelemetryJsonlSink: TelemetrySink = new NoopTelemetrySink(),
   ) {}
 
   async getArtifactContent(runId: string, artifactId: string): Promise<RunArtifactContent> {
@@ -871,7 +887,53 @@ export class NewideBackendService {
     identity: { run_id: string; task_id: string };
     loop: TaskExecutionLoop;
     controller: AbortController;
-    memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+    memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
+    session_id?: string;
+  }): Promise<void> {
+    const { run_id: runId, task_id: taskId } = input.identity;
+    // 新主路径此前完全没有账本：adapter 照常调用 recordProxyLlmUsage，但没有作用域承接，
+    // token 静默消失（`dropped_no_ledger`）。作用域覆盖整轮——run 身份在 beginRun 之前
+    // 就已定死。sink 复用 appendTelemetry，用量事件因此进入 run 事件流，进而落
+    // audit.jsonl 与 timeline.json（终态 summary.token_usage 从后者读出）。
+    const sink: TelemetrySink = {
+      emit: (record) => this.appendTelemetry(input.identity, record),
+    };
+    // 事件计数与账本共用这个 run 作用域：计数器的 ALS 必须在 loop 外层建立，因为
+    // 阶段事件的出口（stage executor 的 emit）与提交回调都在 loop 内部。
+    // 落点刻意**不是**上面那个 registry sink：汇总信号若进 run 的事件流，就会排在
+    // run.completed 之后，破坏「最后一条事件是终态」的消费方断言。观测信号走自己的
+    // 文件（`event-consumption.jsonl`），与 latency.jsonl 同一套约定。
+    const consumption = new RunEventConsumptionRecorder({
+      run_id: runId,
+      task_id: taskId,
+      sink: this.runEventConsumptionSink,
+    });
+    try {
+      await runWithLlmUsageLedger(
+        {
+          case_id: taskId,
+          run_id: runId,
+          task_id: taskId,
+          sink,
+          scaffold_variant: 'full_system',
+        },
+        () => runWithRunEventConsumption(consumption, () => this.runAuthorityLoop(input)),
+      );
+    } finally {
+      // 挂在 run 终态而不是别处：B 记忆维护在循环内部读同一个 run 的账本，提前释放会让
+      // 它读到空账，进而用偏小的部分值覆盖 summary.token_usage。
+      releaseRunLlmUsageLedger(runId);
+      // 与上面同理放 finally：失败的 run 往往才是事件堆得最多的一类，只在成功路径
+      // 发信号会正好把它漏掉。finish() 自身不抛错，不改变原来的异常语义。
+      await consumption.finish();
+    }
+  }
+
+  private async runAuthorityLoop(input: {
+    identity: { run_id: string; task_id: string };
+    loop: TaskExecutionLoop;
+    controller: AbortController;
+    memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
     session_id?: string;
   }): Promise<void> {
     const processor = this.taskProcessor!;
@@ -1555,6 +1617,35 @@ export class NewideBackendService {
     if (record.run_id && record.run_id !== identity.run_id) return;
     if (record.task_id && record.task_id !== identity.task_id) return;
     this.registry.appendEvent(identity.run_id, record.event_type, record.payload);
+    this.writeRunTelemetryRecord(identity, record);
+  }
+
+  /**
+   * 追加一条该 run 的 telemetry 记录到观测文件。
+   *
+   * 挂在 `appendTelemetry` 而不是构造 sink 的地方：这里是 telemetry 记录归属到某个
+   * run 的唯一漏斗，legacy 路径在拿到 identity 之前缓冲的记录也要从这里过一次
+   * （`startLegacyRun` 的 pendingTelemetry），挂在别处要么漏掉它们、要么在 run 还没
+   * 定身份时无处安放。
+   *
+   * `run_id` / `task_id` 按 identity 补齐：文件本就按 run 分目录，一行缺 run_id 在
+   * 这个文件里就是坏行；registry 那边也是按 identity 归属的，两边口径因此一致。
+   */
+  private writeRunTelemetryRecord(
+    identity: { run_id: string; task_id: string },
+    record: TelemetryRecord,
+  ): void {
+    try {
+      void Promise.resolve(
+        this.runTelemetryJsonlSink.emit({
+          ...record,
+          run_id: identity.run_id,
+          task_id: record.task_id ?? identity.task_id,
+        }),
+      ).catch(() => undefined);
+    } catch {
+      // 落盘是观测：同步抛出也只丢这一条信号，不影响 run。
+    }
   }
 
   private appendDomainEvent(identity: { run_id: string; task_id: string }, event: Event): void {

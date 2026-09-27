@@ -22,6 +22,8 @@ import {
 import {
   InMemoryBufferRepository,
   InMemoryRepository,
+  type CallJournalEvent,
+  type CallJournalPort,
   type ToolCallingClient,
 } from '../../src/memory';
 import type { ExperienceRecord, SkillRecord } from '../../src/memory/schemas';
@@ -31,9 +33,58 @@ import {
   type MailboxToolOutcome,
 } from '../../src/mailbox';
 import { SqliteCoordinationStore } from '../../src/persistence';
+import {
+  RunLatencyRecorder,
+  getLlmUsageAttribution,
+  runWithRunLatencyRecorder,
+  type RunLatencySpan,
+  type RunLatencyTraceSink,
+} from '../../src/telemetry';
 import { InMemoryParticipantSessionRegistry } from '../../src/coordination';
 
 describe('DriverRuntimeAgentExecutionFacade', () => {
+  it('cancels a pending Session initialization and releases its provisioning slot', async () => {
+    const driver = new CapturingDriver('succeeded');
+    let finish!: (result: DriverRunResult) => void;
+    const send = vi.spyOn(driver, 'sendPrompt').mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const interrupt = vi.spyOn(driver, 'interrupt');
+    const sessions = new InMemoryParticipantSessionRegistry();
+    const store = new SqliteCoordinationStore(':memory:');
+    const facade = new DriverRuntimeAgentExecutionFacade({
+      driver, repository: new InMemoryRepository(), bufferRepository: new InMemoryBufferRepository(), llm: invokeDriverLlm(),
+      mailbox: { service: new PersistentMailboxService(store), allowedRoleIds: ['primary'], sessionRegistry: sessions },
+    });
+    const controller = new AbortController();
+    const { session_id: _existingSession, ...input } = request('task_cancel_init', 'primary', os.tmpdir());
+    let error: unknown;
+    const pending = facade.runAgent(input, { signal: controller.signal }).catch((failure) => { error = failure; });
+    try {
+      await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+      controller.abort(new Error('Stop Session initialization'));
+      await vi.waitFor(() => expect(error).toBeInstanceOf(Error), { timeout: 500 });
+      expect(interrupt).toHaveBeenCalledWith('Stop Session initialization', `${input.run_id}:session-provision:primary`);
+      expect(sessions.get(input.task_id, path.resolve(os.tmpdir()), 'primary')).toBeUndefined();
+      send.mockResolvedValueOnce({ ...driverResult(driver, 'succeeded', 'session_after_cancel'), response: 'SESSION_READY' });
+      expect(await facade.provisionParticipantSession({ task_id: input.task_id, run_id: 'run_next', role_id: 'primary', workspace_path: os.tmpdir() })).toBe('session_after_cancel');
+      expect(send).toHaveBeenCalledTimes(2);
+    } finally {
+      finish(driverResult(driver, 'cancelled'));
+      await pending;
+      store.close();
+    }
+  });
+
+  it('forwards Session initialization events with the parent run and role', async () => {
+    const driver = new CapturingDriver('succeeded');
+    const original = driver.sendPrompt.bind(driver);
+    vi.spyOn(driver, 'sendPrompt').mockImplementation(async (input) => ({ ...await original(input), session_id: 'session_ready', response: 'SESSION_READY' }));
+    const { facade } = createFacade(driver);
+    const events: Array<{ run_id?: string; role_id?: string }> = [];
+    await facade.provisionParticipantSession({ task_id: 'task_init', run_id: 'run_parent', role_id: 'primary', workspace_path: os.tmpdir() }, {
+      onDriverEvent: (event) => events.push(event),
+    });
+    expect(events).toContainEqual(expect.objectContaining({ run_id: 'run_parent', role_id: 'primary' }));
+  });
   it('lets one real B Agent tool turn send and another role reply through Mailbox', async () => {
     const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-mailbox-agent-'));
     const repository = new InMemoryRepository();
@@ -181,7 +232,63 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     }
   });
 
-  it('keeps the primary Plan phase independent of blocking Mailbox requests', async () => {
+  it('retries a transient Session initialization once and preserves a known Session', async () => {
+    const driver = new CapturingDriver('succeeded');
+    const send = vi.spyOn(driver, 'sendPrompt');
+    send.mockResolvedValueOnce({ ...driverResult(driver, 'failed', 'session_started'), error: { code: 'EXTERNAL_DRIVER_TRANSPORT_ERROR', message: 'temporary connection loss', retryable: true } });
+    send.mockResolvedValueOnce({ ...driverResult(driver, 'succeeded', 'session_started'), response: 'SESSION_READY' });
+    const { facade } = createFacade(driver);
+    expect(await facade.provisionParticipantSession({ task_id: 'task_init', run_id: 'run_init', workspace_path: os.tmpdir(), role_id: 'proposer_a' })).toBe('session_started');
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send.mock.calls[1]![0]).toMatchObject({ session_id: 'session_started', run_id: expect.stringMatching(/:retry$/) });
+  });
+
+  it('uses the real Council turn to create its Session without a warm-up model call', async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-council-session-'));
+    const driver = new CapturingDriver('succeeded');
+    const original = driver.sendPrompt.bind(driver);
+    const send = vi.spyOn(driver, 'sendPrompt').mockImplementation(async (input) => ({
+      ...await original(input),
+      session_id: 'session_council_role',
+    }));
+    const repository = new InMemoryRepository();
+    await repository.initializeAgent({ role_id: 'role_proposer', name: 'Proposer' });
+    const store = new SqliteCoordinationStore(':memory:');
+    const sessions = new InMemoryParticipantSessionRegistry();
+    const facade = new DriverRuntimeAgentExecutionFacade({
+      driver,
+      repository,
+      bufferRepository: new InMemoryBufferRepository(),
+      llm: invokeDriverLlm(),
+      mailbox: {
+        service: new PersistentMailboxService(store),
+        allowedRoleIds: ['role_proposer'],
+        sessionRegistry: sessions,
+      },
+    });
+    const { session_id: _sessionId, ...input } = request(
+      'task_council_session',
+      'role_proposer',
+      workspace,
+    );
+
+    try {
+      const result = await facade.runAgent({ ...input, context_policy: 'council_proposer' });
+
+      expect(result.status).toBe('completed');
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(send.mock.calls[0]![0].run_id).toBe(input.run_id);
+      expect(sessions.get(input.task_id, path.resolve(workspace), input.role_id)).toBe(
+        'session_council_role',
+      );
+    } finally {
+      store.close();
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['council_primary_plan', 'council_proposer', 'council_reviewer', 'council_synthesizer'])(
+    'rejects blocking Mailbox requests immediately in %s', async (contextPolicy) => {
     const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-plan-mailbox-'));
     const repository = new InMemoryRepository();
     await repository.initializeAgent({ role_id: 'role_primary', name: 'Primary' });
@@ -204,7 +311,7 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
         ...request('task_plan_mailbox', 'role_primary', workspace),
         instruction: 'Write council-plan.md.',
         driver_instruction: 'Write council-plan.md.',
-        context_policy: 'council_primary_plan',
+        context_policy: contextPolicy,
       });
 
       expect(result).toMatchObject({
@@ -291,6 +398,87 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
       maintenance_ref: 'b_maintenance_test',
       status: 'scheduled',
     });
+  });
+
+  it('journals memory_query with request identity and forwards workspace to maintenance', async () => {
+    const events: CallJournalEvent[] = [];
+    const callJournal: CallJournalPort = { record: (event) => void events.push(event) };
+    const requests: Parameters<BMemoryMaintenancePort['scheduleBuffer']>[0][] = [];
+    const memoryMaintenance: BMemoryMaintenancePort = {
+      async scheduleBuffer(input) {
+        requests.push(input);
+        return {
+          maintenance_ref: 'b_maintenance_journal',
+          kind: 'experience_extraction',
+          status: 'scheduled',
+          ...input,
+          experiences: [],
+          skills: [],
+          warnings: [],
+          created_at: '2026-07-21T00:00:00.000Z',
+          completed_at: '2026-07-21T00:00:01.000Z',
+          schema_version: SCHEMA_VERSION,
+        };
+      },
+    };
+    // 第一轮：query_memory；第二轮：invoke_driver；第三轮：完成
+    let turn = 0;
+    const llm: ToolCallingClient = {
+      async completeWithTools(input) {
+        const lastMessage = input.messages.at(-1);
+        if (lastMessage?.role === 'tool') {
+          turn += 1;
+          if (turn === 1) return driverToolCalls('tool_call_drv_journal');
+          return { content: 'Task completed. [done]', tool_calls: undefined };
+        }
+        return {
+          content: null,
+          tool_calls: [
+            {
+              id: 'tool_call_query_journal',
+              type: 'function',
+              function: { name: 'query_memory', arguments: '{"query": "boundaries"}' },
+            },
+          ],
+        };
+      },
+    };
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-journal-agent-'));
+    const facade = new DriverRuntimeAgentExecutionFacade({
+      driver: new CapturingDriver('succeeded'),
+      repository: new InMemoryRepository(),
+      bufferRepository: new InMemoryBufferRepository(),
+      llm,
+      memoryMaintenance,
+      callJournal,
+    });
+
+    try {
+      const result = await facade.runAgent(
+        request('task_journal_facade', 'proposer_a', workspace),
+      );
+      expect(result.status).toBe('completed');
+
+      // memory_query 事件带 request 同源身份（run / workspace 归一化后）
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({
+        event: 'memory_query',
+        call_id: 'tool_call_query_journal',
+        task_id: 'task_journal_facade',
+        run_id: 'run_task_journal_facade',
+        role_id: 'proposer_a',
+        workspace_path: path.resolve(workspace),
+        status: 'ok',
+      });
+      // invoke_driver 不在 B1 留档范围
+      expect(events.map((event) => event.event)).toEqual(['memory_query']);
+
+      // maintenance 转发了 workspace（extract 留档的 Session 绑定键）
+      expect(requests).toHaveLength(1);
+      expect(requests[0].workspace_path).toBe(path.resolve(workspace));
+    } finally {
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
   });
 
   it('applies memory_ablation B0/B1/B2 to retrieval and maintenance scheduling', async () => {
@@ -501,6 +689,11 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     expect(exposedTools[0]).toEqual(['query_memory', 'invoke_driver']);
     expect(systemPrompts[0]).toContain('You are Agent "tool_surface_role".');
     expect(systemPrompts[0]).toContain('## Your Identity');
+    expect(systemPrompts[0]).toContain('Retrieve what the task needs with query_memory.');
+    // 身份块不再陈述"有没有技能"：库里有多少技能与提示词无关，Agent 自己去查。
+    // 预置技能写进 persona 的缺失陈述（曾经的 "No skills yet."）会与事实相反。
+    expect(systemPrompts[0]).not.toContain('Skills Overview');
+    expect(systemPrompts[0]).not.toContain('No skills yet.');
   });
 
   it('registers and projects a market candidate without executing A', async () => {
@@ -534,6 +727,46 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     expect(events).toEqual([
       expect.objectContaining({ event_type: 'agent_message_chunk', role_id: 'reviewer' }),
     ]);
+  });
+
+  it('binds LLM calls during an agent run to the executing role', async () => {
+    const inner = invokeDriverLlm();
+    const observedRoles: Array<string | undefined> = [];
+    const { facade } = createFacade(
+      new CapturingDriver('succeeded'),
+      new InMemoryBufferRepository(),
+      {
+        async completeWithTools(input) {
+          observedRoles.push(getLlmUsageAttribution()?.role_id);
+          return inner.completeWithTools(input);
+        },
+      },
+    );
+
+    await facade.runAgent(request('task_role_attribution', 'reviewer'));
+
+    expect(observedRoles.length).toBeGreaterThan(0);
+    // 漏包一层时这里会混进 undefined；不检查轮数，只要求每一轮都归属同一角色。
+    expect(observedRoles.every((role) => role === 'reviewer')).toBe(true);
+  });
+
+  it('把 agent 轮次与工具调用 span 记进驱动这次调用的那个 run', async () => {
+    const { facade } = createFacade(new CapturingDriver('succeeded'));
+    const sink = new CollectingLatencySink();
+
+    await runWithRunLatencyRecorder(createLatencyRecorder(sink), () =>
+      facade.runAgent(request('task_agent_spans', 'reviewer')),
+    );
+
+    // 一条 invoke_driver 工具调用 + 一次收尾文本，共两轮 LLM。
+    const names = sink.spans.map((span) => span.name);
+    expect(names.filter((name) => name === 'agent.llm_round').length).toBe(2);
+    expect(names).toContain('agent.tool.invoke_driver');
+    // 这里 span 能出现本身就是结论：没有 recorder 时 withRunLatencySpan 是空转的，
+    // 而 recorder 要穿过 facade 的 enqueue 队列才够得着 Agent 循环。
+    expect(sink.spans.every((span) => span.run_id === 'run_agent_spans')).toBe(true);
+    // 角色一路从请求传到 span，才能和账本里的 token 按同一把钥匙对齐。
+    expect(sink.spans.every((span) => span.role_id === 'reviewer')).toBe(true);
   });
 
   it('resolves a relative workspace before crossing the B to A process boundary', async () => {
@@ -585,7 +818,7 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     }
   });
 
-  it('retrieves eligible memory before planning and injects it into A and ContextPack evidence', async () => {
+  it('retrieves eligible memory before planning and injects it into the Driver, not the top-level Agent', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-b-retrieval-'));
     try {
       const roleId = 'implementer';
@@ -652,13 +885,11 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
 
       const result = await facade.runAgent(request('task_retrieval', roleId));
 
-      expect(initialMessages[0]).toContain(approvedSkill.description);
-      expect(initialMessages[0]).toContain(approvedSkill.content);
-      expect(initialMessages[0]).toContain(eligibleExperience.description);
-      expect(initialMessages[0]).toContain(eligibleExperience.content);
-      expect(initialMessages[0]).not.toContain(pendingSkill.content);
-      expect(initialMessages[0]).not.toContain(negativeExperience.content);
-      expect(initialMessages[0]).not.toContain(lowConfidenceExperience.content);
+      // 记忆不预注入顶层上下文：Agent 必须自己调 query_memory，否则它的工具轨迹里
+      // 没有"它认为需要什么"的记录。准入过滤由下面 Driver 侧的精确断言覆盖。
+      expect(initialMessages[0]).toContain('Execute through B runtime.');
+      expect(initialMessages[0]).not.toContain(approvedSkill.content);
+      expect(initialMessages[0]).not.toContain(eligibleExperience.content);
 
       const prompt = parseDriverContext(driver.prompts[0]!.prompt) as {
         task_instruction: string;
@@ -1264,6 +1495,19 @@ class BlockingOnceRetrievalRepository extends InMemoryRepository {
     }
     return super.searchSkills(...args);
   }
+}
+
+/** 收集 span 的耗时 sink，用来断言 Agent 循环产生的 span 落进了当前 run。 */
+class CollectingLatencySink implements RunLatencyTraceSink {
+  readonly spans: RunLatencySpan[] = [];
+
+  append(span: RunLatencySpan): void {
+    this.spans.push(span);
+  }
+}
+
+function createLatencyRecorder(sink: RunLatencyTraceSink): RunLatencyRecorder {
+  return new RunLatencyRecorder({ run_id: 'run_agent_spans', task_id: 'task_agent_spans', sink });
 }
 
 function invokeDriverLlm(): ToolCallingClient {

@@ -50,10 +50,12 @@ describe('Council end-to-end coordinator slice', () => {
     });
 
     expect(result.summary.status).toBe('completed');
-    expect(requests.map((request) => request.role_id)).toEqual([
-      'role_ts_engineer',
-      'role_backend_proposer',
-      'role_frontend_proposer',
+    expect(requests[0]?.role_id).toBe('role_ts_engineer');
+    // Proposers are dispatched concurrently, so their invocation order is unspecified.
+    expect(new Set(requests.slice(1, 3).map((request) => request.role_id))).toEqual(
+      new Set(['role_backend_proposer', 'role_frontend_proposer']),
+    );
+    expect(requests.slice(3).map((request) => request.role_id)).toEqual([
       'role_security_reviewer',
       'role_release_synthesizer',
     ]);
@@ -97,7 +99,13 @@ function createCouncilFacade(requests: AgentExecutionRequest[]): AgentExecutionF
       requests.push(input);
       const artifacts =
         input.context_policy === 'council_reviewer'
-          ? []
+          ? [
+              artifact(
+                `artifact_${input.role_id}`,
+                'reviews.json',
+                structuredReviews(input.instruction),
+              ),
+            ]
           : [
               artifact(
                 `artifact_${input.role_id}`,
@@ -118,10 +126,7 @@ function createCouncilFacade(requests: AgentExecutionRequest[]): AgentExecutionF
         artifact_refs: artifacts,
         transcript_ref: transcript(input.role_id),
         session_id: `session_${input.role_id}`,
-        response:
-          input.context_policy === 'council_reviewer'
-            ? structuredReviews(input.instruction)
-            : `${input.role_id} completed`,
+        response: `${input.role_id} completed`,
         tool_events: [],
         diagnostics: {
           driver_id: `driver_${input.role_id}`,

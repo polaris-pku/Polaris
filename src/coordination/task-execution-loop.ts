@@ -18,14 +18,41 @@ import {
   type TaskStageCommitResult,
 } from './task-processor';
 import type { TaskSnapshot } from '../protocol/task-snapshot';
+import {
+  recordRunEventCommittedBatch,
+  runWithLlmUsageAttribution,
+  runWithRunLatencyRecorder,
+  stageSpan,
+  withRunLatencySpan,
+  type RunLatencyRecorder,
+} from '../telemetry';
 
 type CursorInput<TCursor extends TaskResumeCursor> = Extract<TaskCursorInput, { cursor: TCursor }>;
+
+/** `executeStage` 能真正执行的游标——`done` / `mailbox_wait` 是循环退出条件，不是阶段。 */
+type ExecutableStageCursor = Exclude<TaskCursorInput, { cursor: 'done' | 'mailbox_wait' }>['cursor'];
+
+/**
+ * 阶段边界的两条归因必须同源。
+ *
+ * 耗时 span 名与 token 归属的 stage 游标都按同一个游标生成，分开写就会漂移——漂移的
+ * 后果不是报错，而是报告里 token 与耗时的 stage 名对不上。收敛成一个包裹点后，
+ * 「漏包一层归属」或「包错游标」在结构上不可能发生。
+ */
+function runStageWithAttribution<T>(
+  cursor: ExecutableStageCursor,
+  execute: () => Promise<T>,
+): Promise<T> {
+  return runWithLlmUsageAttribution({ stage_cursor: cursor }, () =>
+    withRunLatencySpan(stageSpan(cursor), {}, execute),
+  );
+}
 
 export interface TaskStageExecutionContext<TCursor extends TaskResumeCursor> {
   task_id: string;
   run_id: string;
   mode: PersistedRunMode;
-  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
   task_request: TaskCreateRequest;
   workspace_path: string;
   session_id?: string;
@@ -139,13 +166,18 @@ export interface TaskExecutionLoopOptions {
   evidence_store: RunEvidenceStore;
   executors: TaskExecutionLoopExecutors;
   create_invocation_id?: (cursor: TaskResumeCursor) => string;
+  /**
+   * 墙钟归因。按 run 建一个 recorder，loop 内部据此给根 span 与每个 stage 记耗时。
+   * 不注入时全部埋点自动退化为空操作，单测与 example 无需改动。
+   */
+  create_latency_recorder?: (input: { run_id: string; task_id: string }) => RunLatencyRecorder;
 }
 
 export interface RunTaskExecutionInput {
   task_id: string;
   run_id: string;
   council_override?: boolean;
-  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
   session_id?: string;
   signal?: AbortSignal;
   on_driver_event?: DriverStreamEventListener;
@@ -158,6 +190,9 @@ export class TaskExecutionLoop {
   private readonly evidenceStore: RunEvidenceStore;
   private readonly executors: TaskExecutionLoopExecutors;
   private readonly createInvocationId: (cursor: TaskResumeCursor) => string;
+  private readonly createLatencyRecorder:
+    | ((input: { run_id: string; task_id: string }) => RunLatencyRecorder)
+    | undefined;
 
   constructor(options: TaskExecutionLoopOptions) {
     this.processor = options.processor;
@@ -165,6 +200,7 @@ export class TaskExecutionLoop {
     this.executors = options.executors;
     this.createInvocationId =
       options.create_invocation_id ?? ((cursor) => createId(`invocation_${cursor}`));
+    this.createLatencyRecorder = options.create_latency_recorder;
   }
 
   async run(input: RunTaskExecutionInput): Promise<TaskSnapshot> {
@@ -173,6 +209,24 @@ export class TaskExecutionLoop {
     if (input.council_override === true) {
       this.processor.setCouncilOverride(input.run_id);
     }
+    const recorder = this.createLatencyRecorder?.({
+      run_id: input.run_id,
+      task_id: input.task_id,
+    });
+    if (!recorder) return this.runStages(input);
+
+    // 根 span 覆盖整轮执行；recorder 同时通过 ALS 绑定，让 loop 内部与更深层调用
+    // （facade / stage executor / council 席位）的 span 自动归属同一个 run。
+    return runWithRunLatencyRecorder(recorder, () =>
+      withRunLatencySpan(
+        'run.loop_total',
+        { metaFrom: (snapshot: TaskSnapshot) => ({ status: snapshot.task.status }) },
+        () => this.runStages(input),
+      ),
+    );
+  }
+
+  private async runStages(input: RunTaskExecutionInput): Promise<TaskSnapshot> {
     for (;;) {
       input.signal?.throwIfAborted();
       const state = this.processor.getRunExecutionState(input.run_id);
@@ -206,13 +260,13 @@ export class TaskExecutionLoop {
       expected_cursor: cursorInput.cursor,
       invocation_id: invocationId,
     });
-    controls.on_committed_events?.(started.committed_events);
+    this.notifyCommittedEvents(controls, started.committed_events);
 
     try {
       switch (cursorInput.cursor) {
         case 'select_agent': {
-          const result = await this.executors.select_agent.execute(
-            stageContext(state, cursorInput, controls),
+          const result = await runStageWithAttribution('select_agent', () =>
+            this.executors.select_agent.execute(stageContext(state, cursorInput, controls)),
           );
           return await this.persistAndAdvance(
             state,
@@ -227,8 +281,8 @@ export class TaskExecutionLoop {
           );
         }
         case 'execute_agent': {
-          const result = await this.executors.execute_agent.execute(
-            stageContext(state, cursorInput, controls),
+          const result = await runStageWithAttribution('execute_agent', () =>
+            this.executors.execute_agent.execute(stageContext(state, cursorInput, controls)),
           );
           if (!result.mailbox_wait) assertChangesetResult(result, 'Primary Agent');
           const evidence = await this.writeEvidence(state.run_id, cursorInput.cursor, result);
@@ -275,12 +329,12 @@ export class TaskExecutionLoop {
                 : {}),
             },
           );
-          controls.on_committed_events?.(committed.committed_events);
+          this.notifyCommittedEvents(controls, committed.committed_events);
           return committed;
         }
         case 'council': {
-          const result = await this.executors.council.execute(
-            stageContext(state, cursorInput, controls),
+          const result = await runStageWithAttribution('council', () =>
+            this.executors.council.execute(stageContext(state, cursorInput, controls)),
           );
           assertChangesetResult(result, 'Council');
           return await this.persistAndAdvance(
@@ -299,8 +353,8 @@ export class TaskExecutionLoop {
           );
         }
         case 'gate': {
-          const result = await this.executors.gate.execute(
-            stageContext(state, cursorInput, controls),
+          const result = await runStageWithAttribution('gate', () =>
+            this.executors.gate.execute(stageContext(state, cursorInput, controls)),
           );
           assertGateResultIdentity(result, cursorInput);
           const evidence = await this.writeEvidence(state.run_id, cursorInput.cursor, result);
@@ -321,7 +375,7 @@ export class TaskExecutionLoop {
                 },
               ...(result.artifact_refs ? { artifact_refs: result.artifact_refs } : {}),
             });
-            controls.on_committed_events?.(committed.committed_events);
+            this.notifyCommittedEvents(controls, committed.committed_events);
             return committed;
           }
           const committed = this.advanceWithEvidence(
@@ -336,12 +390,12 @@ export class TaskExecutionLoop {
             },
             result,
           );
-          controls.on_committed_events?.(committed.committed_events);
+          this.notifyCommittedEvents(controls, committed.committed_events);
           return committed;
         }
         case 'deliver': {
-          const result = await this.executors.deliver.execute(
-            stageContext(state, cursorInput, controls),
+          const result = await runStageWithAttribution('deliver', () =>
+            this.executors.deliver.execute(stageContext(state, cursorInput, controls)),
           );
           const evidence = await this.writeEvidence(state.run_id, cursorInput.cursor, result);
           const committed = this.advanceWithEvidence(
@@ -356,7 +410,7 @@ export class TaskExecutionLoop {
               ...(result.warnings ? { warnings: result.warnings } : {}),
             },
           );
-          controls.on_committed_events?.(committed.committed_events);
+          this.notifyCommittedEvents(controls, committed.committed_events);
           return committed;
         }
       }
@@ -382,9 +436,26 @@ export class TaskExecutionLoop {
         ...(failureEvidence ? { evidence_ref: failureEvidence } : {}),
         ...(resultEvidence ? { artifact_refs: [resultEvidence.uri] } : {}),
       });
-      controls.on_committed_events?.(committed.committed_events);
+      this.notifyCommittedEvents(controls, committed.committed_events);
       return committed;
     }
+  }
+
+  /**
+   * 提交批次的通知与计数必须同源。
+   *
+   * 分两处写迟早会漂移——漂移的后果不是报错，而是报告里的「提交了 N 批」跟回调真正
+   * 被叫的次数对不上。收敛成一个方法后，漏记与漏调在结构上不可能发生。
+   *
+   * 与 `emit()` 那处不同，这里**不**因为没人监听就跳过计数：提交在 processor 里已经
+   * 发生了，没有监听者不改变「提交了这么多」这个事实。
+   */
+  private notifyCommittedEvents(
+    controls: Pick<RunTaskExecutionInput, 'on_committed_events'>,
+    events: readonly PersistedCoordinationEvent[],
+  ): void {
+    recordRunEventCommittedBatch(events.length);
+    controls.on_committed_events?.(events);
   }
 
   private async persistAndAdvance(
@@ -404,7 +475,7 @@ export class TaskExecutionLoop {
       nextInput,
       result,
     );
-    controls.on_committed_events?.(committed.committed_events);
+    this.notifyCommittedEvents(controls, committed.committed_events);
     return committed;
   }
 

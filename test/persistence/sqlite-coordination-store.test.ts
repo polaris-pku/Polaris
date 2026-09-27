@@ -17,7 +17,7 @@ afterEach(() => {
 });
 
 describe('SqliteCoordinationStore', () => {
-  it('creates the v3 coordination schema in WAL mode', () => {
+  it('creates the v5 coordination and protocol delivery schema in WAL mode', () => {
     const { databasePath, store } = createStore();
     store.close();
 
@@ -40,16 +40,26 @@ describe('SqliteCoordinationStore', () => {
         'checkpoints',
         'messages',
         'deliveries',
+        'outbox',
+        'inbox',
+        'journal',
       ]),
     );
     expect(journalMode).toEqual({ journal_mode: 'wal' });
-    expect(migration).toEqual({ version: 3 });
+    expect(migration).toEqual({ version: 5 });
 
     const runtimeColumns = database
       .prepare('PRAGMA table_info(task_runtime_states)')
       .all()
       .map((row) => String(row.name));
     expect(runtimeColumns).toContain('cursor_input_json');
+    // v5：journal 的调用留档列（session_id / duration_ms）
+    const journalColumns = database
+      .prepare('PRAGMA table_info(journal)')
+      .all()
+      .map((row) => String(row.name));
+    expect(journalColumns).toContain('session_id');
+    expect(journalColumns).toContain('duration_ms');
     database.close();
   });
 

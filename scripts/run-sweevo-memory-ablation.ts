@@ -22,6 +22,7 @@ import {
   removeEphemeralWorktree,
 } from '../eval/prepare-worktree';
 import { runEvalInstance } from '../eval/run-instance-core';
+import { resolveHarnessTimeoutSeconds } from '../eval/sweevo-harness-adapter';
 import type { MemoryAblation, SweEvoInstance } from '../eval/types';
 import {
   isDriverStreamUsage,
@@ -170,11 +171,6 @@ for (const id of instanceIds) {
   getInstanceOrThrow(instancesById, id);
 }
 
-const databaseUrlTemplate =
-  process.env.NEWIDE_ABLATION_DATABASE_URL_TEMPLATE ??
-  fileEnv.NEWIDE_ABLATION_DATABASE_URL_TEMPLATE ??
-  'postgresql://newide:newide_local@127.0.0.1:55432/newide_{ablation}';
-
 const driverRunnerRaw =
   process.env.ACP_DRIVER_RUNNER_DIR ?? fileEnv.ACP_DRIVER_RUNNER_DIR;
 const driverEnvFileRaw = process.env.ACP_DRIVER_ENV_FILE ?? fileEnv.ACP_DRIVER_ENV_FILE;
@@ -191,6 +187,11 @@ const baseEnv: NodeJS.ProcessEnv = {
     : {}),
   ...(sweEvoRootRaw ? { NEWIDE_SWE_EVO_ROOT: path.resolve(repoRoot, sweEvoRootRaw) } : {}),
 };
+// 全自动化测评：无人审核 → 晋升即批准（替代人工 reviewSkill）。
+// 晋升置信度门槛保持默认 0.95：用后验证回写（usage-feedback）会在任务间
+// 把 driver 上报的引用效果累计为经验置信度，真正常被复用且有效的经验
+// 会自然跨过 0.95；无需（也不应）调低阈值——调低会让所有经验都晋升。
+baseEnv.NEWIDE_B_SKILL_AUTO_APPROVE ??= '1';
 // Driver timeout must not undercut the run budget, or the agent is silently
 // killed early and the arm comparison becomes a timeout comparison.
 if (unlimitedRunTimeout) {
@@ -227,9 +228,14 @@ baseEnv.ACP_DENY_PATH_SUBSTRINGS_JSON ??= JSON.stringify([
   'dist-packages',
   'miniconda',
   'anaconda',
+  '/usr/local/aegis',
+  'PythonLoader/third_party',
 ]);
 baseEnv.ACP_PROCESS_SANDBOX ??= baseEnv.NEWIDE_EVAL_FS_JAIL;
 baseEnv.ACP_PROCESS_SANDBOX_HIDE_PYTHON_PACKAGES ??= '1';
+// A process-level tmpfs HOME intentionally cannot reload a session created by
+// an earlier driver process. B memory remains external and is still enabled.
+baseEnv.NEWIDE_EPHEMERAL_ACP_SESSIONS ??= baseEnv.NEWIDE_EVAL_FS_JAIL;
 baseEnv.ACP_PROCESS_SANDBOX_RO_PATHS_JSON ??= JSON.stringify([
   '.claude/settings.json',
   '.git/config',
@@ -240,10 +246,42 @@ if (baseEnv.NEWIDE_EVAL_FS_JAIL_BWRAP) {
 if (baseEnv.NEWIDE_EVAL_FS_JAIL_NPM_CACHE) {
   baseEnv.ACP_PROCESS_SANDBOX_NPM_CACHE ??= baseEnv.NEWIDE_EVAL_FS_JAIL_NPM_CACHE;
 }
+const sandboxExtraRoBinds = new Set(
+  parseJsonStringArray(
+    baseEnv.ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON,
+    'ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON',
+  ),
+);
 if (baseEnv.NEWIDE_EVAL_FS_JAIL_EXTRA_RO_BINDS) {
-  baseEnv.ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON ??= JSON.stringify(
-    baseEnv.NEWIDE_EVAL_FS_JAIL_EXTRA_RO_BINDS.split(path.delimiter).filter(Boolean),
+  for (const bind of baseEnv.NEWIDE_EVAL_FS_JAIL_EXTRA_RO_BINDS.split(path.delimiter)) {
+    if (bind) sandboxExtraRoBinds.add(bind);
+  }
+}
+if (baseEnv.NEWIDE_EVAL_FS_JAIL === '1') {
+  // `npx -y` cannot bootstrap claude-agent-acp after HOME/cache isolation and
+  // DNS default-deny are enabled. Execute the dependency already installed in
+  // the ACP runner and expose only its node_modules tree read-only.
+  const runnerNodeModules = path.join(String(baseEnv.ACP_DRIVER_RUNNER_DIR), 'node_modules');
+  const claudeAcpEntry = path.join(
+    runnerNodeModules,
+    '@agentclientprotocol',
+    'claude-agent-acp',
+    'dist',
+    'index.js',
   );
+  if (!existsSync(claudeAcpEntry)) {
+    throw new Error(
+      `Offline ACP adapter entrypoint missing: ${claudeAcpEntry}. Run pnpm install in ${String(baseEnv.ACP_DRIVER_RUNNER_DIR)}.`,
+    );
+  }
+  sandboxExtraRoBinds.add(runnerNodeModules);
+  baseEnv.CLAUDE_CLI_COMMAND ??= process.execPath;
+  baseEnv.CLAUDE_CLI_ARGS ??= `${claudeAcpEntry} acp`;
+}
+if (sandboxExtraRoBinds.size > 0) {
+  baseEnv.ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON = JSON.stringify([
+    ...sandboxExtraRoBinds,
+  ]);
 }
 
 log(`experiment root: ${experimentRoot}`);
@@ -256,6 +294,16 @@ log(
 log(`ACP_DRIVER_TIMEOUT_MS: ${baseEnv.ACP_DRIVER_TIMEOUT_MS}`);
 log(`NEWIDE_SWE_EVO_BLOCK_INTERNET: ${baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET}`);
 log(`NEWIDE_SWE_EVO_PYTHON: ${process.env.NEWIDE_SWE_EVO_PYTHON?.trim() || 'python (default)'}`);
+log(
+  `NEWIDE_B_EMBEDDING_PROVIDER: ${baseEnv.NEWIDE_B_EMBEDDING_PROVIDER ?? 'hash'}`,
+);
+log(
+  `NEWIDE_B_EMBEDDING_DIMENSIONS: ${baseEnv.NEWIDE_B_EMBEDDING_DIMENSIONS ?? '32'}`,
+);
+const harnessTimeoutEnv = process.env.NEWIDE_SWE_EVO_HARNESS_TIMEOUT?.trim();
+log(
+  `NEWIDE_SWE_EVO_HARNESS_TIMEOUT: ${harnessTimeoutEnv && harnessTimeoutEnv.length > 0 ? harnessTimeoutEnv : 'default 1800; dask__dask_2024.1.0_2024.1.1 -> 10800'}`,
+);
 log(`NEWIDE_EVAL_FS_JAIL: ${baseEnv.NEWIDE_EVAL_FS_JAIL}`);
 const permissionBuildPath = path.join(
   String(baseEnv.ACP_DRIVER_RUNNER_DIR),
@@ -267,11 +315,25 @@ const permissionBuildPath = path.join(
 const permissionBuildSupportsOfflineBlock =
   existsSync(permissionBuildPath) &&
   readFileSync(permissionBuildPath, 'utf-8').includes('ACP_DENY_NETWORK_TOOLS');
+const permissionBuildBlocksPackageIndex =
+  existsSync(permissionBuildPath) &&
+  /pip3\?|PACKAGE_INDEX_FETCH_RE|SCRIPT_NETWORK_RE/.test(
+    readFileSync(permissionBuildPath, 'utf-8'),
+  );
 if (baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET === '1' && !permissionBuildSupportsOfflineBlock) {
   throw new Error(
     [
       'Offline evaluation requested (NEWIDE_SWE_EVO_BLOCK_INTERNET=1) but the ACP driver build',
       `at ${permissionBuildPath} does not enforce the internet block.`,
+      'Rebuild acp-client-prototype (pnpm build) or set NEWIDE_SWE_EVO_BLOCK_INTERNET=0 (debug only).',
+    ].join(' '),
+  );
+}
+if (baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET === '1' && !permissionBuildBlocksPackageIndex) {
+  throw new Error(
+    [
+      'Offline evaluation requested (NEWIDE_SWE_EVO_BLOCK_INTERNET=1) but the ACP driver build',
+      `at ${permissionBuildPath} does not deny pip/package-index fetches.`,
       'Rebuild acp-client-prototype (pnpm build) or set NEWIDE_SWE_EVO_BLOCK_INTERNET=0 (debug only).',
     ].join(' '),
   );
@@ -318,11 +380,55 @@ if (baseEnv.NEWIDE_EVAL_FS_JAIL === '1') {
     );
   }
   log(`eval FS jail bwrap: ${bwrapPath}`);
+  const jailBuild = existsSync(jailBuildPath) ? readFileSync(jailBuildPath, 'utf-8') : '';
+  const dnsBlockBuildPath = path.join(
+    String(baseEnv.ACP_DRIVER_RUNNER_DIR),
+    'dist',
+    'src',
+    'security',
+    'package-index-block.js',
+  );
+  const dnsBlockBuild = existsSync(dnsBlockBuildPath)
+    ? readFileSync(dnsBlockBuildPath, 'utf-8')
+    : '';
+  if (baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET === '1' && !jailBuild.includes('PIP_NO_INDEX')) {
+    throw new Error(
+      [
+        'Offline evaluation requested (NEWIDE_SWE_EVO_BLOCK_INTERNET=1) but the ACP FS jail build',
+        `at ${jailBuildPath} does not force pip offline.`,
+        'Rebuild acp-client-prototype (pnpm build) or set NEWIDE_SWE_EVO_BLOCK_INTERNET=0 (debug only).',
+      ].join(' '),
+    );
+  }
+  if (
+    baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET === '1' &&
+    (!jailBuild.includes('writeOfflineDnsFiles') || !dnsBlockBuild.includes('hosts: files'))
+  ) {
+    throw new Error(
+      [
+        'Offline evaluation requested (NEWIDE_SWE_EVO_BLOCK_INTERNET=1) but the ACP FS jail build',
+        `at ${jailBuildPath} does not default-deny DNS.`,
+        'Rebuild acp-client-prototype (pnpm build) or set NEWIDE_SWE_EVO_BLOCK_INTERNET=0 (debug only).',
+      ].join(' '),
+    );
+  }
+  if (
+    baseEnv.ACP_PROCESS_SANDBOX_HIDE_PYTHON_PACKAGES !== '0' &&
+    (!jailBuild.includes('listHostOracleHideDirs') || !jailBuild.includes('pushUsrMergeOrRoBind'))
+  ) {
+    throw new Error(
+      [
+        'Eval FS jail requested but the ACP driver build',
+        `at ${jailBuildPath} does not hide usr-merge /lib package aliases or host oracle trees.`,
+        'Rebuild acp-client-prototype (pnpm build) or set NEWIDE_EVAL_FS_JAIL=0 (debug only).',
+      ].join(' '),
+    );
+  }
 }
 const armReports: Array<{
   ablation: MemoryAblation;
   state_root: string;
-  database_schema: string;
+  pglite_data_dir: string;
   total_count: number;
   scored_count: number;
   resolved_count: number;
@@ -335,21 +441,19 @@ const armReports: Array<{
 for (const ablation of ablations) {
   const armDir = path.join(experimentRoot, ablation);
   await fs.mkdir(armDir, { recursive: true });
-  const dbUrl = resolveAblationDatabaseUrl(databaseUrlTemplate, ablation);
   const isolation = await prepareAblationArmIsolation({
     experiment_root: experimentRoot,
     arm: ablation,
-    database_url: dbUrl,
   });
   await fs.mkdir(isolation.state_root, { recursive: true });
   log('');
   log(`=== arm ${ablation} ===`);
   log(`state root: ${isolation.state_root}`);
-  log(`database schema: ${isolation.database_schema}`);
+  log(`pglite data dir: ${isolation.pglite_data_dir}`);
 
-  const backend = await startBackend(ablation, {
+  const backendEnv: NodeJS.ProcessEnv = {
     ...baseEnv,
-    NEWIDE_B_DATABASE_URL: isolation.database_url,
+    NEWIDE_B_PGLITE_DATA_DIR: isolation.pglite_data_dir,
     NEWIDE_B_EMBEDDING_PROVIDER: baseEnv.NEWIDE_B_EMBEDDING_PROVIDER ?? 'hash',
     NEWIDE_B_EMBEDDING_DIMENSIONS: baseEnv.NEWIDE_B_EMBEDDING_DIMENSIONS ?? '32',
     NEWIDE_STATE_ROOT: isolation.state_root,
@@ -364,7 +468,10 @@ for (const ablation of ablations) {
             baseEnv.NEWIDE_PRIMARY_AGENT_ID ?? 'role_fullstack_engineer',
         }
       : {}),
-  });
+  };
+  // 臂隔离靠每臂独立的数据目录：外部 Postgres 不参与，避免臂之间共用同一台服务器。
+  delete backendEnv.NEWIDE_B_DATABASE_URL;
+  const backend = await startBackend(ablation, backendEnv);
 
   const rows: InstanceRow[] = [];
   try {
@@ -395,7 +502,7 @@ for (const ablation of ablations) {
   const armSummary = {
     ablation,
     state_root: isolation.state_root,
-    database_schema: isolation.database_schema,
+    pglite_data_dir: isolation.pglite_data_dir,
     total_count: rows.length,
     scored_count: rows.filter((row) => row.harness_scored === true).length,
     resolved_count: rows.filter((row) => row.resolved === true).length,
@@ -435,6 +542,10 @@ const summary = {
   ablations: [...new Set([...ablations, ...mergedArms.map((arm) => arm.ablation)])],
   run_mode: runMode,
   model_name: modelName,
+  b_embedding: {
+    provider: baseEnv.NEWIDE_B_EMBEDDING_PROVIDER ?? 'hash',
+    dimensions: Number(baseEnv.NEWIDE_B_EMBEDDING_DIMENSIONS ?? '32'),
+  },
   run_harness: runHarness,
   harness_dry_run: harnessDryRun,
   skip_eval: skipEval,
@@ -587,6 +698,12 @@ async function runOneInstance(input: {
     }
 
     try {
+      const harnessTimeoutSeconds = resolveHarnessTimeoutSeconds(instance.instance_id);
+      if (harnessTimeoutSeconds) {
+        log(
+          `  harness timeout override ${instance.instance_id}: ${String(harnessTimeoutSeconds)}s`,
+        );
+      }
       const evalResult = await runEvalInstance({
         instanceId: instance.instance_id,
         predictionMode: 'real',
@@ -602,6 +719,7 @@ async function runOneInstance(input: {
         keepWorktree: true,
         runSweEvoHarness: runHarness || harnessDryRun,
         harnessDryRun,
+        ...(harnessTimeoutSeconds ? { harnessTimeoutSeconds } : {}),
         ...(baseEnv.NEWIDE_SWE_EVO_ROOT ? { sweEvoRoot: baseEnv.NEWIDE_SWE_EVO_ROOT } : {}),
       });
       row.eval_run_dir = evalResult.runDir;
@@ -687,6 +805,20 @@ function buildEvalClaudeSettings(): Record<string, unknown> {
         'Bash(gh *)',
         'Bash(Invoke-WebRequest *)',
         'Bash(iwr *)',
+        'Bash(pip *)',
+        'Bash(pip3 *)',
+        'Bash(python -m pip *)',
+        'Bash(python3 -m pip *)',
+        'Bash(python3 -mpip *)',
+        'Bash(python -mpip *)',
+        'Bash(python3.9 -m pip *)',
+        'Bash(python3.10 -m pip *)',
+        'Bash(python3.11 -m pip *)',
+        'Bash(python3.12 -m pip *)',
+        'Bash(uv pip *)',
+        'Bash(uv add *)',
+        'Bash(poetry add *)',
+        'Bash(conda *)',
       ],
     };
   }
@@ -994,11 +1126,11 @@ function parseAblations(raw: string): MemoryAblation[] {
     .split(',')
     .map((part) => part.trim())
     .filter(Boolean);
-  const allowed: MemoryAblation[] = ['B0', 'B1', 'B2', 'B3'];
+  const allowed: MemoryAblation[] = ['B0', 'B1', 'B2', 'B3', 'B4'];
   const out: MemoryAblation[] = [];
   for (const part of parts) {
     if (!allowed.includes(part as MemoryAblation)) {
-      throw new Error(`Invalid ablation "${part}". Expected comma-separated B0|B1|B2|B3.`);
+      throw new Error(`Invalid ablation "${part}". Expected comma-separated B0|B1|B2|B3|B4.`);
     }
     if (!out.includes(part as MemoryAblation)) out.push(part as MemoryAblation);
   }
@@ -1016,7 +1148,7 @@ async function loadMergedArmReports(
   localArms: Array<{
     ablation: MemoryAblation;
     state_root: string;
-    database_schema: string;
+    pglite_data_dir: string;
     scored_count: number;
     resolved_count: number;
     applied_count: number;
@@ -1025,7 +1157,7 @@ async function loadMergedArmReports(
   }>,
 ): Promise<typeof localArms> {
   const byAblation = new Map(localArms.map((arm) => [arm.ablation, arm]));
-  for (const ablation of ['B0', 'B1', 'B2', 'B3'] as MemoryAblation[]) {
+  for (const ablation of ['B0', 'B1', 'B2', 'B3', 'B4'] as MemoryAblation[]) {
     if (byAblation.has(ablation)) continue;
     const candidate = path.join(root, ablation, 'arm-summary.json');
     const parsed = await readJsonIfExists(candidate);
@@ -1072,19 +1204,28 @@ function loadEnvFile(filePath: string): NodeJS.ProcessEnv {
   );
 }
 
+function parseJsonStringArray(raw: string | undefined, name: string): string[] {
+  if (!raw?.trim()) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new Error(
+      `${name} must be a JSON string array: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (!Array.isArray(parsed) || parsed.some((value) => typeof value !== 'string')) {
+    throw new Error(`${name} must be a JSON string array`);
+  }
+  return parsed;
+}
+
 async function readJsonIfExists(filePath: string): Promise<unknown> {
   try {
     return JSON.parse(await fs.readFile(filePath, 'utf-8'));
   } catch {
     return undefined;
   }
-}
-
-function resolveAblationDatabaseUrl(template: string, ablation: MemoryAblation): string {
-  if (!template.includes('{ablation}')) {
-    throw new Error('NEWIDE_ABLATION_DATABASE_URL_TEMPLATE must contain {ablation}');
-  }
-  return template.replaceAll('{ablation}', ablation.toLowerCase());
 }
 
 function readPositiveInt(raw: string | undefined, fallback: number): number {
