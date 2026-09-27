@@ -262,6 +262,9 @@ export interface RunSnapshot {
      * `TaskSnapshot.council.result` 同形。`quality` 仅审计用，不是完成判定依据。
      */
     result?: {
+      /** 与 CouncilOutcome 同名字段同义（见 ./council）。 */
+      role_failure_count?: number;
+      fallback_used?: boolean;
       quality: 'verified' | 'best_effort';
       final_artifact_ref: string;
       final_artifact_sha256: string;
@@ -312,7 +315,7 @@ export interface RunCreateParams {
   project_id?: string;
   client_task_id?: string;
   title?: string;
-  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
 }
 
 export interface RunCreateResult {

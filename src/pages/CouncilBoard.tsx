@@ -1361,6 +1361,29 @@ function ImplementationBlock({
   );
 }
 
+/**
+ * 合议的降级标记。后端在告警里也写了同样的事，但混在一长串文字里不显眼；
+ * 这两个字段是结构化的，单独做成徽标，一眼就能看出这次结果有没有打折扣。
+ */
+function DegradationBadges({
+  roleFailureCount,
+  fallbackUsed,
+}: {
+  roleFailureCount: number;
+  fallbackUsed: boolean;
+}) {
+  return (
+    <>
+      {fallbackUsed && (
+        <span title="综合席位不可用，结果取自现有提案中最好的一份">
+          <Badge variant="human">综合回退</Badge>
+        </span>
+      )}
+      {roleFailureCount > 0 && <Badge variant="danger">{roleFailureCount} 次角色失败</Badge>}
+    </>
+  );
+}
+
 function OutcomeBlock({ outcome }: { outcome: CouncilOutcome }) {
   const badge = badgeOf(OUTCOME_BADGE, outcome.status) ?? {
     label: outcome.status,
@@ -1377,6 +1400,10 @@ function OutcomeBlock({ outcome }: { outcome: CouncilOutcome }) {
             质量 {labelOf(QUALITY_LABEL, outcome.quality)}{' '}
             <span className="font-mono text-code text-fg-faint">{outcome.quality}</span>
           </span>
+          <DegradationBadges
+            roleFailureCount={outcome.role_failure_count ?? 0}
+            fallbackUsed={outcome.fallback_used === true}
+          />
         </div>
         {outcome.decision_summary ? (
           <p className="mt-2 text-body text-fg-secondary">{outcome.decision_summary}</p>
@@ -1512,6 +1539,10 @@ function ResultBlock({
               质量 {labelOf(QUALITY_LABEL, result.quality)}{' '}
               <span className="font-mono text-code text-fg-faint">{result.quality}</span>
             </span>
+            <DegradationBadges
+              roleFailureCount={result.roleFailureCount}
+              fallbackUsed={result.fallbackUsed}
+            />
           </div>
         )}
         <ArtifactRefs

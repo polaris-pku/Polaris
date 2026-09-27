@@ -67,6 +67,10 @@ export type CouncilOutcomeStatus = 'completed' | 'needs_human' | 'failed';
 
 /** Stable Council result envelope exposed by Run and Task snapshots. */
 export interface CouncilOutcome {
+  /** 中途失败的席位数（提案 / 评审 / 综合失败，加上 plan_first 实施的失败重试）。旧后端不给。 */
+  role_failure_count?: number;
+  /** 综合席位不可用、退回到最佳提案时为 true。旧后端不给。 */
+  fallback_used?: boolean;
   status: CouncilOutcomeStatus;
   participant_role_ids: string[];
   selected_artifact_refs: ArtifactId[];
