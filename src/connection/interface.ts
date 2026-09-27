@@ -31,6 +31,7 @@ export interface SessionRecord {
 
 export interface ConnectionEvent {
   type:
+    | "user_message_chunk"
     | "agent_message_chunk"
     | "agent_thought_chunk"
     | "tool_call"
@@ -40,6 +41,7 @@ export interface ConnectionEvent {
     | "current_mode_update"
     | "config_option_update"
     | "session_info_update"
+    | "usage_update"
     | "permission_request"
     | "disconnect"
     | "stderr";
@@ -68,6 +70,11 @@ export interface AgentConnection {
   }): Promise<InitializeResult>;
   authenticate(methodId: string, authMethod: any): Promise<void>;
   createSession(cwd: string, mcpServers?: McpServerConfig[]): Promise<SessionRecord>;
+  loadSession(
+    sessionId: string,
+    cwd: string,
+    mcpServers?: McpServerConfig[]
+  ): Promise<SessionRecord>;
   sendPrompt(sessionId: string, message: string): Promise<TurnController>;
   cancel(sessionId: string): Promise<void>;
 
