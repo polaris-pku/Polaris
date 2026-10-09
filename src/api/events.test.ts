@@ -8,18 +8,20 @@
  * 另一半钉的是「快照是权威，事件只是增量」：实时流跳号 = 真的丢了事件，
  * 增量补不回来，必须重新拉一次 `run.getSnapshot`；而且一串乱序只该换来一次重拉。
  */
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   getWatchedRunIds,
   onRunEvent,
   onRunResync,
+  onRunSyncError,
+  RUN_OBSERVATION_INTERVAL_MS,
   resetEventChannel,
   unwatchRun,
   watchRun,
 } from './events';
 import { resetTransport } from './transport';
-import type { RunEvent } from './types/rpc';
+import type { RunEvent, RunSnapshot } from './types/rpc';
 
 const READY_STATUS = {
   state: 'ready' as const,
@@ -52,7 +54,7 @@ function evt(runId: string, sequence: number): RunEvent {
 }
 
 /** run.getSnapshot 的最小可信返回（只要 run_id 对得上，本用例不看内容）。 */
-function snapshotOf(runId: string) {
+function snapshotOf(runId: string): RunSnapshot {
   return {
     schema_version: 'v0',
     run_id: runId,
@@ -73,10 +75,16 @@ function snapshotOf(runId: string) {
  *
  * `replay` 模拟后端 `run.subscribe` 的历史重放（registry 会把该 run 的全部事件按实时编号推一遍）。
  */
-function installFakeBackend(options: { replay?: Record<string, RunEvent[]> } = {}) {
+function installFakeBackend(
+  options: {
+    replay?: Record<string, RunEvent[]>;
+    snapshots?: Record<string, RunSnapshot>;
+  } = {},
+) {
   const rpc: Array<{ method: string; params: unknown }> = [];
   const notificationHandlers = new Set<(notification: unknown) => void>();
   const statusHandlers = new Set<(status: unknown) => void>();
+  const failures = new Map<string, number>();
 
   const emit = (event: RunEvent) => {
     notificationHandlers.forEach((handler) =>
@@ -87,13 +95,46 @@ function installFakeBackend(options: { replay?: Record<string, RunEvent[]> } = {
   const backend = {
     call: vi.fn(async (method: string, params: unknown) => {
       rpc.push({ method, params });
+      const code = failures.get(method);
+      if (code !== undefined) {
+        failures.delete(method);
+        return { ok: false as const, code, error: 'test backend error' };
+      }
       if (method === 'run.subscribe') {
-        const runId = (params as { run_id: string }).run_id;
-        for (const event of options.replay?.[runId] ?? []) emit(event);
+        const { run_id: runId, after_sequence } = params as {
+          run_id: string;
+          after_sequence?: number;
+        };
+        for (const event of options.replay?.[runId] ?? []) {
+          if (after_sequence === undefined || event.sequence > after_sequence) emit(event);
+        }
         return { ok: true as const, result: { subscribed: true } };
       }
       if (method === 'run.getSnapshot') {
-        return { ok: true as const, result: snapshotOf((params as { run_id: string }).run_id) };
+        const runId = (params as { run_id: string }).run_id;
+        return {
+          ok: true as const,
+          result: options.snapshots?.[runId] ?? {
+            ...snapshotOf(runId),
+            timeline: options.replay?.[runId] ?? [],
+          },
+        };
+      }
+      if (method === 'run.getEvents') {
+        const { run_id: runId, after_sequence = 0 } = params as {
+          run_id: string;
+          after_sequence?: number;
+        };
+        const events = options.replay?.[runId] ?? [];
+        return {
+          ok: true as const,
+          result: {
+            events: events.filter((event) => event.sequence > after_sequence),
+            after_sequence,
+            latest_sequence: Math.max(0, ...events.map((event) => event.sequence)),
+            has_more: false,
+          },
+        };
       }
       return { ok: true as const, result: {} };
     }),
@@ -117,7 +158,9 @@ function installFakeBackend(options: { replay?: Record<string, RunEvent[]> } = {
   vi.stubGlobal('window', { desktop: { isDesktop: true, platform: 'linux', backend } });
 
   return {
+    backend,
     emit,
+    failNext: (method: string, code: number) => failures.set(method, code),
     /** 推一条后端进程状态（重连 = 掉线之后又 ready）。 */
     setStatus: (state: 'ready' | 'starting' | 'stopped' | 'error') => {
       statusHandlers.forEach((handler) => handler({ ...READY_STATUS, state }));
@@ -125,6 +168,12 @@ function installFakeBackend(options: { replay?: Record<string, RunEvent[]> } = {
     calls: (method: string) => rpc.filter((c) => c.method === method),
   };
 }
+
+afterEach(() => {
+  resetEventChannel();
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+});
 
 describe('watchRun', () => {
   beforeEach(() => {
@@ -166,7 +215,10 @@ describe('watchRun', () => {
         if (method === 'run.subscribe' && rpc.filter((m) => m === 'run.subscribe').length === 1) {
           return { ok: false as const, error: '后端还没起来' };
         }
-        return { ok: true as const, result: {} };
+        return {
+          ok: true as const,
+          result: method === 'run.getSnapshot' ? snapshotOf('run-1') : {},
+        };
       }),
       getStatus: vi.fn(async () => READY_STATUS),
       configure: vi.fn(async () => READY_STATUS),
@@ -210,7 +262,157 @@ describe('断号与重连的重同步', () => {
     resetEventChannel();
   });
 
-  it('顺序到达的事件一次快照都不拉', async () => {
+  describe('运行观测快照', () => {
+    beforeEach(() => {
+      vi.unstubAllGlobals();
+      resetTransport();
+      resetEventChannel();
+    });
+
+    it('没有推送事件时仍刷新 activity、usage 和精确游标，终态后停止轮询', async () => {
+      vi.useFakeTimers();
+      const snapshots = { 'run-1': snapshotOf('run-1') };
+      const fake = installFakeBackend({ snapshots });
+      const observed: RunSnapshot[] = [];
+      const off = onRunResync(({ snapshot }) => observed.push(snapshot));
+      await watchRun('run-1');
+
+      snapshots['run-1'] = {
+        ...snapshots['run-1'],
+        current: {
+          stage: 'executing',
+          active_node_code: 'N8',
+          cursor: 'execute_agent',
+          invocation_id: 'invoke-1',
+        },
+        activity: {
+          subject: 'agent',
+          agents: [
+            {
+              role_id: 'role_ts_engineer',
+              state: 'thinking',
+              since: '2026-01-01T00:00:00Z',
+              seq: 1,
+              stale: false,
+            },
+          ],
+        },
+        usage: {
+          context: {
+            metric: 'context_tokens_used',
+            context_tokens_used: 42,
+            complete: true,
+            sessions: [],
+          },
+        },
+      };
+      await vi.advanceTimersByTimeAsync(RUN_OBSERVATION_INTERVAL_MS);
+      expect(observed[observed.length - 1]).toEqual(snapshots['run-1']);
+      expect(fake.calls('run.getSnapshot')).toHaveLength(2);
+
+      snapshots['run-1'] = { ...snapshotOf('run-1'), status: 'completed' };
+      await vi.advanceTimersByTimeAsync(RUN_OBSERVATION_INTERVAL_MS * 3);
+      const settledCalls = fake.calls('run.getSnapshot').length;
+      await vi.advanceTimersByTimeAsync(RUN_OBSERVATION_INTERVAL_MS * 5);
+      expect(fake.calls('run.getSnapshot')).toHaveLength(settledCalls);
+      expect(observed[observed.length - 1]?.activity).toBeUndefined();
+      expect(observed[observed.length - 1]?.usage).toBeUndefined();
+      off();
+    });
+
+    it('快照中的并列序号不会被去重，后续重复推送按 event_id 去重', async () => {
+      const first = evt('run-1', 1);
+      const second = { ...first, event_id: 'snapshot-only', type: 'task.created' };
+      const snapshots = { 'run-1': { ...snapshotOf('run-1'), timeline: [second, first] } };
+      const fake = installFakeBackend({ snapshots });
+      const received: string[] = [];
+      const canonical: string[][] = [];
+      const offEvent = onRunEvent((event) => received.push(event.event_id));
+      const offSnapshot = onRunResync(({ snapshot }) => {
+        canonical.push(snapshot.timeline.map((event) => event.event_id));
+      });
+
+      await watchRun('run-1');
+      fake.emit(first);
+      fake.emit(second);
+      expect(received).toEqual([second.event_id, first.event_id]);
+      expect(canonical).toEqual([[second.event_id, first.event_id]]);
+      offEvent();
+      offSnapshot();
+    });
+
+    it('退订期间仍在途的快照不再回写，也不会重新开始轮询', async () => {
+      vi.useFakeTimers();
+      const fake = installFakeBackend();
+      const originalCall = fake.backend.call.getMockImplementation()!;
+      let finish: ((result: { ok: true; result: RunSnapshot }) => void) | undefined;
+      let started: (() => void) | undefined;
+      const pendingSnapshot = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      fake.backend.call.mockImplementation((method, params) =>
+        method === 'run.getSnapshot'
+          ? new Promise((resolve) => {
+              finish = resolve;
+              started?.();
+            })
+          : originalCall(method, params),
+      );
+      const snapshots: RunSnapshot[] = [];
+      const off = onRunResync(({ snapshot }) => snapshots.push(snapshot));
+      const watching = watchRun('run-1');
+      await pendingSnapshot;
+      await unwatchRun('run-1');
+      finish?.({ ok: true, result: snapshotOf('run-1') });
+      await watching;
+      await vi.advanceTimersByTimeAsync(RUN_OBSERVATION_INTERVAL_MS * 3);
+      expect(snapshots).toEqual([]);
+      expect(getWatchedRunIds()).toEqual([]);
+      off();
+    });
+
+    it('旧后端缺少增量方法时快照仍可恢复，并明确报告版本限制', async () => {
+      vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const fake = installFakeBackend();
+      const errors: Array<string | null> = [];
+      const off = onRunSyncError(({ error }) => errors.push(error));
+      await watchRun('run-1');
+      fake.failNext('run.getEvents', -32601);
+      fake.failNext('run.subscribe', -32602);
+      fake.setStatus('stopped');
+      fake.setStatus('ready');
+      await vi.waitFor(() => expect(fake.calls('run.subscribe')).toHaveLength(3));
+      expect(fake.calls('run.subscribe')[1].params).toEqual({ run_id: 'run-1', after_sequence: 0 });
+      expect(fake.calls('run.subscribe')[2].params).toEqual({ run_id: 'run-1' });
+      await vi.waitFor(() => expect(errors[errors.length - 1]).toContain('后端版本不支持'));
+      off();
+    });
+
+    it('同步错误可见，找不到 run 时停止无效轮询但保留重连机会', async () => {
+      vi.useFakeTimers();
+      vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const fake = installFakeBackend();
+      const errors: Array<string | null> = [];
+      const off = onRunSyncError(({ error }) => errors.push(error));
+      fake.failNext('run.getSnapshot', -32004);
+      await watchRun('run-1');
+      expect(errors[errors.length - 1]).toContain('运行状态同步失败');
+      await vi.advanceTimersByTimeAsync(RUN_OBSERVATION_INTERVAL_MS * 5);
+      expect(fake.calls('run.getSnapshot')).toHaveLength(1);
+      expect(getWatchedRunIds()).toEqual(['run-1']);
+      fake.setStatus('error');
+      fake.setStatus('ready');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(errors[errors.length - 1]).toBeNull();
+      expect(fake.calls('run.subscribe').slice(-1)[0]?.params).toEqual({
+        run_id: 'run-1',
+        after_sequence: 0,
+      });
+      off();
+    });
+  });
+
+  it('顺序事件不会额外触发补拉，首次关注会读取快照', async () => {
     const fake = installFakeBackend();
     const received: number[] = [];
     const off = onRunEvent((event) => received.push(event.sequence));
@@ -221,7 +423,8 @@ describe('断号与重连的重同步', () => {
     fake.emit(evt('run-1', 3));
 
     expect(received).toEqual([1, 2, 3]);
-    expect(fake.calls('run.getSnapshot')).toHaveLength(0);
+    expect(fake.calls('run.getSnapshot')).toHaveLength(1);
+    expect(fake.calls('run.getEvents')).toHaveLength(0);
     off();
   });
 
@@ -236,11 +439,11 @@ describe('断号与重连的重同步', () => {
     fake.emit(evt('run-1', 2));
 
     expect(received).toEqual(['run-1-e1', 'run-1-e2']);
-    expect(fake.calls('run.getSnapshot')).toHaveLength(0);
+    expect(fake.calls('run.getSnapshot')).toHaveLength(1);
     off();
   });
 
-  it('跳号 → 重新拉一次权威快照，并靠重订阅把断掉的那条补回来', async () => {
+  it('跳号用 getEvents 补回缺失事件，再按快照水位重订阅', async () => {
     // 后端 registry 在（重）订阅时会把该 run 当时的全部事件按实时编号重放一遍。
     const replay: Record<string, RunEvent[]> = {
       'run-1': [evt('run-1', 1), evt('run-1', 2), evt('run-1', 3)],
@@ -256,36 +459,47 @@ describe('断号与重连的重同步', () => {
     await watchRun('run-1');
     // 首次订阅的重放：1/2/3 都到了。
     expect(received).toEqual([1, 2, 3]);
+    resynced.length = 0;
 
     // 后端接着产生了第 4、5 条，但第 4 条在推送途中丢了，第 5 条直接到 —— 这就是断号。
     replay['run-1'] = [1, 2, 3, 4, 5].map((sequence) => evt('run-1', sequence));
     fake.emit(evt('run-1', 5));
     await vi.waitFor(() => expect(resynced).toHaveLength(1));
 
-    expect(fake.calls('run.getSnapshot').map((c) => c.params)).toEqual([{ run_id: 'run-1' }]);
+    expect(fake.calls('run.getSnapshot').map((c) => c.params)).toEqual([
+      { run_id: 'run-1' },
+      { run_id: 'run-1' },
+    ]);
+    expect(fake.calls('run.getEvents').map((c) => c.params)).toEqual([
+      { run_id: 'run-1', after_sequence: 3 },
+    ]);
     expect(resynced).toEqual([{ run_id: 'run-1', reason: 'gap' }]);
     // 重订阅的重放把丢掉的第 4 条补了回来 —— 已经投递过的靠 event_id 去重挡住，不会重来一遍。
     // （到达顺序是 5 在前 4 在后，消费方按 sequence 排序，本就不依赖到达顺序。）
     await vi.waitFor(() => expect(received).toEqual([1, 2, 3, 5, 4]));
     expect(fake.calls('run.subscribe')).toHaveLength(2);
+    expect(fake.calls('run.subscribe')[1].params).toEqual({ run_id: 'run-1', after_sequence: 5 });
     offEvent();
     offResync();
   });
 
   it('一串乱序/跳号只换来一次重拉（不能每条事件拉一次）', async () => {
-    const fake = installFakeBackend();
+    const replay: Record<string, RunEvent[]> = {};
+    const fake = installFakeBackend({ replay });
     const off = onRunEvent(() => undefined);
 
     await watchRun('run-1');
+    replay['run-1'] = Array.from({ length: 12 }, (_, index) => evt('run-1', index + 1));
     fake.emit(evt('run-1', 1));
     fake.emit(evt('run-1', 5));
     fake.emit(evt('run-1', 9));
     fake.emit(evt('run-1', 3));
     fake.emit(evt('run-1', 12));
-    await vi.waitFor(() => expect(fake.calls('run.getSnapshot')).toHaveLength(1));
+    await vi.waitFor(() => expect(fake.calls('run.getSnapshot')).toHaveLength(2));
 
     // 断号期间的事件一条都不能丢：晚到的 3 也照常投递。
-    expect(fake.calls('run.getSnapshot')).toHaveLength(1);
+    expect(fake.calls('run.getSnapshot')).toHaveLength(2);
+    expect(fake.calls('run.getEvents')).toHaveLength(1);
     off();
   });
 
@@ -299,9 +513,11 @@ describe('断号与重连的重同步', () => {
     // 后端进程掉了又起来（切工作区 / 崩溃重启）：旧订阅注册在上一个进程里，已经作废。
     fake.setStatus('stopped');
     fake.setStatus('ready');
-    await vi.waitFor(() => expect(fake.calls('run.getSnapshot')).toHaveLength(2));
+    await vi.waitFor(() => expect(fake.calls('run.getSnapshot')).toHaveLength(4));
 
     expect(fake.calls('run.getSnapshot').map((c) => c.params)).toEqual([
+      { run_id: 'run-1' },
+      { run_id: 'run-2' },
       { run_id: 'run-1' },
       { run_id: 'run-2' },
     ]);
@@ -315,6 +531,6 @@ describe('断号与重连的重同步', () => {
     fake.setStatus('ready');
     fake.setStatus('ready');
 
-    expect(fake.calls('run.getSnapshot')).toHaveLength(0);
+    expect(fake.calls('run.getSnapshot')).toHaveLength(1);
   });
 });

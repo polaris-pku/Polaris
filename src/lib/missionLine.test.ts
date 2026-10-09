@@ -62,7 +62,86 @@ function live(over: Partial<LiveRunState> = {}): LiveRunState {
   };
 }
 
+function observedSnapshot(over: Partial<RunSnapshot> = {}): RunSnapshot {
+  return {
+    schema_version: 'v0',
+    run_id: 'run-1',
+    task_id: 'btask-1',
+    mode: 'single_agent',
+    status: 'running',
+    current: { stage: 'executing', active_node_code: 'N8', cursor: 'execute_agent' },
+    timeline: [],
+    agent_runs: [],
+    artifacts: [],
+    gates: [],
+    errors: [],
+    ...over,
+  };
+}
+
 describe('missionLineOf', () => {
+  it('活动快照优先于粗阶段，显示真实工具及其开始时间', () => {
+    const m = missionLineOf({
+      task: task({ contractRunId: 'run-1' }),
+      live: live({
+        snapshot: observedSnapshot({
+          activity: {
+            subject: 'agent',
+            agents: [
+              {
+                role_id: 'role_ts_engineer',
+                state: 'delegating',
+                since: '2026-01-01T00:00:00Z',
+                seq: 1,
+                stale: false,
+                tool_name: 'invoke_driver',
+                driver: {
+                  state: 'tool_running',
+                  tool_name: 'Edit',
+                  since: '2026-01-01T00:00:30Z',
+                  last_event_at: '2026-01-01T00:01:10Z',
+                  stale: false,
+                },
+              },
+            ],
+          },
+        }),
+      }),
+      now: NOW,
+    });
+    expect(m.headline).toBe('TypeScript 工程师 正在执行工具 · Edit · 42.0s');
+    expect(m.headline).not.toContain('invoke_driver');
+  });
+
+  it('没有活动块时使用精确 cursor，缺少调用起点不伪造耗时', () => {
+    const m = missionLineOf({
+      task: task({ contractRunId: 'run-1' }),
+      live: live({
+        snapshot: observedSnapshot({
+          current: {
+            stage: 'delivery',
+            active_node_code: 'N13',
+            cursor: 'gate',
+            invocation_id: 'invoke-1',
+          },
+        }),
+      }),
+      now: NOW,
+    });
+    expect(m.headline).toBe('正在检查交付条件');
+    expect(m.headline).not.toContain('0s');
+  });
+
+  it('观测错误不被冒充为执行失败，也不继续声称正在思考', () => {
+    const m = missionLineOf({
+      task: task({ contractRunId: 'run-1' }),
+      live: live({ syncError: '后端连接中断' }),
+      now: NOW,
+    });
+    expect(m.state).toBe('running');
+    expect(m.headline).toContain('执行状态待同步');
+    expect(m.sub).toBe('后端连接中断');
+  });
   it('idle：准备执行「标题」+ 需求首行', () => {
     const m = missionLineOf({ task: task(), live: undefined, now: NOW });
     expect(m.state).toBe('idle');

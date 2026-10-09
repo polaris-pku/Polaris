@@ -61,6 +61,7 @@ const taskSchema = z
     spec: z.string().min(1),
     completion_criteria: z.array(z.string().min(1)),
     affected_paths: z.array(z.string()),
+    workspace_path: z.string().min(1).optional(),
     budget: z
       .object({
         max_tokens: z.number().int().positive().optional(),

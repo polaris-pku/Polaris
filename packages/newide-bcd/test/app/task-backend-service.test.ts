@@ -14,6 +14,7 @@ import { InMemoryRunRegistry, type AppRunEvent } from '../../src/app/run-registr
 import { FileRunRequestStore } from '../../src/app/run-request-store';
 import { FileRunAuditWriter } from '../../src/app/run-audit-writer';
 import { FileRunTerminalOutputWriter } from '../../src/app/run-terminal-output-writer';
+import { NoopDriverStreamAuditWriter } from '../../src/app/driver-stream-audit-writer';
 import {
   TaskExecutionLoop,
   TaskProcessor,
@@ -261,7 +262,7 @@ describe('NewideBackendService Task-first view', () => {
       undefined, // mailboxRecovery
       undefined, // closeRuntime
       undefined, // bMemoryService
-      undefined, // driverStreamAuditWriter
+      new NoopDriverStreamAuditWriter(), // driverStreamAuditWriter
       loop,
       undefined, // systemStatusService
       undefined, // mailboxDeliveryWorker
@@ -393,10 +394,7 @@ function recordFakeUsage(): Promise<void> {
  * `subscribeTask` 先注册监听器再读快照，两者之间没有窗口：完成事件要么进回调，要么
  * 已经反映在返回的快照里。所以这里既不轮询也不赌时序。
  */
-async function waitForTerminalTask(
-  service: NewideBackendService,
-  taskId: string,
-): Promise<void> {
+async function waitForTerminalTask(service: NewideBackendService, taskId: string): Promise<void> {
   let resolveTerminal!: () => void;
   const terminal = new Promise<void>((resolve) => {
     resolveTerminal = resolve;

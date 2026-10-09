@@ -43,12 +43,7 @@ export interface BSkillPromotionRequest {
   requested_by: string;
 }
 
-export type BMemoryMaintenanceStatus =
-  | 'scheduled'
-  | 'running'
-  | 'completed'
-  | 'skipped'
-  | 'failed';
+export type BMemoryMaintenanceStatus = 'scheduled' | 'running' | 'completed' | 'skipped' | 'failed';
 
 export interface BMemoryMaintenanceEvidence {
   maintenance_ref: string;
@@ -371,11 +366,7 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
       const outcomes = await promoteExperiencesForAgent(
         input.role_id,
         (role_id) =>
-          createAgentMemoryScope(
-            this.options.repository,
-            this.options.bufferRepository,
-            role_id,
-          ),
+          createAgentMemoryScope(this.options.repository, this.options.bufferRepository, role_id),
         this.promoter,
         { confidenceThreshold: this.promotionConfidenceThreshold },
       );
@@ -510,9 +501,7 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
     return running;
   }
 
-  private async persist(
-    evidence: BMemoryMaintenanceEvidence,
-  ): Promise<BMemoryMaintenanceEvidence> {
+  private async persist(evidence: BMemoryMaintenanceEvidence): Promise<BMemoryMaintenanceEvidence> {
     const saved = await this.options.evidenceStore.save(evidence);
     return { ...evidence, evidence_uri: saved.uri };
   }
@@ -525,12 +514,21 @@ export class BMemoryMaintenanceRunner implements BMemoryMaintenancePort {
       const raw = JSON.parse(await fs.readFile(summaryPath, 'utf8')) as Record<string, unknown>;
       const taskId = typeof raw.task_id === 'string' ? raw.task_id : undefined;
       const driverUsage = preferDriverUsage(
-        isDriverStreamUsage(raw.driver_usage) ? raw.driver_usage : raw.token_usage,
+        isDriverStreamUsage(raw.driver_context_usage)
+          ? raw.driver_context_usage
+          : isDriverStreamUsage(raw.driver_usage)
+            ? raw.driver_usage
+            : raw.token_usage,
         taskId ? await projectTaskDriverUsage(runsRoot, taskId) : undefined,
       );
       let changed = false;
-      if (driverUsage && raw.driver_usage !== driverUsage) {
-        raw.driver_usage = driverUsage;
+      if (driverUsage && raw.driver_context_usage !== driverUsage) {
+        raw.driver_context_usage = driverUsage;
+        changed = true;
+      }
+      // 旧块名迁到新键：driver_context_usage 是「上下文占用」的正式口径名。
+      if (raw.driver_usage !== undefined) {
+        delete raw.driver_usage;
         changed = true;
       }
       if (isDriverStreamUsage(raw.token_usage)) {
@@ -567,7 +565,9 @@ export class FileBMemoryMaintenanceEvidenceStore implements BMemoryMaintenanceEv
 
   async get(maintenanceRef: string): Promise<BMemoryMaintenanceEvidence | undefined> {
     try {
-      return JSON.parse(await fs.readFile(this.filePath(maintenanceRef), 'utf8')) as BMemoryMaintenanceEvidence;
+      return JSON.parse(
+        await fs.readFile(this.filePath(maintenanceRef), 'utf8'),
+      ) as BMemoryMaintenanceEvidence;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
       throw error;

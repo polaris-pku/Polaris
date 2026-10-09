@@ -27,6 +27,12 @@ export interface AgentTaskRequest {
   run_id?: string;
   /** 本次执行的工作区（绝对路径）；Session 绑定键 (task, workspace, role) 之一 */
   workspace_path?: string;
+  /**
+   * 面向**观测**的 run：在飞状态点（`agent-activity`）按它归集。
+   *
+   * 调用方可把多个阶段执行归到同一个面板 run；缺省等于 `run_id`。
+   */
+  activity_run_id?: string;
   /** Driver 调用 ID，写入 AgentContextSnapshot.driver_calls 供溯源 */
   call_id?: string;
   /** 执行该任务的 Driver 标识；缺省为 "mock-driver" */

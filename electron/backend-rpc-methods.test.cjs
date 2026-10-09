@@ -5,15 +5,18 @@ const methods = require('./backend-rpc-methods.json');
 const expectedGroups = {
   system: 6,
   task: 8,
-  run: 7,
+  run: 10,
   memory: 34,
   mailbox: 4,
   artifact: 1,
 };
 
 test('RPC method manifest exposes the complete contract surface', () => {
-  assert.equal(methods.length, 60);
-  assert.equal(new Set(methods).size, 60);
+  assert.equal(methods.length, 63);
+  assert.equal(new Set(methods).size, 63);
+  for (const method of ['run.getUsage', 'run.getEvents', 'run.getPayload']) {
+    assert.ok(methods.includes(method));
+  }
   for (const [prefix, count] of Object.entries(expectedGroups)) {
     assert.equal(methods.filter((method) => method.startsWith(`${prefix}.`)).length, count);
   }

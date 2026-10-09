@@ -1,0 +1,312 @@
+/**
+ * DriverStreamEvent → 领域事件的投影：决定 driver 事件流里哪些进事件模型、带什么字段。
+ *
+ * 契约要点：
+ * - 11 类 session/update 与 stderr / disconnect 全部有落点，未知类型也进模型
+ *   （`driver.*` 原样保留，其余收进 `driver.session_update_unknown`），不再静默丢弃。
+ * - 小字段内联；序列化后超过 PAYLOAD_INLINE_LIMIT_BYTES 的大字段（工具 rawInput /
+ *   rawOutput / content、长 stderr、大 chunk）不内联，由 `payload_ref` 指回
+ *   driver-stream.jsonl 的原始行（相对 run 目录）。引用优先用 run 级单调序号
+ *   `driver-stream.jsonl#stream_sequence=<n>`——driver 自带的 `event.sequence`
+ *   每次 invoke 重置，多 invoke 下不唯一；老数据没有 stream_sequence 时退化为
+ *   `driver-stream.jsonl#sequence=<n>`。两个序号都没有时无法引用，大字段一律
+ *   内联——宁可胖，不可丢。
+ * - 信封字段 session_id / role_id / event_sequence / stream_sequence 统一放 payload 顶层。
+ */
+import { SCHEMA_VERSION, createId, type Event } from '../core';
+import type { DriverStreamEvent } from '../driver/contract';
+
+/** payload_ref 指回 driver-stream.jsonl 原始行的引用前缀（run 级唯一键，优先）。 */
+export const DRIVER_STREAM_SEQUENCE_REF_PREFIX = 'driver-stream.jsonl#stream_sequence=';
+/** payload_ref 的旧式引用前缀（driver 侧序号，多 invoke 下不唯一，仅为老数据兼容）。 */
+export const DRIVER_STREAM_REF_PREFIX = 'driver-stream.jsonl#sequence=';
+
+/** 载荷内联上限（JSON 序列化字节）。超限字段走 payload_ref，不进事件模型。 */
+export const PAYLOAD_INLINE_LIMIT_BYTES = 8 * 1024;
+
+/**
+ * 投影事件的两条去向。
+ *
+ * 两条通道的事件都会进进程内 registry 与 `audit.jsonl`（后者由
+ * `registry.subscribe` 无条件落盘）。区别只在于**是否同时进协调事件流**：
+ *
+ * - `coordination`：额外走 `TaskProcessor.recordRunEvent` → SQLite `events` 表。
+ *   持久快照的 `timeline` 因此带着 driver 状态，进程重启后仍读得到。
+ *   状态类——低频、是完整的转移、有状态价值。
+ * - `stream_only`：不进 SQLite，只留 `audit.jsonl` / `driver-stream.jsonl` 与进程内
+ *   registry。片段类——可合并、高频、体量大，逐条读出来不构成任何状态。
+ *
+ * 分界是**可合并性**，不是重要程度。
+ */
+export type DriverStreamChannel = 'coordination' | 'stream_only';
+
+/**
+ * 分流表 —— **唯一**一处决定 driver 投影事件去哪条通道。
+ *
+ * 为什么必须分：实测 `.newide/runs` 下 28 份 `driver-stream.jsonl` 共 41525 条，其中
+ * 片段类（3 个 chunk + stderr + tool_progress + 未知 session/update）占 **98.4% 的行 /
+ * 97.0% 的字节**（平均 ~1459 行 / ~1052 KB 每 run），而状态类全部加起来只有
+ * **663 行 / 903 KB（1.6% / 3.0%）**，平均 ~24 行 / ~32 KB 每 run。片段进 SQLite 是
+ * 纯损失：一次 council run 会多出约 1500 行事务与约 1 MB，而每行只是一条消息的一个
+ * 片段，单独看什么也不说明。
+ *
+ * 表覆盖投影器能**命名**的全部 20 个类型。漂移由
+ * `test/app/driver-stream-persistence.test.ts` 的全量枚举用例钉住（同一张表同时驱动
+ * 分类断言与真实 run 的事件注入）：新增一个投影分支而忘了在这里表态会红，表里出现
+ * 投影器产不出的陈旧类型也会红。表外的类型走 {@link DEFAULT_DRIVER_STREAM_CHANNEL}
+ * ——那是 driver 自己发的、投影器原样透传的 `driver.*` 名字（实测生产者：
+ * `driver.phase`、`driver.turn_cancel_requested`、`driver.turn_cancel_failed`、
+ * `driver.event_collection_failed`），按 driver 的命名惯例属于生命周期而非片段，
+ * 所以默认进协调事件流。
+ *
+ * 已知残余风险，写在这里以免下一个改的人以为它是安全的：**将来若出现一个高频的 `driver.*`
+ * 片段类型，默认值会让它灌进 SQLite**。处理方式是在这张表里显式表态为 `stream_only`。
+ */
+export const DRIVER_STREAM_CHANNELS: Readonly<Record<string, DriverStreamChannel>> = Object.freeze({
+  // ── turn / 会话生命周期：状态转移，低频 ──
+  'driver.turn_started': 'coordination',
+  'driver.turn_completed': 'coordination',
+  'driver.turn_failed': 'coordination',
+  'driver.interrupt_requested': 'coordination',
+  'driver.disconnected': 'coordination',
+  // ── 工具调用：started / completed / failed 是三个完整状态，progress 是它们的中间片段 ──
+  'driver.tool_started': 'coordination',
+  'driver.tool_completed': 'coordination',
+  'driver.tool_failed': 'coordination',
+  'driver.tool_progress': 'stream_only',
+  // ── 流式片段：一条消息被切成的若干片，可合并 ──
+  'driver.agent_message_chunk': 'stream_only',
+  'driver.agent_thought_chunk': 'stream_only',
+  'driver.user_message_chunk': 'stream_only',
+  'driver.stderr': 'stream_only',
+  // ── 会话状态：最后一次赋值即真相，低频 ──
+  'driver.plan_updated': 'coordination',
+  'driver.mode_changed': 'coordination',
+  'driver.available_commands_updated': 'coordination',
+  'driver.config_options_changed': 'coordination',
+  'driver.session_info_changed': 'coordination',
+  'driver.usage_updated': 'coordination',
+  // 协议侧未知 session/update 的兜底桶：名字本身就说明「不知道它是什么」，而它来自 ACP
+  // 的流式通道——按「不知道就别往 SQLite 写」处理，方向刻意选这一边。
+  'driver.session_update_unknown': 'stream_only',
+});
+
+const DEFAULT_DRIVER_STREAM_CHANNEL: DriverStreamChannel = 'coordination';
+
+/** 某个**已投影**的 driver 事件类型去哪条通道。未知类型按 §DRIVER_STREAM_CHANNELS 的说明。 */
+export function driverStreamChannel(eventType: string): DriverStreamChannel {
+  return DRIVER_STREAM_CHANNELS[eventType] ?? DEFAULT_DRIVER_STREAM_CHANNEL;
+}
+
+/**
+ * 这条**已投影**的事件类型是不是「可合并的流式片段」。
+ *
+ * **一条判据，三个消费方**（都读 `DRIVER_STREAM_CHANNELS` 这同一张表，任何一个消费方
+ * 都不该自己另判一遍——漂移的方向恰好最糟：只在一处生效时，片段要么灌进 SQLite、
+ * 要么灌进前端、要么灌进快照 timeline）：
+ *
+ * | 消费方 | 片段 | 状态类 |
+ * |---|---|---|
+ * | 协调事件流（SQLite 持久 timeline） | 不进（§7.4 P5） | 进 |
+ * | 推流通道（`run.event` / `task.subscribe`） | 不发（§7.6 决策 B，2026-10-03 拍板） | 发 |
+ * | 存活期内存（registry 的 `events` 与快照 timeline） | 只留有界一段（§7.7） | 全留 |
+ *
+ * 片段不进推流与快照的代价要写清楚，它是一处**契约变更**：今天渲染 driver 思考流的前端
+ * 会看不到片段。这是刻意的——要看思考流必须开**独立的合并通道**（§4.4 / D4：片段是
+ * last-value 语义，逐条推给前端既贵又不可用）。**片段本身没丢**：`audit.jsonl`（无保留
+ * 上限）与 `driver-stream.jsonl`（8 MiB 上限）都照写，`payload_ref` 可回取。
+ *
+ * 非 `driver.*` 的类型一律返回 false：表的默认通道是 `coordination`。
+ */
+export function isStreamFragment(eventType: string): boolean {
+  return driverStreamChannel(eventType) === 'stream_only';
+}
+
+export function projectDriverStreamLifecycleEvent(
+  event: DriverStreamEvent,
+  streamSequence?: number,
+): Event | undefined {
+  const rawPayload = recordValue(event.payload);
+  const update = recordValue(rawPayload?.update);
+  const hasStreamRef = typeof streamSequence === 'number';
+  const hasLegacyRef = typeof event.sequence === 'number';
+  const hasRef = hasStreamRef || hasLegacyRef;
+  const payload: Record<string, unknown> = {
+    ...(event.session_id ? { session_id: event.session_id } : {}),
+    ...(event.role_id ? { role_id: event.role_id } : {}),
+    ...(event.sequence !== undefined ? { event_sequence: event.sequence } : {}),
+    ...(hasStreamRef ? { stream_sequence: streamSequence } : {}),
+    ...(hasStreamRef
+      ? { payload_ref: `${DRIVER_STREAM_SEQUENCE_REF_PREFIX}${String(streamSequence)}` }
+      : hasLegacyRef
+        ? { payload_ref: `${DRIVER_STREAM_REF_PREFIX}${String(event.sequence)}` }
+        : {}),
+  };
+
+  let eventType: string;
+  switch (event.event_type) {
+    case 'driver.turn_started':
+    case 'turn_started':
+      eventType = 'driver.turn_started';
+      addNumber(payload, 'prompt_length', rawPayload?.prompt_length);
+      break;
+    case 'driver.turn_completed':
+    case 'turn_completed':
+      eventType = 'driver.turn_completed';
+      // 两条生产路径：driver 自产事件把 stop_reason 放 payload 顶层，旧式
+      // turn_completed 放 update.stopReason。两个位置都读，谁有算谁。
+      addString(payload, 'stop_reason', rawPayload?.stop_reason ?? update?.stopReason);
+      break;
+    case 'driver.turn_failed':
+    case 'turn_failed':
+      eventType = 'driver.turn_failed';
+      addString(payload, 'reason', update?.reason ?? rawPayload?.error ?? rawPayload?.reason);
+      break;
+    case 'driver.interrupt_requested':
+      eventType = 'driver.interrupt_requested';
+      addString(payload, 'reason', rawPayload?.reason);
+      break;
+    case 'tool_call':
+      eventType = 'driver.tool_started';
+      addToolFields(payload, update, hasRef);
+      break;
+    case 'tool_call_update': {
+      addToolFields(payload, update, hasRef);
+      const status = typeof update?.status === 'string' ? update.status : undefined;
+      eventType =
+        status === 'completed'
+          ? 'driver.tool_completed'
+          : status === 'failed'
+            ? 'driver.tool_failed'
+            : 'driver.tool_progress';
+      break;
+    }
+    case 'agent_message_chunk':
+      eventType = 'driver.agent_message_chunk';
+      addLarge(payload, 'content', update?.content, hasRef);
+      break;
+    case 'agent_thought_chunk':
+      eventType = 'driver.agent_thought_chunk';
+      addLarge(payload, 'content', update?.content, hasRef);
+      break;
+    case 'user_message_chunk':
+      eventType = 'driver.user_message_chunk';
+      addLarge(payload, 'content', update?.content, hasRef);
+      break;
+    case 'plan':
+      eventType = 'driver.plan_updated';
+      addLarge(payload, 'entries', update?.entries, hasRef);
+      break;
+    case 'available_commands_update':
+      eventType = 'driver.available_commands_updated';
+      addLarge(payload, 'available_commands', update?.availableCommands, hasRef);
+      break;
+    case 'current_mode_update':
+      eventType = 'driver.mode_changed';
+      addString(payload, 'current_mode_id', update?.currentModeId);
+      break;
+    case 'config_option_update':
+      eventType = 'driver.config_options_changed';
+      addLarge(payload, 'config_options', update?.configOptions, hasRef);
+      break;
+    case 'session_info_update':
+      eventType = 'driver.session_info_changed';
+      addString(payload, 'title', update?.title);
+      addString(payload, 'updated_at', update?.updatedAt);
+      break;
+    case 'usage_update':
+      eventType = 'driver.usage_updated';
+      addNumber(payload, 'used', update?.used);
+      addNumber(payload, 'size', update?.size);
+      addLarge(payload, 'cost', update?.cost, hasRef);
+      break;
+    case 'stderr':
+      eventType = 'driver.stderr';
+      addLarge(
+        payload,
+        'text',
+        typeof event.payload === 'string' ? event.payload : undefined,
+        hasRef,
+      );
+      break;
+    case 'disconnect':
+      eventType = 'driver.disconnected';
+      addLarge(payload, 'exit_status', rawPayload, hasRef);
+      break;
+    default:
+      // 未知类型不再静默丢弃：driver.* 原样进模型，协议侧新增类型收进统一的未知桶，
+      // 带上源类型名，消费者按需自行展开。
+      eventType = event.event_type.startsWith('driver.')
+        ? event.event_type
+        : 'driver.session_update_unknown';
+      if (eventType === 'driver.session_update_unknown')
+        payload.source_event_type = event.event_type;
+      addLarge(payload, 'raw', event.payload, hasRef);
+      break;
+  }
+
+  return {
+    event_id: createId('run_event'),
+    event_type: eventType,
+    subject_id: event.run_id ?? event.session_id ?? event.event_type,
+    ...(event.run_id ? { run_id: event.run_id } : {}),
+    ...(event.task_id ? { task_id: event.task_id } : {}),
+    payload,
+    created_at: event.created_at ?? new Date().toISOString(),
+    schema_version: SCHEMA_VERSION,
+  };
+}
+
+/**
+ * 工具调用的身份与细节。tool_call 与 tool_call_update 共用——update 是部分更新，
+ * 缺席的字段自然跳过，由上层把多次投影叠加起来看全貌。
+ */
+function addToolFields(
+  payload: Record<string, unknown>,
+  update: Record<string, unknown> | undefined,
+  hasRef: boolean,
+): void {
+  addString(payload, 'tool_call_id', update?.toolCallId);
+  addString(payload, 'title', update?.title);
+  addString(payload, 'kind', update?.kind);
+  addString(payload, 'status', update?.status);
+  const meta = recordValue(update?._meta);
+  const claudeCode = recordValue(meta?.claudeCode);
+  addString(payload, 'tool_name', claudeCode?.toolName);
+  addLarge(payload, 'locations', update?.locations, hasRef);
+  addLarge(payload, 'raw_input', update?.rawInput, hasRef);
+  addLarge(payload, 'raw_output', update?.rawOutput, hasRef);
+  addLarge(payload, 'content', update?.content, hasRef);
+}
+
+function addString(target: Record<string, unknown>, key: string, value: unknown): void {
+  if (typeof value === 'string' && value.length > 0) target[key] = value;
+}
+
+function addNumber(target: Record<string, unknown>, key: string, value: unknown): void {
+  if (typeof value === 'number' && Number.isFinite(value)) target[key] = value;
+}
+
+/**
+ * 大字段的内联/外置判定。超限且可引用时跳过内联（payload_ref 已指向原始行）；
+ * 不可引用时无论多大都内联——投影的底线是信息不丢。
+ */
+function addLarge(
+  target: Record<string, unknown>,
+  key: string,
+  value: unknown,
+  hasRef: boolean,
+): void {
+  if (value === undefined) return;
+  if (hasRef) {
+    const bytes = Buffer.byteLength(JSON.stringify(value) ?? '', 'utf8');
+    if (bytes > PAYLOAD_INLINE_LIMIT_BYTES) return;
+  }
+  target[key] = value;
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}

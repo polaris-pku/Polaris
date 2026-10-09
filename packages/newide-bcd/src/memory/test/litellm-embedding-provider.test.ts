@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import type { LiteLLMClient } from '../../litellm/contract';
 import { LiteLLMEmbeddingProvider } from '../adapters/litellm-embedding-provider';
-import { getRunLlmUsageLedger, releaseRunLlmUsageLedger, runWithLlmUsageLedger } from '../../telemetry';
+import {
+  getRunLlmUsageLedger,
+  releaseRunLlmUsageLedger,
+  runWithLlmUsageLedger,
+} from '../../telemetry';
 
 const RUN_IDS: string[] = [];
 

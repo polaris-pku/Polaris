@@ -42,10 +42,7 @@ const storage = new AsyncLocalStorage<LlmUsageAttribution>();
  * 与外层已有的归属叠加：只覆盖本次显式给出的维度，未给出的沿用外层。返回值与异常
  * 原样透传；没有绑定记录器时的行为与调用点自己写一遍赋值完全相同。
  */
-export function runWithLlmUsageAttribution<T>(
-  attribution: LlmUsageAttribution,
-  run: () => T,
-): T {
+export function runWithLlmUsageAttribution<T>(attribution: LlmUsageAttribution, run: () => T): T {
   return storage.run(mergeAttribution(storage.getStore(), attribution), run);
 }
 

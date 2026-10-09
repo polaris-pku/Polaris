@@ -31,19 +31,37 @@ function ev(
 }
 
 describe('buildEventRows', () => {
-  it('按后端的 sequence 升序排列（后端是权威顺序，前端不按时间戳猜）', () => {
+  it('保留后端数组顺序，不再按序号重排', () => {
     const rows = buildEventRows([
       ev(3, 'agent.execution_completed', 'agent'),
       ev(1, 'task.created', 'coordinator'),
       ev(2, 'agent.execution_requested', 'agent'),
     ]);
 
-    expect(rows.map((r) => r.seq)).toEqual([1, 2, 3]);
+    expect(rows.map((r) => r.seq)).toEqual([3, 1, 2]);
     expect(rows.map((r) => r.type)).toEqual([
+      'agent.execution_completed',
       'task.created',
       'agent.execution_requested',
-      'agent.execution_completed',
     ]);
+  });
+
+  it('并列序号全部保留，载荷引用只读取 payload 内的字段', () => {
+    const first = ev(1, 'task.created', 'coordinator');
+    const second = {
+      ...ev(1, 'driver.tool_started', 'driver', {
+        payload_ref: 'driver-stream.jsonl#stream_sequence=0',
+      }),
+      event_id: 'tool-1',
+    };
+    const rows = buildEventRows([first, second]);
+    expect(rows.map((row) => row.eventId)).toEqual([first.event_id, second.event_id]);
+    expect(rows[1]).toMatchObject({
+      runId: 'run-1',
+      payloadRef: 'driver-stream.jsonl#stream_sequence=0',
+    });
+    const wrongEnvelope = { ...first, payload_ref: 'not-a-payload-field' };
+    expect(buildEventRows([wrongEnvelope])[0].payloadRef).toBeUndefined();
   });
 
   it('时间戳取事件自带的 created_at → HH:MM:SS', () => {
@@ -75,6 +93,15 @@ describe('buildEventRows', () => {
     expect(rows[1].type).toBe('some.unmapped_event');
     expect(rows[1].stepLabel).toBe('审查');
     expect(rows[1].payload).toContain('"note"');
+  });
+
+  it('用量事件不属于工作流步骤，但仍完整出现在事件流', () => {
+    const rows = buildEventRows([
+      ev(1, 'proxy.llm_usage_recorded', 'coordinator', { input_tokens: 10 }),
+    ]);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].stepId).toBe('');
+    expect(rows[0].payload).toContain('"input_tokens": 10');
   });
 
   it('保留后端原文的 source 与 type（协议词在 L3 里是合法的）', () => {

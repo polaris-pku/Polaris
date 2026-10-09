@@ -3,7 +3,6 @@ import type {
   PersistedCoordinationEvent,
   PersistedRunState,
   PersistedTaskAggregate,
-  TaskResumeCursor,
 } from '../persistence';
 import {
   councilOutcomeEvidenceSchema,
@@ -13,6 +12,7 @@ import {
 import { projectRunEventSource } from '../protocol/run-event';
 import type { RunOutcome } from '../coordinator/run-outcome';
 import { buildRunOutputPaths } from '../coordinator/run-result';
+import { nodeCodeForCursor, stageForCursor } from './run-stage-mapping';
 
 export function projectPersistedRunSnapshot(
   aggregate: PersistedTaskAggregate,
@@ -60,8 +60,11 @@ export function projectPersistedRunSnapshot(
         : agentArtifactRefs,
   );
   const status = runStatus(run);
-  const stage = currentStage(aggregate.runtime_state.resume_cursor, run.status);
-  const activeNodeCode = nodeCode(aggregate.runtime_state.resume_cursor, run.status);
+  const stage = stageForCursor(aggregate.runtime_state.resume_cursor, run.status);
+  const activeNodeCode = nodeCodeForCursor(aggregate.runtime_state.resume_cursor, run.status);
+  // 「此刻是否真有一个 stage 调用在跑」只有 active_stage 说了算：它由 startStage 写入、
+  // 由 advanceStageOnce / failStage / finishRun 摘除，存在即代表在跑。
+  const activeStage = activeStageFacts(aggregate.runtime_state.diagnostics);
   const response = stringValue(agent?.payload.response) ?? '';
   const sessionId = run.session_id ?? stringValue(agent?.payload.session_id);
   const worktreePath =
@@ -92,6 +95,13 @@ export function projectPersistedRunSnapshot(
       stage,
       active_node_code: activeNodeCode,
       task_status: aggregate.task.status,
+      cursor: aggregate.runtime_state.resume_cursor,
+      ...(activeStage
+        ? {
+            invocation_id: activeStage.invocation_id,
+            ...(activeStage.started_at ? { stage_started_at: activeStage.started_at } : {}),
+          }
+        : {}),
     },
     task: {
       task_id: aggregate.task.task_id,
@@ -137,17 +147,11 @@ export function projectPersistedRunSnapshot(
     },
     links,
     timeline,
-    agent_runs: events
-      .filter((event) => event.event_type.startsWith('agent.'))
-      .map(eventRecord),
+    agent_runs: events.filter((event) => event.event_type.startsWith('agent.')).map(eventRecord),
     artifacts: artifactRefs.map((artifactRef) => ({ artifact_id: artifactRef })),
-    gates: events
-      .filter((event) => event.event_type === 'gate.result')
-      .map(eventRecord),
+    gates: events.filter((event) => event.event_type === 'gate.result').map(eventRecord),
     ...(projectedMarket ? { market: projectedMarket } : {}),
-    ...(run.mode === 'council'
-      ? { council: councilProjection(events, status) }
-      : {}),
+    ...(run.mode === 'council' ? { council: councilProjection(events, status) } : {}),
     errors: run.error ? [{ ...run.error }] : [],
     ...(status !== 'running'
       ? {
@@ -158,8 +162,7 @@ export function projectPersistedRunSnapshot(
             changed_files: changedFiles,
             ...(status === 'completed'
               ? {
-                  outcome:
-                    filesWritten.length > 0 ? 'completed_files' : 'completed_response',
+                  outcome: filesWritten.length > 0 ? 'completed_files' : 'completed_response',
                 }
               : { outcome: 'failed' }),
             response,
@@ -172,44 +175,29 @@ export function projectPersistedRunSnapshot(
   });
 }
 
-function runStatus(
-  run: PersistedRunState,
-): 'running' | 'completed' | 'failed' | 'cancelled' {
+function runStatus(run: PersistedRunState): 'running' | 'completed' | 'failed' | 'cancelled' {
   if (run.status === 'created' || run.status === 'running') return 'running';
   if (run.status === 'interrupted') return 'failed';
   return run.status;
 }
 
-function currentStage(
-  cursor: TaskResumeCursor,
-  status: PersistedRunState['status'],
-): 'executing' | 'council' | 'delivery' | 'intervention' {
-  if (status === 'failed' || status === 'cancelled' || status === 'interrupted') {
-    return 'intervention';
-  }
-  if (cursor === 'council') return 'council';
-  if (cursor === 'gate' || cursor === 'deliver' || cursor === 'done') return 'delivery';
-  if (cursor === 'mailbox_wait') return 'intervention';
-  return 'executing';
-}
-
-function nodeCode(cursor: TaskResumeCursor, status: PersistedRunState['status']): string {
-  if (status !== 'created' && status !== 'running') return 'N18';
-  switch (cursor) {
-    case 'select_agent':
-      return 'N3';
-    case 'execute_agent':
-      return 'N8';
-    case 'council':
-      return 'N14';
-    case 'gate':
-      return 'N13';
-    case 'deliver':
-    case 'done':
-      return 'N18';
-    case 'mailbox_wait':
-      return 'N16';
-  }
+/**
+ * 当前活跃 stage 调用的事实（`runtime_state.diagnostics.active_stage`）。
+ *
+ * 这里刻意比 `TaskProcessor.readActiveStage` 宽容：那边对损坏诊断直接抛错（写路径该硬），
+ * 这边是给前端读快照，不该因为一条脏诊断把整个 `run.getSnapshot` 打挂——结构不完整就
+ * 省略字段，而不是拼一个半真的对象出来。
+ */
+function activeStageFacts(
+  diagnostics: Record<string, unknown>,
+): { invocation_id: string; started_at?: string } | undefined {
+  const value = diagnostics.active_stage;
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const invocationId = stringValue(record.invocation_id);
+  if (!invocationId) return undefined;
+  const startedAt = stringValue(record.started_at);
+  return { invocation_id: invocationId, ...(startedAt ? { started_at: startedAt } : {}) };
 }
 
 function stageNodeStatuses(events: readonly PersistedCoordinationEvent[]) {
@@ -239,9 +227,7 @@ function stageNodeStatuses(events: readonly PersistedCoordinationEvent[]) {
   });
 }
 
-function marketProjection(
-  event: PersistedCoordinationEvent,
-): RunSnapshot['market'] | undefined {
+function marketProjection(event: PersistedCoordinationEvent): RunSnapshot['market'] | undefined {
   const projected = {
     winner_agent_id: stringValue(event.payload.winner_agent_id),
     winner_bid_id: stringValue(event.payload.winner_bid_id),
@@ -264,9 +250,7 @@ function councilProjection(
   const proposalEvents = events.filter(
     (event) => event.event_type === 'council.proposal.completed',
   );
-  const reviewEvents = events.filter(
-    (event) => event.event_type === 'council.review.completed',
-  );
+  const reviewEvents = events.filter((event) => event.event_type === 'council.review.completed');
   const synthesisCompleted = lastEvent(events, 'council.synthesis.completed');
   const implementationCompleted = lastEvent(events, 'council.implementation.completed');
   const decision = lastEvent(events, 'council.decision');
@@ -287,8 +271,7 @@ function councilProjection(
     payload.reviews,
     reviewEvents.flatMap((event) => asRecords(event.payload.reviews)),
   );
-  const synthesis =
-    asRecord(payload.synthesis) ?? asRecord(synthesisCompleted?.payload.synthesis);
+  const synthesis = asRecord(payload.synthesis) ?? asRecord(synthesisCompleted?.payload.synthesis);
   const implementation =
     asRecord(payload.plan_execution) ?? asRecord(implementationCompleted?.payload);
   const councilRunId = firstString(
@@ -363,14 +346,10 @@ function councilPhase(
       return phase;
     }
   }
-  return events.some((event) => event.event_type === 'council.started')
-    ? 'selecting'
-    : undefined;
+  return events.some((event) => event.event_type === 'council.started') ? 'selecting' : undefined;
 }
 
-function projectAuctions(
-  events: readonly PersistedCoordinationEvent[],
-): Record<string, unknown>[] {
+function projectAuctions(events: readonly PersistedCoordinationEvent[]): Record<string, unknown>[] {
   const byAuction = new Map<string, Record<string, unknown>>();
   for (const event of events) {
     if (
@@ -461,9 +440,7 @@ function unique(values: readonly string[]): string[] {
   return [...new Set(values)];
 }
 
-function compactRecord(
-  value: Record<string, string | undefined>,
-): Record<string, unknown> {
+function compactRecord(value: Record<string, string | undefined>): Record<string, unknown> {
   return Object.fromEntries(
     Object.entries(value).filter((entry): entry is [string, string] => entry[1] !== undefined),
   );

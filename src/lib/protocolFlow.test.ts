@@ -22,6 +22,13 @@ const statusOf = (nodes: ReturnType<typeof projectProtocolFlow>, code: string) =
   nodes.find((n) => n.code === code)?.status;
 
 describe('protocolFlow · 事件驱动的 N0–N18 投影', () => {
+  it('同序号时按数组中最后出现的事件推进节点', () => {
+    const first = { ...event('task.created'), sequence: 1 };
+    const second = { ...event('run.created'), sequence: 1 };
+    const nodes = projectProtocolFlow([first, second], 'running');
+    expect(statusOf(nodes, 'N2')).toBe('done');
+    expect(statusOf(nodes, 'N3')).toBe('active');
+  });
   it('单 agent 全程点亮 N2/N3/N5/N6/N8/N9/N10/N11/N13/N16/N18；无事件的节点保持 pending', () => {
     const timeline = [
       event('task.created'),

@@ -105,6 +105,8 @@ export interface TaskRunExecutionState {
   memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
   task_request: TaskCreateRequest;
   workspace_path: string;
+  /** Stable user destination; Mailbox Runs may execute in a Council scratch workspace. */
+  delivery_workspace_path?: string;
   resume_cursor: TaskResumeCursor;
   cursor_input?: TaskCursorInput;
   council_override: boolean;
@@ -197,7 +199,10 @@ export class TaskProcessor {
   constructor(
     private readonly store: CoordinationStateStore,
     options: TaskProcessorOptions & {
-      mailboxStore?: Pick<MailboxStateStore, 'getMailboxEnvelope' | 'listReplayableMailboxDeliveries'> &
+      mailboxStore?: Pick<
+        MailboxStateStore,
+        'getMailboxEnvelope' | 'listReplayableMailboxDeliveries'
+      > &
         Partial<Pick<MailboxStateStore, 'getMailboxHighWatermark' | 'listMailboxDeliveriesAfter'>>;
     } = {},
   ) {
@@ -415,11 +420,7 @@ export class TaskProcessor {
     assertEvidenceReference(input.evidence_ref);
     const nextInput = parseTaskCursorInput(resolveStageNextInput(aggregate, input));
     assertCursorTransition(input.expected_cursor, nextInput.cursor);
-    assertChangesetIdentity(
-      aggregate.runtime_state.cursor_input,
-      nextInput,
-      input.final_output,
-    );
+    assertChangesetIdentity(aggregate.runtime_state.cursor_input, nextInput, input.final_output);
     const completing = nextInput.cursor === 'done';
     if (completing && !input.final_output) {
       throw new Error('Advancing deliver to done requires final_output');
@@ -602,9 +603,7 @@ export class TaskProcessor {
   getRunExecutionState(runId: string): TaskRunExecutionState {
     const aggregate = this.requireAggregateForRun(runId);
     const run = requireRun(aggregate, runId);
-    const memoryAblation = readMemoryAblation(
-      aggregate.runtime_state.diagnostics.memory_ablation,
-    );
+    const memoryAblation = readMemoryAblation(aggregate.runtime_state.diagnostics.memory_ablation);
     return {
       task_id: aggregate.task.task_id,
       run_id: runId,
@@ -620,14 +619,13 @@ export class TaskProcessor {
         ...(aggregate.task.budget ? { budget: { ...aggregate.task.budget } } : {}),
       },
       workspace_path: run.workspace_path,
+      delivery_workspace_path: aggregate.task.workspace_path,
       resume_cursor: aggregate.runtime_state.resume_cursor,
       ...(aggregate.runtime_state.cursor_input
         ? { cursor_input: aggregate.runtime_state.cursor_input }
         : {}),
       council_override: aggregate.runtime_state.diagnostics.council_override === true,
-      ...(run.restarted_from_run_id
-        ? { restarted_from_run_id: run.restarted_from_run_id }
-        : {}),
+      ...(run.restarted_from_run_id ? { restarted_from_run_id: run.restarted_from_run_id } : {}),
     };
   }
 
@@ -648,13 +646,10 @@ export class TaskProcessor {
       delivery_ids: [...cursorInput.delivery_ids],
       interrupted_run_id: runId,
     };
-    const runCompleted = this.createEvent(
-      'run.completed',
-      runId,
-      aggregate.task.task_id,
-      runId,
-      { status: 'completed', outcome: 'mailbox_wait' },
-    );
+    const runCompleted = this.createEvent('run.completed', runId, aggregate.task.task_id, runId, {
+      status: 'completed',
+      outcome: 'mailbox_wait',
+    });
     const taskWaiting = this.createEvent(
       'task.waiting_help',
       aggregate.task.task_id,
@@ -662,8 +657,7 @@ export class TaskProcessor {
       runId,
       { reason, delivery_ids: [...cursorInput.delivery_ids] },
     );
-    const { current_run_id: _currentRunId, ...runtimeWithoutCurrentRun } =
-      aggregate.runtime_state;
+    const { current_run_id: _currentRunId, ...runtimeWithoutCurrentRun } = aggregate.runtime_state;
     const committed = this.store.commitState({
       expected_task_revision: aggregate.task.revision,
       task: {
@@ -710,10 +704,7 @@ export class TaskProcessor {
     const aggregate = this.store.getTaskAggregate(taskId);
     if (!aggregate) throw new TaskProcessorTaskNotFoundError(taskId);
     const code = 'collaboration_deadlock';
-    if (
-      aggregate.task.status === 'blocked' &&
-      aggregate.task.error?.code === code
-    ) {
+    if (aggregate.task.status === 'blocked' && aggregate.task.error?.code === code) {
       return projectAggregate(aggregate, this.runsRoot);
     }
     assertTaskStatusTransition(aggregate.task.status, 'blocked');
@@ -734,13 +725,7 @@ export class TaskProcessor {
         ? { delivery_ids: [...aggregate.runtime_state.cursor_input.delivery_ids] }
         : {}),
     };
-    const taskBlocked = this.createEvent(
-      'task.blocked',
-      taskId,
-      taskId,
-      runId,
-      { code, reason },
-    );
+    const taskBlocked = this.createEvent('task.blocked', taskId, taskId, runId, { code, reason });
     this.store.commitState({
       expected_task_revision: aggregate.task.revision,
       task: {
@@ -768,10 +753,9 @@ export class TaskProcessor {
   listMailboxWaitContexts(): TaskMailboxWaitContext[] {
     return this.store.listTaskAggregates().flatMap((aggregate) => {
       const cursorInput = aggregate.runtime_state.cursor_input;
-      const runId = readPayloadString(
-        aggregate.runtime_state.interrupt_state ?? {},
-        'interrupted_run_id',
-      ) ?? aggregate.runtime_state.current_run_id;
+      const runId =
+        readPayloadString(aggregate.runtime_state.interrupt_state ?? {}, 'interrupted_run_id') ??
+        aggregate.runtime_state.current_run_id;
       const run = runId
         ? aggregate.runs.find((candidate) => candidate.run_id === runId)
         : undefined;
@@ -787,26 +771,28 @@ export class TaskProcessor {
       ) {
         return [];
       }
-      return [{
-        task_id: aggregate.task.task_id,
-        task_request: {
-          spec: aggregate.task.spec,
-          ...(aggregate.task.role_id ? { role_id: aggregate.task.role_id } : {}),
-          ...(aggregate.task.parent_id ? { parent_task_id: aggregate.task.parent_id } : {}),
-          risk_level: aggregate.task.risk_level,
-          affected_paths: [...aggregate.task.affected_paths],
-          completion_criteria: [...aggregate.task.completion_criteria],
-          ...(aggregate.task.budget ? { budget: { ...aggregate.task.budget } } : {}),
+      return [
+        {
+          task_id: aggregate.task.task_id,
+          task_request: {
+            spec: aggregate.task.spec,
+            ...(aggregate.task.role_id ? { role_id: aggregate.task.role_id } : {}),
+            ...(aggregate.task.parent_id ? { parent_task_id: aggregate.task.parent_id } : {}),
+            risk_level: aggregate.task.risk_level,
+            affected_paths: [...aggregate.task.affected_paths],
+            completion_criteria: [...aggregate.task.completion_criteria],
+            ...(aggregate.task.budget ? { budget: { ...aggregate.task.budget } } : {}),
+          },
+          workspace_path: aggregate.task.workspace_path,
+          ...(run.session_id ? { session_id: run.session_id } : {}),
+          run_id: run.run_id,
+          mode: run.mode,
+          ...(memoryAblation ? { memory_ablation: memoryAblation } : {}),
+          sender_role_id: aggregate.task.owner_agent_id,
+          delivery_ids: [...cursorInput.delivery_ids],
+          waiting_reason: cursorInput.waiting_reason,
         },
-        workspace_path: aggregate.task.workspace_path,
-        ...(run.session_id ? { session_id: run.session_id } : {}),
-        run_id: run.run_id,
-        mode: run.mode,
-        ...(memoryAblation ? { memory_ablation: memoryAblation } : {}),
-        sender_role_id: aggregate.task.owner_agent_id,
-        delivery_ids: [...cursorInput.delivery_ids],
-        waiting_reason: cursorInput.waiting_reason,
-      }];
+      ];
     });
   }
 
@@ -908,16 +894,12 @@ export class TaskProcessor {
       },
       runtime_state: {
         ...(shouldProjectCursor ? runtimeWithoutCursorInput : aggregate.runtime_state),
-        resume_cursor: shouldProjectCursor
-          ? nextCursor
-          : aggregate.runtime_state.resume_cursor,
+        resume_cursor: shouldProjectCursor ? nextCursor : aggregate.runtime_state.resume_cursor,
         artifact_refs: artifactRefs,
         diagnostics: {
           ...aggregate.runtime_state.diagnostics,
           ...(shouldProjectCursor ? { legacy_cursor_projection: true } : {}),
-          ...(cursorMoved && hasActiveStage
-            ? { legacy_cursor_projection_suppressed: true }
-            : {}),
+          ...(cursorMoved && hasActiveStage ? { legacy_cursor_projection_suppressed: true } : {}),
           last_event_id: event.event_id,
           last_event_type: event.event_type,
         },
@@ -977,6 +959,12 @@ export class TaskProcessor {
     } = aggregate.task;
     const { error: _previousRunError, ...runWithoutError } = run;
     const { current_run_id: _currentRunId, ...runtimeWithoutCurrentRun } = aggregate.runtime_state;
+    // 终态必须摘掉 active_stage：它「存在」是「有一个 stage 调用在跑」的唯一依据，
+    // 读快照的前端据此显示「正在执行」。成功路径由 advanceStageOnce 摘、失败路径由
+    // failStage 摘，而这条「直接终结」（取消等）过去漏了——于是取消之后活跃标记会
+    // 永久残留，前端会一直显示还在执行。
+    const { active_stage: _activeStage, ...diagnosticsWithoutActiveStage } =
+      aggregate.runtime_state.diagnostics;
 
     this.store.commitState({
       expected_task_revision: aggregate.task.revision,
@@ -1008,7 +996,7 @@ export class TaskProcessor {
         waiting_on: [],
         artifact_refs: artifactRefs,
         diagnostics: {
-          ...aggregate.runtime_state.diagnostics,
+          ...diagnosticsWithoutActiveStage,
           terminal_status: input.status,
           terminal_event_id: terminalEvent.event_id,
         },
@@ -1036,7 +1024,9 @@ export class TaskProcessor {
     if (!aggregate) throw new TaskProcessorTaskNotFoundError(taskId);
     const events = afterEventId
       ? (() => {
-          const cursorIndex = aggregate.events.findIndex((event) => event.event_id === afterEventId);
+          const cursorIndex = aggregate.events.findIndex(
+            (event) => event.event_id === afterEventId,
+          );
           if (cursorIndex < 0) throw new TaskEventCursorNotFoundError(taskId, afterEventId);
           return aggregate.events.slice(cursorIndex + 1);
         })()
@@ -1069,9 +1059,7 @@ export class TaskProcessor {
     const aggregate = this.store.getTaskAggregate(taskId);
     if (!aggregate) throw new TaskProcessorTaskNotFoundError(taskId);
     const latestSession = aggregate.runs.find((run) => run.session_id)?.session_id;
-    const memoryAblation = readMemoryAblation(
-      aggregate.runtime_state.diagnostics.memory_ablation,
-    );
+    const memoryAblation = readMemoryAblation(aggregate.runtime_state.diagnostics.memory_ablation);
     return {
       task_request: {
         spec: aggregate.task.spec,
@@ -1159,13 +1147,10 @@ export class TaskProcessor {
   ): void {
     const aggregate = this.store.getTaskAggregate(taskId);
     if (!aggregate) return;
-    const event = this.createEvent(
-      'checkpoint.workspace_restored',
-      checkpointId,
-      taskId,
-      runId,
-      { checkpoint_id: checkpointId, ...outcome },
-    );
+    const event = this.createEvent('checkpoint.workspace_restored', checkpointId, taskId, runId, {
+      checkpoint_id: checkpointId,
+      ...outcome,
+    });
     const timestamp = this.now();
     try {
       this.store.commitState({
@@ -1389,6 +1374,7 @@ function projectAggregate(aggregate: PersistedTaskAggregate, runsRoot: string): 
     task: {
       ...projected.task,
       status: aggregate.task.status,
+      workspace_path: aggregate.task.workspace_path,
       ...(aggregate.task.owner_agent_id ? { owner_agent_id: aggregate.task.owner_agent_id } : {}),
       updated_at: aggregate.task.updated_at,
     },
@@ -1497,9 +1483,7 @@ function resolveStageNextInput(
       'Council override input is only valid for execute_agent -> gate with persistent_override',
     );
   }
-  return overrideRequested
-    ? input.council_override_input
-    : input.next_input;
+  return overrideRequested ? input.council_override_input : input.next_input;
 }
 
 function assertBeginRunIntent(
@@ -1528,9 +1512,7 @@ function assertBeginRunIntent(
     return;
   }
   if (!existing) {
-    throw new Error(
-      `Run intent ${intent.type} requires an existing Task ${input.task_id}`,
-    );
+    throw new Error(`Run intent ${intent.type} requires an existing Task ${input.task_id}`);
   }
 
   if (intent.type === 'council_refinement') {
@@ -1624,9 +1606,7 @@ function assertBeginRunIntent(
       cursorInput.cursor !== latestCheckpoint.resume_cursor) ||
     (intent.strategy === 'restart_from_beginning' && cursorInput.cursor !== 'select_agent')
   ) {
-    throw new Error(
-      `Checkpoint resume cursor does not match strategy ${intent.strategy}`,
-    );
+    throw new Error(`Checkpoint resume cursor does not match strategy ${intent.strategy}`);
   }
 }
 
@@ -1643,11 +1623,7 @@ function requireMailboxEnvelope(
 }
 
 function assertFinalOutputEvidence(output: PersistedTaskFinalOutput): void {
-  if (
-    !output.artifact_ref ||
-    !output.workspace_path ||
-    !/^[a-f0-9]{64}$/.test(output.sha256)
-  ) {
+  if (!output.artifact_ref || !output.workspace_path || !/^[a-f0-9]{64}$/.test(output.sha256)) {
     throw new Error(
       'Final output requires a non-empty artifact, workspace path, and lowercase SHA256',
     );
@@ -1837,7 +1813,6 @@ function readPayloadStringArray(payload: Record<string, unknown>, key: string): 
 function appendUnique(current: readonly string[], additions: readonly string[]): string[] {
   return [...new Set([...current, ...additions])];
 }
-
 
 function councilWarnings(snapshot: RunSnapshot | undefined): string[] {
   const result = snapshot?.council?.result;

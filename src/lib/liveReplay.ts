@@ -293,14 +293,25 @@ export function buildLiveRunReplay(snapshot: RunSnapshot): RunReplay | null {
   };
 }
 
-/** 本次 run 里 agent 真正写到工作区的文件绝对路径（用于挂进项目文件树）。 */
-export function liveProducedFiles(snapshot: RunSnapshot): string[] {
-  if (!isFrontendWorkflowV01(snapshot)) return [];
+/** 兼容旧快照里由 diff 制品提供的文件路径。 */
+export function liveArtifactFiles(snapshot: RunSnapshot): string[] {
   return snapshot.artifacts
     .map((artifact) => asRecord(artifact))
     .filter((artifact) => artifact.type === 'diff')
-    .map((artifact) => str(artifact.source_path, ''))
-    .filter(Boolean);
+    .map((artifact) => artifact.source_path)
+    .filter((path): path is string => typeof path === 'string' && path.length > 0);
+}
+
+/** 交付报告是文件清单的主来源，不能要求同时存在 diff 制品。 */
+export function liveProducedFiles(snapshot: RunSnapshot): string[] {
+  for (const files of [
+    snapshot.delivery_report?.files_written,
+    snapshot.final_output?.files_written,
+  ]) {
+    const paths = (files ?? []).filter((path) => typeof path === 'string' && path.length > 0);
+    if (paths.length > 0) return [...new Set(paths)];
+  }
+  return [...new Set(liveArtifactFiles(snapshot))];
 }
 
 /** 事件图（供 store 投影泳道图用）。 */
