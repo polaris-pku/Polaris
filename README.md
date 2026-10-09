@@ -86,8 +86,11 @@ Web 版全程 mock；桌面版（Electron）在同一份 UI 之上接通了真�
 - **Agent 生成文件真实落盘**：任务推进到 N7 执行段时，`gate:allow` 的写操作自动写入磁盘；带权限请求的写操作挂起，等你在文件操作面板里点「允许」后才落盘（拒绝则不写）。每条写操作下方有落盘回执（写入中 / 已写入 + 绝对路径 / 失败原因），点路径可在系统文件管理器中定位；写成功的文件同步挂进左侧项目文件树。
 - **自定义保存位置**：新建项目时可选保存文件夹；缺省写入 `文档/polaris-workspace/<项目名>/`。
 - **从文件夹打开项目**：启动页「打开项目」内选择本机目录，自动扫描为项目文件树（跳过 `node_modules`/`.git`/`dist` 等，深度 8 / 2000 条护栏）；同一目录再次打开会切回已有项目。
+- **启动停留在首页**：后台恢复历史任务只更新观测数据，不自动选择旧项目或任务，也不覆盖启动期间用户已打开的页面和输入的草稿。进入项目必须由用户选择；已有实例运行时再次点击快捷方式仍会聚焦该窗口，不中断当前工作。
+- **续跑与交付以 Task 为准**：等待协作回复时，一个 Run 可以结束，但需求尚未交付。前端持续刷新 `task.get` 并跟随新的 `current_run`，不会停在第一段已结束的 Run；等待期间也不允许跨项目绑定重启后端。只有写入用户项目目录的交付路径进入文件列表，审查临时目录不算交付。
 - **保存执行 Trace**：侧栏项目行的 Trace 按钮把 agent 执行审计快照（任务时间线 / 人机确认 / 落盘回执 / 事件观测窗口）存为 JSON —— 桌面版写入项目根目录 `.polaris/`，浏览器回退为下载。Trace 是只读复盘材料，不支持导回应用。
 - **文件查看页**：点文件树中的文件即可只读浏览。内容来源按可信度降级：磁盘真实内容（`DISK` 徽标）→ agent 生成内容（`AGENT` 徽标，未落盘时的回退）→ 演示占位；落盘完成后自动从 AGENT 切到 DISK。
+- **交付文件自动回填文件树**：以快照的 `delivery_report.files_written` 为主，兼容 `final_output.files_written` 与旧版 diff 制品路径；即使没有 diff 制品或完整图数据，也会显示后端确认已写入的文件。路径按提交时后端确认的工作区解析，支持 Windows 反斜杠与嵌套目录，不把后端审计目录误放进项目树。
 
 安全模型：渲染进程**无法凭空指定任意磁盘路径**。自定义目录必须经过主进程的原生目录选择器（选择即授权，进入会话级 `authorizedRoots`）；默认工作区之外未经授权的路径，写入 / 读取 / 扫描 / 定位一律被主进程拒绝，授权目录内部也拒绝 `..` 逃逸。预览另有 512KB 大小与二进制两道护栏。实现见 `electron/fsBridge.cjs`（IPC）与 `src/lib/agentFs.ts`（渲染层适配）。
 
@@ -95,15 +98,34 @@ Web 版全程 mock；桌面版（Electron）在同一份 UI 之上接通了真�
 
 ## 真实 Run 的投影
 
-界面上与运行有关的一切**只来自后端**：`run.event` 事件流（实时）与 `run.getSnapshot` 快照（终态），
+界面上与运行有关的一切**只来自后端**：`run.event` 状态事件流与 `run.getSnapshot` 快照（运行中定期刷新，终态再次对齐），
 由 `src/lib/liveReplay.ts` 与 `src/lib/eventGraph.ts` 程序化派生——后端给什么展示什么，前端不补写叙事：
 
 - **步骤由事件生成**：泳道图/步骤轨的节点是「事件 → 语义步骤」的投影（`eventGraph.STEPS`），
   没触发的步骤压根不出现，不预设条数、不画灰色待办；
-- **协议节点由事件点亮**：N0–N18 的状态由时间线纯函数重建（`src/lib/protocolFlow.ts`）——
-  快照里的 `flow.active_node_code` 是硬编码占位，不读它；
+- **协议节点由事件点亮**：N0–N18 的状态由时间线纯函数重建（`src/lib/protocolFlow.ts`）；主句优先显示 `activity` 的真实角色/工具状态，再使用 `current.cursor` 的精确阶段，不把粗粒度 `stage` 当作具体进度；
 - **文案取事件 payload 原文**，时间戳只在后端给了的地方显示，不插值；
 - **契约有但本次 run 没给的不虚构**：无 tool_events → 不显示文件操作流；无 Council 数据 → 合议页空态。
+
+### 运行观测接口
+
+已对齐 `frontend-run-observability-api.md` 描述的接口（上游 `9582f358`），只同步相关观测实现，保留模型 API 认证与 PGlite 适配：
+
+| 接口 / 字段                             | 前端用途                                                           |
+| --------------------------------------- | ------------------------------------------------------------------ |
+| `run.getUsage`                          | 「用量」折叠项中按 run / task / system / role 查询历史累计         |
+| `run.getEvents`                         | 断号、重连时补拉事件；补拉不设 `limit`，避免并列序号被分页边界截断 |
+| `run.getPayload`                        | 事件流展开后，按 `event.payload.payload_ref` 按需读取完整载荷      |
+| `run.subscribe.after_sequence`          | 为运行中的 run 按快照水位重订阅，不丢并发订阅；历史终态只恢复快照  |
+| `usage` / `activity` / `current.cursor` | 运行中每 2 秒刷新，终态短暂复查结算后停止轮询                      |
+
+计费 token、上下文占用和分阶段模型 API 用量**分别显示、互不相加**。运行中的 `pending_sources` 明示执行器账单尚待结算；缺失用量或耗时不显示成 0。`activity` 缺失不解释为「空闲」，陈旧状态明确提示。
+
+三条 run 通道的同一事件使用同源 `sequence`，但序号可以并列：时间线按后端数组顺序展示、按 `event_id` 去重。连接中断不会被当作执行失败；重连后补拉快照并重建订阅。`-32601` 显示后端版本限制，`-32017` 显示载荷已不可读取，均不伪造空内容。
+
+Task 快照携带可选的 `task.workspace_path`，始终是该需求的用户项目目录；启动恢复时按此路径关联项目与历史任务，但仍停留首页。Mailbox 续跑的 `run.workspace_path` 可能是角色会话绑定的审查目录，不能拿它作为最终交付落点；阶段上下文通过独立的 `delivery_workspace_path` 保持原项目目标不变。
+
+浏览恢复的项目不触发后端重启。默认工作区的直属项目目录，无论通过项目名还是绝对路径访问，都使用同一默认权限边界；自定义目录在新会话中仍需经原生目录选择器授权，历史元数据不会自动授予磁盘访问权限。
 
 > 启动页曾有一个「样例 · Run 回放」入口，加载仓库自带的落盘快照（`api/run_be712da2….zip`）。
 > 它连同其余面向用户的 mock 数据在 `daaa45d` 一并删除——提交后端失败时亮出一整套假的交付报告，
@@ -133,14 +155,37 @@ A（ACP runner）
 真实 agent CLI（claude / gemini / codex …）
 ```
 
-**A ↔ BCD 的集成来自上游，我们没有改动**：BCD 通过 `ACP_DRIVER_RUNNER_DIR` 把 A 当外部 driver 拉起。
-前端只需要接 BCD 一个入口，全部能力面就是 5 个 RPC：`run.create` / `run.getSnapshot` / `run.subscribe` / `run.unsubscribe` / `run.cancel`，外加一个 `run.event` 推送通知。
+**A ↔ BCD 仍走上游 Driver 契约**：BCD 通过 `ACP_DRIVER_RUNNER_DIR` 把 A 当外部 driver 拉起。
+前端通过 BCD 一个入口调用 `run.*`、`task.*`、`memory.*` 等 RPC，事件由 `run.event` / `task.event` 推送。Electron IPC 与本地 Web bridge 共用 `electron/backend-rpc-methods.json` 方法白名单。
 
-契约镜像见 `src/api/types/rpc.ts`（对齐 BCD 的 `frontend-workflow.v0.1`），传输选路见 `src/api/transport.ts`。
+契约镜像见 `src/api/types/rpc.ts` 与 `src/api/types/observability.ts`（对齐 BCD 的 `frontend-workflow.v0.1`），传输选路见 `src/api/transport.ts`。本轮 `run.*` 接口尚未登记到后端 `system.schema` / 能力表，不能靠能力表判断它们是否存在。
+
+分发版本使用「设置 → 模型与认证」中的服务商、API Key、端点和模型配置。支持 Anthropic 官方 API 及 Anthropic 兼容端点；密钥只保存在用户本机，不回传界面。本机个人调试代理的账号、地址与无凭据切换逻辑不属于分发配置，也不作为启动前提。
+
+### 项目驱动路由
+
+「设置 → 驱动路由」对齐 `driver-routing.v1`：通过 `driver.getConfig` 读取快照，
+`driver.updateRouting` 保存默认驱动与完整角色映射，`driver.resetRouting` 恢复文件配置。
+选项只来自后端 `drivers`，是否禁用只看 `selectable`；`degraded` 的「CLI 就绪未验证」不是故障。
+目录未确认的角色仍保留映射，不推断其无效，也不在保存时丢弃。
+
+保存和恢复均带读取到的 `expected_revision`。发生 `-32021` 会读取最新配置并保留草稿，
+由用户选择采用最新配置或保留自己的改动，再明确保存；`-32026` 可重试同一请求。
+`-32025` 会将默认驱动选择器恢复并锁定到后端给出的值；驱动不可选错误定位到具体角色，
+写入失败显示诊断信息。不会自动覆盖并发修改，也不为路由保存重启后端。
+
+覆盖文件位于当前后端工作区的 `.agent/drivers.ui.local.yaml`，不是 AppData 状态目录。
+桌面版通过 `ACP_WORKSPACE` 定位工作区，设置区会显示该路径；路由只影响该项目中新创建的 Run，
+在飞 Run 保留创建时冻结的映射；议会各阶段按所属 Run 解析路由，同时保留独立执行 ID。
+零配置仍使用 `acp-external` / Claude，模型认证继续沿用用户配置的 API。
+若浏览的历史项目与当前后端工作区不同，界面会先要求显式切换到该项目，避免保存到错误目录；
+有任务执行或等待协作时禁止切换工作区，但允许保存已经绑定项目的路由。
+可参考 `packages/newide-bcd/.agent/drivers.example.yaml` 添加手工档案；新增档案需重启后端，
+界面仅编辑路由，不安装其他 CLI、不编辑凭据，也不声称 CLI 已验证可运行。
 
 ### 跑起来
 
-桌面壳启动时会自动拉起 BCD（主进程负责，无需手动启后端）。打开项目时，agent 的工作区自动绑到该项目根目录 —— **agent 写进哪里 = 文件树读哪里**。
+桌面壳启动时会自动拉起 BCD（主进程负责，无需手动启后端）。提交需求前会将 agent 的工作区绑定到该项目根目录；只浏览项目不会重启后端。驱动路由设置也会先确认工作区一致，再允许编辑。
 
 ```bash
 pnpm install
@@ -162,10 +207,11 @@ export ACP_AGENT_ID=claude            # 或 gemini / codex / opencode …
 ### 当前能力边界（诚实说明）
 
 - **可以**：真实提交需求 → agent 真实写代码 → 前端实时收到 22 个流程事件（N0–N18 节点态、Gate 结果、Council 决策、交付报告）。
+- **可以**：A 会以解析符号链接后的真实路径约束工作区、终端 cwd 与可继承环境变量；BCD 已接入持久 Mailbox、Plan-first Council、Skill 审批、Persona 演化和 Gate 输出解析。
 - **不可以**：**人类无法真正挡住 agent**。BCD 目前只暴露「创建」和「取消」，Council 由 `proposer/reviewer/synthesis` 几个 agent 角色自己裁决（`can_create_merge_authorization` 恒为 `false`），A 那边权限请求也是自动批准的。
   前端的 Intervene / Council 裁决按钮仍可用，但**只改前端本地状态、不回写后端**。
   扩展位已留好：待 BCD 补上 `gate.submitDecision` / `council.submitVerdict` 之类的方法，只需在 `src/api/transport.ts` + `client.ts` 各加一个薄封装，**UI 层一行都不用改**（`map.ts` 里 UI→契约的裁决映射已经写好）。
-- **拿不到 token 级流式输出**：A 的 `contract-runner` 把 agent 的流式事件收集在进程内，只汇总成统计与 tool_events 摘要返回。但 BCD 的 `run.event` 是实时的，**节点级进度推进是真实且实时的**。
+- **前端仍不展示 token 级流式正文**：A 已保留回复正文、内联产物及完整 Driver 事件；BCD 会实时投影 turn/tool 生命周期并持久化完整事件审计，但 agent 消息 chunk 尚未投影成前端 `run.event`。**节点级进度推进与工具生命周期是真实且实时的**。
 
 ## 技术栈
 
@@ -186,7 +232,7 @@ pnpm install       # 首次运行（workspace，会一并装 A / BCD 的依赖�
 pnpm dev           # http://localhost:5173/（Web 版：无桌面桥 → 后端与文件能力均降级为 mock）
 ```
 
-构建生产版本：`pnpm build`，预览：`pnpm preview`；提交前自检：`pnpm verify`（lint + typecheck + vitest，只覆盖前端）。
+构建生产版本：`pnpm build`，预览：`pnpm preview`；提交前自检：`pnpm verify`（前端 lint/typecheck/vitest、Electron/打包脚本回归与设计规范检查）。
 全量自检（含 A / BCD）：`pnpm -r verify`。
 
 > 若本机未全局安装 Node，项目可能内置一份本地运行时（`.node/`）。此时可运行 `./start.sh`，或先 `export PATH="$PWD/.node/bin:$PATH"` 再执行上面的命令。
@@ -210,6 +256,28 @@ pnpm electron:build:dir    # 当前系统的免安装解包版，快速自测
 ```
 
 > Linux/WSL 下运行需要 GUI 依赖库（`libnspr4 libnss3 libgbm1 libgtk-3-0 …`）。也可直接在原生 Windows / Mac 上开发。
+
+### Windows 本地免安装版：更新并自动清理旧版
+
+本项目的本地免安装版统一通过以下流程交付，不再手工往桌面累积多个旧包：
+
+```bash
+pnpm electron:portable:win
+```
+
+此命令构建 Windows x64 后端与**目录式免安装版**，一次复制到实际 Windows 桌面的 `Polaris-portable-x64/`，逐文件校验后更新「Polaris-免安装版」快捷方式，直接启动目录内的 `Polaris.exe`。单文件 NSIS portable 每次启动都完整解压、退出时又删除展开目录；日常使用不再走这个入口，也不需要安装或修改系统注册表。
+
+已有目录版正在运行时会拒绝覆盖，需先退出；复制或快捷方式切换失败会保留旧版。首次从单文件版迁移时，可先放好新目录并切换快捷方式，不会强杀旧窗口；退出旧版、通过快捷方式启动新版后，会按交付清单和校验值自动清除旧桌面包及旧快捷方式。
+
+清理仅针对同架构、不高于当前版本的已确认旧包。程序目录包含逐文件交付清单，更新前若发现自行添加或修改的文件会拒绝覆盖，不猜测其归属；请将项目保存在程序目录之外。配置、项目、B Memory、其他架构/更高版本包及仓库构建缓存均不在清理范围内。目录版不调用面向安装版的自动更新器，本地更新统一走此发布流程。
+
+已经构建好的包可单独交付并触发相同的清理：
+
+```bash
+pnpm portable:deploy release/portable/win-unpacked
+```
+
+脚本兼容 Windows 和 WSL，通过系统接口定位实际 Windows 桌面。流程使用 `--publish never`，不会向 GitHub 上传本地测试包；回归检查为 `pnpm test:packaging`。仍可显式传入旧式 `Polaris-<version>-win-<arch>-portable.exe` 单文件包，但这种交付要求先退出所有 Polaris 实例，且启动时仍需完整解压。
 
 ### 发布新版本（自动出安装包）
 

@@ -67,6 +67,7 @@ function TaskBoardInner() {
   // 文件写进别的项目也毫无察觉：run 照样显示已交付，产物却不在你的目录里。
   const [workspace, setWorkspace] = useState('');
   useEffect(() => onBackendStatus((s) => setWorkspace(s.workspace)), []);
+  const taskWorkspace = activeTask?.contractWorkspacePath ?? activeProject?.rootPath ?? workspace;
 
   // 两个视图开关都是**本地状态**，不进 store：它们是这一屏的看法，不是这次 run 的事实。
   const [view, setView] = useState<'rail' | 'canvas' | null>(null);
@@ -118,14 +119,19 @@ function TaskBoardInner() {
             state={state}
             headline={mission.headline}
             sub={mission.sub}
-            workspacePath={liveRun ? workspace || undefined : undefined}
+            workspacePath={liveRun ? taskWorkspace || undefined : undefined}
             channel={eventChannelStatus}
             onRetry={mission.retry ? onRetry : undefined}
             onRevealWorkspace={() => {
-              if (workspace) revealAgentFile(workspace);
+              if (taskWorkspace) revealAgentFile(taskWorkspace);
             }}
           />
 
+          {liveRun?.syncError && state !== 'running' && (
+            <p role="alert" className="text-body text-human">
+              {liveRun.syncError}
+            </p>
+          )}
           <ProgressRibbon phases={phaseSegments(nodes, activeNodeId ?? undefined)} />
         </div>
 

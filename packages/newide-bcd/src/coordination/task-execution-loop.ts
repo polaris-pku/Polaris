@@ -30,7 +30,10 @@ import {
 type CursorInput<TCursor extends TaskResumeCursor> = Extract<TaskCursorInput, { cursor: TCursor }>;
 
 /** `executeStage` 能真正执行的游标——`done` / `mailbox_wait` 是循环退出条件，不是阶段。 */
-type ExecutableStageCursor = Exclude<TaskCursorInput, { cursor: 'done' | 'mailbox_wait' }>['cursor'];
+type ExecutableStageCursor = Exclude<
+  TaskCursorInput,
+  { cursor: 'done' | 'mailbox_wait' }
+>['cursor'];
 
 /**
  * 阶段边界的两条归因必须同源。
@@ -55,6 +58,7 @@ export interface TaskStageExecutionContext<TCursor extends TaskResumeCursor> {
   memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
   task_request: TaskCreateRequest;
   workspace_path: string;
+  delivery_workspace_path?: string;
   session_id?: string;
   cursor_input: CursorInput<TCursor>;
   /**
@@ -295,17 +299,17 @@ export class TaskExecutionLoop {
               }
             : trigger
               ? {
-                cursor: 'council',
-                trigger,
-                primary_evidence_ref: evidence.uri,
-                candidate_manifest_ref: result.changeset_ref,
+                  cursor: 'council',
+                  trigger,
+                  primary_evidence_ref: evidence.uri,
+                  candidate_manifest_ref: result.changeset_ref,
                 }
               : {
-                cursor: 'gate',
-                subject_ref: result.changeset_ref,
-                phase: 'post_primary',
-                changeset_ref: result.changeset_ref,
-                expected_sha256: result.expected_sha256,
+                  cursor: 'gate',
+                  subject_ref: result.changeset_ref,
+                  phase: 'post_primary',
+                  changeset_ref: result.changeset_ref,
+                  expected_sha256: result.expected_sha256,
                 };
           const committed = this.advanceWithEvidence(
             state,
@@ -364,15 +368,13 @@ export class TaskExecutionLoop {
               expected_cursor: cursorInput.cursor,
               invocation_id: invocationId,
               evidence_ref: evidence,
-              error:
-                result.error ??
-                {
-                  code: result.status === 'denied' ? 'gate_denied' : 'gate_blocked',
-                  message:
-                    result.status === 'denied'
-                      ? 'Production Gate denied the changeset'
-                      : 'Production Gate blocked the changeset',
-                },
+              error: result.error ?? {
+                code: result.status === 'denied' ? 'gate_denied' : 'gate_blocked',
+                message:
+                  result.status === 'denied'
+                    ? 'Production Gate denied the changeset'
+                    : 'Production Gate blocked the changeset',
+              },
               ...(result.artifact_refs ? { artifact_refs: result.artifact_refs } : {}),
             });
             this.notifyCommittedEvents(controls, committed.committed_events);
@@ -582,14 +584,13 @@ function stageContext<TCursor extends Exclude<TaskResumeCursor, 'done' | 'mailbo
     ...(state.memory_ablation ? { memory_ablation: state.memory_ablation } : {}),
     task_request: state.task_request,
     workspace_path: state.workspace_path,
-    ...(controls.memory_ablation
-      ? { memory_ablation: controls.memory_ablation }
+    ...(state.delivery_workspace_path
+      ? { delivery_workspace_path: state.delivery_workspace_path }
       : {}),
+    ...(controls.memory_ablation ? { memory_ablation: controls.memory_ablation } : {}),
     ...(controls.session_id ? { session_id: controls.session_id } : {}),
     cursor_input: cursorInput,
-    ...(state.restarted_from_run_id
-      ? { restarted_from_run_id: state.restarted_from_run_id }
-      : {}),
+    ...(state.restarted_from_run_id ? { restarted_from_run_id: state.restarted_from_run_id } : {}),
     ...(controls.signal ? { signal: controls.signal } : {}),
     ...(controls.on_driver_event ? { on_driver_event: controls.on_driver_event } : {}),
     ...(controls.on_event ? { on_event: controls.on_event } : {}),

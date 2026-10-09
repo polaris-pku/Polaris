@@ -16,6 +16,11 @@ import { APP_VERSION } from '@/lib/version';
 import { onBackendStatus } from '@/api/events';
 import type { BackendStatus } from '@/api/transport';
 import { cn } from '@/lib/utils';
+import { DriverRoutingPanel } from '@/components/DriverRoutingPanel';
+import { useDemoStore } from '@/store/useDemoStore';
+import { bindBackendWorkspace } from '@/lib/backendWorkspace';
+import { sameProjectPath } from '@/lib/projectPaths';
+import { hasActiveTasks } from '@/store/lib/liveRuns';
 
 /**
  * 设置弹窗。
@@ -32,6 +37,34 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
   const backend = window.desktop?.backend;
 
   const [status, setStatus] = useState<BackendStatus | null>(null);
+  const project = useDemoStore((state) =>
+    state.projects.find((item) => item.id === state.activeProjectId),
+  );
+  const [bindingRouting, setBindingRouting] = useState(false);
+  const [routingScopeError, setRoutingScopeError] = useState<string>();
+  const routingMismatch =
+    !!backend &&
+    !!project?.rootPath &&
+    !!status?.workspace &&
+    !sameProjectPath(project.rootPath, status.workspace);
+  const bindRoutingProject = async () => {
+    if (!project || bindingRouting) return;
+    if (hasActiveTasks(useDemoStore.getState())) {
+      setRoutingScopeError(
+        '还有任务在执行或等待协作，不能切换后端工作区。路由保存本身不会重启后端。',
+      );
+      return;
+    }
+    setBindingRouting(true);
+    setRoutingScopeError(undefined);
+    try {
+      await bindBackendWorkspace(project);
+    } catch (reason) {
+      setRoutingScopeError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBindingRouting(false);
+    }
+  };
   const [providerId, setProviderId] = useState('anthropic');
   const [key, setKey] = useState('');
   const [baseUrl, setBaseUrl] = useState('');
@@ -611,6 +644,39 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
             </p>
           )
         )}
+
+        {open &&
+          (routingMismatch ? (
+            <section className="mt-4 rounded-panel border border-edge bg-surface-panel p-4">
+              <h3 className="text-title text-fg-primary">驱动路由</h3>
+              <p className="mt-2 text-body text-fg-secondary">
+                当前后端尚未绑定「{project?.name}
+                」。先切换到该项目，再编辑其驱动路由；这一步会重新启动空闲后端。
+              </p>
+              <p className="mt-1 break-all font-mono text-code text-fg-muted">
+                {project?.rootPath}
+              </p>
+              <Button
+                className="mt-3"
+                size="sm"
+                disabled={bindingRouting || status?.state === 'starting'}
+                onClick={() => void bindRoutingProject()}
+              >
+                {bindingRouting ? '正在切换工作区' : '读取当前项目的路由'}
+              </Button>
+              {routingScopeError && (
+                <p className="mt-2 text-body text-danger-soft" role="alert">
+                  {routingScopeError}
+                </p>
+              )}
+            </section>
+          ) : (
+            <DriverRoutingPanel
+              key={status?.workspace ?? 'backend-project'}
+              workspace={status?.workspace}
+              available={status?.state === 'ready'}
+            />
+          ))}
 
         {/* ── 关于 ── */}
         <div className="mt-4 flex items-center gap-3 rounded-panel border border-edge bg-brand-void p-3">

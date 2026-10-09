@@ -10,7 +10,7 @@
  *  - **一条不丢**：`groupEvents()` 会丢掉不属于任何语义步骤的事件（`stepOf()` 返回
  *    undefined 的那些）——但日志不能丢。这里对**全量 timeline** 建行，步骤归属只是
  *    行上的一个可选注解（`stepId === ''` = 不属于任何步骤，照样渲染）。
- *  - **后端的 sequence 是权威顺序**，前端不重排、不按时间戳猜。
+ *  - **后端 timeline 的数组顺序是权威顺序**，同序号事件保留。
  */
 import type { RunEvent } from '@/api/types/rpc';
 import { STEPS, groupEvents, type StepKey } from '@/lib/eventGraph';
@@ -26,6 +26,7 @@ export const EVENT_STREAM_CAP = 1000;
 export type EventStreamRow = {
   /** React key：后端的 event_id 全局唯一 */
   eventId: string;
+  runId: string;
   seq: number;
   /** HH:MM:SS —— 取自事件自带的 created_at（后端给的真值，不是本地时钟） */
   time: string;
@@ -37,6 +38,7 @@ export type EventStreamRow = {
   stepLabel: string;
   /** 格式化后的 payload JSON 原文。'' = 无 payload（此行不可展开） */
   payload: string;
+  payloadRef?: string;
 };
 
 /** ISO → HH:MM:SS。事件都带 created_at，时间戳是后端给的真值。 */
@@ -64,7 +66,7 @@ export function stepLabelOf(stepId: string): string {
 }
 
 /**
- * 全量事件 → 事件流行，按 sequence 升序。
+ * 全量事件 → 事件流行，保留后端数组顺序。
  *
  * 步骤归属复用 `groupEvents()`（与步骤轨 / 右栏 Fold **同一个真值源**），
  * 但不属于任何步骤的事件**照样成行** —— 见文件头「一条不丢」。
@@ -75,21 +77,23 @@ export function buildEventRows(events: RunEvent[]): EventStreamRow[] {
     for (const event of group.events) stepIdByEventId.set(event.event_id, group.nodeId);
   }
 
-  return [...events]
-    .sort((a, b) => a.sequence - b.sequence)
-    .map((event) => {
-      const stepId = stepIdByEventId.get(event.event_id) ?? '';
-      return {
-        eventId: event.event_id,
-        seq: event.sequence,
-        time: hms(event.created_at),
-        type: event.type,
-        source: event.source,
-        stepId,
-        stepLabel: stepLabelOf(stepId),
-        payload: formatPayload(event.payload),
-      };
-    });
+  return events.map((event) => {
+    const stepId = stepIdByEventId.get(event.event_id) ?? '';
+    return {
+      eventId: event.event_id,
+      runId: event.run_id,
+      seq: event.sequence,
+      time: hms(event.created_at),
+      type: event.type,
+      source: event.source,
+      stepId,
+      stepLabel: stepLabelOf(stepId),
+      payload: formatPayload(event.payload),
+      ...(typeof event.payload.payload_ref === 'string' && event.payload.payload_ref
+        ? { payloadRef: event.payload.payload_ref }
+        : {}),
+    };
+  });
 }
 
 /** 按步骤过滤（F3 的落点：Fold 的「原始事件 · N 条 ↗」把 stepId 送进来）。null = 不过滤。 */

@@ -10,7 +10,11 @@ import {
   type ChangesetManifest,
 } from '../coordinator/changeset-manifest';
 import { buildDriverRunResultFromAgentExecution } from '../coordinator/agent-execution-driver-result';
-import { collectWorkspaceArtifacts, mergeArtifacts, snapshotWorkspaceFiles } from '../coordinator/workspace-change-detector';
+import {
+  collectWorkspaceArtifacts,
+  mergeArtifacts,
+  snapshotWorkspaceFiles,
+} from '../coordinator/workspace-change-detector';
 import { buildRunOutputPaths } from '../coordinator/run-result';
 import { DeliverArtifactHandler } from '../coordinator/handlers/deliver-artifact-handler';
 import {
@@ -188,9 +192,7 @@ export function createProductionStageExecutors(
       const auctionCompleted = auctionDisabled
         ? undefined
         : marketAuctionCompletedPayload({ context: marketContext, result });
-      const auctionId = auctionCompleted
-        ? String(auctionCompleted.auction_id)
-        : undefined;
+      const auctionId = auctionCompleted ? String(auctionCompleted.auction_id) : undefined;
       if (auctionCompleted && auctionId) {
         emit(context, 'market.auction.completed', auctionId, auctionCompleted);
       }
@@ -225,15 +227,18 @@ export function createProductionStageExecutors(
       const strategyName = councilStrategyName(dependencies.councilProvider);
       const planFirst = context.mode === 'council' && strategyName === 'plan_first';
       const executionWorkspace =
-        context.mode === 'council'
-          ? path.join(
-              councilRunWorkspaceRoot(
-                dependencies.councilRoot,
-                context.restarted_from_run_id ?? context.run_id,
-              ),
-              'primary',
-            )
-          : context.workspace_path;
+        context.delivery_workspace_path &&
+        context.workspace_path !== context.delivery_workspace_path
+          ? context.workspace_path
+          : context.mode === 'council'
+            ? path.join(
+                councilRunWorkspaceRoot(
+                  dependencies.councilRoot,
+                  context.restarted_from_run_id ?? context.run_id,
+                ),
+                'primary',
+              )
+            : context.workspace_path;
       if (context.mode === 'council') {
         if (!context.restarted_from_run_id) {
           await prepareCouncilWorkspace(context.workspace_path, executionWorkspace);
@@ -244,9 +249,7 @@ export function createProductionStageExecutors(
       emit(context, 'agent.execution_requested', context.run_id, {
         role_id: context.cursor_input.winner_agent_id,
         workspace_path: executionWorkspace,
-        ...(context.memory_ablation
-          ? { ablation: context.memory_ablation }
-          : {}),
+        ...(context.memory_ablation ? { ablation: context.memory_ablation } : {}),
       });
       const primaryInstruction = agentExecutionInstruction(context, planFirst);
       const executePrimary = (instruction: string, sessionId = context.session_id) =>
@@ -278,11 +281,14 @@ export function createProductionStageExecutors(
         try {
           assertCouncilPlanArtifacts(result.artifact_refs, 'primary proposal');
         } catch {
-          result = await executePrimary([
-            primaryInstruction,
-            'RETRY: the previous turn did not create the required council-plan.md artifact.',
-            'Call invoke_driver and write that file now. Do not send Mailbox requests or finish with text only.',
-          ].join('\n'), result.session_id || context.session_id);
+          result = await executePrimary(
+            [
+              primaryInstruction,
+              'RETRY: the previous turn did not create the required council-plan.md artifact.',
+              'Call invoke_driver and write that file now. Do not send Mailbox requests or finish with text only.',
+            ].join('\n'),
+            result.session_id || context.session_id,
+          );
           mailboxWait = result.status === 'completed' ? mailboxWaitFromResult(result) : undefined;
         }
       }
@@ -356,11 +362,10 @@ export function createProductionStageExecutors(
           driverId: String(result.diagnostics.driver_id ?? result.role_id),
           runsRoot: dependencies.runsRoot,
         });
-        await stateStore.update(
-          context.run_id,
-          context.task_id,
-          { primary: { result }, selection },
-        );
+        await stateStore.update(context.run_id, context.task_id, {
+          primary: { result },
+          selection,
+        });
         // Keep ablation on the timeline even when primary fails so fallback
         // summary writers (and --backend-summary checks) still see B0–B3.
         emit(context, 'memory.context_pack_built', result.context_pack_ref, {
@@ -370,9 +375,7 @@ export function createProductionStageExecutors(
           memory_buffer_ref: result.memory_buffer_ref,
           diagnostics: result.diagnostics,
           primary_status: result.status,
-          ...(context.memory_ablation
-            ? { ablation: context.memory_ablation }
-            : {}),
+          ...(context.memory_ablation ? { ablation: context.memory_ablation } : {}),
         });
         emit(context, 'agent.execution_completed', result.agent_run_id, {
           agent_id: result.agent_id ?? result.role_id,
@@ -386,9 +389,7 @@ export function createProductionStageExecutors(
           memory_buffer_ref: result.memory_buffer_ref,
           driver_run_result_id: result.driver_run_result_id,
           diagnostics: result.diagnostics,
-          ...(context.memory_ablation
-            ? { ablation: context.memory_ablation }
-            : {}),
+          ...(context.memory_ablation ? { ablation: context.memory_ablation } : {}),
         });
         return {
           changeset_ref: selection.manifest_ref,
@@ -397,7 +398,10 @@ export function createProductionStageExecutors(
           session_id: result.session_id,
           // escalation_request is redundant in council mode (councilTrigger always
           // returns 'explicit_mode'), but included for audit clarity.
-          escalation_request: { type: 'request_council' as const, reason: `primary_agent_${result.status}` },
+          escalation_request: {
+            type: 'request_council' as const,
+            reason: `primary_agent_${result.status}`,
+          },
           evidence: {
             status: result.status,
             agent_id: result.agent_id ?? result.role_id,
@@ -537,7 +541,7 @@ export function createProductionStageExecutors(
             gate_results: [],
             evidence_pack: evidencePack,
             question: context.task_request.spec,
-            workspace_path: context.workspace_path,
+            workspace_path: context.delivery_workspace_path ?? context.workspace_path,
             proposal_agent_id: primary.agent_id ?? primary.role_id,
             ...(context.memory_ablation ? { memory_ablation: context.memory_ablation } : {}),
           },
@@ -694,7 +698,7 @@ export function createProductionStageExecutors(
         run_id: context.run_id,
         task_id: context.task_id,
         phase: context.mode === 'council' ? 'post_council' : 'pre_selection',
-        workspace_path: context.workspace_path,
+        workspace_path: context.delivery_workspace_path ?? context.workspace_path,
         completion_criteria: context.task_request.completion_criteria,
         artifact_refs: selection.selected_artifacts.map((artifact) => artifact.artifact_id),
       });
@@ -720,7 +724,7 @@ export function createProductionStageExecutors(
         manifest_path: pathFromFileRef(selection.manifest_ref),
         delivery_receipt_path: buildRunOutputPaths(context.run_id, dependencies.runsRoot)
           .delivery_receipt_path,
-        user_workspace_path: context.workspace_path,
+        user_workspace_path: context.delivery_workspace_path ?? context.workspace_path,
         ...(context.mode === 'council'
           ? {
               council_workspace_path: councilRunWorkspaceRoot(
@@ -860,7 +864,8 @@ export function createProductionStageExecutors(
         files: delivery.files,
         quality: gateState.completion_evaluation.outcome,
       });
-      const firstFile = delivery.files[0]?.file_path ?? context.workspace_path;
+      const firstFile =
+        delivery.files[0]?.file_path ?? context.delivery_workspace_path ?? context.workspace_path;
       return {
         final_output: {
           artifact_ref: selection.manifest_ref,
@@ -907,7 +912,11 @@ async function executeFinalCouncilPlan(input: {
   dependencies: ProductionStageExecutorDependencies;
   councilRunId: string;
   phaseId: string;
-}): Promise<{ result: AgentExecutionResult; artifact_refs: ArtifactRef[]; failed_attempts: number }> {
+}): Promise<{
+  result: AgentExecutionResult;
+  artifact_refs: ArtifactRef[];
+  failed_attempts: number;
+}> {
   const workspace = path.join(
     councilRunWorkspaceRoot(
       input.dependencies.councilRoot,
@@ -980,9 +989,7 @@ async function executeFinalCouncilPlan(input: {
       },
       {
         ...(input.context.signal ? { signal: input.context.signal } : {}),
-        ...(input.context.on_driver_event
-          ? { onDriverEvent: input.context.on_driver_event }
-          : {}),
+        ...(input.context.on_driver_event ? { onDriverEvent: input.context.on_driver_event } : {}),
       },
     );
   };
@@ -992,20 +999,27 @@ async function executeFinalCouncilPlan(input: {
     recordFailure(result, 1, true);
     phaseId = createId('council_phase');
     emit(input.context, 'council.phase.started', phaseId, {
-      council_run_id: input.councilRunId, phase_id: phaseId, phase: 'implementation', attempt: 2,
+      council_run_id: input.councilRunId,
+      phase_id: phaseId,
+      phase: 'implementation',
+      attempt: 2,
       agent_id: input.primary.agent_id ?? input.primary.role_id,
-      session_id: input.primary.session_id, recovery: 'same_session_continuation',
+      session_id: input.primary.session_id,
+      recovery: 'same_session_continuation',
       input_artifact_refs: input.finalPlans.map((artifact) => artifact.artifact_id),
     });
     result = await runImplementation(2);
     if (result.status === 'completed') {
       result = {
         ...result,
-        artifact_refs: mergeArtifacts(result.artifact_refs, await collectWorkspaceArtifacts(
-          { task_id: input.context.task_id, workspace_path: workspace },
-          workspaceBefore,
-          String(result.diagnostics.driver_id ?? result.role_id),
-        )),
+        artifact_refs: mergeArtifacts(
+          result.artifact_refs,
+          await collectWorkspaceArtifacts(
+            { task_id: input.context.task_id, workspace_path: workspace },
+            workspaceBefore,
+            String(result.diagnostics.driver_id ?? result.role_id),
+          ),
+        ),
       };
     }
     implementationArtifacts = implementationArtifactsFrom(result);
@@ -1016,7 +1030,9 @@ async function executeFinalCouncilPlan(input: {
   }
   if (implementationArtifacts.length === 0) {
     recordFailure(result, failedAttempts + 1, false);
-    throw new Error('Primary Agent completed the final Council Plan without implementation artifacts');
+    throw new Error(
+      'Primary Agent completed the final Council Plan without implementation artifacts',
+    );
   }
   emit(input.context, 'agent.execution_completed', result.agent_run_id, {
     phase: 'council_plan_execution',
@@ -1042,9 +1058,7 @@ async function executeFinalCouncilPlan(input: {
     agent_run_id: result.agent_run_id,
     driver_run_result_id: result.driver_run_result_id,
     final_plan_artifact_refs: input.finalPlans.map((artifact) => artifact.artifact_id),
-    implementation_artifact_refs: implementationArtifacts.map(
-      (artifact) => artifact.artifact_id,
-    ),
+    implementation_artifact_refs: implementationArtifacts.map((artifact) => artifact.artifact_id),
     response: result.response,
   });
   return { result, artifact_refs: implementationArtifacts, failed_attempts: failedAttempts };
@@ -1069,7 +1083,9 @@ function shouldResumeFinalCouncilPlan(
       !Array.isArray(driverError) &&
       Reflect.get(driverError, 'retryable') === true) ||
       (result.diagnostics.driver_error_code === 'EXTERNAL_DRIVER_TRANSPORT_ERROR' &&
-        (!driverError || typeof driverError !== 'object' || Reflect.get(driverError, 'retryable') !== false)));
+        (!driverError ||
+          typeof driverError !== 'object' ||
+          Reflect.get(driverError, 'retryable') !== false)));
   return (
     result.status === 'interrupted' ||
     (result.status === 'failed' && result.diagnostics.driver_error_code === 'B_BLOCKED') ||
@@ -1091,10 +1107,15 @@ async function attachPlanExecution(
   const updatedResult = {
     ...councilResult,
     role_failure_count: (councilResult.role_failure_count ?? 0) + failedAttempts,
-    ...(failedAttempts > 0 ? {
-      quality: 'best_effort' as const,
-      warnings: [...councilResult.warnings, `Council implementation recovered after ${String(failedAttempts)} failed attempt(s).`],
-    } : {}),
+    ...(failedAttempts > 0
+      ? {
+          quality: 'best_effort' as const,
+          warnings: [
+            ...councilResult.warnings,
+            `Council implementation recovered after ${String(failedAttempts)} failed attempt(s).`,
+          ],
+        }
+      : {}),
     final_artifact_ref: firstArtifact.artifact_id,
     final_artifact_sha256: sha256(await readArtifactBytes(firstArtifact)),
     verification_refs: uniqueStrings([
@@ -1116,7 +1137,10 @@ async function attachPlanExecution(
       decision: {
         ...councilRunResult.decision,
         selected_artifact_refs: implementationRefs,
-        evidence_refs: uniqueStrings([...councilRunResult.decision.evidence_refs, ...finalPlans.map((plan) => plan.artifact_id)]),
+        evidence_refs: uniqueStrings([
+          ...councilRunResult.decision.evidence_refs,
+          ...finalPlans.map((plan) => plan.artifact_id),
+        ]),
       },
       result: updatedResult,
       plan_execution: {

@@ -24,7 +24,9 @@
 
 阶段：执行。汇聚：`agent.execution_requested` · `agent.execution_completed` · `agent.execution_failed`。
 
-这一步是一个跨度（requested → completed / failed）。未闭合时界面上跑的是实时秒表 —— 后端在 agent 干活的那十几秒里一个事件都不发，没有秒表，界面在最关键的时段是死的。
+这一步是一个跨度（requested → completed / failed）。运行期间还会收到执行器 turn / tool 生命周期事件；主句优先读取活动快照，区分思考、委派和执行工具。流式文字片段不进入状态事件流。
+
+执行器生命周期归入同一个执行步骤，工具结束不会提前关闭 Agent 跨度；工具失败后 Agent 成功恢复，也不会把整个步骤判成失败。用量记账事件仅供用量与原始事件查看，不凭空生成审查步骤。
 
 ### 产出
 
@@ -56,6 +58,48 @@
 - `RunSnapshot.delivery_report.files_written` 是一个字符串数组（文件路径）。
 
 快照到了就用数组的长度；快照还没到，就直接把那个数字当数量用。
+
+## 运行观测接口
+
+运行中会定期读取 `run.getSnapshot`。主句和「当前活动」使用 `activity.agents` 中的思考、委派及执行器工具状态；缺少活动块不代表空闲。`stale` 表示观测可能已陈旧，`since` 与 `last_event_at` 都来自后端。
+
+`current.cursor` 是精确阶段：`select_agent`、`execute_agent`、`council`、`gate`、`deliver`、`mailbox_wait`、`done`。`stage` 只是粗映射；没有 `invocation_id` 表示此刻没有阶段调用在跑。
+
+### 用量
+
+「用量」分三种口径，互不相加：
+
+- `billed`：按 `proxy` 与驱动档案的计费来源（默认 `claude_session_jsonl`）分别展示计费 token。`proxy` 表示后端模型 API 调用，不要求个人调试代理；`pending_sources` 标出尚待收尾结算的来源。
+- `context`：执行器上下文占用，不是计费用量。`complete=false` 会显示观测不完整。
+- `by_stage`：仅模型 API 调用一侧的分阶段计费统计，不是阶段总量。没有 `duration_ms` 时显示「耗时未提供」，不是 0。
+
+`run.getUsage` 可按 run、task、system、role 查看持久历史累计。没有用量的运行计入 `runs_without_usage`，不当作 0；查询失败会显示错误与刷新入口。
+
+### 增量事件与重连
+
+`run.event`、`run.getEvents` 与快照时间线对同一事件使用相同的 `sequence`。序号可以并列，因此按后端数组顺序展示、按 `event_id` 去重。
+
+断号与重连时先补拉、再对齐快照，并用 `run.subscribe.after_sequence` 恢复订阅。后端重启可能改变持久回放的序号空间，所以重连必须重新读取权威快照，不能仅沿用旧水位。前端补拉不分页，避免并列序号在页边界丢失。
+
+### 完整载荷
+
+超出内联上限的大字段在 `event.payload.payload_ref` 留引用。展开事件流中的对应行，点「读取完整载荷」，由 `run.getPayload` 取回原始事件。
+
+引用对应的文件可能已经截断或清理：`-32017` 会显示不可读取，不返回假空内容。`-32601` 表示后端版本不支持接口。状态事件照常推送，但消息 chunk、工具 progress 和 stderr 不逐条进入状态时间线，也没有独立的流式文字合并通道。
+
+## 驱动路由
+
+设置中的「驱动路由」使用三个接口：`driver.getConfig`、`driver.updateRouting`、`driver.resetRouting`。成功返回均为 `driver-routing.v1` 快照，不另套结果信封。
+
+编辑默认驱动和角色时，保存的是完整角色映射，不是单条 patch。`roles` 已包含目录未确认的显式映射；它们不会因为 `known_role=false` 被当作无效或从请求中删掉。与默认驱动相同的映射由后端规范化合并。
+
+`selectable` 决定选项是否可选。`degraded` 与 `AGENT_CLI_READINESS_NOT_VERIFIABLE` 只表示当前进程无法确认 A 侧 CLI 是否就绪，不是驱动故障。界面不显示运行时环境变量、凭据、runner 路径或启动命令。
+
+保存和恢复文件配置都要带 `expected_revision`。`-32021` 会保留草稿并读取最新快照，由用户决定如何合并，不自动覆盖；`-32026` 可稍后重试同一请求。`-32025` 表示部署锁定了默认驱动，选择器会恢复到 `locked_driver_id`，角色仍可编辑。
+
+`-32022` / `-32023` 按 `field` 定位不可用的驱动选择；`-32024` 展示写入诊断；旧后端的 `-32601` 提示版本限制，不伪造可选驱动。
+
+路由覆盖保存在当前后端工作区的 `.agent/drivers.ui.local.yaml`。保存不重启后端：已创建 Run 使用冻结映射，新 Run 才读取新配置。议会阶段的执行 ID 仍独立，但路由按 `activity_run_id` 所属 Run 的冻结映射解析。新增或移除驱动档案需要重启进程，不由本设置区完成。
 
 ## Gate 与合议
 

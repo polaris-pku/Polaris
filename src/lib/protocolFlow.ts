@@ -99,7 +99,7 @@ export function projectProtocolFlow(
   runStatus: 'running' | 'completed' | 'failed' | 'cancelled',
 ): ProtocolNode[] {
   const byCode = new Map<string, RunEvent[]>();
-  let latest: { code: string; sequence: number } | undefined;
+  let latestCode: string | undefined;
 
   for (const event of timeline) {
     const code = EVENT_NODE[event.type];
@@ -107,7 +107,7 @@ export function projectProtocolFlow(
     const list = byCode.get(code) ?? [];
     list.push(event);
     byCode.set(code, list);
-    if (!latest || event.sequence > latest.sequence) latest = { code, sequence: event.sequence };
+    latestCode = code;
   }
 
   return CATALOG.map(({ code, labelCn, ownerCn }) => {
@@ -117,7 +117,7 @@ export function projectProtocolFlow(
     }
     const last = events[events.length - 1];
     const blocked = events.some(isFailure);
-    const active = runStatus === 'running' && latest?.code === code && !blocked;
+    const active = runStatus === 'running' && latestCode === code && !blocked;
     return {
       code,
       labelCn,

@@ -1,9 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { SCHEMA_VERSION, type TaskCreateRequest } from '../../src/core';
-import {
-  TaskExecutionLoop,
-  type TaskExecutionLoopExecutors,
-} from '../../src/coordination';
+import { TaskExecutionLoop, type TaskExecutionLoopExecutors } from '../../src/coordination';
 import { TaskProcessor } from '../../src/coordination';
 import {
   createRunLatency,
@@ -225,8 +222,7 @@ describe('TaskExecutionLoop', () => {
         .listEvents('task_loop')
         .filter(
           (event) =>
-            event.event_type === 'handler.completed' &&
-            event.payload.cursor === 'execute_agent',
+            event.event_type === 'handler.completed' && event.payload.cursor === 'execute_agent',
         ),
     ).toHaveLength(1);
   });
@@ -235,9 +231,9 @@ describe('TaskExecutionLoop', () => {
     const fixture = createFixture({ coordinationFailureAt: 'execute_agent' });
     begin(fixture.processor, selectInput, 'single_agent');
 
-    await expect(
-      fixture.loop.run({ task_id: 'task_loop', run_id: 'run_loop' }),
-    ).rejects.toThrow(/coordination commit failed/i);
+    await expect(fixture.loop.run({ task_id: 'task_loop', run_id: 'run_loop' })).rejects.toThrow(
+      /coordination commit failed/i,
+    );
 
     expect(fixture.store.getTaskAggregate('task_loop')).toMatchObject({
       task: { status: 'running' },
@@ -254,9 +250,7 @@ describe('TaskExecutionLoop', () => {
       },
     });
     expect(
-      fixture.store
-        .listEvents('task_loop')
-        .some((event) => event.event_type === 'handler.failed'),
+      fixture.store.listEvents('task_loop').some((event) => event.event_type === 'handler.failed'),
     ).toBe(false);
   });
 
@@ -513,7 +507,11 @@ function createFixture(options: FixtureOptions = {}): {
     if (options.coordinationFailureAt && completedCursor === options.coordinationFailureAt) {
       throw new Error('database unavailable during coordination commit');
     }
-    if (completedCursor === 'execute_agent' && options.overrideDuringExecuteCommit && !conflictInjected) {
+    if (
+      completedCursor === 'execute_agent' &&
+      options.overrideDuringExecuteCommit &&
+      !conflictInjected
+    ) {
       conflictInjected = true;
       new TaskProcessor(store, conflictClock()).setCouncilOverride('run_loop');
     }
@@ -535,19 +533,20 @@ function createFixture(options: FixtureOptions = {}): {
         cursor_input: TInput;
         memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
       }): Promise<TResult> => {
-      calls.push(cursor);
-      observedAttributions.push({ cursor, stage_cursor: getLlmUsageAttribution()?.stage_cursor });
-      inputs[cursor] = context.cursor_input;
-      memoryAblations.push(context.memory_ablation);
-      if (options.llmUsageAt?.includes(cursor)) {
-        await recordProxyLlmUsage({ input_tokens: 100, output_tokens: 10, model: 'fake-model' });
-      }
-      if (cursor === 'execute_agent' && options.overrideDuringExecute) {
-        processor.setCouncilOverride('run_loop');
-      }
-      if (options.failAt === cursor) throw new Error(`${cursor.replace('_agent', '')} failed`);
-      return result;
-    });
+        calls.push(cursor);
+        observedAttributions.push({ cursor, stage_cursor: getLlmUsageAttribution()?.stage_cursor });
+        inputs[cursor] = context.cursor_input;
+        memoryAblations.push(context.memory_ablation);
+        if (options.llmUsageAt?.includes(cursor)) {
+          await recordProxyLlmUsage({ input_tokens: 100, output_tokens: 10, model: 'fake-model' });
+        }
+        if (cursor === 'execute_agent' && options.overrideDuringExecute) {
+          processor.setCouncilOverride('run_loop');
+        }
+        if (options.failAt === cursor) throw new Error(`${cursor.replace('_agent', '')} failed`);
+        return result;
+      },
+    );
   const executors: TaskExecutionLoopExecutors = {
     select_agent: {
       execute: execute('select_agent', {

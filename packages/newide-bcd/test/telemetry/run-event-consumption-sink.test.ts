@@ -44,10 +44,7 @@ describe('FileRunEventConsumptionSink', () => {
     });
     await recorder.finish();
 
-    const lines = readFileSync(
-      path.join(root, 'run_sink', 'event-consumption.jsonl'),
-      'utf8',
-    )
+    const lines = readFileSync(path.join(root, 'run_sink', 'event-consumption.jsonl'), 'utf8')
       .trim()
       .split('\n')
       .map((line) => JSON.parse(line) as { event_type: string; payload: Record<string, unknown> });
@@ -57,7 +54,10 @@ describe('FileRunEventConsumptionSink', () => {
       'run.event_committed_batch',
     ]);
     // 汇总必须带上分类明细，否则这个文件只能回答「多少条」、答不了「都是什么」。
-    expect(lines[0]?.payload).toMatchObject({ total_events: 1, by_type: { 'market.selected': { count: 1 } } });
+    expect(lines[0]?.payload).toMatchObject({
+      total_events: 1,
+      by_type: { 'market.selected': { count: 1 } },
+    });
   });
 
   it('目录建不出来时只丢信号，不影响 run', async () => {

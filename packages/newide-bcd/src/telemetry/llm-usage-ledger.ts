@@ -19,7 +19,14 @@ import {
 import { getLlmUsageAttribution, type LlmUsageAttribution } from './llm-usage-attribution';
 import { emitTelemetry, type TelemetrySink } from './telemetry-sink';
 
-export type LlmUsageSource = 'proxy' | 'claude_session_jsonl';
+/**
+ * 用量来自哪条腿。
+ *
+ * 与账本那一侧同域，同为**开放取值域**：driver 计费腿的名字由 driver 档案声明
+ * （见 `src/persistence/token-usage-ledger.ts` 的 `TokenUsageSource`），所以不收窄成
+ * 字面量联合。
+ */
+export type LlmUsageSource = string;
 
 /**
  * 一条 LLM 用量记录。
@@ -52,11 +59,25 @@ export interface LlmUsageTotals {
   by_source: Partial<Record<LlmUsageSource, Omit<LlmUsageTotals, 'by_source' | 'sources'>>>;
 }
 
+/** 单个 driver 会话的实际计费细分（按 session JSONL 逐会话汇总）。 */
+export interface SessionBilledUsage {
+  session_id: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_creation_input_tokens: number;
+  cache_read_input_tokens: number;
+  total_input_tokens: number;
+  total_tokens: number;
+  call_count: number;
+}
+
 export interface RunTokenUsageSummary extends LlmUsageTotals {
   schema_version: 'newide.token_usage.v1';
   source: LlmUsageSource | 'mixed' | 'unavailable';
   session_id?: string;
   session_path?: string;
+  /** 逐会话计费细分（键为 session id）；只有刮取到会话级数据时才有。 */
+  by_session?: Record<string, SessionBilledUsage>;
 }
 
 export interface LlmUsageLedger {
@@ -251,9 +272,7 @@ export function isPopulatedRunTokenUsage(value: unknown): value is RunTokenUsage
   const totalTokens = Number(record.total_tokens ?? 0);
   const callCount = Number(record.call_count ?? 0);
   return (
-    Number.isFinite(totalTokens) &&
-    Number.isFinite(callCount) &&
-    (totalTokens > 0 || callCount > 0)
+    Number.isFinite(totalTokens) && Number.isFinite(callCount) && (totalTokens > 0 || callCount > 0)
   );
 }
 
@@ -327,10 +346,7 @@ export async function recordProxyLlmUsage(
     output_tokens: Math.max(0, Math.floor(input.output_tokens)),
     ...(input.cache_creation_input_tokens !== undefined
       ? {
-          cache_creation_input_tokens: Math.max(
-            0,
-            Math.floor(input.cache_creation_input_tokens),
-          ),
+          cache_creation_input_tokens: Math.max(0, Math.floor(input.cache_creation_input_tokens)),
         }
       : {}),
     ...(input.cache_read_input_tokens !== undefined

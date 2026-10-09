@@ -8,15 +8,19 @@ import type { AppRunSnapshot } from './run-registry';
 import { projectRunSnapshot } from './run-snapshot-projector';
 import {
   isDriverStreamUsage,
+  mergeTaskDriverUsage,
   preferDriverUsage,
   projectTaskDriverUsage,
   type TaskDriverUsage,
 } from './driver-usage-projector';
-import {
-  mergeBilledTokenUsage,
-  type CollectClaudeSessionUsage,
-} from './run-token-usage-merge';
+import { mergeBilledTokenUsage, type CollectClaudeSessionUsage } from './run-token-usage-merge';
 import { collectClaudeSessionUsage } from '../telemetry';
+import type { TokenUsageLedgerStore } from '../persistence';
+import {
+  buildTokenUsageLedgerEntries,
+  readClaudeSessionLeg,
+  type LedgerTimelineEvent,
+} from './run-usage-ledger-entries';
 
 export interface RunTerminalOutputWriter {
   finalize(snapshot: AppRunSnapshot): Promise<RunTerminalOutputEvidence | void>;
@@ -60,6 +64,15 @@ export interface RunConsumptionSummary {
 /** 归属不到 stage 的事件的桶名，与账本汇总里的桶同名。 */
 const UNATTRIBUTED_STAGE = 'unattributed';
 
+/**
+ * driver 事件流投影事件的桶名。
+ *
+ * 这些事件自带 event_sequence（driver-stream 信封序号），是执行过程的观测副本：
+ * 量级由会话长度决定而不是阶段做功，算进 enclosing stage 会让 execute_agent 的
+ * 事件计数被 chunk 洪流淹没。单独成桶既不丢总数，也不污染阶段口径。
+ */
+const DRIVER_STREAM_STAGE = 'driver_stream';
+
 export class FileRunTerminalOutputWriter implements RunTerminalOutputWriter {
   constructor(
     private readonly runsRoot = '.newide/runs',
@@ -74,6 +87,19 @@ export class FileRunTerminalOutputWriter implements RunTerminalOutputWriter {
      * 测试用，免得碰真实的 `~/.claude`。
      */
     private readonly collectClaudeUsage: CollectClaudeSessionUsage = collectClaudeSessionUsage,
+    /**
+     * 进程内实时折叠的 driver usage（事件流正源）。终态时它与文件回读的兜底
+     * 合并：文件可能被保留上限截断而缺尾，正源补上；不注入时行为与从前一致
+     * （只信文件回读，截断缺尾标 complete: false）。
+     */
+    private readonly accumulatedUsage?: (taskId: string) => TaskDriverUsage | undefined,
+    /**
+     * 用量账本。run 收尾时把这次 run 的两条计费腿作为**只追加行**落库，这样累计用量
+     * 不再依赖 `runs/<id>/summary.json` 那棵没有保留策略的目录树存活。
+     *
+     * 不注入时整步空转（单测与 example 零改动），行为与从前完全一致。
+     */
+    private readonly tokenUsageLedger?: TokenUsageLedgerStore,
   ) {}
 
   async finalize(snapshot: AppRunSnapshot): Promise<RunTerminalOutputEvidence | undefined> {
@@ -86,7 +112,10 @@ export class FileRunTerminalOutputWriter implements RunTerminalOutputWriter {
     const frontendSnapshotPath = path.join(runDir, 'frontend-snapshot.json');
 
     const projected = projectRunSnapshot(snapshot);
-    const tokenUsage = await projectTaskDriverUsage(this.runsRoot, snapshot.task_id);
+    const tokenUsage = mergeTaskDriverUsage(
+      await projectTaskDriverUsage(this.runsRoot, snapshot.task_id),
+      this.accumulatedUsage?.(snapshot.task_id),
+    );
     const consumption = summarizeRunConsumption(
       projected.timeline,
       this.runLatency?.snapshot(snapshot.run_id),
@@ -122,15 +151,86 @@ export class FileRunTerminalOutputWriter implements RunTerminalOutputWriter {
       ...fallbackWrites,
       fs.writeFile(frontendSnapshotPath, serializedSnapshot, 'utf-8'),
     ]);
-    await mergeSummaryExtras(summaryPath, { driverUsage: tokenUsage, consumption });
+    await this.bestEffort('summary extras', () =>
+      mergeSummaryExtras(summaryPath, { driverUsage: tokenUsage, consumption }),
+    );
     // driver 侧真实 coding agent 的计费 token 不进事件流，只能等 summary 落盘后从
     // Claude Code 的 session JSONL 刮取再并进来。放在这里而不是 B maintenance：
     // maintenance 由 buffer 触发，跑在 run 收尾之前，读不到 summary.json。
-    await mergeBilledTokenUsage(summaryPath, this.collectClaudeUsage);
+    await this.bestEffort('driver billed scrape', () =>
+      mergeBilledTokenUsage(summaryPath, this.collectClaudeUsage),
+    );
+    await this.appendUsageLedger(snapshot, projected.timeline, summaryPath);
     return {
       artifact_ref: pathToFileURL(path.resolve(frontendSnapshotPath)).href,
       sha256: createHash('sha256').update(serializedSnapshot).digest('hex'),
     };
+  }
+
+  /**
+   * 跑一个**观测性**的终态附加步骤：失败只丢这一块，不让 run 变成 `TERMINAL_OUTPUT_FAILED`。
+   *
+   * 为什么需要这一层：`finalize` 的失败会一路走到 `persistTerminal` 的 catch，把已经完成的
+   * run 重写成 `failed`——那是给「核心产物（`result.json` / `summary.json` / `timeline.json` /
+   * `frontend-snapshot.json`）写不出来」准备的语义，不该被追加观测的失败触发。而这两步恰好
+   * 是最容易失败的两步：刮 Claude 的 session JSONL 依赖外部目录，重写 `summary.json` 在
+   * Windows 上会撞 EBUSY/EPERM（与仓库里 SQLite `-wal` 那类清理失败同源）。
+   *
+   * `summarizeRunConsumption` 的文档把这条纪律写得很明白（「任何一步都不抛错——它跑在终态
+   * 写盘路径上」），`appendUsageLedger` 也照做了；这里只是把同一条纪律补给它上面的两步。
+   *
+   * 失败**写 stderr**：`appendUsageLedger` 的失败有一个派生的可见面（`runs_without_usage`），
+   * 这两步没有——刮取失败现在至少留在 `summary.json` 的 `driver_billed_merge` 里，但连
+   * summary 都写不动时，只剩这一行日志。
+   */
+  private async bestEffort(label: string, action: () => Promise<unknown>): Promise<void> {
+    try {
+      await action();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      process.stderr.write(`[terminal-output] ${label} failed for a run: ${message}\n`);
+    }
+  }
+
+  /**
+   * 把这次 run 的计费腿作为只追加行写进账本。
+   *
+   * 读回 `summary.json` 而不是复用内存里那份：`driver_billed_usage` 是
+   * `mergeBilledTokenUsage` 刚刚才刮出来并写盘的（driver 腿从不进 run 事件流），
+   * 收尾前内存里根本没有它。落盘的那份正是账本要对齐的权威件。
+   *
+   * **失败只吞掉，不让 run 失败**——与本仓库观测层的既有纪律一致
+   * （`FileRunEventConsumptionSink`、`RunEventConsumptionRecorder.finish` 都是这个取向）。
+   * 而且这里的失败**不是静默的**：这个 run 之后会以「有 `handler.started`、账本里没有行」
+   * 的形式出现在 `runs_without_usage` 里，把 `complete` 拉成 false。写入失败会被看见。
+   */
+  private async appendUsageLedger(
+    snapshot: AppRunSnapshot,
+    timeline: readonly LedgerTimelineEvent[],
+    summaryPath: string,
+  ): Promise<void> {
+    if (!this.tokenUsageLedger) return;
+    try {
+      const raw = JSON.parse(await fs.readFile(summaryPath, 'utf8')) as Record<string, unknown>;
+      // exactOptionalPropertyTypes：可选字段不能显式传 undefined，只能条件展开。
+      const driverBilledLeg = readClaudeSessionLeg(raw.token_usage);
+      const entries = buildTokenUsageLedgerEntries({
+        run_id: snapshot.run_id,
+        task_id: snapshot.task_id,
+        timeline,
+        ...(driverBilledLeg ? { driverBilledLeg } : {}),
+        ...(raw.driver_billed_usage !== undefined
+          ? { driverBilledUsage: raw.driver_billed_usage }
+          : {}),
+        recorded_at: new Date().toISOString(),
+      });
+      this.tokenUsageLedger.appendTokenUsage(entries);
+    } catch (error) {
+      // 见上：不计入账本 ⇒ 该 run 会成为已知缺口，而不是被当成 0。
+      // 顺带留一行日志：派生信号（`runs_without_usage`）只说明「有 run 缺席」，说不出是哪一次。
+      const message = error instanceof Error ? error.message : String(error);
+      process.stderr.write(`[terminal-output] usage ledger append failed: ${message}\n`);
+    }
   }
 }
 
@@ -175,7 +275,7 @@ function buildBackendSummary(
     artifacts_materialized: projected.artifacts.length,
     ...(proxyTokenUsage ? { token_usage: proxyTokenUsage } : {}),
     consumption,
-    ...(tokenUsage.available ? { driver_usage: tokenUsage } : {}),
+    ...(tokenUsage.available ? { driver_context_usage: tokenUsage } : {}),
     ...(memoryAblation ? { memory_ablation: memoryAblation } : {}),
     result_path: paths.result_path,
     summary_path: paths.summary_path,
@@ -201,15 +301,36 @@ function resolveMemoryAblation(
     const value = timeline
       .filter((event) => event.type === type)
       .map((event) => event.payload.ablation ?? event.payload.memory_ablation)
-      .find((candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0);
+      .find(
+        (candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0,
+      );
     if (value) return value;
   }
   return timeline
     .map((event) => event.payload.ablation ?? event.payload.memory_ablation)
-    .find((candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0);
+    .find(
+      (candidate): candidate is string => typeof candidate === 'string' && candidate.length > 0,
+    );
 }
 
-function resolveTokenUsageFromTimeline(
+/**
+ * 从时间线里的 `proxy.llm_usage_recorded` 事件汇总 proxy 腿的计费用量。
+ *
+ * 导出是给运行快照的 `usage` 块复用：实时快照与终态 summary 必须用**同一个**口径，
+ * 各写一份必然漂移。
+ *
+ * **口径含 cache**：`total_input_tokens = input + cache_creation + cache_read`，
+ * `total_tokens = total_input_tokens + output`。这与 `summarizeRunConsumption`（按 stage 分桶）
+ * 和用量账本的行（`run-usage-ledger-entries.ts` 的 `rollupProxy`）是**同一套算术**——它们
+ * 是同一个量的三份拷贝，任何一份偏小都会让面板上两个数字对不上。
+ *
+ * 这段曾经把 cache 写死 0、`total_tokens` 只数 input+output，理由是「三个
+ * `recordProxyLlmUsage` 调用点都不传 cache，所以今天数值相同」。那是**靠巧合相等**：
+ * 一旦有调用点开始传 cache，summary / 账本 / 按 stage 分桶三处就会给出三个不同的
+ * 「这一轮花了多少」。现在改成读 payload 里的 cache 字段——今天的行为一模一样
+ * （没有生产者传），但不再依赖那个巧合。
+ */
+export function resolveTokenUsageFromTimeline(
   timeline: ReadonlyArray<{ type: string; payload: Record<string, unknown> }>,
 ):
   | {
@@ -240,20 +361,25 @@ function resolveTokenUsageFromTimeline(
   if (usageEvents.length === 0) return undefined;
   let input = 0;
   let output = 0;
+  let cacheCreation = 0;
+  let cacheRead = 0;
   for (const event of usageEvents) {
     const nextInput = Number(event.payload.input_tokens ?? 0);
     const nextOutput = Number(event.payload.output_tokens ?? 0);
     if (!Number.isFinite(nextInput) || !Number.isFinite(nextOutput)) continue;
     input += nextInput;
     output += nextOutput;
+    cacheCreation += Number(event.payload.cache_creation_input_tokens ?? 0);
+    cacheRead += Number(event.payload.cache_read_input_tokens ?? 0);
   }
+  const totalInput = input + cacheCreation + cacheRead;
   const proxy = {
     input_tokens: input,
     output_tokens: output,
-    cache_creation_input_tokens: 0,
-    cache_read_input_tokens: 0,
-    total_input_tokens: input,
-    total_tokens: input + output,
+    cache_creation_input_tokens: cacheCreation,
+    cache_read_input_tokens: cacheRead,
+    total_input_tokens: totalInput,
+    total_tokens: totalInput + output,
     call_count: usageEvents.length,
   };
   return {
@@ -279,12 +405,22 @@ async function mergeSummaryExtras(
   try {
     const raw = JSON.parse(await fs.readFile(summaryPath, 'utf8')) as Record<string, unknown>;
     const preferred = preferDriverUsage(
-      isDriverStreamUsage(raw.driver_usage) ? raw.driver_usage : raw.token_usage,
+      isDriverStreamUsage(raw.driver_context_usage)
+        ? raw.driver_context_usage
+        : isDriverStreamUsage(raw.driver_usage)
+          ? raw.driver_usage
+          : raw.token_usage,
       driverUsage,
     );
     let changed = false;
-    if (preferred && raw.driver_usage !== preferred) {
-      raw.driver_usage = preferred;
+    if (preferred && raw.driver_context_usage !== preferred) {
+      raw.driver_context_usage = preferred;
+      changed = true;
+    }
+    // 老 summary 的旧块名迁到新键：driver_context_usage 才是「上下文占用」的正式口径
+    // 名，旧名 driver_usage 容易被误读成消耗量（实际消耗在 driver_billed_usage）。
+    if (raw.driver_usage !== undefined) {
+      delete raw.driver_usage;
       changed = true;
     }
     if (isDriverStreamUsage(raw.token_usage)) {
@@ -328,6 +464,10 @@ function emptyConsumptionMetrics(): RunConsumptionMetrics {
  * 把 cache 也算进 `total_tokens`。两者在今天的生产出口上一致（唯一的记账点不传 cache
  * 字段），一旦有人开始传就会分叉，分叉是刻意的：这一版是完整口径。
  *
+ * driver 事件流的投影事件（payload 带 event_sequence）单独归 `driver_stream` 桶：
+ * 它们是执行过程的观测副本，量级由会话长度决定而不是阶段做功，混进 enclosing stage
+ * 会让阶段事件计数虚高。总数仍含它们——总数是各桶之和，口径不变。
+ *
  * 任何一步都不抛错——它跑在终态写盘路径上，观测算不出来只该少一块，不该弄挂 run。
  */
 export function summarizeRunConsumption(
@@ -351,7 +491,11 @@ export function summarizeRunConsumption(
       const cursor = readNonEmptyString(payload.cursor);
       if (cursor) currentStage = cursor;
     }
-    const metrics = bucketFor(readNonEmptyString(payload.stage_cursor) ?? currentStage);
+    // driver 事件流投影（带 event_sequence）归自己的桶，不占阶段做功的计数。
+    const stage = isDriverStreamProjection(payload)
+      ? DRIVER_STREAM_STAGE
+      : (readNonEmptyString(payload.stage_cursor) ?? currentStage);
+    const metrics = bucketFor(stage);
     metrics.events += 1;
     if (event.type !== 'proxy.llm_usage_recorded') {
       // 关窗要在归属之后：stage 结束后的 run.completed 之类的生命周期事件属于 run，
@@ -409,6 +553,17 @@ function readNonEmptyString(value: unknown): string | undefined {
 function readFiniteNumber(value: unknown): number {
   const parsed = Number(value ?? 0);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/**
+ * driver 事件流的投影事件：payload 带 event_sequence / stream_sequence（driver-stream
+ * 信封序号）。
+ *
+ * 阶段自己发的 driver.* 领域事件（如 driver.run_result）没有这些字段，仍算阶段做功
+ * ——所以用它而不是 `type.startsWith('driver.')` 做判别。
+ */
+function isDriverStreamProjection(payload: Record<string, unknown>): boolean {
+  return typeof payload.event_sequence === 'number' || typeof payload.stream_sequence === 'number';
 }
 
 async function writeJsonIfMissing(filePath: string, value: unknown): Promise<void> {

@@ -118,7 +118,10 @@ describe('BMemoryMaintenanceRunner', () => {
       expect(result.status).toBe('failed');
       expect(port.events).toHaveLength(1);
       expect(port.events[0]).toMatchObject({
-        event: 'extract', status: 'error', task_id: 'task_j2', run_id: 'run_j2',
+        event: 'extract',
+        status: 'error',
+        task_id: 'task_j2',
+        run_id: 'run_j2',
       });
       expect(port.events[0].summary).toContain('LLM provider unavailable');
     });
@@ -160,20 +163,14 @@ describe('BMemoryMaintenanceRunner', () => {
     };
     await repository.saveExperience('role_ts_engineer', referenced);
 
-    const seq = await writePending(
-      repository,
-      bufferRepository,
-      'role_ts_engineer',
-      'task_usage',
-      [
-        {
-          experience_id: referenced.id,
-          applied: true,
-          effectiveness: 'fully_effective',
-          note: 'normalization pattern worked',
-        },
-      ],
-    );
+    const seq = await writePending(repository, bufferRepository, 'role_ts_engineer', 'task_usage', [
+      {
+        experience_id: referenced.id,
+        applied: true,
+        effectiveness: 'fully_effective',
+        note: 'normalization pattern worked',
+      },
+    ]);
 
     const result = await runner.processBuffer({
       task_id: 'task_usage',
@@ -333,9 +330,14 @@ describe('BMemoryMaintenanceRunner', () => {
   });
 
   it('auto-approves promoted Skills via promotion.autoApprove (automated evaluation)', async () => {
-    const { runner, repository, bufferRepository } = await fixture(maintenanceLlm(), undefined, undefined, {
-      promotion: { autoApprove: true },
-    });
+    const { runner, repository, bufferRepository } = await fixture(
+      maintenanceLlm(),
+      undefined,
+      undefined,
+      {
+        promotion: { autoApprove: true },
+      },
+    );
     const seq = await writePending(repository, bufferRepository, 'role_ts_engineer', 'task_auto');
     await runner.processBuffer({
       task_id: 'task_auto',
@@ -428,9 +430,7 @@ describe('BMemoryMaintenanceRunner', () => {
     });
 
     expect(result.status).toBe('completed');
-    expect(result.skills).toEqual([
-      expect.objectContaining({ review_status: 'approved' }),
-    ]);
+    expect(result.skills).toEqual([expect.objectContaining({ review_status: 'approved' })]);
     await expect(repository.listSkills('role_ts_engineer')).resolves.toMatchObject([
       { review_status: 'approved' },
     ]);
@@ -580,25 +580,29 @@ describe('BMemoryMaintenanceRunner', () => {
     await mkdir(runDir, { recursive: true });
     await writeFile(
       path.join(runDir, 'summary.json'),
-      `${JSON.stringify({
-        run_id: 'run_token_refresh',
-        task_id: 'task_token_refresh',
-        session_id: 'session_primary',
-        worktree_path: '/tmp/worktree',
-        token_usage: {
-          schema_version: 'newide.token_usage.v1',
-          source: 'proxy',
-          input_tokens: 12,
-          output_tokens: 3,
-          cache_creation_input_tokens: 0,
-          cache_read_input_tokens: 0,
-          total_input_tokens: 12,
-          total_tokens: 15,
-          call_count: 1,
-          sources: ['proxy'],
-          by_source: {},
+      `${JSON.stringify(
+        {
+          run_id: 'run_token_refresh',
+          task_id: 'task_token_refresh',
+          session_id: 'session_primary',
+          worktree_path: '/tmp/worktree',
+          token_usage: {
+            schema_version: 'newide.token_usage.v1',
+            source: 'proxy',
+            input_tokens: 12,
+            output_tokens: 3,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            total_input_tokens: 12,
+            total_tokens: 15,
+            call_count: 1,
+            sources: ['proxy'],
+            by_source: {},
+          },
         },
-      }, null, 2)}\n`,
+        null,
+        2,
+      )}\n`,
       'utf8',
     );
     await writeFile(
@@ -637,9 +641,9 @@ describe('BMemoryMaintenanceRunner', () => {
 
     const summary = JSON.parse(await readFile(path.join(runDir, 'summary.json'), 'utf8')) as {
       token_usage?: { source?: string; schema_version?: string };
-      driver_usage?: { source?: string; context_tokens_used?: number };
+      driver_context_usage?: { source?: string; context_tokens_used?: number };
     };
-    expect(summary.driver_usage).toMatchObject({
+    expect(summary.driver_context_usage).toMatchObject({
       source: 'driver_stream_usage_update',
       context_tokens_used: 321,
     });

@@ -9,9 +9,8 @@
  * 仍然 100% 由事件派生 —— 一个步骤只有在**有事件佐证**时才存在，没触发的步骤压根不出现
  * （单 agent 模式下就没有「议会」这一步）。
  *
- * 时间也回来了：agent 执行是一个**跨度**（requested→completed），带真实耗时；
- * 未闭合时节点上有实时秒表 —— 后端在 agent 干活的十几秒里一个事件都不发，
- * 没有它，界面在最关键的时段是死的。
+ * Agent 执行是一个跨度（requested→completed）；其间的 driver 生命周期归入同一步，
+ * 不因工具调用完成就提前结束父级 Agent 步骤。
  */
 import type { RunEvent } from '@/api/types/rpc';
 import type { PhaseKey } from '@/data/workflow';
@@ -126,6 +125,7 @@ function stepOf(event: RunEvent): StepKey | undefined {
     case 'task.created':
     case 'run.created':
     case 'run.started':
+    case 'task.waiting_help':
       return 'intake';
 
     case 'memory.context_pack_built':
@@ -165,12 +165,22 @@ function stepOf(event: RunEvent): StepKey | undefined {
     case 'checkpoint.saved':
     case 'coord.checkpoint_observed':
     case 'run.completed':
+      return (event.payload as { outcome?: unknown }).outcome === 'mailbox_wait'
+        ? undefined
+        : 'deliver';
+    case 'artifact.delivered':
     case 'run.failed':
     case 'run.cancelled':
       return 'deliver';
 
+    case 'proxy.llm_usage_recorded':
+    case 'proxy.llm_usage_dropped':
+      return undefined;
+
     // 未登记的事件类型：不丢弃、不编造 —— 收进「审查」步骤，原始事件在 Inspector 里可查
     default:
+      if (event.type.startsWith('driver.')) return 'execute';
+      if (event.type.startsWith('council.')) return 'council';
       return 'review';
   }
 }
@@ -335,16 +345,15 @@ function ownerOf(step: StepKey, role: string, events: RunEvent[]): string {
 
 /**
  * 事件流 → 语义步骤分组。
- * 步骤按「首个事件的到达顺序」排列 —— 后端的 sequence 是权威顺序，前端不重排。
+ * 步骤按后端 timeline 的数组顺序排列；并列序号不重排。
  */
 export function groupEvents(events: RunEvent[]): EventGroup[] {
-  const sorted = [...events].sort((a, b) => a.sequence - b.sequence);
-  const roles = resolveRoles(sorted);
+  const roles = resolveRoles(events);
 
   const groups: EventGroup[] = [];
   const byKey = new Map<string, EventGroup>();
 
-  for (const event of sorted) {
+  for (const event of events) {
     const step = stepOf(event);
     if (!step) continue;
     const def = STEPS[step];
@@ -378,6 +387,17 @@ function roleKeyOf(group: EventGroup): string {
 
 function statusOf(group: EventGroup, runStatus: LiveRunStatus): WorkflowNodeStatus {
   if (group.open) return runStatus === 'running' ? 'active' : 'blocked';
+  const executionResult = [...group.events]
+    .reverse()
+    .find(
+      (event) =>
+        event.type === 'agent.execution_completed' || event.type === 'agent.execution_failed',
+    );
+  if (
+    executionResult?.type === 'agent.execution_completed' &&
+    asRecord(executionResult.payload).status === 'succeeded'
+  )
+    return 'done';
   if (group.events.some((e) => e.type.endsWith('.failed'))) return 'blocked';
   // 后端失败不总用 `.failed` 事件表达：agent 失败发的是 `agent.execution_completed` +
   // payload.status='failed'。只看类型后缀会把失败的步骤画成「完成」。

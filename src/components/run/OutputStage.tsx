@@ -16,10 +16,7 @@ import type { RunState } from '@/lib/runState';
  * 权重和「机器握手」并列。** 最大的区域应该给最大的事实。所以舞台归它。
  *
  * ── 它安静的时候在说什么 ──
- * agent 干活的那几十秒里，这里确实没东西可显示 —— 不是我们没画，是后端没给：
- * A 的 `contract-runner.ts` 把 agent 回复的正文降维成字符数就扔了（见 abcd_changes_plan.md ①），
- * BCD 在 agent 执行期间也不发事件。所以这里**如实说明为什么是静的**，而不是转一个假装在忙的圈。
- * ① 修好之后，agent 的实时输出就该长在这块地方 —— 那才是让这一屏真正活过来的东西。
+ * 产物登记前不虚构文件。实时活动由主句与「当前活动」呈现，流式正文不进入状态事件流。
  *
  * ── 它不做的事 ──
  * 不渲染 L3 入口。原始事件的唯一出口是 Fold 的 `evidence` 行（F3）——
@@ -28,13 +25,13 @@ import type { RunState } from '@/lib/runState';
 export function OutputStage({ facts, state }: { facts: ArtifactFacts; state: RunState }) {
   if (facts.count > 0) return <FileList facts={facts} />;
 
-  if (state === 'running' || state === 'blocked') {
+  if (state === 'running' || state === 'blocked' || state === 'waiting') {
     return (
       <Center>
         <EmptyState
           icon={Hourglass}
-          title="Agent 正在写代码"
-          hint="后端在这段时间不推事件，所以这里是静的。它写出的文件会直接出现在这里。"
+          title={state === 'waiting' ? '等待协作完成后交付' : '等待文件交付'}
+          hint="审查临时目录中的文件不算交付。通过审查并写入项目目录后，文件会自动出现在这里和左侧列表。"
         />
       </Center>
     );
@@ -46,7 +43,7 @@ export function OutputStage({ facts, state }: { facts: ArtifactFacts; state: Run
         <EmptyState
           icon={FileCode2}
           title="本次没有产出文件"
-          hint="后端没有登记任何产物。agent 可能只给了文字回复 —— 那部分内容当前拿不到（见「帮助」里的已知限制）。"
+          hint="后端没有登记文件产物。请查看交付信息与事件流；没有登记不代表磁盘上没有文件。"
         />
       </Center>
     );

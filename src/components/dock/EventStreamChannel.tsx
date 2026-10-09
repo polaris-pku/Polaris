@@ -1,7 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Activity, ChevronDown, ChevronRight, X } from 'lucide-react';
+import { Activity, ChevronDown, ChevronRight, Loader2, X } from 'lucide-react';
+import { runApi } from '@/api/run';
+import { Button } from '@/components/ui/Button';
 import { EmptyState } from '@/components/ui/EmptyState';
-import { buildEventRows, capRows, filterRows, type EventStreamRow } from '@/lib/eventStream';
+import {
+  buildEventRows,
+  capRows,
+  filterRows,
+  formatPayload,
+  type EventStreamRow,
+} from '@/lib/eventStream';
+import { observationError } from '@/lib/runObservability';
 import { cn } from '@/lib/utils';
 import { selectActiveLiveRun, useDemoStore } from '@/store/useDemoStore';
 
@@ -72,7 +81,7 @@ export function EventStreamChannel() {
           }
         />
       ) : (
-        <EventRowList rows={rows} hidden={hidden} />
+        <EventRowList key={liveRun.runId} rows={rows} hidden={hidden} />
       )}
     </div>
   );
@@ -119,13 +128,14 @@ function EventRowList({ rows, hidden }: { rows: EventStreamRow[]; hidden: number
  */
 function EventRow({ row }: { row: EventStreamRow }) {
   const [open, setOpen] = useState(false);
-  const expandable = row.payload !== '';
+  const expandable = row.payload !== '' || !!row.payloadRef;
 
   return (
     <li>
       <button
         type="button"
         disabled={!expandable}
+        aria-expanded={expandable ? open : undefined}
         onClick={() => setOpen((v) => !v)}
         className={cn(
           'flex w-full items-baseline gap-3 rounded-chip px-2 py-1 text-left',
@@ -153,10 +163,63 @@ function EventRow({ row }: { row: EventStreamRow }) {
       </button>
 
       {open && expandable && (
-        <pre className="mx-2 mb-1 overflow-x-auto rounded-chip bg-surface-raised px-3 py-2 text-code text-fg-secondary">
-          {row.payload}
-        </pre>
+        <div className="mx-2 mb-1 rounded-chip bg-surface-raised px-3 py-2">
+          <pre className="overflow-x-auto text-code text-fg-secondary">{row.payload}</pre>
+          {row.payloadRef && (
+            <ExternalPayload
+              key={`${row.runId}:${row.payloadRef}`}
+              runId={row.runId}
+              payloadRef={row.payloadRef}
+            />
+          )}
+        </div>
       )}
     </li>
+  );
+}
+
+function ExternalPayload({ runId, payloadRef }: { runId: string; payloadRef: string }) {
+  const [content, setContent] = useState<string>();
+  const [error, setError] = useState<string>();
+  const [loading, setLoading] = useState(false);
+  const request = useRef(0);
+  useEffect(
+    () => () => {
+      request.current += 1;
+    },
+    [],
+  );
+
+  const load = async () => {
+    const id = ++request.current;
+    setLoading(true);
+    setError(undefined);
+    try {
+      const result = await runApi.getPayload(runId, payloadRef);
+      if (id === request.current) setContent(formatPayload(result.event));
+    } catch (reason) {
+      if (id === request.current) setError(observationError(reason));
+    } finally {
+      if (id === request.current) setLoading(false);
+    }
+  };
+
+  return (
+    <div className="mt-2 border-t border-edge pt-2">
+      {content === undefined && (
+        <Button variant="ghost" size="sm" disabled={loading} onClick={() => void load()}>
+          {loading && <Loader2 className="h-3 w-3 animate-spin" aria-hidden />}
+          {loading ? '正在读取完整载荷…' : error ? '重试读取完整载荷' : '读取完整载荷'}
+        </Button>
+      )}
+      {error && (
+        <p role="alert" className="text-body text-danger-soft">
+          {error}
+        </p>
+      )}
+      {content !== undefined && (
+        <pre className="max-h-96 overflow-auto text-code text-fg-secondary">{content}</pre>
+      )}
+    </div>
   );
 }

@@ -5,7 +5,7 @@ const Module = require('node:module');
 const { PassThrough } = require('node:stream');
 const test = require('node:test');
 
-test('serializes restarts and reports the effective B Memory database source', async (t) => {
+test('serializes restarts, preserves API authentication and reports B Memory settings', async (t) => {
   const handlers = new Map();
   const appHandlers = new Map();
   const processes = [];
@@ -18,8 +18,11 @@ test('serializes restarts and reports the effective B Memory database source', a
   const originalLoad = Module._load;
   const originalSetTimeout = global.setTimeout;
 
-  function fakeProcess() {
+  function fakeProcess(command, args, options) {
+    assert.equal(typeof command, 'string');
+    assert.ok(Array.isArray(args));
     const proc = new EventEmitter();
+    proc.spawnOptions = options;
     proc.pid = 10_000 + processes.length;
     proc.exitCode = null;
     proc.signalCode = null;
@@ -127,7 +130,25 @@ test('serializes restarts and reports the effective B Memory database source', a
   bridge.setupBackendBridge(() => null);
   await new Promise(setImmediate);
   assert.equal(processes.length, 1);
+  const env = processes[0].spawnOptions.env;
+  assert.equal(env.ANTHROPIC_API_KEY, 'test-key');
+  assert.equal(env.NEWIDE_LLM_API_KEY, 'test-key');
+  assert.equal(env.NEWIDE_LLM_PROVIDER, 'anthropic');
+  assert.equal(env.NEWIDE_LLM_CREDENTIALLESS, undefined);
+  assert.equal(env.POLARIS_MODEL_PROXY_BASE_URL, undefined);
+  const publicSettings = await handlers.get('backend:getSettings')();
+  assert.equal(publicSettings.provider, 'anthropic');
+  assert.equal(publicSettings.configured.anthropic.hasKey, true);
+  assert.equal(Object.hasOwn(publicSettings, 'modelProxy'), false);
+  assert.equal(JSON.stringify(publicSettings).includes('test-key'), false);
 
+  settings.provider = 'custom';
+  settings.providers.custom = {
+    key: 'custom-test-key',
+    baseUrl: 'https://models.example.test/anthropic',
+    model: 'custom-model',
+    fastModel: 'custom-fast-model',
+  };
   const restart = handlers.get('backend:restart')();
   await new Promise(setImmediate);
   assert.equal(processes[0].stdin.ended, true);
@@ -136,6 +157,18 @@ test('serializes restarts and reports the effective B Memory database source', a
   processes[0].finish();
   await restart;
   assert.equal(processes.length, 2);
+  const customEnv = processes[1].spawnOptions.env;
+  assert.equal(customEnv.ANTHROPIC_API_KEY, undefined);
+  assert.equal(customEnv.ANTHROPIC_AUTH_TOKEN, 'custom-test-key');
+  assert.equal(customEnv.ANTHROPIC_BASE_URL, 'https://models.example.test/anthropic');
+  assert.equal(customEnv.ANTHROPIC_MODEL, 'custom-model');
+  assert.equal(customEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL, 'custom-fast-model');
+  assert.equal(customEnv.NEWIDE_LLM_API_KEY, 'custom-test-key');
+  assert.equal(customEnv.NEWIDE_LLM_BASE_URL, 'https://models.example.test/anthropic/v1');
+  const customSettings = await handlers.get('backend:getSettings')();
+  assert.equal(customSettings.provider, 'custom');
+  assert.equal(customSettings.configured.custom.hasKey, true);
+  assert.equal(JSON.stringify(customSettings).includes('custom-test-key'), false);
 
   delete process.env.NEWIDE_B_DATABASE_URL;
   assert.deepEqual((await handlers.get('backend:getSettings')()).bMemory, {

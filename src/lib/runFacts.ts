@@ -11,6 +11,8 @@
  * 对前者做 `.length` / `.map()` 会当场崩。取数规则见 artifactFactsOf()。
  */
 import type { RunEvent, RunSnapshot } from '@/api/types/rpc';
+import { liveArtifactFiles, liveProducedFiles } from '@/lib/liveReplay';
+import { isAbsoluteFilePath } from '@/lib/projectPaths';
 import { isFrontendWorkflowV01 } from '@/api/types/rpc';
 import { groupEvents, type StepKey } from '@/lib/eventGraph';
 import { OWNER_FALLBACK, roleName } from '@/lib/roleNames';
@@ -191,15 +193,6 @@ export type ArtifactFacts = { count: number; files: ArtifactFile[] };
 
 const baseName = (p: string): string => p.split(/[\\/]/).filter(Boolean).pop() ?? p;
 
-/** 快照里 agent 真正写进工作区的文件（artifacts[type=diff].source_path，绝对路径）。 */
-function producedAbsPaths(snapshot: RunSnapshot): string[] {
-  return snapshot.artifacts
-    .map((artifact) => asRecord(artifact))
-    .filter((artifact) => str(artifact.type) === 'diff')
-    .map((artifact) => str(artifact.source_path))
-    .filter(Boolean);
-}
-
 /**
  * `worktree.materialized` 的 `payload.files_written` —— 它是**数量**，不是数组。
  * 快照还没到（run 刚结束的那一瞬）时，这是唯一能拿到文件数的地方。
@@ -257,20 +250,27 @@ export function artifactFactsOf(live: LiveRunState | undefined): ArtifactFacts {
   if (!live) return { count: 0, files: [] };
 
   const snapshot = live.snapshot;
-  if (snapshot && isFrontendWorkflowV01(snapshot)) {
-    const abs = producedAbsPaths(snapshot);
-    const written = snapshot.delivery_report.files_written;
-    if (written.length > 0) {
-      return {
-        count: written.length,
-        files: written.map((path) => ({
-          label: path,
-          absPath: abs.find((a) => a === path || baseName(a) === baseName(path)),
-        })),
-      };
-    }
-    // files_written 为空但产物里有代码文件 —— 两者都来自同一份快照，取能点开的那个
-    return { count: abs.length, files: abs.map((a) => ({ label: baseName(a), absPath: a })) };
+  if (
+    snapshot &&
+    (snapshot.delivery_report || snapshot.final_output || liveArtifactFiles(snapshot).length > 0)
+  ) {
+    const written = liveProducedFiles(snapshot);
+    const legacy = liveArtifactFiles(snapshot).filter(isAbsoluteFilePath);
+    const reported =
+      !!snapshot.delivery_report?.files_written.length ||
+      !!snapshot.final_output?.files_written.length;
+    return {
+      count: written.length,
+      files: written.map((path) => {
+        const matches = legacy.filter((candidate) =>
+          candidate.replace(/\\/g, '/').endsWith(`/${path.replace(/\\/g, '/')}`),
+        );
+        return {
+          label: reported ? path : baseName(path),
+          absPath: isAbsoluteFilePath(path) ? path : matches.length === 1 ? matches[0] : undefined,
+        };
+      }),
+    };
   }
 
   // 快照未到：名字优先取 worktree.materialized 的 changed_files（真数组），

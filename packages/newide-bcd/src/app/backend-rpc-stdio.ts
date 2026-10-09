@@ -16,12 +16,8 @@ import {
   readCouncilStrategy,
   SynthesisAgentCouncilProvider,
 } from '../council';
-import { CommandDriverTransport, ExternalDriverRuntime } from '../driver';
-import {
-  LiteLLMToolCallingClient,
-  type LlmClient,
-  type ToolCallingClient,
-} from '../memory';
+import { createDriverRegistry, DriverRoutingService, loadDriverConfig } from '../driver';
+import { LiteLLMToolCallingClient, type LlmClient, type ToolCallingClient } from '../memory';
 import { BAgentProjectionAdapter, FileMarketEvidenceStore } from '../market';
 import { JsonRpcDispatcher, JsonRpcLineSession } from '../rpc/json-rpc-dispatcher';
 import { RunRpcMethods } from '../rpc/run-methods';
@@ -29,6 +25,7 @@ import { TaskRpcMethods } from '../rpc/task-methods';
 import { MailboxRpcMethods } from '../rpc/mailbox-methods';
 import { MemoryRpcMethods } from '../rpc/memory-methods';
 import { FileRunEvidenceStore, SqliteCoordinationStore } from '../persistence';
+import { DEFAULT_DRIVER_BILLED_SOURCE } from '../persistence';
 import { DriverRuntimeAgentExecutionFacade } from './driver-runtime-agent-execution-facade';
 import { ProtocolCallJournal } from './protocol-call-journal';
 import { FileAgentExecutionEvidenceStore } from './agent-execution-evidence-store';
@@ -36,6 +33,11 @@ import { NewideBackendService } from './newide-backend-service';
 import { InMemoryRunRegistry } from './run-registry';
 import { FileRunAuditWriter } from './run-audit-writer';
 import { FileDriverStreamAuditWriter } from './driver-stream-audit-writer';
+import {
+  FileRunDriverUsageJsonlSink,
+  NoopDriverUsageSink,
+  type DriverUsageSink,
+} from './driver-usage-jsonl-sink';
 import { ProductionGateExecutor } from './production-gate-executor';
 import type { IntegrationV0GateExecutor } from '../coordinator/gate-executor';
 import { FileRunRequestStore } from './run-request-store';
@@ -62,9 +64,12 @@ import {
 } from './market-event-payload';
 import { SystemRpcMethods } from '../rpc/system-methods';
 import { ArtifactRpcMethods } from '../rpc/artifact-methods';
+import { DriverRpcMethods, createDriverMethodsService } from '../rpc/driver-methods';
 import { createProductionSystemStatusService } from './system-status-service';
 import { AgentMaintenanceScheduler } from './agent-maintenance-scheduler';
 import { FileRunArtifactContentReader } from './run-artifact-content-reader';
+import { FileRunPayloadReader } from './run-payload-reader';
+import { LedgerRunUsageHistoryReader } from './run-usage-history';
 import {
   createRunLatency,
   FileRunEventConsumptionSink,
@@ -93,6 +98,9 @@ export interface ProductionBackendServiceDependencies {
   gateExecutor?: IntegrationV0GateExecutor;
 }
 
+/** A 侧 runner 入口，相对 runner 检出目录。 */
+const DRIVER_RUNNER_ENTRY_RELATIVE = path.join('dist', 'src', 'driver', 'contract-runner.js');
+
 export async function createProductionBackendService(
   env: NodeJS.ProcessEnv = process.env,
   dependencies: ProductionBackendServiceDependencies = {},
@@ -120,7 +128,7 @@ export async function createProductionBackendService(
     throw new Error(`ACP driver runner has no driver:run script: ${runnerDir}`);
   }
 
-  const driverRunnerJs = path.join(runnerDir, 'dist', 'src', 'driver', 'contract-runner.js');
+  const driverRunnerJs = path.join(runnerDir, DRIVER_RUNNER_ENTRY_RELATIVE);
   if (!existsSync(driverRunnerJs)) {
     throw new Error(
       `ACP driver runner build missing: ${driverRunnerJs} (run pnpm --dir ${runnerDir} build)`,
@@ -135,75 +143,74 @@ export async function createProductionBackendService(
   const ephemeralAcpSessions =
     env.NEWIDE_EPHEMERAL_ACP_SESSIONS === '1' ||
     env.NEWIDE_EPHEMERAL_ACP_SESSIONS?.toLowerCase() === 'true';
-  const driver = new ExternalDriverRuntime({
-    driver_id: 'acp-external',
-    capabilities: {
+  // driver 可配置化：可用 driver 是一份数据体（默认 <repoRoot>/.agent/drivers.yaml），
+  // 每个档案各建一个 runtime。基础环境里**不含** ACP_AGENT_ID——它由档案的 agent 决定，
+  // 于是「换 driver」就是换 spawn 时的 agent，A 侧无需改动（进程本就是每次调用一次性）。
+  // Packaged hosts keep cwd in application state; routing belongs to the selected project.
+  const driverProjectRoot = path.resolve(env.ACP_WORKSPACE?.trim() || repoRoot);
+  const driverConfig = loadDriverConfig({ projectRoot: driverProjectRoot, env });
+  const driverRegistry = createDriverRegistry({
+    config: driverConfig,
+    runnerDir,
+    defaultEntryRelative: DRIVER_RUNNER_ENTRY_RELATIVE,
+    baseEnv: {
+      ...driverEnv,
+      COREPACK_ENABLE_PROJECT_SPEC: env.COREPACK_ENABLE_PROJECT_SPEC ?? '0',
+      PNPM_CONFIG_PM_ON_FAIL: env.PNPM_CONFIG_PM_ON_FAIL ?? 'ignore',
+      ACP_WORKSPACE: env.ACP_WORKSPACE ?? path.join(stateRoot, 'test-workspace'),
+      // Offline evals execute the already-installed ACP adapter entrypoint
+      // instead of letting npx resolve/download a package inside the jail.
+      ...(env.CLAUDE_CLI_COMMAND !== undefined
+        ? { CLAUDE_CLI_COMMAND: env.CLAUDE_CLI_COMMAND }
+        : {}),
+      ...(env.CLAUDE_CLI_ARGS !== undefined ? { CLAUDE_CLI_ARGS: env.CLAUDE_CLI_ARGS } : {}),
+      // Non-interactive eval / batch runs must not block on ACP permission prompts.
+      AUTO_APPROVE: env.AUTO_APPROVE ?? '1',
+      // NewIDE owns benchmark policy; ACP receives only generic enforcement settings.
+      ...(env.ACP_DENY_NETWORK_TOOLS !== undefined
+        ? { ACP_DENY_NETWORK_TOOLS: env.ACP_DENY_NETWORK_TOOLS }
+        : {}),
+      ...(env.ACP_DENY_PATH_SUBSTRINGS_JSON !== undefined
+        ? { ACP_DENY_PATH_SUBSTRINGS_JSON: env.ACP_DENY_PATH_SUBSTRINGS_JSON }
+        : {}),
+      ...(env.ACP_PROCESS_SANDBOX !== undefined
+        ? { ACP_PROCESS_SANDBOX: env.ACP_PROCESS_SANDBOX }
+        : {}),
+      ...(env.ACP_PROCESS_SANDBOX_BWRAP !== undefined
+        ? { ACP_PROCESS_SANDBOX_BWRAP: env.ACP_PROCESS_SANDBOX_BWRAP }
+        : {}),
+      ...(env.ACP_PROCESS_SANDBOX_NPM_CACHE !== undefined
+        ? { ACP_PROCESS_SANDBOX_NPM_CACHE: env.ACP_PROCESS_SANDBOX_NPM_CACHE }
+        : {}),
+      ...(env.ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON !== undefined
+        ? {
+            ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON: env.ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON,
+          }
+        : {}),
+      ...(env.ACP_PROCESS_SANDBOX_RO_PATHS_JSON !== undefined
+        ? { ACP_PROCESS_SANDBOX_RO_PATHS_JSON: env.ACP_PROCESS_SANDBOX_RO_PATHS_JSON }
+        : {}),
+      ...(env.ACP_PROCESS_SANDBOX_HIDE_PYTHON_PACKAGES !== undefined
+        ? {
+            ACP_PROCESS_SANDBOX_HIDE_PYTHON_PACKAGES: env.ACP_PROCESS_SANDBOX_HIDE_PYTHON_PACKAGES,
+          }
+        : {}),
+    },
+    unsetEnv: [
+      'NEWIDE_B_DATABASE_URL',
+      ...MODEL_OVERRIDE_ENV.filter((key) => driverEnv[key] === undefined && env[key] === undefined),
+    ],
+    defaultCapabilities: {
       supports_acp_extension: true,
       supports_session_load: !ephemeralAcpSessions,
       supports_tool_events: true,
     },
-    transport: new CommandDriverTransport({
-      // Invoke node directly — Windows `spawn('pnpm'/'pnpm.cmd')` is unreliable without shell.
-      command: process.execPath,
-      args: [driverRunnerJs],
-      cwd: runnerDir,
-      env: {
-        ...driverEnv,
-        COREPACK_ENABLE_PROJECT_SPEC: env.COREPACK_ENABLE_PROJECT_SPEC ?? '0',
-        PNPM_CONFIG_PM_ON_FAIL: env.PNPM_CONFIG_PM_ON_FAIL ?? 'ignore',
-        ACP_AGENT_ID: env.ACP_AGENT_ID ?? 'claude',
-        ACP_WORKSPACE: env.ACP_WORKSPACE ?? path.join(stateRoot, 'test-workspace'),
-        // Offline evals execute the already-installed ACP adapter entrypoint
-        // instead of letting npx resolve/download a package inside the jail.
-        ...(env.CLAUDE_CLI_COMMAND !== undefined
-          ? { CLAUDE_CLI_COMMAND: env.CLAUDE_CLI_COMMAND }
-          : {}),
-        ...(env.CLAUDE_CLI_ARGS !== undefined ? { CLAUDE_CLI_ARGS: env.CLAUDE_CLI_ARGS } : {}),
-        // Non-interactive eval / batch runs must not block on ACP permission prompts.
-        AUTO_APPROVE: env.AUTO_APPROVE ?? '1',
-        // NewIDE owns benchmark policy; ACP receives only generic enforcement settings.
-        ...(env.ACP_DENY_NETWORK_TOOLS !== undefined
-          ? { ACP_DENY_NETWORK_TOOLS: env.ACP_DENY_NETWORK_TOOLS }
-          : {}),
-        ...(env.ACP_DENY_PATH_SUBSTRINGS_JSON !== undefined
-          ? { ACP_DENY_PATH_SUBSTRINGS_JSON: env.ACP_DENY_PATH_SUBSTRINGS_JSON }
-          : {}),
-        ...(env.ACP_PROCESS_SANDBOX !== undefined
-          ? { ACP_PROCESS_SANDBOX: env.ACP_PROCESS_SANDBOX }
-          : {}),
-        ...(env.ACP_PROCESS_SANDBOX_BWRAP !== undefined
-          ? { ACP_PROCESS_SANDBOX_BWRAP: env.ACP_PROCESS_SANDBOX_BWRAP }
-          : {}),
-        ...(env.ACP_PROCESS_SANDBOX_NPM_CACHE !== undefined
-          ? { ACP_PROCESS_SANDBOX_NPM_CACHE: env.ACP_PROCESS_SANDBOX_NPM_CACHE }
-          : {}),
-        ...(env.ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON !== undefined
-          ? {
-              ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON:
-                env.ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON,
-            }
-          : {}),
-        ...(env.ACP_PROCESS_SANDBOX_RO_PATHS_JSON !== undefined
-          ? { ACP_PROCESS_SANDBOX_RO_PATHS_JSON: env.ACP_PROCESS_SANDBOX_RO_PATHS_JSON }
-          : {}),
-        ...(env.ACP_PROCESS_SANDBOX_HIDE_PYTHON_PACKAGES !== undefined
-          ? {
-              ACP_PROCESS_SANDBOX_HIDE_PYTHON_PACKAGES:
-                env.ACP_PROCESS_SANDBOX_HIDE_PYTHON_PACKAGES,
-            }
-          : {}),
-      },
-      unsetEnv: [
-        'NEWIDE_B_DATABASE_URL',
-        ...MODEL_OVERRIDE_ENV.filter(
-          (key) => driverEnv[key] === undefined && env[key] === undefined,
-        ),
-      ],
-      inactivityTimeoutMs: readDriverTimeout(
-        env.ACP_DRIVER_INACTIVITY_TIMEOUT_MS ?? env.ACP_DRIVER_TIMEOUT_MS,
-      ),
-    }),
+    inactivityTimeoutMs: readDriverTimeout(
+      env.ACP_DRIVER_INACTIVITY_TIMEOUT_MS ?? env.ACP_DRIVER_TIMEOUT_MS,
+    ),
   });
+  // 未配置任何 driver 档案时，这里拿到的是唯一那个 acp-external，与历史装配一致。
+  const driver = driverRegistry.get(driverConfig.default_driver);
   let bRuntime: BackendBRuntime | undefined;
   let memoryMaintenance: BMemoryMaintenanceRunner | undefined;
   let coordinationStore: SqliteCoordinationStore | undefined;
@@ -212,7 +219,7 @@ export async function createProductionBackendService(
     const failures: unknown[] = [];
     for (const close of [
       () => maintenanceScheduler?.stop(),
-      () => driver.shutdown(),
+      () => driverRegistry.shutdown(),
       () => memoryMaintenance?.waitForIdle(),
       () => bRuntime?.close(),
       () => coordinationStore?.close(),
@@ -266,10 +273,7 @@ export async function createProductionBackendService(
         // dependencies.memoryMaintenance 覆盖路径会绕过留档（测试缝，接受）
         callJournal: protocolCallJournal,
         promotion: {
-          confidenceThreshold: readNumberEnv(
-            env.NEWIDE_B_PROMOTION_CONFIDENCE_THRESHOLD,
-            0.95,
-          ),
+          confidenceThreshold: readNumberEnv(env.NEWIDE_B_PROMOTION_CONFIDENCE_THRESHOLD, 0.95),
           autoApprove: env.NEWIDE_B_SKILL_AUTO_APPROVE === '1',
         },
       });
@@ -285,16 +289,28 @@ export async function createProductionBackendService(
       bCapabilities.boardQuery,
       bRuntime.market_agent_ids,
     );
+    // driver routing 领域服务：读 UI 覆盖文件、算 revision、热更新 mapping，并按 Run 快照解析。
+    // registry 在启动时构造一次，Phase 1 的更新只换 mapping、不重建 runtime。
+    const driverRoutingService = new DriverRoutingService({
+      projectRoot: driverProjectRoot,
+      env,
+      registry: driverRegistry,
+      // 可协作 role 用同一条动态目录：运行时新增/退休的 Agent 立即反映在路由快照里。
+      knownRoleIds: agentCatalogProvider,
+    });
     const agentExecutionFacade = new DriverRuntimeAgentExecutionFacade({
       driver,
+      // driver 可配置化：role 显式映射优先，否则落 default_driver。未配置任何档案时
+      // 这条解析恒等于上面那个 driver，行为与历史一致。
+      // Run 隔离：run_id 用于取该 Run 冻结的 routing，绝不回读保存后的全局配置。
+      resolveDriver: (roleId, runId) =>
+        driverRoutingService.resolveForRunRole(runId, roleId).handle,
       repository: bCapabilities.repository,
       bufferRepository: bCapabilities.bufferRepository,
       ...(bRuntime.embedding ? { embedding: bRuntime.embedding } : {}),
       llm:
         dependencies.agentLlm ??
-        new ProductionAgentToolCallingClient(
-          createProductionToolCallingClient(productionLlm, env),
-        ),
+        new ProductionAgentToolCallingClient(createProductionToolCallingClient(productionLlm, env)),
       memoryMaintenance: bCapabilities.maintenance,
       // B1 调用留档与 mailbox.sessionRegistry 无关：journal 用自己持有的注册表引用，
       // ephemeral 会话下注册表为空 → session_id 记 null（规定回退）。
@@ -325,9 +341,7 @@ export async function createProductionBackendService(
     const baseCouncilProvider = new SynthesisAgentCouncilProvider({
       agentExecutionFacade,
       councilRoot: path.join(stateRoot, 'council'),
-      roleInactivityTimeoutMs: readDriverTimeout(
-        env.NEWIDE_COUNCIL_ROLE_INACTIVITY_TIMEOUT_MS,
-      ),
+      roleInactivityTimeoutMs: readDriverTimeout(env.NEWIDE_COUNCIL_ROLE_INACTIVITY_TIMEOUT_MS),
       participantResolver: new AgentBoardCouncilParticipantResolver({
         boardQuery: bCapabilities.boardQuery,
         resolveAllowedAgentIds: agentCatalogProvider,
@@ -492,6 +506,12 @@ export async function createProductionBackendService(
       coordination_durable: databasePath !== ':memory:',
       driver_provider_id: runnerPackageIdentity.name,
       driver_provider_version: runnerPackageIdentity.version,
+      // 「有哪些 driver 可用」的对外出口：逐档案带上 agent 与档案自报的限制。
+      driver_profiles: Object.entries(driverConfig.drivers).map(([driverId, profile]) => ({
+        driver_id: driverId,
+        agent: profile.agent,
+        ...(profile.limitations ? { limitations: profile.limitations } : {}),
+      })),
       b_repository_mode: dependencies.bRuntime ? 'host-injected' : 'postgresql',
       b_embedding: bRuntime.embedding_info ?? {
         provider: 'host-managed repository',
@@ -505,11 +525,32 @@ export async function createProductionBackendService(
     )
       ? new FileRunTelemetryJsonlSink(runsRoot)
       : new NoopTelemetrySink();
+    // 一次 run 一份 driver-usage.jsonl：driver 侧 usage 观测逐条同步追加，不受
+    // driver-stream.jsonl 的保留上限截断。关掉开关时换成空转 sink，生产行为与接线前
+    // 逐位一致：不建文件、不写盘。
+    const driverUsageSink: DriverUsageSink = readDriverUsageJsonlEnabled(
+      env.NEWIDE_DRIVER_USAGE_JSONL,
+    )
+      ? new FileRunDriverUsageJsonlSink(runsRoot)
+      : new NoopDriverUsageSink();
+    // terminalWriter 的 usage 正源回调要引用 service，而 service 尚在构造中：用可变
+    // 持有对象让回调在 finalize 时（构造早已完成）取到进程内累加器，截断缺尾由此补全。
+    const serviceHolder: { service?: NewideBackendService } = {};
     const service = new NewideBackendService(
       runner,
       new InMemoryRunRegistry(),
       new FileRunAuditWriter(runsRoot),
-      new FileRunTerminalOutputWriter(runsRoot, runLatency),
+      // 第 5 个参数是用量账本：run 收尾时把两条计费腿作为只追加行落库，使累计用量不再
+      // 依赖 runs/ 目录树存活。（第 3 个参数是 Claude session 刮取，用生产默认实现。）
+      new FileRunTerminalOutputWriter(
+        runsRoot,
+        runLatency,
+        undefined,
+        (taskId) => serviceHolder.service?.getAccumulatedDriverUsage(taskId),
+        coordinationStore,
+      ),
+      // driver 配置不再由 store 在构造期固定：每个 Run 创建时从 routing service 冻结一份
+      // 并通过 `save({ driver_config })` 逐 Run 写入，热更新才能只影响新 Run。
       new FileRunRequestStore(runsRoot),
       taskProcessor,
       mailboxService,
@@ -519,16 +560,23 @@ export async function createProductionBackendService(
       new FileDriverStreamAuditWriter(runsRoot),
       taskExecutionLoop,
       systemStatusService,
-      new MailboxDeliveryWorker(
-        mailboxService,
-        agentExecutionFacade,
-        participantSessions,
-      ),
+      new MailboxDeliveryWorker(mailboxService, agentExecutionFacade, participantSessions),
       (input) => agentExecutionFacade.provisionParticipantSession(input),
       new FileRunArtifactContentReader(runsRoot),
       new FileRunEventConsumptionSink(runsRoot),
       runTelemetryJsonlSink,
+      driverUsageSink,
+      new FileRunPayloadReader(runsRoot),
+      // 历史读账本而不是扫目录：目录树没有任何保留策略，往期一旦被清理，重算出来的
+      // 「累计」会变小。首次读会惰性回填一次目录树里已有的用量（幂等）。
+      new LedgerRunUsageHistoryReader(coordinationStore, runsRoot),
+      // driver 计费腿的名字按档案解析，缺省仍是历史名 claude_session_jsonl。
+      driverConfig.drivers[driverConfig.default_driver]?.billing?.source ??
+        DEFAULT_DRIVER_BILLED_SOURCE,
+      // Run 创建时冻结 routing 快照；`startBackendRpcServer` 也从 service 上取它注册 driver.* 方法。
+      driverRoutingService,
     );
+    serviceHolder.service = service;
     await service.recoverMailboxWaits();
     return service;
   } catch (error) {
@@ -562,10 +610,7 @@ export function resolveProductionLlmRuntime(
   env: NodeJS.ProcessEnv,
   driverEnv: NodeJS.ProcessEnv,
 ): ProductionLlmRuntime | undefined {
-  const model = firstNonBlank(
-    env.NEWIDE_AGENT_LLM_MODEL,
-    driverEnv.ANTHROPIC_MODEL,
-  );
+  const model = firstNonBlank(env.NEWIDE_AGENT_LLM_MODEL, driverEnv.ANTHROPIC_MODEL);
   const apiKey = firstNonBlank(
     env.OPENAI_API_KEY,
     driverEnv.ANTHROPIC_AUTH_TOKEN,
@@ -592,9 +637,7 @@ function createProductionToolCallingClient(
     });
   }
   return new LiteLLMToolCallingClient({
-    ...(env.NEWIDE_AGENT_LLM_MODEL?.trim()
-      ? { model: env.NEWIDE_AGENT_LLM_MODEL.trim() }
-      : {}),
+    ...(env.NEWIDE_AGENT_LLM_MODEL?.trim() ? { model: env.NEWIDE_AGENT_LLM_MODEL.trim() } : {}),
   });
 }
 
@@ -663,10 +706,7 @@ function readPackageIdentity(
   const rawName = Reflect.get(value, 'name');
   const rawVersion = Reflect.get(value, 'version');
   return {
-    name:
-      typeof rawName === 'string' && rawName.trim().length > 0
-        ? rawName.trim()
-        : fallbackName,
+    name: typeof rawName === 'string' && rawName.trim().length > 0 ? rawName.trim() : fallbackName,
     version:
       typeof rawVersion === 'string' && rawVersion.trim().length > 0
         ? rawVersion.trim()
@@ -694,6 +734,12 @@ export function startBackendRpcServer(options: BackendRpcServerOptions): Backend
   mailboxMethods.register(dispatcher);
   memoryMethods.register(dispatcher);
   artifactMethods.register(dispatcher);
+  // driver 读写 RPC 只在组装点注入了 routing service 时注册：测试里的裸 service 不会凭空
+  // 多出三个方法，生产装配则自动带上（`system.*` 的只读语义不受影响）。
+  if (service.driverRouting) {
+    const driverMethods = new DriverRpcMethods(createDriverMethodsService(service.driverRouting));
+    driverMethods.register(dispatcher);
+  }
 
   const lines = createInterface({ input: options.input, crlfDelay: Infinity });
   let pending = Promise.resolve();
@@ -765,9 +811,7 @@ export function parseDriverEnv(content: string): NodeJS.ProcessEnv {
   );
 }
 
-export async function runBackendRpcMain(
-  env: NodeJS.ProcessEnv = process.env,
-): Promise<void> {
+export async function runBackendRpcMain(env: NodeJS.ProcessEnv = process.env): Promise<void> {
   let service: NewideBackendService | undefined;
   let server: BackendRpcServer | undefined;
   let shutdownRequested = false;
@@ -895,7 +939,9 @@ function fallbackDriverInstruction(
   const message = input.messages.find(
     (candidate) => candidate.role === 'user' && typeof candidate.content === 'string',
   )?.content;
-  const match = message?.match(/(?:^|\n)Task:\s*([\s\S]*?)(?:\n\n(?:Retrieved memory|Collaboration brief):|$)/);
+  const match = message?.match(
+    /(?:^|\n)Task:\s*([\s\S]*?)(?:\n\n(?:Retrieved memory|Collaboration brief):|$)/,
+  );
   return match?.[1]?.trim() || 'Execute the assigned production task.';
 }
 
@@ -964,14 +1010,29 @@ export function readTelemetryJsonlEnabled(value: string | undefined): boolean {
   throw new Error(`Invalid NEWIDE_TELEMETRY_JSONL: ${value}. Expected 0/1/true/false.`);
 }
 
+/**
+ * NEWIDE_DRIVER_USAGE_JSONL 解析：默认 true；"0"/"false" 关闭。
+ *
+ * 与 `NEWIDE_TELEMETRY_JSONL` 同形，管的是 driver 侧 usage 账本
+ * （`<state-root>/runs/<run_id>/driver-usage.jsonl`）。这条路径是同步追加，写的是每 run
+ * 一两百行的小文件，成本可以忽略；开关留着，是因为「怀疑埋点本身在干扰被测 run」时
+ * 需要一个能一键退回接线前状态的对照手段。关闭路径必须干净：换空转 sink，不建文件、
+ * 不写盘。
+ */
+export function readDriverUsageJsonlEnabled(value: string | undefined): boolean {
+  const raw = value?.trim();
+  if (!raw) return true;
+  if (raw === '0' || raw.toLowerCase() === 'false') return false;
+  if (raw === '1' || raw.toLowerCase() === 'true') return true;
+  throw new Error(`Invalid NEWIDE_DRIVER_USAGE_JSONL: ${value}. Expected 0/1/true/false.`);
+}
+
 export function readCouncilAuctionEnabled(value: string | undefined): boolean {
   const raw = value?.trim();
   if (!raw) return false;
   if (raw === '0' || raw.toLowerCase() === 'false') return false;
   if (raw === '1' || raw.toLowerCase() === 'true') return true;
-  throw new Error(
-    `Invalid NEWIDE_COUNCIL_AUCTION_ENABLED: ${value}. Expected 0/1/true/false.`,
-  );
+  throw new Error(`Invalid NEWIDE_COUNCIL_AUCTION_ENABLED: ${value}. Expected 0/1/true/false.`);
 }
 
 export function readCouncilProposerCount(value: string | undefined): number {

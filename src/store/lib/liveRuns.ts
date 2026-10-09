@@ -1,5 +1,6 @@
 import type { DemoTask } from '@/types';
 import type { LiveRunState } from '@/store/types';
+import { runStateOf } from '@/lib/runState';
 
 /**
  * 从 liveRuns 表里摘掉若干 run。
@@ -28,6 +29,17 @@ export function runningRuns(state: RunLookup): LiveRunState[] {
   return Object.values(state.liveRuns).filter((r) => r.status === 'running');
 }
 
+export function hasActiveTasks(state: RunLookup): boolean {
+  return (
+    runningRuns(state).length > 0 ||
+    state.tasks.some((task) => {
+      const run = task.contractRunId ? state.liveRuns[task.contractRunId] : undefined;
+      const status = runStateOf(task, run);
+      return status === 'running' || status === 'waiting';
+    })
+  );
+}
+
 /**
  * 能不能把 agent 工作区绑到 `projectId`？
  *
@@ -48,6 +60,12 @@ export function canBindWorkspace(
   state: RunLookup,
   projectId: string,
 ): { ok: true } | { ok: false; blockingTask: DemoTask } {
+  for (const task of state.tasks) {
+    if (task.projectId === projectId || !task.contractTaskId) continue;
+    const live = task.contractRunId ? state.liveRuns[task.contractRunId] : undefined;
+    const status = runStateOf(task, live);
+    if (status === 'waiting' || status === 'running') return { ok: false, blockingTask: task };
+  }
   for (const run of runningRuns(state)) {
     const task = state.tasks.find((t) => t.contractRunId === run.runId);
     if (task && task.projectId !== projectId) {

@@ -191,16 +191,15 @@ describe('总览如实写出了每一条能力边界', () => {
     // 5. contract-runner 把 agent 消息正文降维成字符数丢掉
     ['看不到 agent 的文字回复正文', '看不到 agent 的文字回复正文'],
     // 6. 打包版只随包分发 claude
-    ['只有 Claude Code 一个 agent', '只有 Claude Code 一个 agent'],
+    ['默认只随包分发 Claude Code', '打包版默认只分发 Claude Code'],
     // 7. 管道式终端，不是真 PTY
     ['Python 终端不是真正的 TTY', 'Python 终端不是真正的 TTY'],
     // 产物只来自 tool_call_update 里 type==='diff' 的块 —— 命令写的盘一个都不登记
     ['产出卡只认写文件工具', '产出卡只认写文件工具'],
     // artifact-finalizer + integration-v0-flow:780：选中 0 个产物 → run 判失败
     ['没有产物会把 run 判成失败', '没有可选产物'],
-    // 交付报告数的是工作树里的一条元数据记录
-    ['已交付 N 个文件恒为 1', '恒为 1'],
-    ['文件树只补挂一个文件', '文件树只补挂一个文件'],
+    ['交付列表以已写入路径为准', 'delivery_report.files_written'],
+    ['文件树没有文件系统监听', '文件树不是磁盘实时镜像'],
     // Gate 出厂只挂一条空检查
     ['Gate 放行一切', '放行一切'],
     ['ContextPack 是占位', 'ContextPack 是占位'],
@@ -211,10 +210,38 @@ describe('总览如实写出了每一条能力边界', () => {
     ['合议没有人工裁决通道', '没有人工裁决通道'],
     // backendBridge 的 PROVIDERS：需求正文与文件内容要发给模型服务商
     ['代码会出网', '你的代码会发给模型服务商'],
-    // 全仓没有任何 usage/cost 上报
-    ['花费不可见', '花费不可见'],
+    ['token 数据不是实际账单', '实际花费以服务商账单为准'],
   ])('%s', (_name, needle) => {
     expect(overviewDoc).toContain(needle);
+  });
+
+  it('观测说明与新的 API 及缺失数据语义保持一致', () => {
+    for (const method of [
+      'run.getUsage',
+      'run.getEvents',
+      'run.getPayload',
+      'run.subscribe.after_sequence',
+    ]) {
+      expect(protoDoc).toContain(method);
+    }
+    expect(protoDoc).toContain('互不相加');
+    expect(protoDoc).toContain('pending_sources');
+    expect(protoDoc).toContain('-32017');
+    expect(overviewDoc).toContain('执行状态待同步');
+    expect(overviewDoc).not.toContain('后端在这段时间里一条事件都不发');
+    expect(overviewDoc).not.toContain('恒为 1');
+    expect(overviewDoc).toContain('仍停留首页');
+  });
+
+  it('路由说明保留正式 API 配置与新运行生效边界', () => {
+    for (const method of ['driver.getConfig', 'driver.updateRouting', 'driver.resetRouting']) {
+      expect(protoDoc).toContain(method);
+    }
+    expect(protoDoc).toContain('expected_revision');
+    expect(protoDoc).toContain('新 Run 才读取新配置');
+    expect(protoDoc).toContain('activity_run_id');
+    expect(overviewDoc).toContain('填写自己的 API Key');
+    expect(overviewDoc).not.toContain('不保存模型 API key');
   });
 
   /**

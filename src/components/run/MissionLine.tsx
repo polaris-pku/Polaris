@@ -20,6 +20,7 @@ import { cn } from '@/lib/utils';
 const HEADLINE_TONE: Record<RunState, string> = {
   idle: 'text-fg-primary',
   running: 'text-fg-primary',
+  waiting: 'text-fg-primary',
   blocked: 'text-human',
   completed: 'text-fg-primary',
   failed: 'text-danger',
@@ -88,7 +89,11 @@ export function MissionLine({
           )}
         </h1>
 
-        {sub && <p className="truncate text-body text-fg-secondary">{sub}</p>}
+        {sub && (
+          <p title={sub} className="truncate text-body text-fg-secondary">
+            {sub}
+          </p>
+        )}
 
         {/* agent 到底把文件写到哪 —— **全屏后果最重的一条事实**。
             它原来是侧栏第二行的 10px 灰字；文件写错项目也毫无察觉，run 照样显示已交付。 */}

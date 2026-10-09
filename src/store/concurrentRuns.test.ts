@@ -9,8 +9,11 @@
  * 这个用例走完整链路（createTask → run.create → watchRun → 后端推事件 → 泳道图投影），
  * 交错喂两个 run 的事件，断言两个任务各自独立推进。
  */
-import { beforeEach, describe, expect, it, vi } from 'vitest';
-import type { RunEvent } from '@/api/types/rpc';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { RunEvent, RunSnapshot } from '@/api/types/rpc';
+import type { TaskSnapshot } from '@/api/types/task';
+import { runStateOf } from '@/lib/runState';
+import { canBindWorkspace } from '@/store/lib/liveRuns';
 
 type BackendEventCb = (notification: {
   method: 'task.event' | 'run.event';
@@ -36,14 +39,26 @@ const READY_STATUS = {
 };
 
 /** 可编程的假后端桥（形状对齐 electron/preload.cjs 的 window.desktop.backend）。 */
-function installFakeBackend() {
+function installFakeBackend(
+  options: {
+    snapshots?: Record<string, RunSnapshot>;
+    taskSnapshots?: Record<string, TaskSnapshot>;
+    workspace?: string;
+  } = {},
+) {
   const eventCbs = new Set<BackendEventCb>();
+  const statusCbs = new Set<(status: unknown) => void>();
   const rpc: Array<{ method: string; params: unknown }> = [];
+  const historicalRuns = new Set<string>();
   let created = 0;
+  const readyStatus = { ...READY_STATUS, workspace: options.workspace ?? READY_STATUS.workspace };
 
   const backend = {
     call: vi.fn(async (method: string, params: unknown) => {
       rpc.push({ method, params });
+      if (method === 'run.subscribe' && historicalRuns.has((params as { run_id: string }).run_id)) {
+        return { ok: false as const, code: -32004, error: 'Run not found in live registry' };
+      }
       if (method === 'task.create') {
         created += 1;
         const taskId = `btask-${created}`;
@@ -78,52 +93,69 @@ function installFakeBackend() {
           },
         };
       }
-      if (method === 'task.subscribe') {
+      if (method === 'task.subscribe' || method === 'task.get') {
         const taskId = (params as { task_id: string }).task_id;
         const index = Number(taskId.split('-')[1]);
+        const snapshot = options.taskSnapshots?.[taskId] ?? {
+          contract_version: 'task-snapshot.v0',
+          schema_version: 'test',
+          revision: 1,
+          task: {
+            task_id: taskId,
+            status: 'running',
+            risk_level: 'medium',
+            spec: index === 1 ? '实现贪吃蛇' : '实现俄罗斯方块',
+            completion_criteria: ['游戏可运行'],
+            affected_paths: [],
+            created_at: '2026-01-01T00:00:00.000Z',
+            updated_at: '2026-01-01T00:00:00.000Z',
+            schema_version: 'test',
+          },
+          current_run: {
+            run_id: `run-${index}`,
+            task_id: taskId,
+            status: 'running',
+            mode: 'single_agent',
+            restartable: false,
+          },
+          run_history: [],
+          warnings: [],
+        };
         return {
           ok: true as const,
-          result: {
-            subscribed: true,
-            snapshot: {
-              contract_version: 'task-snapshot.v0',
-              schema_version: 'test',
-              revision: 1,
-              task: {
-                task_id: taskId,
-                status: 'running',
-                risk_level: 'medium',
-                spec: index === 1 ? '实现贪吃蛇' : '实现俄罗斯方块',
-                completion_criteria: ['游戏可运行'],
-                affected_paths: [],
-                created_at: '2026-01-01T00:00:00.000Z',
-                updated_at: '2026-01-01T00:00:00.000Z',
-                schema_version: 'test',
-              },
-              current_run: {
-                run_id: `run-${index}`,
-                task_id: taskId,
-                status: 'running',
-                mode: 'single_agent',
-                restartable: false,
-              },
-              run_history: [],
-              warnings: [],
-            },
-            replay_events: [],
-          },
+          result:
+            method === 'task.get' ? snapshot : { subscribed: true, snapshot, replay_events: [] },
         };
       }
       if (method === 'run.getSnapshot') {
+        const runId = (params as { run_id: string }).run_id;
+        if (options.snapshots?.[runId])
+          return { ok: true as const, result: options.snapshots[runId] };
         // 本用例不测终态快照链路 —— 让它失败。store 会把错误记在对应 run 上，
         // 不影响已收到的事件时间线（这正是它该有的行为）。
         return { ok: false as const, error: '本用例不提供快照' };
       }
+      if (method === 'run.getEvents') {
+        const { run_id: runId, after_sequence = 0 } = params as {
+          run_id: string;
+          after_sequence?: number;
+        };
+        const events = options.snapshots?.[runId]?.timeline ?? [];
+        return {
+          ok: true as const,
+          result: {
+            events: events.filter((event) => event.sequence > after_sequence),
+            after_sequence,
+            latest_sequence: Math.max(0, ...events.map((event) => event.sequence)),
+            has_more: false,
+          },
+        };
+      }
       return { ok: true as const, result: {} };
     }),
-    getStatus: vi.fn(async () => READY_STATUS),
-    configure: vi.fn(async () => READY_STATUS),
-    restart: vi.fn(async () => READY_STATUS),
+    getStatus: vi.fn(async () => readyStatus),
+    configure: vi.fn(async () => readyStatus),
+    restart: vi.fn(async () => readyStatus),
     getSettings: vi.fn(async () => ({
       provider: 'anthropic',
       bMemory: { configured: true },
@@ -134,7 +166,10 @@ function installFakeBackend() {
       eventCbs.add(cb);
       return () => eventCbs.delete(cb);
     },
-    onStatus: vi.fn(() => () => {}),
+    onStatus: (cb: (status: unknown) => void) => {
+      statusCbs.add(cb);
+      return () => statusCbs.delete(cb);
+    },
   };
 
   /**
@@ -156,6 +191,7 @@ function installFakeBackend() {
 
   return {
     backend,
+    markHistorical: (runId: string) => historicalRuns.add(runId),
     terminal,
     /** 模拟后端推一条 run.event 上来 */
     emit(event: RunEvent) {
@@ -163,7 +199,15 @@ function installFakeBackend() {
         cb({ method: 'run.event', params: { run_id: event.run_id, event } }),
       );
     },
+    emitTask(event: RunEvent) {
+      eventCbs.forEach((cb) =>
+        cb({ method: 'task.event', params: { task_id: event.task_id, event } }),
+      );
+    },
     calls: (method: string) => rpc.filter((c) => c.method === method),
+    setStatus: (state: 'ready' | 'error' | 'stopped') => {
+      statusCbs.forEach((cb) => cb({ ...readyStatus, state }));
+    },
   };
 }
 
@@ -189,6 +233,231 @@ describe('并发跑两个需求', () => {
     seq = 0;
     vi.unstubAllGlobals();
   });
+  afterEach(async () => {
+    const { unwatchAllTasks } = await import('@/api/task');
+    await unwatchAllTasks();
+    const { resetEventChannel } = await import('@/api/events');
+    resetEventChannel();
+  });
+
+  it('follows a Mailbox continuation to real delivery instead of freezing on the completed first Run', async () => {
+    const workspace = 'C:\\Users\\tester\\Documents\\polaris-workspace\\cook';
+    const taskSnapshots: Record<string, TaskSnapshot> = {
+      'btask-1': {
+        contract_version: 'task-snapshot.v0',
+        schema_version: 'test',
+        revision: 2,
+        task: {
+          task_id: 'btask-1',
+          status: 'waiting_help',
+          spec: 'Python game',
+          risk_level: 'low',
+          completion_criteria: ['Playable'],
+          affected_paths: [],
+          created_at: '2026-01-01T00:00:00Z',
+          updated_at: '2026-01-01T00:00:00Z',
+          schema_version: 'test',
+        },
+        run_history: [
+          {
+            run_id: 'run-1',
+            task_id: 'btask-1',
+            status: 'completed',
+            mode: 'council',
+            restartable: false,
+          },
+        ],
+        warnings: [],
+      },
+    };
+    const snapshots: Record<string, RunSnapshot> = {
+      'run-1': {
+        schema_version: 'test',
+        run_id: 'run-1',
+        task_id: 'btask-1',
+        mode: 'council',
+        status: 'completed',
+        current: {
+          stage: 'executing',
+          active_node_code: 'N8',
+          cursor: 'mailbox_wait',
+          task_status: 'waiting_help',
+        },
+        timeline: [evt('run-1', 'run.completed', { outcome: 'mailbox_wait' })],
+        agent_runs: [],
+        artifacts: [],
+        gates: [],
+        errors: [],
+      },
+      'run-2': {
+        schema_version: 'test',
+        run_id: 'run-2',
+        task_id: 'btask-1',
+        mode: 'council',
+        status: 'running',
+        current: {
+          stage: 'executing',
+          active_node_code: 'N14',
+          cursor: 'council',
+          task_status: 'running',
+        },
+        timeline: [],
+        agent_runs: [],
+        artifacts: [],
+        gates: [],
+        errors: [],
+      },
+    };
+    const fake = installFakeBackend({ snapshots, taskSnapshots, workspace });
+    const { resetTransport } = await import('@/api/transport');
+    resetTransport();
+    const { resetEventChannel } = await import('@/api/events');
+    resetEventChannel();
+    const { useDemoStore } = await import('@/store/useDemoStore');
+    useDemoStore.getState().resetDemo();
+    useDemoStore.getState().createProject('cook', undefined, workspace);
+    await useDemoStore.getState().createTask('Python game', undefined, ['Playable']);
+    const taskId = useDemoStore.getState().tasks[0].id;
+    const projectId = useDemoStore.getState().activeProjectId;
+    expect(
+      runStateOf(useDemoStore.getState().tasks[0], useDemoStore.getState().liveRuns['run-1']),
+    ).toBe('waiting');
+    expect(canBindWorkspace(useDemoStore.getState(), 'another-project').ok).toBe(false);
+    taskSnapshots['btask-1'] = {
+      ...taskSnapshots['btask-1'],
+      revision: 3,
+      task: { ...taskSnapshots['btask-1'].task, status: 'running' },
+      current_run: {
+        run_id: 'run-2',
+        task_id: 'btask-1',
+        status: 'running',
+        mode: 'council',
+        restartable: false,
+      },
+    };
+    fake.emitTask({ ...evt('run-2', 'run.started'), task_id: 'btask-1' });
+    await vi.waitFor(() => expect(useDemoStore.getState().tasks[0].contractRunId).toBe('run-2'));
+    expect(useDemoStore.getState().tasks).toHaveLength(1);
+    expect(useDemoStore.getState().tasks[0].id).toBe(taskId);
+    expect(useDemoStore.getState().activeProjectId).toBe(projectId);
+    snapshots['run-2'] = {
+      ...snapshots['run-2'],
+      status: 'completed',
+      final_output: {
+        status: 'completed',
+        artifact_refs: [],
+        files_written: [`${workspace}\\guess_number.py`],
+        changed_files: ['guess_number.py'],
+      },
+    };
+    taskSnapshots['btask-1'] = {
+      ...taskSnapshots['btask-1'],
+      revision: 4,
+      task: { ...taskSnapshots['btask-1'].task, status: 'completed' },
+      current_run: undefined,
+      run_history: [
+        {
+          run_id: 'run-2',
+          task_id: 'btask-1',
+          status: 'completed',
+          mode: 'council',
+          restartable: false,
+        },
+        ...taskSnapshots['btask-1'].run_history,
+      ],
+    };
+    fake.emit({ ...evt('run-2', 'run.completed'), task_id: 'btask-1' });
+    fake.emitTask({ ...evt('run-2', 'task.completed'), task_id: 'btask-1' });
+    await vi.waitFor(() =>
+      expect(useDemoStore.getState().projects[0].files[0]?.name).toBe('guess_number.py'),
+    );
+    await vi.waitFor(() =>
+      expect(
+        runStateOf(useDemoStore.getState().tasks[0], useDemoStore.getState().liveRuns['run-2']),
+      ).toBe('completed'),
+    );
+    expect(useDemoStore.getState().tasks[0].contractWorkspacePath).toBe(workspace);
+    const { unwatchAllTasks } = await import('@/api/task');
+    const { unwatchRun } = await import('@/api/events');
+    const { recoverBackendTasks } = await import('@/store/lib/backendRecovery');
+    await unwatchAllTasks();
+    await unwatchRun();
+    fake.markHistorical('run-2');
+    taskSnapshots['btask-1'].task.workspace_path = workspace;
+    const before = fake.calls('run.subscribe').length;
+    useDemoStore.getState().resetDemo();
+    useDemoStore.setState((state) => recoverBackendTasks(state, [taskSnapshots['btask-1']]));
+    await useDemoStore.getState().observeTask('btask-1');
+    await vi.waitFor(() =>
+      expect(useDemoStore.getState().projects[0].files[0]?.name).toBe('guess_number.py'),
+    );
+    expect(fake.calls('run.subscribe')).toHaveLength(before);
+    expect(useDemoStore.getState().activeProjectId).toBeNull();
+  });
+
+  it.each(['completed', 'failed', 'cancelled'] as const)(
+    '%s 快照的交付文件进入所属项目，兼容 Windows 路径和缺少 diff/图数据',
+    async (status) => {
+      const workspace = 'C:\\Users\\tester\\Documents\\polaris-workspace\\天下';
+      const snapshots: Record<string, RunSnapshot> = {
+        'run-1': {
+          schema_version: 'v0',
+          run_id: 'run-1',
+          task_id: 'btask-1',
+          mode: 'single_agent',
+          status: 'running',
+          current: { stage: 'executing', active_node_code: 'N3' },
+          timeline: [],
+          agent_runs: [],
+          artifacts: [{ artifact_id: 'result-bundle' }],
+          gates: [],
+          errors: [],
+        },
+      };
+      const fake = installFakeBackend({ snapshots, workspace });
+      const { resetTransport } = await import('@/api/transport');
+      resetTransport();
+      const { resetEventChannel } = await import('@/api/events');
+      resetEventChannel();
+      const { useDemoStore } = await import('@/store/useDemoStore');
+      useDemoStore.getState().resetDemo();
+      useDemoStore.getState().createProject('天下', '文件同步');
+      const projectId = useDemoStore.getState().activeProjectId;
+      await useDemoStore.getState().createTask('写一个 hello world', undefined, ['生成文件']);
+      expect(useDemoStore.getState().tasks[0].contractWorkspacePath).toBe(workspace);
+      expect(useDemoStore.getState().projects[0].files).toEqual([]);
+
+      useDemoStore.getState().createProject('其他项目', '不应接收另一项目的文件');
+      const files = [`${workspace}\\hello_world.py`, `${workspace}\\src\\main.py`];
+      snapshots['run-1'] = {
+        ...snapshots['run-1'],
+        status,
+        delivery_report: { files_written: files, artifacts_materialized: 1 },
+        final_output: { status, files_written: files, artifact_refs: [] },
+      };
+      fake.emit(evt('run-1', `run.${status}`));
+      const expected = [
+        { name: 'hello_world.py', origin: 'live' },
+        { name: 'src', children: [{ name: 'main.py', origin: 'live' }] },
+      ];
+      await vi.waitFor(() =>
+        expect(
+          useDemoStore.getState().projects.find((project) => project.id === projectId)?.files,
+        ).toEqual(expected),
+      );
+      expect(
+        useDemoStore.getState().projects.find((project) => project.id !== projectId)?.files,
+      ).toEqual([]);
+
+      useDemoStore.getState().attachLiveRun('run-1', snapshots['run-1']);
+      expect(
+        useDemoStore.getState().projects.find((project) => project.id === projectId)?.files,
+      ).toEqual(expected);
+      if (!projectId) throw new Error('Project was not created');
+      useDemoStore.getState().openFile(projectId, 'src/main.py');
+      expect(useDemoStore.getState().openedFile).toEqual({ projectId, path: 'src/main.py' });
+    },
+  );
 
   it('第二个需求不会把第一个卡死：两个 run 各自独立推进', async () => {
     const fake = installFakeBackend();
@@ -209,6 +478,8 @@ describe('并发跑两个需求', () => {
 
     await useDemoStore.getState().createTask('实现俄罗斯方块', undefined, ['游戏可运行']);
     await vi.waitFor(() => expect(useDemoStore.getState().tasks[1].contractRunId).toBe('run-2'));
+    expect(useDemoStore.getState().liveRuns['run-1'].syncError).toContain('本用例不提供快照');
+    expect(useDemoStore.getState().liveRuns['run-2'].syncError).toContain('本用例不提供快照');
 
     // 两个 run 都必须处于订阅状态，且一个都没被退订。
     expect(fake.calls('run.subscribe').map((c) => c.params)).toEqual([
@@ -296,8 +567,32 @@ describe('并发跑两个需求', () => {
     expect(fake.calls('run.unsubscribe')).toHaveLength(0);
   });
 
-  it('后端进程掉线 → 在跑的 run 如实标成失败，而不是永远转圈', async () => {
-    const fake = installFakeBackend();
+  it('掉线不伪造执行失败，重连后用持久快照恢复用量和终态', async () => {
+    vi.resetModules();
+    const snapshots: Record<string, RunSnapshot> = {
+      'run-1': {
+        schema_version: 'v0',
+        run_id: 'run-1',
+        task_id: 'btask-1',
+        mode: 'single_agent',
+        status: 'running',
+        current: { stage: 'executing', active_node_code: 'N3', cursor: 'select_agent' },
+        timeline: [],
+        agent_runs: [],
+        artifacts: [],
+        gates: [],
+        errors: [],
+        usage: {
+          context: {
+            metric: 'context_tokens_used',
+            context_tokens_used: 42,
+            complete: true,
+            sessions: [],
+          },
+        },
+      },
+    };
+    const fake = installFakeBackend({ snapshots });
 
     const { resetTransport } = await import('@/api/transport');
     resetTransport();
@@ -312,14 +607,37 @@ describe('并发跑两个需求', () => {
     fake.emit(evt('run-1', 'task.created', { spec: '实现贪吃蛇' }));
     expect(useDemoStore.getState().liveRuns['run-1'].status).toBe('running');
 
-    // 后端进程没了（崩溃 / 被重启杀掉）
-    useDemoStore.getState().failLiveRuns('后端进程已重启或退出，该 run 已中断。');
+    expect(
+      useDemoStore.getState().liveRuns['run-1'].snapshot?.usage?.context?.context_tokens_used,
+    ).toBe(42);
+    fake.setStatus('error');
+    expect(useDemoStore.getState().liveRuns['run-1'].status).toBe('running');
+    expect(useDemoStore.getState().liveRuns['run-1'].syncError).toContain('连接中断');
+    expect(fake.calls('run.unsubscribe')).toHaveLength(0);
 
-    const run = useDemoStore.getState().liveRuns['run-1'];
-    expect(run.status).toBe('failed');
-    expect(run.error).toContain('中断');
-    // 任务被推到终态 —— 不会再挂着「执行中」等一个永远不来的事件
+    useDemoStore.setState((state) => ({
+      liveRuns: {
+        ...state.liveRuns,
+        'run-1': {
+          ...state.liveRuns['run-1'],
+          timeline: [{ ...evt('run-1', 'run.completed'), sequence: 999 }],
+        },
+      },
+    }));
+    snapshots['run-1'] = {
+      ...snapshots['run-1'],
+      status: 'failed',
+      current: { stage: 'delivery', active_node_code: 'N18', cursor: 'done' },
+      timeline: [evt('run-1', 'run.failed')],
+      usage: undefined,
+    };
+    fake.setStatus('ready');
+    await vi.waitFor(() => expect(useDemoStore.getState().liveRuns['run-1'].status).toBe('failed'));
+    await vi.waitFor(() => expect(useDemoStore.getState().liveRuns['run-1'].syncError).toBeNull());
+    expect(useDemoStore.getState().liveRuns['run-1'].snapshot?.usage).toBeUndefined();
     expect(useDemoStore.getState().tasks[0].stage).toBe('delivery');
+    // 已结束的持久 run 不必在新进程的内存 registry 里重新订阅。
+    expect(fake.calls('run.subscribe')).toHaveLength(1);
   });
 
   it('后端事件永远不会启动终端进程（R3/I5 硬红线）', async () => {

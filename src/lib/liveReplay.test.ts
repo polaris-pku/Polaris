@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { RunEvent, RunSnapshot } from '@/api/types/rpc';
-import { buildLiveProgressReplay, buildLiveRunReplay } from '@/lib/liveReplay';
+import { buildLiveProgressReplay, buildLiveRunReplay, liveProducedFiles } from '@/lib/liveReplay';
 
 let seq = 0;
 const event = (type: string, payload: Record<string, unknown> = {}): RunEvent => {
@@ -69,6 +69,52 @@ describe('liveReplay · meta.spec 是任务标题的来源', () => {
       META,
     );
     expect(replay.meta.spec).toBe('为订单接口增加权限校验');
+  });
+
+  describe('liveReplay · 交付文件', () => {
+    it('uses files_written even when artifacts contain no diff paths', () => {
+      const snapshot = snapshotWith('hello world');
+      const file = 'C:\\workspace\\天下\\hello_world.py';
+      snapshot.delivery_report = { files_written: [file, file], artifacts_materialized: 1 };
+      snapshot.artifacts = [{ artifact_id: 'result-bundle' }];
+      expect(liveProducedFiles(snapshot)).toEqual([file]);
+    });
+
+    it('accepts final-output files in thin snapshots', () => {
+      const snapshot = snapshotWith('hello world');
+      snapshot.contract_version = undefined;
+      snapshot.delivery_report = undefined;
+      snapshot.final_output = {
+        status: 'completed',
+        artifact_refs: [],
+        files_written: ['src/main.py'],
+      };
+      expect(liveProducedFiles(snapshot)).toEqual(['src/main.py']);
+    });
+
+    it('keeps the delivery report authoritative rather than adding duplicate output variants', () => {
+      const snapshot = snapshotWith('hello world');
+      snapshot.delivery_report = {
+        files_written: ['C:\\workspace\\main.py'],
+        artifacts_materialized: 1,
+      };
+      snapshot.final_output = {
+        status: 'completed',
+        artifact_refs: [],
+        files_written: ['main.py'],
+      };
+      expect(liveProducedFiles(snapshot)).toEqual(['C:\\workspace\\main.py']);
+    });
+
+    it('preserves legacy diff support, without inventing files from non-path metadata', () => {
+      const snapshot = snapshotWith('legacy');
+      snapshot.artifacts = [
+        { type: 'diff', source_path: '/work/main.py' },
+        { type: 'diff', source_path: { label: 'not a filesystem path' } },
+        { type: 'transcript', source_path: '/work/transcript.json' },
+      ];
+      expect(liveProducedFiles(snapshot)).toEqual(['/work/main.py']);
+    });
   });
 
   it('实时路径：task.created 还没到 → 退回 taskId，绝不是空串', () => {

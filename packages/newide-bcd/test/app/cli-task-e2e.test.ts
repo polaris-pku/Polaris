@@ -50,10 +50,7 @@ describe('CLI task E2E through the production composition', () => {
       '{"scripts":{"driver:run":"node fake-driver.mjs"}}',
     );
     await writeFile(path.join(runnerDir, '.env'), 'NEWIDE_B_DATABASE_URL=should-not-leak\n');
-    await writeFile(
-      path.join(runnerDir, 'fake-driver.mjs'),
-      fakeDriverSource,
-    );
+    await writeFile(path.join(runnerDir, 'fake-driver.mjs'), fakeDriverSource);
     writeFakeAcpRunnerBuild(runnerDir, { importFromRunnerRoot: 'fake-driver.mjs' });
 
     const repository = new InMemoryRepository(alwaysRelevantEmbedding());
@@ -97,6 +94,24 @@ describe('CLI task E2E through the production composition', () => {
       const snapshot = service.getSnapshot(created.run_id);
 
       expect(snapshot.status).toBe('completed');
+
+      // ── 1b. Run 创建点冻结的 driver 配置逐 Run 落进 request.json ──
+      // 零配置下就是那个历史 driver，并且是**非敏感投影**：只有 id 与 agent。
+      const persistedRequest = JSON.parse(
+        await readFile(
+          path.join(process.cwd(), '.newide', 'runs', created.run_id, 'request.json'),
+          'utf8',
+        ),
+      ) as { driver_config?: Record<string, unknown> };
+      expect(persistedRequest.driver_config).toMatchObject({
+        default_driver: 'acp-external',
+        drivers: { 'acp-external': 'claude' },
+      });
+      expect(Object.keys(persistedRequest.driver_config ?? {}).sort()).toEqual([
+        'default_driver',
+        'drivers',
+      ]);
+
       const executionCompleted = snapshot.events.find(
         (event) => event.type === 'agent.execution_completed',
       );
@@ -112,20 +127,13 @@ describe('CLI task E2E through the production composition', () => {
       expect(WORKSPACE_AGENT_IDS).toContain(agentId);
 
       // ── 2. maintenance 自动提取经验并持久化 ──
-      const maintenance = await waitForMaintenance(
-        service,
-        agentId,
-        created.run_id,
-        10_000,
-      );
+      const maintenance = await waitForMaintenance(service, agentId, created.run_id, 10_000);
       expect(maintenance.status).toBe('completed');
       expect(maintenance.kind).toBe('experience_extraction');
       expect(maintenance.experiences.length).toBeGreaterThan(0);
 
       const experiences = await repository.listExperiences(agentId);
-      const promotedCandidate = experiences.find(
-        (experience) => experience.confidence > 0.95,
-      );
+      const promotedCandidate = experiences.find((experience) => experience.confidence > 0.95);
       expect(promotedCandidate).toBeDefined();
       expect(promotedCandidate).toMatchObject({
         content: 'Fake ACP completed the request.',
@@ -200,9 +208,7 @@ function invokeDriverLlm(): ToolCallingClient {
       if (lastMessage?.role === 'tool') {
         return { content: 'Task completed. [done]', tool_calls: undefined };
       }
-      const userMessage = [...input.messages]
-        .reverse()
-        .find((message) => message.role === 'user');
+      const userMessage = [...input.messages].reverse().find((message) => message.role === 'user');
       sequence += 1;
       return {
         content: null,

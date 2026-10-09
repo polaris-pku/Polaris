@@ -13,7 +13,10 @@ import {
   mergeArtifacts,
   snapshotWorkspaceFiles,
 } from '../coordinator/workspace-change-detector';
-export { mergeArtifacts, normalizeArtifactTargetPath } from '../coordinator/workspace-change-detector';
+export {
+  mergeArtifacts,
+  normalizeArtifactTargetPath,
+} from '../coordinator/workspace-change-detector';
 import {
   AgentManager,
   InvokeDriverTool,
@@ -85,6 +88,18 @@ import type {
 
 export interface DriverRuntimeAgentExecutionFacadeOptions {
   driver: DriverRuntimeHandle;
+  /**
+   * 按 B 侧 role 解析 driver，`runId` 用于取该 Run 冻结的 routing 快照。缺省时所有 role
+   * 都用 `driver`，即历史单 driver 行为。
+   *
+   * role 从 `invocationContext`（ALS）取——`execute_agent`、council 各席位、mailbox
+   * 投递都从同一个入口进，所以解析点只需收敛在这里一处，调用方不必各自叠一层。
+   * driver 是 per-role 的无状态工具：换 driver 不影响 B 侧记忆（它绑在 role_id 上）。
+   *
+   * `runId` 是 Run 隔离的关键：同一个 Run 的每个席位都必须解析到同一份 routing 快照，
+   * 否则会出现「第一个席位用旧映射、第二个席位用刚保存的新映射」。
+   */
+  resolveDriver?: (roleId: string, runId?: string) => DriverRuntimeHandle;
   repository: MemoryRepository;
   bufferRepository: BufferRepository;
   llm: ToolCallingClient;
@@ -105,6 +120,7 @@ export interface DriverRuntimeAgentExecutionFacadeOptions {
 interface InvocationContext {
   task_id: string;
   run_id: string;
+  routing_run_id: string;
   role_id: string;
   context_policy: string;
   instruction: string;
@@ -141,10 +157,20 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
   private readonly executionQueues = new Map<string, Promise<void>>();
   private readonly sessionProvisioning = new Map<string, Promise<string>>();
   private readonly invocationContext = new AsyncLocalStorage<InvocationContext>();
-  private readonly invokeDriverRuntime: ReturnType<typeof createDriverRuntimeInvoker>;
-
+  /** 按 role 解析 driver；未配置档案时恒为构造时那一个（历史行为）。 */
+  private readonly driverFor: (roleId: string, runId?: string) => DriverRuntimeHandle;
+  /**
+   * 每个 driver_id 各持一个 invoker。
+   *
+   * `createDriverRuntimeInvoker` 把 driver 闭包进去，并硬校验
+   * `input.source_driver === driver.driver_id`，所以不能共用一个。
+   */
+  private readonly driverInvokers = new Map<
+    string,
+    ReturnType<typeof createDriverRuntimeInvoker>
+  >();
   constructor(private readonly options: DriverRuntimeAgentExecutionFacadeOptions) {
-    this.invokeDriverRuntime = createDriverRuntimeInvoker(options.driver);
+    this.driverFor = options.resolveDriver ?? (() => options.driver);
     this.manager = this.createManager();
   }
 
@@ -152,12 +178,19 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     await this.manager;
   }
 
+  /** 取（并按 driver_id 缓存）某个 driver 的 invoker。 */
+  private invokerFor(driver: DriverRuntimeHandle) {
+    const existing = this.driverInvokers.get(driver.driver_id);
+    if (existing) return existing;
+    const created = createDriverRuntimeInvoker(driver);
+    this.driverInvokers.set(driver.driver_id, created);
+    return created;
+  }
+
   private createManager(): Promise<AgentManager> {
     const tools = [
       new InvokeDriverTool((task) => this.invokeDriver(task)),
-      ...(this.options.mailbox
-        ? [new MailboxSendTool((input) => this.sendMailbox(input))]
-        : []),
+      ...(this.options.mailbox ? [new MailboxSendTool((input) => this.sendMailbox(input))] : []),
     ];
     return AgentManager.create(this.options.repository, this.options.bufferRepository, {
       tools: {
@@ -207,6 +240,8 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
   ): Promise<string> {
     await this.ensureRole(input.role_id);
     throwIfAborted(options?.signal);
+    // 会话 provisioning 也必须按 role + Run 快照选 driver：否则会把某个 agent 的会话发给另一个。
+    const driver = this.driverFor(input.role_id, input.run_id);
     const prompt = {
       task_id: input.task_id,
       run_id: `${input.run_id}:session-provision:${input.role_id}`,
@@ -221,24 +256,34 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       schema_version: SCHEMA_VERSION,
     };
     const onDriverEvent: DriverStreamEventListener | undefined = options?.onDriverEvent
-      ? (event) => options.onDriverEvent?.({ ...event, run_id: input.run_id, role_id: input.role_id })
+      ? (event) =>
+          options.onDriverEvent?.({ ...event, run_id: input.run_id, role_id: input.role_id })
       : undefined;
-    let result = await runDriverPromptWithSignal(
-      this.options.driver, prompt, options?.signal, onDriverEvent,
-    );
-    if (isArtifactFreeRetryableFailure(result) && !/\bSESSION_READY\b/.test(result.response ?? '')) {
-      const sessionId = result.session_id && result.session_id !== this.options.driver.session_id && result.session_id !== 'session-unavailable'
-        ? result.session_id : undefined;
+    let result = await runDriverPromptWithSignal(driver, prompt, options?.signal, onDriverEvent);
+    if (
+      isArtifactFreeRetryableFailure(result) &&
+      !/\bSESSION_READY\b/.test(result.response ?? '')
+    ) {
+      const sessionId =
+        result.session_id &&
+        result.session_id !== driver.session_id &&
+        result.session_id !== 'session-unavailable'
+          ? result.session_id
+          : undefined;
       result = await runDriverPromptWithSignal(
-        this.options.driver,
-        { ...prompt, run_id: `${prompt.run_id}:retry`, ...(sessionId ? { session_id: sessionId } : {}) },
+        driver,
+        {
+          ...prompt,
+          run_id: `${prompt.run_id}:retry`,
+          ...(sessionId ? { session_id: sessionId } : {}),
+        },
         options?.signal,
         onDriverEvent,
       );
     }
     const usableSession =
       Boolean(result.session_id) &&
-      result.session_id !== this.options.driver.session_id &&
+      result.session_id !== driver.session_id &&
       result.session_id !== 'session-unavailable';
     // Claude Agent SDK can stream SESSION_READY then throw a DeepSeek 402 on a
     // follow-up (title / telemetry). The init turn already succeeded.
@@ -346,7 +391,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
           task_id: normalizedInput.task_id,
           workspace_path: normalizedInput.workspace_path,
           role_id: normalizedInput.role_id,
-          run_id: normalizedInput.run_id,
+          run_id: normalizedInput.activity_run_id ?? normalizedInput.run_id,
         },
         options,
       );
@@ -358,9 +403,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     const runtimeRoleId = scopedInput.role_id;
     // Mailbox semantics serialize one logical role, while different roles
     // remain runnable in parallel even when they share a workspace.
-    const queueKeys = [
-      `role:${runtimeRoleId}`,
-    ];
+    const queueKeys = [`role:${runtimeRoleId}`];
     return this.enqueue(
       queueKeys,
       async () => {
@@ -416,6 +459,8 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
   ): Promise<AgentExecutionResult> {
     throwIfAborted(options?.signal);
     const ablationPolicy = resolveMemoryAblationPolicy(input.memory_ablation);
+    // Council phase IDs identify executions; routing is frozen on the owning Run.
+    const routingRunId = input.activity_run_id ?? input.run_id;
     const task: AgentTaskRequest = {
       spec: input.instruction,
       task_id: input.task_id,
@@ -423,8 +468,11 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       // 同源（workspace_path 已在上面 path.resolve 归一化）。
       run_id: input.run_id,
       ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
+      // 透传面板 run，避免阶段执行的观测被归到面板无法查询的身份下。
+      ...(input.activity_run_id ? { activity_run_id: input.activity_run_id } : {}),
       call_id: createId('call'),
-      source_driver: this.options.driver.driver_id,
+      // 归属到本 role 实际会用的 driver（按本 Run 冻结的 routing 解析），与真正下发的那一个保持一致。
+      source_driver: this.driverFor(runtimeRoleId, routingRunId).driver_id,
     };
     const inboundMailbox = input.mailbox_delivery_id
       ? this.requireInboundMailbox(input)
@@ -434,8 +482,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         ? this.options.mailbox.service
             .inbox(input.task_id, input.workspace_path, input.role_id)
             .filter(
-              (envelope) =>
-                isMailboxDeliveryAvailable(envelope) && !envelopeExpectsReply(envelope),
+              (envelope) => isMailboxDeliveryAvailable(envelope) && !envelopeExpectsReply(envelope),
             )
         : [];
     return runWithMemoryAblationPolicy(ablationPolicy, async () => {
@@ -462,6 +509,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       const invocation: InvocationContext = {
         task_id: input.task_id,
         run_id: input.run_id,
+        routing_run_id: routingRunId,
         role_id: runtimeRoleId,
         context_policy: input.context_policy,
         instruction: input.instruction,
@@ -653,7 +701,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     if (!invocation.workspace_path) {
       throw new Error('mailbox.send requires a workspace-bound Agent invocation');
     }
-    if (!await this.isAllowedMailboxRecipient(input.to_role_id)) {
+    if (!(await this.isAllowedMailboxRecipient(input.to_role_id))) {
       throw new Error(`Mailbox recipient ${input.to_role_id} is not in the collaboration roster`);
     }
     const waitForReply = expectsMailboxReply(kind);
@@ -672,13 +720,9 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       throw new Error('An Agent turn can wait for only one Mailbox reply');
     }
     const idempotencyKey = `${invocation.run_id}:mailbox:${String(invocation.mailbox_sequence)}`;
-    const deadlineSeconds =
-      mailbox.defaultDeadlineSeconds ?? DEFAULT_MAILBOX_DEADLINE_SECONDS;
+    const deadlineSeconds = mailbox.defaultDeadlineSeconds ?? DEFAULT_MAILBOX_DEADLINE_SECONDS;
 
-    if (
-      invocation.inbound_mailbox &&
-      envelopeExpectsReply(invocation.inbound_mailbox)
-    ) {
+    if (invocation.inbound_mailbox && envelopeExpectsReply(invocation.inbound_mailbox)) {
       const inbound = invocation.inbound_mailbox;
       if (input.to_role_id !== inbound.message.from_role_id) {
         throw new Error(
@@ -769,20 +813,16 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     const current = mailbox.service.getEnvelope(inbound.delivery.delivery_id).delivery;
     const injected =
       current.status === 'pending'
-      ? mailbox.service.markInjected(
+        ? mailbox.service.markInjected(
             current.delivery_id,
             current.recipient_role_id,
             boundSessionId ?? result.session_id,
           )
         : current;
     const replied = outcomes.some(
-      (outcome) =>
-        outcome.kind === 'reply' && outcome.source_delivery_id === injected.delivery_id,
+      (outcome) => outcome.kind === 'reply' && outcome.source_delivery_id === injected.delivery_id,
     );
-    if (
-      injected.status === 'injected' &&
-      (!envelopeExpectsReply(inbound) || replied)
-    ) {
+    if (injected.status === 'injected' && (!envelopeExpectsReply(inbound) || replied)) {
       mailbox.service.ack(injected.delivery_id, injected.recipient_role_id);
     }
   }
@@ -851,10 +891,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     ].join('\n');
   }
 
-  private finishNoticeMailbox(
-    input: AgentExecutionRequest,
-    result: AgentExecutionResult,
-  ): void {
+  private finishNoticeMailbox(input: AgentExecutionRequest, result: AgentExecutionResult): void {
     const mailbox = this.options.mailbox;
     if (!mailbox || !input.workspace_path) return;
     const notices = mailbox.service
@@ -887,6 +924,8 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       throw new Error('A C role execution can invoke the driver only once');
     }
     throwIfAborted(invocation.signal);
+    // 解析点收敛在这里：role 与 run 都来自 ALS，任何进入 invoke_driver 的路径都经过它。
+    const driver = this.driverFor(invocation.role_id, invocation.routing_run_id);
     try {
       const driverInvocationContext: DriverRuntimeInvokerInput['driver_context'] = {
         task_instruction: invocation.driver_instruction,
@@ -905,14 +944,14 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       invocation.driver_invocation_context = driverInvocationContext;
       const invoke = () => {
         invocation.driver_attempts += 1;
-        return this.invokeDriverRuntime(
+        return this.invokerFor(driver)(
           {
             task_id: invocation.task_id,
             run_id: invocation.run_id,
             ...(invocation.workspace_path ? { workspace_path: invocation.workspace_path } : {}),
             ...(invocation.session_id ? { session_id: invocation.session_id } : {}),
             call_id: createId('call'),
-            source_driver: this.options.driver.driver_id,
+            source_driver: driver.driver_id,
             driver_context: driverInvocationContext,
           },
           invocation.signal || invocation.onDriverEvent
@@ -999,6 +1038,9 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         driver_status: execution.status,
         driver_attempts: driverAttempts,
         driver_report: dispatched.cycle.buffer_snapshot.driver_return,
+        // 驱动自报的逐次调用用量：过去只到进程就被丢掉，这里落进阶段证据、
+        // 从而进入事件流与 run 目录，成为一条独立于上下文占用与 Claude 刮取的计费口径。
+        ...(execution.usage ? { driver_usage: { ...execution.usage } } : {}),
         dispatch_status: dispatched.status,
         context_policy: input.context_policy,
         input_artifact_refs: [...input.input_artifact_refs],
@@ -1039,6 +1081,8 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     mailboxOutcomes: readonly MailboxToolOutcome[],
   ): Promise<AgentExecutionResult> {
     const created_at = nowTimestamp();
+    // 无执行结果的路径也要按 role 归属，否则 transcript / session 会记到别的 driver 上。
+    const driver = this.driverFor(input.role_id, input.activity_run_id ?? input.run_id);
     const mailboxWait = mailboxOutcomes.find(
       (outcome) => outcome.kind === 'request' && outcome.wait_for_reply,
     );
@@ -1048,7 +1092,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       artifact_id: createId('artifact'),
       type: 'transcript',
       uri: `artifact://transcript/${encodeURIComponent(input.task_id)}/${encodeURIComponent(input.role_id)}`,
-      producer_id: this.options.driver.driver_id,
+      producer_id: driver.driver_id,
       task_id: input.task_id,
       metadata: { dispatch_status: dispatched.status, error: errorMessage },
       created_at,
@@ -1071,13 +1115,11 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       driver_run_result_id: createId('driver_result'),
       artifact_refs: [...workspaceArtifacts],
       transcript_ref: transcript,
-      session_id: input.session_id ?? this.options.driver.session_id,
-      response: mailboxWait
-        ? `Waiting for Mailbox reply from ${mailboxWait.to_role_id}.`
-        : '',
+      session_id: input.session_id ?? driver.session_id,
+      response: mailboxWait ? `Waiting for Mailbox reply from ${mailboxWait.to_role_id}.` : '',
       tool_events: [],
       diagnostics: {
-        driver_id: this.options.driver.driver_id,
+        driver_id: driver.driver_id,
         driver_status: mailboxWait ? 'not_invoked' : 'failed',
         dispatch_status: dispatched.status,
         ...(mailboxWait
@@ -1261,7 +1303,9 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
 function envelopeExpectsReply(envelope: PersistedMailboxEnvelope): boolean {
   return (
     !envelope.message.reply_to_message_id &&
-    expectsMailboxReply(envelope.message.kind ?? legacyMailboxKind(envelope.message.type) ?? 'notice')
+    expectsMailboxReply(
+      envelope.message.kind ?? legacyMailboxKind(envelope.message.type) ?? 'notice',
+    )
   );
 }
 
@@ -1269,9 +1313,7 @@ function isMailboxDeliveryAvailable(envelope: PersistedMailboxEnvelope): boolean
   return envelope.delivery.status === 'pending' || envelope.delivery.status === 'injected';
 }
 
-function legacyMailboxKind(
-  type: AgentMessageType | undefined,
-): 'request' | 'notice' | undefined {
+function legacyMailboxKind(type: AgentMessageType | undefined): 'request' | 'notice' | undefined {
   if (!type) return undefined;
   return expectsMailboxReply(type) ? 'request' : 'notice';
 }

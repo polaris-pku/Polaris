@@ -61,7 +61,9 @@ describe('RunEventConsumptionRecorder', () => {
     // 6 个汉字：字符长度 6，UTF-8 却是 18 字节（另加两个引号 20）。中文 payload 在这个仓
     // 很常见，用 .length 会系统性少算，报告里的「事件体积」就失去意义。
     recorder.consume('council.decision', { 摘要: '通过评审' });
-    expect(recorder.snapshot().payload_bytes).toBe(Buffer.byteLength('{"摘要":"通过评审"}', 'utf-8'));
+    expect(recorder.snapshot().payload_bytes).toBe(
+      Buffer.byteLength('{"摘要":"通过评审"}', 'utf-8'),
+    );
   });
 
   it('payload 序列化不了时记 0 字节而不是抛错', () => {
@@ -83,9 +85,7 @@ describe('RunEventConsumptionRecorder', () => {
     ] as const) {
       for (const type of order) recorder.consume(type, {});
     }
-    expect(Object.keys(first.snapshot().by_type)).toEqual(
-      Object.keys(second.snapshot().by_type),
-    );
+    expect(Object.keys(first.snapshot().by_type)).toEqual(Object.keys(second.snapshot().by_type));
   });
 
   it('累计提交批次与条数', () => {
@@ -166,7 +166,9 @@ describe('RunEventConsumptionRecorder', () => {
   });
 
   it('本 PR 新增的两个事件类型已登记进目录', () => {
-    expect(requireTelemetryCatalogEntry('run.event_consumed').event_type).toBe('run.event_consumed');
+    expect(requireTelemetryCatalogEntry('run.event_consumed').event_type).toBe(
+      'run.event_consumed',
+    );
     expect(requireTelemetryCatalogEntry('run.event_committed_batch').event_type).toBe(
       'run.event_committed_batch',
     );

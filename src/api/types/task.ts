@@ -37,6 +37,7 @@ export interface TaskSnapshot {
     spec: string;
     completion_criteria: string[];
     affected_paths: string[];
+    workspace_path?: string;
     budget?: {
       max_tokens?: number;
       max_wall_clock_seconds?: number;

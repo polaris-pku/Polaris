@@ -66,20 +66,17 @@ if (usesTemporaryRunner) {
   localServer = startBackendRpcServer({
     input,
     writeLine: (line) => localOutput!.write(`${line}\n`),
-    service: await createProductionBackendService(
-      backendEnv,
-      {
-        agentLlm: invokeDriverLlm(),
-        memoryLlm: deterministicMaintenanceLlm(),
-        bRuntime: {
-          repository: new InMemoryRepository(),
-          bufferRepository: new InMemoryBufferRepository(),
-          app_state_root: process.env.NEWIDE_B_APP_STATE_ROOT ?? path.join(stateRoot, 'b'),
-          market_agent_ids: ['role_fullstack_engineer', 'role_ts_engineer'],
-          close: async () => undefined,
-        },
+    service: await createProductionBackendService(backendEnv, {
+      agentLlm: invokeDriverLlm(),
+      memoryLlm: deterministicMaintenanceLlm(),
+      bRuntime: {
+        repository: new InMemoryRepository(),
+        bufferRepository: new InMemoryBufferRepository(),
+        app_state_root: process.env.NEWIDE_B_APP_STATE_ROOT ?? path.join(stateRoot, 'b'),
+        market_agent_ids: ['role_fullstack_engineer', 'role_ts_engineer'],
+        close: async () => undefined,
       },
-    ),
+    }),
   });
   backendInput = input;
   backendOutput = localOutput;
@@ -145,6 +142,32 @@ try {
   const unknown = smokeMode === 'all' ? await requestRaw('unknown.method', {}) : undefined;
   if (unknown) assert(unknown.error?.code === -32601, 'Unknown method did not return -32601');
 
+  // driver.* 注册面：`driver.getConfig` 是只读的，直接调用验证返回形状；
+  // update/reset 用**空参数**探测——参数非法返回 -32602 就证明方法已注册，且不会写任何文件
+  // （冒烟脚本跑在真实仓库上，绝不能在这里改 routing）。
+  const driverConfig = smokeMode === 'all' ? await requestRaw('driver.getConfig', {}) : undefined;
+  if (driverConfig) {
+    assert(
+      driverConfig.error === undefined,
+      `driver.getConfig failed: ${JSON.stringify(driverConfig.error)}`,
+    );
+  }
+  const driverUpdateProbe =
+    smokeMode === 'all' ? await requestRaw('driver.updateRouting', {}) : undefined;
+  if (driverUpdateProbe) {
+    assert(
+      driverUpdateProbe.error?.code === -32602,
+      'driver.updateRouting is not registered or did not reject empty params',
+    );
+  }
+  const driverResetProbe =
+    smokeMode === 'all' ? await requestRaw('driver.resetRouting', {}) : undefined;
+  if (driverResetProbe) {
+    assert(
+      driverResetProbe.error?.code === -32602,
+      'driver.resetRouting is not registered or did not reject empty params',
+    );
+  }
   process.stdout.write(
     `${JSON.stringify({
       status: 'ok',
@@ -156,6 +179,9 @@ try {
       ...(cancelled ? { cancelled } : {}),
       ...(parseError ? { malformed_json_error: parseError.error?.code } : {}),
       ...(unknown ? { unknown_method_error: unknown.error?.code } : {}),
+      ...(driverConfig?.result === undefined ? {} : { driver_config: driverConfig.result }),
+      ...(driverUpdateProbe ? { driver_update_invalid_params: driverUpdateProbe.error?.code } : {}),
+      ...(driverResetProbe ? { driver_reset_invalid_params: driverResetProbe.error?.code } : {}),
     })}\n`,
   );
 } finally {
@@ -174,9 +200,7 @@ try {
       ...taskIds.map((taskId) =>
         fs.rm(path.join(stateRoot, 'worktrees', taskId), { recursive: true, force: true }),
       ),
-      ...(usesTemporaryRunner
-        ? generatedFiles.map((file) => fs.rm(file, { force: true }))
-        : []),
+      ...(usesTemporaryRunner ? generatedFiles.map((file) => fs.rm(file, { force: true })) : []),
       ...(usesTemporaryRunner ? [fs.rm(runnerDir, { recursive: true, force: true })] : []),
     ]);
   }
@@ -238,8 +262,7 @@ async function runAndVerify(mode: 'single_agent' | 'council'): Promise<Record<st
       'Council finalization events are incomplete',
     );
     assert(
-      councilCompleted < artifactSelected &&
-        artifactSelected < materializedEvent,
+      councilCompleted < artifactSelected && artifactSelected < materializedEvent,
       'Council finalization event order is invalid',
     );
     assert(
@@ -343,7 +366,12 @@ async function assertRunFiles(runId: string): Promise<void> {
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
     const visible = await Promise.all(
-      files.map((file) => fs.access(file).then(() => true, () => false)),
+      files.map((file) =>
+        fs.access(file).then(
+          () => true,
+          () => false,
+        ),
+      ),
     );
     if (visible.every(Boolean)) return;
     await new Promise((resolve) => setTimeout(resolve, 25));
