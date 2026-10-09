@@ -6,6 +6,7 @@ import { SCHEMA_VERSION, type Event, type TaskCreateRequest } from '../../src/co
 import { TaskProcessor } from '../../src/coordination';
 import { PersistentMailboxService } from '../../src/mailbox';
 import { SqliteCoordinationStore, type TaskCursorInput } from '../../src/persistence';
+import { projectPersistedRunSnapshot } from '../../src/app/task-run-snapshot-projector';
 import type { RunSnapshot } from '../../src/protocol/run-snapshot';
 
 const temporaryDirectories: string[] = [];
@@ -402,16 +403,18 @@ describe('TaskProcessor', () => {
       memory_ablation: 'B0',
       workspace_path: '/workspace/.newide/council/primary',
       resume_cursor: 'execute_agent',
+      delivery_workspace_path: '/workspace',
       cursor_input: {
         winner_agent_id: 'agent_a',
         mailbox_delivery_id: replyDeliveryId,
       },
     });
     const persisted = store.getTaskAggregate('task_mailbox_continue');
+    expect(processor.getTaskSnapshot('task_mailbox_continue').task.workspace_path).toBe(
+      '/workspace',
+    );
     expect(persisted?.task.workspace_path).toBe('/workspace');
-    expect(
-      persisted?.runs.find((run) => run.run_id === 'run_mailbox_continuation'),
-    ).toMatchObject({
+    expect(persisted?.runs.find((run) => run.run_id === 'run_mailbox_continuation')).toMatchObject({
       workspace_path: '/workspace/.newide/council/primary',
     });
     expect(() =>
@@ -807,9 +810,9 @@ describe('TaskProcessor', () => {
     );
 
     expect(() => processor.setCouncilOverride('run_override_late')).toThrow(/too late|gate/i);
-    expect(store.getTaskAggregate('task_override_late')?.runtime_state.diagnostics).not.toHaveProperty(
-      'council_override',
-    );
+    expect(
+      store.getTaskAggregate('task_override_late')?.runtime_state.diagnostics,
+    ).not.toHaveProperty('council_override');
     store.close();
   });
 
@@ -980,6 +983,126 @@ describe('TaskProcessor', () => {
     expect(store.getTaskAggregate('task_processor')?.task.revision).toBe(revision);
     store.close();
   });
+
+  /**
+   * 终态必须摘掉 `active_stage`。
+   *
+   * 它的「存在」是「有一个 stage 调用在跑」的唯一依据，也是快照 `current.invocation_id`
+   * 的唯一来源。成功路径由 `advanceStageOnce` 摘、失败路径由 `failStage` 摘，而 `finishRun`
+   * 这条直接终结的路径过去漏了——于是取消之后活跃标记永久残留，前端会一直显示还在执行。
+   */
+  it('clears the active stage when a run finishes while a stage is in flight', () => {
+    const { processor, store } = createProcessor();
+    processor.beginRun({
+      task_id: 'task_terminal_stage',
+      run_id: 'run_terminal_stage',
+      task_request: taskRequest,
+      workspace_path: '/workspace',
+      mode: 'single_agent',
+      cursor_input: selectInput,
+    });
+    processor.startStage({
+      run_id: 'run_terminal_stage',
+      expected_cursor: 'select_agent',
+      invocation_id: 'invocation_select',
+    });
+    expect(store.getTaskAggregate('task_terminal_stage')?.runtime_state.diagnostics).toHaveProperty(
+      'active_stage',
+    );
+
+    processor.finishRun({ run_id: 'run_terminal_stage', status: 'cancelled' });
+
+    const runtime = store.getTaskAggregate('task_terminal_stage')?.runtime_state;
+    expect(runtime?.resume_cursor).toBe('done');
+    expect(runtime?.diagnostics).not.toHaveProperty('active_stage');
+
+    const projected = projectRun(store, 'task_terminal_stage', 'run_terminal_stage');
+    expect(projected.current.cursor).toBe('done');
+    expect(projected.current.stage).toBe('intervention');
+    expect(projected.current).not.toHaveProperty('invocation_id');
+    store.close();
+  });
+
+  /**
+   * 快照要能区分「这个游标正在跑」与「刚跑完」。
+   *
+   * `cursor` 必须一直在（终态也有，值是最后停下的那个）；`invocation_id` /
+   * `stage_started_at` 只在真有一个 stage 调用在跑时出现，缺席即表示没有——不编空串。
+   */
+  it('projects the real cursor and exposes an invocation only while a stage runs', () => {
+    const { processor, store } = createProcessor();
+    processor.beginRun({
+      task_id: 'task_projection',
+      run_id: 'run_projection',
+      task_request: taskRequest,
+      workspace_path: '/workspace',
+      mode: 'single_agent',
+      cursor_input: selectInput,
+    });
+
+    const beforeStage = projectRun(store, 'task_projection', 'run_projection');
+    expect(beforeStage.current.cursor).toBe('select_agent');
+    expect(beforeStage.current).not.toHaveProperty('invocation_id');
+    expect(beforeStage.current).not.toHaveProperty('stage_started_at');
+
+    processor.startStage({
+      run_id: 'run_projection',
+      expected_cursor: 'select_agent',
+      invocation_id: 'invocation_select',
+    });
+
+    const duringStage = projectRun(store, 'task_projection', 'run_projection');
+    expect(duringStage.current).toMatchObject({
+      stage: 'executing',
+      active_node_code: 'N3',
+      cursor: 'select_agent',
+      invocation_id: 'invocation_select',
+    });
+    expect(duringStage.current.stage_started_at).toBeTruthy();
+
+    processor.advanceStage({
+      run_id: 'run_projection',
+      expected_cursor: 'select_agent',
+      invocation_id: 'invocation_select',
+      evidence_ref: {
+        uri: 'file:///evidence/select_agent.json',
+        sha256: 'a'.repeat(64),
+      },
+      next_input: {
+        cursor: 'execute_agent',
+        winner_agent_id: 'agent_a',
+        execution_evidence_ref: 'file:///evidence/select_agent.json',
+      },
+    });
+
+    // 推进之后：游标动了、invocation 必须清掉。
+    const afterFirstStage = projectRun(store, 'task_projection', 'run_projection');
+    expect(afterFirstStage.current.cursor).toBe('execute_agent');
+    expect(afterFirstStage.current).not.toHaveProperty('invocation_id');
+
+    processor.startStage({
+      run_id: 'run_projection',
+      expected_cursor: 'execute_agent',
+      invocation_id: 'invocation_execute',
+    });
+    processor.advanceStage({
+      run_id: 'run_projection',
+      expected_cursor: 'execute_agent',
+      invocation_id: 'invocation_execute',
+      evidence_ref: {
+        uri: 'file:///evidence/execute_agent.json',
+        sha256: 'b'.repeat(64),
+      },
+      next_input: { cursor: 'council', trigger: 'explicit_mode' },
+    });
+
+    // 游标推到 council 之后 stage 必须跟着变：`stage` 是游标的粗粒度映射，
+    // 不是创建时定死的一个值。
+    const afterCouncil = projectRun(store, 'task_projection', 'run_projection');
+    expect(afterCouncil.current).toMatchObject({ cursor: 'council', stage: 'council' });
+    expect(afterCouncil.current).not.toHaveProperty('invocation_id');
+    store.close();
+  });
 });
 
 const taskRequest: TaskCreateRequest = {
@@ -995,6 +1118,13 @@ const selectInput: TaskCursorInput = {
   seed: 'seed_processor',
   candidate_ids: ['agent_a', 'agent_b'],
 };
+
+/** 把持久聚合投影成对外快照；`runsRoot` 只是路径拼接，不落盘。 */
+function projectRun(store: SqliteCoordinationStore, taskId: string, runId: string): RunSnapshot {
+  const aggregate = store.getTaskAggregate(taskId);
+  if (!aggregate) throw new Error(`Task ${taskId} has no persisted aggregate`);
+  return projectPersistedRunSnapshot(aggregate, runId, '/runs');
+}
 
 function createProcessor(): {
   databasePath: string;

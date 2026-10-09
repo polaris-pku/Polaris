@@ -3,6 +3,8 @@ import { Fold } from '@/components/ui/Fold';
 import { IdChip } from '@/components/ui/IdChip';
 import { KeyValue, KeyValueList } from '@/components/ui/KeyValue';
 import { driverLabel, modeLabel, type RunMeta } from '@/lib/runFacts';
+import { stageLabel } from '@/lib/runObservability';
+import type { RunSnapshot } from '@/api/types/rpc';
 
 /**
  * ⑦「运行信息」—— **全应用唯一能出现机器 ID 的地方。**
@@ -13,9 +15,11 @@ import { driverLabel, modeLabel, type RunMeta } from '@/lib/runFacts';
  */
 export function RunInfoFold({
   meta,
+  current,
   onOpenEvidence,
 }: {
   meta: RunMeta;
+  current?: RunSnapshot['current'];
   onOpenEvidence: () => void;
 }) {
   const copyAll = () => {
@@ -28,6 +32,7 @@ export function RunInfoFold({
           driver_id: meta.driverId,
           events: meta.eventCount,
           events_by_source: Object.fromEntries(meta.sourceCounts),
+          ...(current ? { current } : {}),
           ...(meta.selection ? { artifact_selection: meta.selection } : {}),
         },
         null,
@@ -51,6 +56,9 @@ export function RunInfoFold({
       <KeyValueList onCopyAll={copyAll}>
         <IdRow k="任务 ID" value={meta.taskId} />
         <IdRow k="运行 ID" value={meta.runId} />
+        {current?.cursor && <KeyValue k="当前阶段" v={stageLabel(current.cursor)} />}
+        {current?.invocation_id && <IdRow k="阶段调用" value={current.invocation_id} />}
+        {current?.stage_started_at && <KeyValue k="阶段开始" v={current.stage_started_at} mono />}
         {meta.mode && <KeyValue k="模式" v={`${modeLabel(meta.mode)}（${meta.mode}）`} />}
         {meta.driverId && (
           <KeyValue k="执行器" v={`${driverLabel(meta.driverId)}（${meta.driverId}）`} />

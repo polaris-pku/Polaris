@@ -33,12 +33,14 @@ export type LiveRunState = {
   taskId: string;
   /** 后端权威状态。running → 终态由 run.completed / run.failed / run.cancelled 事件带出 */
   status: 'running' | 'completed' | 'failed' | 'cancelled';
-  /** 按 sequence 升序的事件时间线（已在 events.ts 去重） */
+  /** 后端数组顺序；同序号事件保留，按 event_id 去重。 */
   timeline: RunEvent[];
-  /** 终态后拉取的完整快照（含 flow.node_statuses / delivery_report / errors） */
+  /** 定期刷新的权威快照（含实时 activity / usage / current.cursor）。 */
   snapshot: RunSnapshot | null;
   /** 拉快照或提交失败时的错误消息 */
   error: string | null;
+  /** 观测失败不等同于执行失败，保留最后一次后端事实。 */
+  syncError?: string | null;
 };
 
 /** 单个任务的执行 trace（agent 执行过程的审计快照，只读；不支持导回应用）。 */
@@ -137,6 +139,7 @@ export type TeamSlice = {
 
 /** 任务域：任务生命周期与页面导航。 */
 export type TaskSlice = {
+  observeTask: (taskId: string) => Promise<() => Promise<void>>;
   setPage: (page: PageKey) => void;
   setTaskText: (text: string) => void;
   /**

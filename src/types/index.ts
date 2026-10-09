@@ -26,7 +26,7 @@ export type FileNode = {
    * 文件的来源。真实后端 run 与 mock 演示剧本会写进**同一个工作区**，
    * 产物混在一起、肉眼无法分辨 —— 所以能确知来源的必须标出来。
    *
-   * 'live' = 本次真实 run 的 agent 写出（后端快照 `artifacts[].source_path` 给的绝对路径）。
+   * 'live' = 后端交付报告或兼容制品字段确认的已写入文件。
    * 'demo' = 由 mock 演示剧本写入（桌面壳代 A 落盘）。
    * 缺省   = 来源未知（从磁盘扫描来的既有文件）。
    */
@@ -47,7 +47,7 @@ export type Project = {
    * 缺省写入默认工作区 文档/polaris-workspace/<项目名>/。仅桌面版有意义。
    */
   rootPath?: string;
-  /** 项目文件树（mock；从文件夹打开时为磁盘扫描结果） */
+  /** 项目文件树：磁盘扫描结果与后端交付文件。 */
   files: FileNode[];
   /** 项目 Agent 团队（引用全局 Agent 池的 id 子集） */
   agentIds: string[];
@@ -112,6 +112,11 @@ export type DemoTask = {
   /** 后端受理后回填的 run_id（run.create 一次性建 Task + Run 并立刻开跑）；
    *  缺失 = 未接后端或提交失败。真实 run 的事件/快照都按它索引。 */
   contractRunId?: string;
+  /** 提交时后端确认的工作区，默认目录和自选目录均为绝对路径。 */
+  contractWorkspacePath?: string;
+  /** Task lifecycle remains active across completed Mailbox Runs. */
+  contractTaskStatus?: string;
+  contractWaitingReason?: string;
   /** 提交给后端失败的原因（后端没受理这个需求 → 它只是个本地任务）。
    *  必须显示出来：否则用户以为自己提了需求，实际什么都没发生。 */
   submitError?: string;

@@ -61,9 +61,7 @@ describe('SynthesisAgentCouncilProvider', () => {
     expect(requests[3]?.instruction).toContain('Do not implement');
     expect(result.reviews).toHaveLength(2);
     expect(result.reviews.every((review) => review.verdict === 'approve')).toBe(true);
-    expect(result.selected_artifact_refs).toEqual([
-      `artifact_${COUNCIL_AGENTS.synthesizer}`,
-    ]);
+    expect(result.selected_artifact_refs).toEqual([`artifact_${COUNCIL_AGENTS.synthesizer}`]);
   });
 
   it('rejects product files emitted by a plan-first Council role', async () => {
@@ -124,7 +122,9 @@ describe('SynthesisAgentCouncilProvider', () => {
           role_id: input.role_id,
           context_pack_ref: `context_${input.role_id}`,
           driver_run_result_id: `driver_result_${input.role_id}`,
-          artifact_refs: withReview(input, [createArtifact(`artifact_${input.role_id}`, input.role_id)]),
+          artifact_refs: withReview(input, [
+            createArtifact(`artifact_${input.role_id}`, input.role_id),
+          ]),
           transcript_ref: createArtifact(
             `transcript_${input.role_id}`,
             input.role_id,
@@ -390,12 +390,8 @@ describe('SynthesisAgentCouncilProvider', () => {
     });
 
     expect(result.proposals).toHaveLength(1);
-    expect(result.selected_artifact_refs).toEqual([
-      `artifact_${COUNCIL_AGENTS.synthesizer}`,
-    ]);
-    expect(result.diagnostic_refs).toContain(
-      'COUNCIL_PROPOSAL_FAILED:participant_proposer_0',
-    );
+    expect(result.selected_artifact_refs).toEqual([`artifact_${COUNCIL_AGENTS.synthesizer}`]);
+    expect(result.diagnostic_refs).toContain('COUNCIL_PROPOSAL_FAILED:participant_proposer_0');
     expect(lifecycleEvents).toContainEqual(
       expect.objectContaining({
         type: 'council.role.failed',
@@ -483,7 +479,9 @@ describe('SynthesisAgentCouncilProvider', () => {
         const ids = [...new Set(input.instruction.match(/proposal_[a-z0-9-]+/g) ?? [])];
         return {
           ...result,
-          artifact_refs: [reviewsArtifact(JSON.stringify(reviewPayload(ids)), 'outputs/reviews.json')],
+          artifact_refs: [
+            reviewsArtifact(JSON.stringify(reviewPayload(ids)), 'outputs/reviews.json'),
+          ],
         };
       },
     };
@@ -578,10 +576,7 @@ describe('SynthesisAgentCouncilProvider', () => {
       expect(new Set(requests.slice(0, 2))).toEqual(
         new Set([COUNCIL_AGENTS.proposerA, COUNCIL_AGENTS.proposerB]),
       );
-      expect(requests.slice(2)).toEqual([
-        COUNCIL_AGENTS.reviewer,
-        COUNCIL_AGENTS.synthesizer,
-      ]);
+      expect(requests.slice(2)).toEqual([COUNCIL_AGENTS.reviewer, COUNCIL_AGENTS.synthesizer]);
       expect(lifecycleEvents).toContainEqual(
         expect.objectContaining({
           type: 'council.role.failed',
@@ -657,6 +652,27 @@ describe('SynthesisAgentCouncilProvider', () => {
       }),
     ).rejects.toThrow('observer unavailable');
   });
+
+  it('pins activity to the panel run without changing existing execution identities', async () => {
+    // 执行身份保留上游的阶段隔离；只有活动观测归到同一个面板 run。
+    const requests: AgentExecutionRequest[] = [];
+    const provider = new SynthesisAgentCouncilProvider({
+      agentExecutionFacade: {
+        async runAgent(input) {
+          requests.push(input);
+          return completedExecution(input);
+        },
+      },
+    });
+
+    await provider.runCouncilRound(baseInput());
+
+    expect(requests.length).toBeGreaterThan(0);
+    for (const request of requests) {
+      expect(request.activity_run_id).toBe('run_observer');
+      expect(request.run_id).toMatch(/^run_observer_council_phase_[0-9a-f-]+$/);
+    }
+  });
 });
 
 function baseInput() {
@@ -719,9 +735,15 @@ function completedExecution(input: AgentExecutionRequest) {
 }
 
 function reviewResponse(input: AgentExecutionRequest): string {
-  return JSON.stringify({ reviews: [...new Set(input.instruction.match(/proposal_[a-z0-9-]+/g) ?? [])].map((id) => ({
-    proposal_id: id, verdict: 'approve', reason: 'Evidence supports this proposal.', unmet_criteria: [], evidence_refs: [],
-  })) });
+  return JSON.stringify({
+    reviews: [...new Set(input.instruction.match(/proposal_[a-z0-9-]+/g) ?? [])].map((id) => ({
+      proposal_id: id,
+      verdict: 'approve',
+      reason: 'Evidence supports this proposal.',
+      unmet_criteria: [],
+      evidence_refs: [],
+    })),
+  });
 }
 
 function reviewPayload(proposalIds: readonly string[]) {

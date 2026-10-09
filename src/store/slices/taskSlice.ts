@@ -7,6 +7,7 @@ import { runApi } from '@/api/run';
 import { bindBackendWorkspace } from '@/lib/backendWorkspace';
 import { buildLiveProgressReplay, buildLiveRunReplay, liveProducedFiles } from '@/lib/liveReplay';
 import { projectLiveBoard } from '@/lib/liveBoard';
+import { relativeProjectFileParts } from '@/lib/projectPaths';
 import { resetTimelineSeq } from '@/lib/snapshot';
 import { isFrontendWorkflowV01 } from '@/api/types/rpc';
 import type { DemoState, PartialExecState, SliceCreator, TaskSlice } from '@/store/types';
@@ -15,14 +16,7 @@ import { canBindWorkspace, dropRun } from '@/store/lib/liveRuns';
 import { insertFileNode } from '@/store/lib/fileTree';
 import { buildTimelineEvent, getNodeLog } from '@/store/lib/timeline';
 import { extractTaskFields, pickProjectTask, syncTasks, taskToState } from '@/store/lib/taskSync';
-
-/** 绝对路径 → 相对项目根的分段（agent 写在工作区根下，取项目名之后的部分）。 */
-function relativeParts(absPath: string, project: Project | undefined): string[] {
-  const parts = absPath.split('/').filter(Boolean);
-  const rootName = project?.rootPath?.split('/').filter(Boolean).pop() ?? project?.name;
-  const at = rootName ? parts.lastIndexOf(rootName) : -1;
-  return at >= 0 ? parts.slice(at + 1) : parts.slice(-1);
-}
+import { applyTaskSnapshot } from '@/store/lib/taskObservation';
 
 /**
  * 工作区被**别的项目**的 run 占着时的拒绝理由。
@@ -58,6 +52,55 @@ export const selectStartCouncil = (state: DemoState): TaskCouncilSlice['startCou
 
 /** 任务域：任务生命周期（新建/开始/切换/删除）与页面导航。 */
 export const createTaskSlice: SliceCreator<TaskSlice & TaskCouncilSlice> = (set, get) => ({
+  observeTask: async (taskId) => {
+    let observedRunId: string | undefined;
+    const reportError = (message: string) =>
+      set((state) => {
+        const task = state.liveTasks[taskId];
+        return task
+          ? {
+              liveTasks: {
+                ...state.liveTasks,
+                [taskId]: { ...task, status: 'error', error: message },
+              },
+            }
+          : {};
+      });
+    return watchTask(taskId, {
+      onSnapshot(snapshot) {
+        set((state) => applyTaskSnapshot(state, snapshot));
+        const runId = get().tasks.find((task) => task.contractTaskId === taskId)?.contractRunId;
+        if (runId && runId !== observedRunId) {
+          observedRunId = runId;
+          void watchRun(runId, get().liveRuns[runId]?.status).catch((error: unknown) => {
+            const message = error instanceof Error ? error.message : String(error);
+            console.warn(`[task observation] ${taskId}: run subscription failed`, error);
+            reportError(message);
+          });
+        }
+      },
+      onEvent(event) {
+        set((state) => {
+          const task = state.liveTasks[taskId];
+          if (!task) return {};
+          return {
+            liveTasks: {
+              ...state.liveTasks,
+              [taskId]: {
+                ...task,
+                events: [...task.events, event].sort(
+                  (left, right) => left.sequence - right.sequence,
+                ),
+                cursor: event.event_id,
+              },
+            },
+          };
+        });
+      },
+      onError: reportError,
+    });
+  },
+
   setPage: (page) => set({ currentPage: page }),
 
   setTaskText: (text) =>
@@ -109,6 +152,7 @@ export const createTaskSlice: SliceCreator<TaskSlice & TaskCouncilSlice> = (set,
           snapshot.task.completion_criteria,
         ),
         contractTaskId: snapshot.task.task_id,
+        contractWorkspacePath: workspacePath,
         ...(currentRunId ? { contractRunId: currentRunId } : {}),
         ...(mode ? { mode } : {}),
       };
@@ -128,38 +172,7 @@ export const createTaskSlice: SliceCreator<TaskSlice & TaskCouncilSlice> = (set,
         isAutoRunning: false,
       }));
       try {
-        await watchTask(snapshot.task.task_id, {
-          onSnapshot: (nextSnapshot) => {
-            set((current) => ({
-              liveTasks: {
-                ...current.liveTasks,
-                [nextSnapshot.task.task_id]: {
-                  ...(current.liveTasks[nextSnapshot.task.task_id] ?? {
-                    events: [],
-                    status: 'subscribing' as const,
-                  }),
-                  snapshot: nextSnapshot,
-                  status: 'live',
-                },
-              },
-            }));
-          },
-          onEvent: (event) => {
-            set((current) => {
-              const liveTask = current.liveTasks[event.task_id];
-              if (!liveTask) return {};
-              const events = [...liveTask.events, event].sort(
-                (left, right) => left.sequence - right.sequence,
-              );
-              return {
-                liveTasks: {
-                  ...current.liveTasks,
-                  [event.task_id]: { ...liveTask, events, cursor: event.event_id, status: 'live' },
-                },
-              };
-            });
-          },
-        });
+        await get().observeTask(snapshot.task.task_id);
         if (currentRunId) await watchRun(currentRunId);
       } catch (subscriptionError) {
         const message =
@@ -194,21 +207,7 @@ export const createTaskSlice: SliceCreator<TaskSlice & TaskCouncilSlice> = (set,
       const snapshot = await taskApi.get(backendTaskId);
       if (snapshot.task.status === 'blocked') {
         const resumed = await taskApi.resume(backendTaskId);
-        set((current) => ({
-          liveTasks: {
-            ...current.liveTasks,
-            [backendTaskId]: {
-              ...(current.liveTasks[backendTaskId] ?? { events: [] }),
-              snapshot: resumed,
-              status: 'live',
-            },
-          },
-          tasks: current.tasks.map((item) =>
-            item.id === task.id
-              ? { ...item, contractRunId: resumed.current_run?.run_id, submitError: undefined }
-              : item,
-          ),
-        }));
+        set((current) => applyTaskSnapshot(current, resumed));
         if (resumed.current_run) await watchRun(resumed.current_run.run_id);
       } else {
         const restartable = snapshot.run_history.find(
@@ -254,26 +253,7 @@ export const createTaskSlice: SliceCreator<TaskSlice & TaskCouncilSlice> = (set,
     try {
       const snapshot = await taskApi.startCouncil(backendTaskId);
       const runId = snapshot.current_run?.run_id;
-      set((current) => ({
-        liveTasks: {
-          ...current.liveTasks,
-          [backendTaskId]: {
-            ...(current.liveTasks[backendTaskId] ?? { events: [] }),
-            snapshot,
-            status: 'live',
-          },
-        },
-        tasks: current.tasks.map((item) =>
-          item.id === task.id
-            ? {
-                ...item,
-                ...(runId ? { contractRunId: runId } : {}),
-                mode: 'council' as const,
-                submitError: undefined,
-              }
-            : item,
-        ),
-      }));
+      set((current) => applyTaskSnapshot(current, snapshot));
       if (runId) await watchRun(runId);
       return { ok: true };
     } catch (err) {
@@ -393,26 +373,45 @@ export const createTaskSlice: SliceCreator<TaskSlice & TaskCouncilSlice> = (set,
    * （消费方本就是「replay 优先、mock 回退」）。
    *
    * 泳道图按后端实际派单的 agent 正向组图：后端派几个，图上就长几条执行泳道。
-   * agent 真写到工作区的文件（artifacts[].source_path）同时挂进项目文件树，标 origin='live'。
+   * 交付文件独立回填项目文件树，不依赖图投影或 diff 制品是否存在。
    */
   attachLiveRun: (runId, snapshot) => {
-    const replay = buildLiveRunReplay(snapshot);
-    // 瘦快照（run 早早被取消，缺 task/run/flow）派生不出可展示内容 → 保持原状，不硬切
-    if (!replay || !isFrontendWorkflowV01(snapshot)) return;
-
     const state = get();
     const task = state.tasks.find((t) => t.contractRunId === runId);
     if (!task) return;
+    const project = state.projects.find((p) => p.id === task.projectId);
+    const workspacePath = task.contractWorkspacePath ?? project?.rootPath;
+    let files = project?.files;
+    for (const filePath of liveProducedFiles(snapshot)) {
+      const parts = relativeProjectFileParts(filePath, workspacePath);
+      if (!parts) {
+        console.warn('[files] 交付路径无法映射到项目工作区：', { runId, filePath, workspacePath });
+        continue;
+      }
+      if (files) files = insertFileNode(files, parts, false, 'live');
+    }
+    const updatedFiles = files;
+    const fileUpdate =
+      project && updatedFiles && updatedFiles !== project.files
+        ? {
+            projects: state.projects.map((p) =>
+              p.id === project.id ? { ...p, files: updatedFiles } : p,
+            ),
+          }
+        : {};
+    const replay = buildLiveRunReplay(snapshot);
+    if (!replay || !isFrontendWorkflowV01(snapshot)) {
+      set(fileUpdate);
+      return;
+    }
 
     // 终态节点状态仍由事件投影决定（与实时阶段同一套逻辑），只是内容换成更全的快照版 replay。
     // 不能在这里重新 compose 一张全 pending 的图 —— 那会把已经点亮的进度抹掉。
     const projection = projectLiveBoard(snapshot.timeline, snapshot.status);
-    if (!projection) return;
-
-    const project = state.projects.find((p) => p.id === task.projectId);
-    const producedParts = liveProducedFiles(snapshot)
-      .map((abs) => relativeParts(abs, project))
-      .filter((parts) => parts.length > 0);
+    if (!projection) {
+      set(fileUpdate);
+      return;
+    }
 
     // 时间线：已点亮的节点各一条，内容换成快照版 replay 的原文
     resetTimelineSeq();
@@ -452,18 +451,8 @@ export const createTaskSlice: SliceCreator<TaskSlice & TaskCouncilSlice> = (set,
     };
 
     set({
+      ...fileUpdate,
       tasks: state.tasks.map((t) => (t.id === task.id ? nextTask : t)),
-      projects: state.projects.map((p) =>
-        p.id === task.projectId
-          ? {
-              ...p,
-              files: producedParts.reduce(
-                (files, parts) => insertFileNode(files, parts, false, 'live'),
-                p.files,
-              ),
-            }
-          : p,
-      ),
       // 切的是当前任务 → 同步把实时态也换过去，界面立刻变成真实 run
       ...(state.activeTaskId === task.id ? taskToState(nextTask) : {}),
     });

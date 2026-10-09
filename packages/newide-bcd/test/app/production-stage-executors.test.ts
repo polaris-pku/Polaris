@@ -3,12 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { describe, expect, it } from 'vitest';
-import {
-  SCHEMA_VERSION,
-  nowTimestamp,
-  type ArtifactRef,
-  type Event,
-} from '../../src/core';
+import { SCHEMA_VERSION, nowTimestamp, type ArtifactRef, type Event } from '../../src/core';
 import { completionCriterionId } from '../../src/coordinator/completion-criteria-evaluator';
 import { createProductionStageExecutors } from '../../src/app/production-stage-executors';
 import {
@@ -39,7 +34,13 @@ describe('production stage executors', () => {
     };
     const finalPlan = fileArtifact('artifact_final_plan', 'final-plan.md', '# Final plan');
     const implementation = fileArtifact('artifact_implementation', 'src/result.ts', 'export {};');
-    const requests: Array<{ role_id: string; session_id?: string; workspace_path?: string; context_policy: string; input_artifact_refs: string[] }> = [];
+    const requests: Array<{
+      role_id: string;
+      session_id?: string;
+      workspace_path?: string;
+      context_policy: string;
+      input_artifact_refs: string[];
+    }> = [];
     let executionCount = 0;
     const councilProvider = {
       strategyName: 'plan_first',
@@ -126,7 +127,10 @@ describe('production stage executors', () => {
           requests.push(input);
           executionCount += 1;
           if (executionCount === 3) {
-            await writeFile(path.join(input.workspace_path!, 'first-part.ts'), 'export const preserved = true;');
+            await writeFile(
+              path.join(input.workspace_path!, 'first-part.ts'),
+              'export const preserved = true;',
+            );
           }
           const artifact =
             executionCount === 1
@@ -158,7 +162,9 @@ describe('production stage executors', () => {
         },
       },
       councilProvider,
-      gateExecutor: { execute: async () => ({ hook_point: 'task.completed', matched: false, gate_results: [] }) },
+      gateExecutor: {
+        execute: async () => ({ hook_point: 'task.completed', matched: false, gate_results: [] }),
+      },
       bootstrapAgentIds: ['role_primary'],
       runsRoot: path.join(root, 'runs'),
       councilRoot: path.join(root, 'council'),
@@ -224,16 +230,32 @@ describe('production stage executors', () => {
     expect(council.artifact_refs).toHaveLength(2);
     const state = JSON.parse(
       await readFile(path.join(root, 'runs', 'run_plan', 'production-stage-state.json'), 'utf8'),
-    ) as { selection: { selected_artifacts: ArtifactRef[]; council_run_result: { result: { role_failure_count: number }; decision: { selected_artifact_refs: string[] }; plan_execution: unknown; selected_artifact_refs: string[] } } };
+    ) as {
+      selection: {
+        selected_artifacts: ArtifactRef[];
+        council_run_result: {
+          result: { role_failure_count: number };
+          decision: { selected_artifact_refs: string[] };
+          plan_execution: unknown;
+          selected_artifact_refs: string[];
+        };
+      };
+    };
     expect(state.selection.council_run_result.plan_execution).toMatchObject({
       executor_role_id: 'role_primary',
       session_id: 'session_primary',
       final_plan_artifact_refs: [finalPlan.artifact_id],
       implementation_artifact_refs: council.artifact_refs,
     });
-    expect(state.selection.council_run_result.selected_artifact_refs).toEqual(council.artifact_refs);
-    expect(state.selection.council_run_result.decision.selected_artifact_refs).toEqual(council.artifact_refs);
-    expect(state.selection.selected_artifacts.map((artifact) => artifact.content?.target_path).sort()).toEqual(['first-part.ts', 'src/result.ts']);
+    expect(state.selection.council_run_result.selected_artifact_refs).toEqual(
+      council.artifact_refs,
+    );
+    expect(state.selection.council_run_result.decision.selected_artifact_refs).toEqual(
+      council.artifact_refs,
+    );
+    expect(
+      state.selection.selected_artifacts.map((artifact) => artifact.content?.target_path).sort(),
+    ).toEqual(['first-part.ts', 'src/result.ts']);
     expect(state.selection.council_run_result.result.role_failure_count).toBe(1);
     const failed = events.find((event) => event.event_type === 'council.role.failed')!;
     expect(failed.payload).toMatchObject({ phase: 'implementation', attempt: 1, will_retry: true });
@@ -241,14 +263,27 @@ describe('production stage executors', () => {
     expect(phases).toHaveLength(2);
     expect(phases[1]!.payload).toMatchObject({ attempt: 2 });
     expect(phases[0]!.payload.phase_id).not.toEqual(phases[1]!.payload.phase_id);
-    await executors.gate.execute({ ...common, cursor_input: {
-      cursor: 'gate', subject_ref: council.changeset_ref, phase: 'post_council',
-      changeset_ref: council.changeset_ref, expected_sha256: council.expected_sha256,
-    } });
-    await executors.deliver.execute({ ...common, cursor_input: {
-      cursor: 'deliver', changeset_ref: council.changeset_ref, expected_sha256: council.expected_sha256,
-    } });
-    expect(await readFile(path.join(workspace, 'first-part.ts'), 'utf8')).toBe('export const preserved = true;');
+    await executors.gate.execute({
+      ...common,
+      cursor_input: {
+        cursor: 'gate',
+        subject_ref: council.changeset_ref,
+        phase: 'post_council',
+        changeset_ref: council.changeset_ref,
+        expected_sha256: council.expected_sha256,
+      },
+    });
+    await executors.deliver.execute({
+      ...common,
+      cursor_input: {
+        cursor: 'deliver',
+        changeset_ref: council.changeset_ref,
+        expected_sha256: council.expected_sha256,
+      },
+    });
+    expect(await readFile(path.join(workspace, 'first-part.ts'), 'utf8')).toBe(
+      'export const preserved = true;',
+    );
     expect(await readFile(path.join(workspace, 'src/result.ts'), 'utf8')).toBe('export {};');
   });
 
@@ -328,7 +363,9 @@ describe('production stage executors', () => {
       },
       agentExecutionFacade,
       councilProvider,
-      gateExecutor: { execute: async () => ({ hook_point: 'task.completed', matched: false, gate_results: [] }) },
+      gateExecutor: {
+        execute: async () => ({ hook_point: 'task.completed', matched: false, gate_results: [] }),
+      },
       bootstrapAgentIds: ['role_primary', 'role_deputy', 'role_reviewer', 'role_synthesizer'],
       auctionEnabled: false,
       primaryAgentId: 'role_primary',
@@ -379,7 +416,10 @@ describe('production stage executors', () => {
     ]);
     // Council produced the fixed seats and concrete Plan artifacts.
     const state = JSON.parse(
-      await readFile(path.join(root, 'runs', 'run_plan_e2e', 'production-stage-state.json'), 'utf8'),
+      await readFile(
+        path.join(root, 'runs', 'run_plan_e2e', 'production-stage-state.json'),
+        'utf8',
+      ),
     ) as {
       selection: {
         council_run_result: {
@@ -406,8 +446,9 @@ describe('production stage executors', () => {
     ]);
     expect(councilResult.proposals.length).toBeGreaterThanOrEqual(2);
     expect(councilResult.synthesis?.artifact_refs).toHaveLength(1);
-    expect(requests.find((request) => request.context_policy === 'council_synthesizer')?.instruction)
-      .toContain('final-plan.md');
+    expect(
+      requests.find((request) => request.context_policy === 'council_synthesizer')?.instruction,
+    ).toContain('final-plan.md');
     // The primary implemented the final Plan through its original Session.
     const implementation = requests.find(
       (request) => request.context_policy === 'council_plan_execution',
@@ -417,7 +458,9 @@ describe('production stage executors', () => {
       session_id: 'session_primary',
       input_artifact_refs: councilResult.synthesis?.artifact_refs,
     });
-    expect(implementation?.driver_instruction).toContain('Implement the approved final Council Plan');
+    expect(implementation?.driver_instruction).toContain(
+      'Implement the approved final Council Plan',
+    );
     expect(council.artifact_refs).toEqual(['artifact_role_primary_council_plan_execution']);
     expect(councilResult.plan_execution).toMatchObject({
       executor_role_id: 'role_primary',
@@ -427,191 +470,203 @@ describe('production stage executors', () => {
     });
   });
 
-  it('connects real selection, Agent, Gate, manifest and idempotent Deliver boundaries', async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), 'newide-production-stages-'));
-    const workspace = path.join(root, 'workspace');
-    const criterion = 'output.txt is delivered';
-    let receivedAgentRequest: AgentExecutionRequest | undefined;
-    const emittedEvents: Event[] = [];
-    const artifact: ArtifactRef = {
-      artifact_id: 'artifact_output',
-      type: 'file',
-      producer_id: 'role_ts_engineer',
-      content: {
-        kind: 'text',
-        content_ref: 'data:text/plain;charset=utf-8,production%20output',
-        target_path: 'output.txt',
-      },
-      created_at: nowTimestamp(),
-      schema_version: SCHEMA_VERSION,
-    };
-    const executors = createProductionStageExecutors({
-      selectAgentHandler: {
-        execute: async (input) => ({
-          winner_agent_id: 'role_ts_engineer',
-          winner_bid_id: 'bid_1',
-          ledger_ref: 'file:///market/ledger.json',
-          audit_ref: 'file:///market/audit.json',
-          ledger: {
-            ledger_id: 'ledger_1',
-            task_id: input.task_id,
-            seed: input.seed,
-            policy_version: 'market-v0',
-            bids: [],
-            winner_bid_id: 'bid_1',
-            winner_agent_id: 'role_ts_engineer',
-            created_at: nowTimestamp(),
-            schema_version: SCHEMA_VERSION,
-          },
-          audit: {
-            audit_id: 'audit_1',
-            task_id: input.task_id,
+  it.each([false, true])(
+    'connects Gate and idempotent Deliver to the user workspace (scratch execution: %s)',
+    async (scratchExecution) => {
+      const root = await mkdtemp(path.join(os.tmpdir(), 'newide-production-stages-'));
+      const workspace = path.join(root, 'workspace');
+      const executionWorkspace = scratchExecution
+        ? path.join(root, 'council', 'primary')
+        : workspace;
+      const criterion = 'output.txt is delivered';
+      let receivedAgentRequest: AgentExecutionRequest | undefined;
+      const emittedEvents: Event[] = [];
+      const artifact: ArtifactRef = {
+        artifact_id: 'artifact_output',
+        type: 'file',
+        producer_id: 'role_ts_engineer',
+        content: {
+          kind: 'text',
+          content_ref: 'data:text/plain;charset=utf-8,production%20output',
+          target_path: 'output.txt',
+        },
+        created_at: nowTimestamp(),
+        schema_version: SCHEMA_VERSION,
+      };
+      const executors = createProductionStageExecutors({
+        selectAgentHandler: {
+          execute: async (input) => ({
             winner_agent_id: 'role_ts_engineer',
             winner_bid_id: 'bid_1',
-            entries: [],
-            created_at: nowTimestamp(),
-            schema_version: SCHEMA_VERSION,
-          },
-          market_task: {
-            task_id: input.task_id,
-            task_description: input.task_description,
-            requirement_profile: {
-              persona_keywords: [],
-              preferred_skill_tags: [],
-              preferred_experience_tags: [],
-            },
-            context: { urgency: 0.5, exploration_level: 0.3 },
-          },
-        }),
-      },
-      agentExecutionFacade: {
-        runAgent: async (request) => {
-          receivedAgentRequest = request;
-          return {
-          agent_run_id: 'agent_run_1',
-          agent_id: 'role_ts_engineer',
-          role_id: 'role_ts_engineer',
-          context_pack_ref: 'context_pack_1',
-          driver_run_result_id: 'driver_result_1',
-          artifact_refs: [artifact],
-          transcript_ref: {
-            artifact_id: 'transcript_1',
-            type: 'transcript',
-            producer_id: 'role_ts_engineer',
-            created_at: nowTimestamp(),
-            schema_version: SCHEMA_VERSION,
-          },
-          session_id: 'session_1',
-          response: 'done',
-          tool_events: [],
-          diagnostics: { driver_id: 'acp-external' },
-          status: 'completed',
-          created_at: nowTimestamp(),
-          schema_version: SCHEMA_VERSION,
-          };
-        },
-      },
-      councilProvider: {
-        runCouncilRound: async () => {
-          throw new Error('Council is not expected in single-agent mode');
-        },
-      },
-      gateExecutor: {
-        execute: async (_input) => ({
-          hook_point: 'task.completed',
-          matched: true,
-          gate_results: [
-            {
-              gate_result_id: 'gate_result_1',
-              gate_id: 'acceptance',
-              gate_point: 'task.completed',
-              request_id: 'gate_request_1',
-              subject_id: completionCriterionId(criterion, 0),
-              subject_type: 'completion_criterion',
-              decision: 'allow',
-              reason: 'verified',
-              required_actions: [],
-              audit_ref: path.join(root, 'gate-audit.json'),
-              target_state: 'reviewing',
+            ledger_ref: 'file:///market/ledger.json',
+            audit_ref: 'file:///market/audit.json',
+            ledger: {
+              ledger_id: 'ledger_1',
+              task_id: input.task_id,
+              seed: input.seed,
+              policy_version: 'market-v0',
+              bids: [],
+              winner_bid_id: 'bid_1',
+              winner_agent_id: 'role_ts_engineer',
               created_at: nowTimestamp(),
               schema_version: SCHEMA_VERSION,
             },
-          ],
-        }),
-      },
-      bootstrapAgentIds: ['role_ts_engineer'],
-      runsRoot: path.join(root, 'runs'),
-      councilRoot: path.join(root, 'council'),
-      worktreesRoot: path.join(root, 'worktrees'),
-    });
-    const taskRequest = {
-      spec: 'create output.txt',
-      completion_criteria: [criterion],
-    };
-    const common = {
-      task_id: 'task_1',
-      run_id: 'run_1',
-      mode: 'single_agent' as const,
-      task_request: taskRequest,
-      workspace_path: workspace,
-      memory_ablation: 'B0' as const,
-      on_event: (event: Event) => emittedEvents.push(event),
-    };
+            audit: {
+              audit_id: 'audit_1',
+              task_id: input.task_id,
+              winner_agent_id: 'role_ts_engineer',
+              winner_bid_id: 'bid_1',
+              entries: [],
+              created_at: nowTimestamp(),
+              schema_version: SCHEMA_VERSION,
+            },
+            market_task: {
+              task_id: input.task_id,
+              task_description: input.task_description,
+              requirement_profile: {
+                persona_keywords: [],
+                preferred_skill_tags: [],
+                preferred_experience_tags: [],
+              },
+              context: { urgency: 0.5, exploration_level: 0.3 },
+            },
+          }),
+        },
+        agentExecutionFacade: {
+          runAgent: async (request) => {
+            receivedAgentRequest = request;
+            return {
+              agent_run_id: 'agent_run_1',
+              agent_id: 'role_ts_engineer',
+              role_id: 'role_ts_engineer',
+              context_pack_ref: 'context_pack_1',
+              driver_run_result_id: 'driver_result_1',
+              artifact_refs: [artifact],
+              transcript_ref: {
+                artifact_id: 'transcript_1',
+                type: 'transcript',
+                producer_id: 'role_ts_engineer',
+                created_at: nowTimestamp(),
+                schema_version: SCHEMA_VERSION,
+              },
+              session_id: 'session_1',
+              response: 'done',
+              tool_events: [],
+              diagnostics: { driver_id: 'acp-external' },
+              status: 'completed',
+              created_at: nowTimestamp(),
+              schema_version: SCHEMA_VERSION,
+            };
+          },
+        },
+        councilProvider: {
+          runCouncilRound: async () => {
+            throw new Error('Council is not expected in single-agent mode');
+          },
+        },
+        gateExecutor: {
+          execute: async (_input) => ({
+            hook_point: 'task.completed',
+            matched: true,
+            gate_results: [
+              {
+                gate_result_id: 'gate_result_1',
+                gate_id: 'acceptance',
+                gate_point: 'task.completed',
+                request_id: 'gate_request_1',
+                subject_id: completionCriterionId(criterion, 0),
+                subject_type: 'completion_criterion',
+                decision: 'allow',
+                reason: 'verified',
+                required_actions: [],
+                audit_ref: path.join(root, 'gate-audit.json'),
+                target_state: 'reviewing',
+                created_at: nowTimestamp(),
+                schema_version: SCHEMA_VERSION,
+              },
+            ],
+          }),
+        },
+        bootstrapAgentIds: ['role_ts_engineer'],
+        runsRoot: path.join(root, 'runs'),
+        councilRoot: path.join(root, 'council'),
+        worktreesRoot: path.join(root, 'worktrees'),
+      });
+      const taskRequest = {
+        spec: 'create output.txt',
+        completion_criteria: [criterion],
+      };
+      const common = {
+        task_id: 'task_1',
+        run_id: 'run_1',
+        mode: 'single_agent' as const,
+        task_request: taskRequest,
+        workspace_path: executionWorkspace,
+        delivery_workspace_path: workspace,
+        memory_ablation: 'B0' as const,
+        on_event: (event: Event) => emittedEvents.push(event),
+      };
 
-    const selected = await executors.select_agent.execute({
-      ...common,
-      cursor_input: { cursor: 'select_agent', seed: 'run_1', candidate_ids: [] },
-    });
-    const executed = await executors.execute_agent.execute({
-      ...common,
-      cursor_input: { cursor: 'execute_agent', winner_agent_id: selected.winner_agent_id },
-    });
-    expect(receivedAgentRequest).toMatchObject({ memory_ablation: 'B0' });
-    expect(
-      emittedEvents.find((event) => event.event_type === 'memory.context_pack_built')?.payload,
-    ).toMatchObject({ ablation: 'B0' });
-    const gated = await executors.gate.execute({
-      ...common,
-      cursor_input: {
-        cursor: 'gate',
-        subject_ref: executed.changeset_ref,
-        phase: 'post_primary',
-        changeset_ref: executed.changeset_ref,
-        expected_sha256: executed.expected_sha256,
-      },
-    });
-    expect(gated.status).toBe('allowed');
-    // Gate resolves selection.manifest_ref (file URL) back to a native path.
-    // On Windows, URL.pathname("/D:/...") must not become "D:\D:\...".
-    const manifestPath = path.join(root, 'runs', 'run_1', 'changeset-manifest.json');
-    await access(manifestPath);
-    expect(pathToFileURL(manifestPath).href).toBe(executed.changeset_ref);
-    const delivered = await executors.deliver.execute({
-      ...common,
-      cursor_input: {
-        cursor: 'deliver',
-        changeset_ref: executed.changeset_ref,
-        expected_sha256: executed.expected_sha256,
-      },
-    });
-    const replayed = await executors.deliver.execute({
-      ...common,
-      cursor_input: {
-        cursor: 'deliver',
-        changeset_ref: executed.changeset_ref,
-        expected_sha256: executed.expected_sha256,
-      },
-    });
+      const selected = await executors.select_agent.execute({
+        ...common,
+        cursor_input: { cursor: 'select_agent', seed: 'run_1', candidate_ids: [] },
+      });
+      const executed = await executors.execute_agent.execute({
+        ...common,
+        cursor_input: { cursor: 'execute_agent', winner_agent_id: selected.winner_agent_id },
+      });
+      expect(receivedAgentRequest).toMatchObject({ memory_ablation: 'B0' });
+      expect(receivedAgentRequest?.workspace_path).toBe(executionWorkspace);
+      expect(
+        emittedEvents.find((event) => event.event_type === 'memory.context_pack_built')?.payload,
+      ).toMatchObject({ ablation: 'B0' });
+      const gated = await executors.gate.execute({
+        ...common,
+        cursor_input: {
+          cursor: 'gate',
+          subject_ref: executed.changeset_ref,
+          phase: 'post_primary',
+          changeset_ref: executed.changeset_ref,
+          expected_sha256: executed.expected_sha256,
+        },
+      });
+      expect(gated.status).toBe('allowed');
+      // Gate resolves selection.manifest_ref (file URL) back to a native path.
+      // On Windows, URL.pathname("/D:/...") must not become "D:\D:\...".
+      const manifestPath = path.join(root, 'runs', 'run_1', 'changeset-manifest.json');
+      await access(manifestPath);
+      expect(pathToFileURL(manifestPath).href).toBe(executed.changeset_ref);
+      const delivered = await executors.deliver.execute({
+        ...common,
+        cursor_input: {
+          cursor: 'deliver',
+          changeset_ref: executed.changeset_ref,
+          expected_sha256: executed.expected_sha256,
+        },
+      });
+      const replayed = await executors.deliver.execute({
+        ...common,
+        cursor_input: {
+          cursor: 'deliver',
+          changeset_ref: executed.changeset_ref,
+          expected_sha256: executed.expected_sha256,
+        },
+      });
 
-    expect(await readFile(path.join(workspace, 'output.txt'), 'utf8')).toBe(
-      'production output',
-    );
-    expect(delivered.final_output).toEqual(replayed.final_output);
-    expect(delivered.evidence).toMatchObject({
-      idempotency_key: expect.stringMatching(/^deliver:/),
-      run_outcome: { status: 'verified' },
-    });
-  });
+      expect(await readFile(path.join(workspace, 'output.txt'), 'utf8')).toBe('production output');
+      expect(delivered.final_output).toEqual(replayed.final_output);
+      expect(delivered.final_output.workspace_path).toBe(path.join(workspace, 'output.txt'));
+      if (scratchExecution) {
+        await expect(access(path.join(executionWorkspace, 'output.txt'))).rejects.toMatchObject({
+          code: 'ENOENT',
+        });
+      }
+      expect(delivered.evidence).toMatchObject({
+        idempotency_key: expect.stringMatching(/^deliver:/),
+        run_outcome: { status: 'verified' },
+      });
+    },
+  );
 
   it('lets a failed plan-first primary continue into Council recovery', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'newide-production-stages-'));

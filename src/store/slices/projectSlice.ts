@@ -121,13 +121,7 @@ export const createProjectSlice: SliceCreator<ProjectSlice> = (set, get) => ({
       activeTaskId,
       ...taskState,
     });
-    // 把 agent 的工作区绑到这个项目：BCD 只在启动时读 ACP_WORKSPACE，所以要重启后端。
-    //
-    // ⚠️ 只在没有别的项目的 run 在跑时才绑。重启 BCD = 杀掉整个进程组，**包括正在写文件的 agent**。
-    // 从前这里是无条件绑定的 —— 于是「点一下侧栏切到另一个项目」就足以静默杀死一次正在跑的需求，
-    // 而那个任务会永远停在「执行中」。浏览项目不该有这种副作用。
-    // 跳过绑定不会写错目录：提交需求时 createTask 会再对齐一次，那才是权威时机。
-    if (canBindWorkspace(get(), project.id).ok) void bindBackendWorkspace(project);
+    // 浏览历史项目不重启后端，也不隐式授权自定义目录；提交需求时再绑定工作区。
   },
 
   closeProject: () => {

@@ -40,7 +40,12 @@ import {
   isCouncilReviewArtifact,
 } from '../plan-artifact';
 import { proposalReportFields } from '../proposal-adapter';
-import { collectWorkspaceArtifacts, mergeArtifacts, snapshotWorkspaceFiles, type WorkspaceFileSnapshot } from '../../coordinator/workspace-change-detector';
+import {
+  collectWorkspaceArtifacts,
+  mergeArtifacts,
+  snapshotWorkspaceFiles,
+  type WorkspaceFileSnapshot,
+} from '../../coordinator/workspace-change-detector';
 
 export type CouncilRoleFailureCode =
   | 'COUNCIL_PROPOSAL_FAILED'
@@ -598,6 +603,8 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
         {
           task_id: input.task_id,
           run_id: executionRunId,
+          // 观测身份锚到面板 run，执行身份仍沿用现有规则。
+          activity_run_id: input.run_id ?? executionRunId,
           role_id: participant.agent_id,
           participant_id: participant.participant_id,
           council_seat: participant.seat,
@@ -638,11 +645,14 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     if (workspaceBefore && result.status === 'completed') {
       result = {
         ...result,
-        artifact_refs: mergeArtifacts(result.artifact_refs, await collectWorkspaceArtifacts(
-          { task_id: input.task_id, workspace_path: workspacePath },
-          workspaceBefore,
-          String(result.diagnostics.driver_id ?? result.role_id),
-        )),
+        artifact_refs: mergeArtifacts(
+          result.artifact_refs,
+          await collectWorkspaceArtifacts(
+            { task_id: input.task_id, workspace_path: workspacePath },
+            workspaceBefore,
+            String(result.diagnostics.driver_id ?? result.role_id),
+          ),
+        ),
       };
     }
     if (hasBlockingMailboxRequest(result)) {
@@ -893,7 +903,10 @@ function failedEvent(error: CouncilRoleExecutionError): CouncilLifecycleEvent {
       phase: error.council_phase,
       attempt: error.failure_details.attempt,
       will_retry: error.failure_details.will_retry === true,
-      fallback_action: error.failure_details.will_retry === true ? 'retry_role' : 'continue_with_available_evidence',
+      fallback_action:
+        error.failure_details.will_retry === true
+          ? 'retry_role'
+          : 'continue_with_available_evidence',
     },
   };
 }

@@ -38,6 +38,13 @@ export interface AgentExecutionRequest {
   mailbox_delivery_id?: string;
   input_artifact_refs: ArtifactId[];
   context_policy: string;
+  /**
+   * 这次执行在**面板/观测**那一侧属于哪个 run。
+   *
+   * 显式提供观测身份，允许调用方把阶段执行归到同一个面板 run。
+   * 不改变 `run_id` 的生成规则；缺省时观测与执行身份相同。
+   */
+  activity_run_id?: RunId;
   /** RFC §1.2 memory ablation; applied by production Agent execution facade. */
   memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
   schema_version: SchemaVersion;

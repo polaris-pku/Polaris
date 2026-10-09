@@ -17,11 +17,7 @@ import {
   SynthesisAgentCouncilProvider,
 } from '../council';
 import { CommandDriverTransport, ExternalDriverRuntime } from '../driver';
-import {
-  LiteLLMToolCallingClient,
-  type LlmClient,
-  type ToolCallingClient,
-} from '../memory';
+import { LiteLLMToolCallingClient, type LlmClient, type ToolCallingClient } from '../memory';
 import { BAgentProjectionAdapter, FileMarketEvidenceStore } from '../market';
 import { JsonRpcDispatcher, JsonRpcLineSession } from '../rpc/json-rpc-dispatcher';
 import { RunRpcMethods } from '../rpc/run-methods';
@@ -36,6 +32,11 @@ import { NewideBackendService } from './newide-backend-service';
 import { InMemoryRunRegistry } from './run-registry';
 import { FileRunAuditWriter } from './run-audit-writer';
 import { FileDriverStreamAuditWriter } from './driver-stream-audit-writer';
+import {
+  FileRunDriverUsageJsonlSink,
+  NoopDriverUsageSink,
+  type DriverUsageSink,
+} from './driver-usage-jsonl-sink';
 import { ProductionGateExecutor } from './production-gate-executor';
 import type { IntegrationV0GateExecutor } from '../coordinator/gate-executor';
 import { FileRunRequestStore } from './run-request-store';
@@ -65,6 +66,8 @@ import { ArtifactRpcMethods } from '../rpc/artifact-methods';
 import { createProductionSystemStatusService } from './system-status-service';
 import { AgentMaintenanceScheduler } from './agent-maintenance-scheduler';
 import { FileRunArtifactContentReader } from './run-artifact-content-reader';
+import { FileRunPayloadReader } from './run-payload-reader';
+import { LedgerRunUsageHistoryReader } from './run-usage-history';
 import {
   createRunLatency,
   FileRunEventConsumptionSink,
@@ -179,8 +182,7 @@ export async function createProductionBackendService(
           : {}),
         ...(env.ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON !== undefined
           ? {
-              ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON:
-                env.ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON,
+              ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON: env.ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON,
             }
           : {}),
         ...(env.ACP_PROCESS_SANDBOX_RO_PATHS_JSON !== undefined
@@ -266,10 +268,7 @@ export async function createProductionBackendService(
         // dependencies.memoryMaintenance 覆盖路径会绕过留档（测试缝，接受）
         callJournal: protocolCallJournal,
         promotion: {
-          confidenceThreshold: readNumberEnv(
-            env.NEWIDE_B_PROMOTION_CONFIDENCE_THRESHOLD,
-            0.95,
-          ),
+          confidenceThreshold: readNumberEnv(env.NEWIDE_B_PROMOTION_CONFIDENCE_THRESHOLD, 0.95),
           autoApprove: env.NEWIDE_B_SKILL_AUTO_APPROVE === '1',
         },
       });
@@ -292,9 +291,7 @@ export async function createProductionBackendService(
       ...(bRuntime.embedding ? { embedding: bRuntime.embedding } : {}),
       llm:
         dependencies.agentLlm ??
-        new ProductionAgentToolCallingClient(
-          createProductionToolCallingClient(productionLlm, env),
-        ),
+        new ProductionAgentToolCallingClient(createProductionToolCallingClient(productionLlm, env)),
       memoryMaintenance: bCapabilities.maintenance,
       // B1 调用留档与 mailbox.sessionRegistry 无关：journal 用自己持有的注册表引用，
       // ephemeral 会话下注册表为空 → session_id 记 null（规定回退）。
@@ -325,9 +322,7 @@ export async function createProductionBackendService(
     const baseCouncilProvider = new SynthesisAgentCouncilProvider({
       agentExecutionFacade,
       councilRoot: path.join(stateRoot, 'council'),
-      roleInactivityTimeoutMs: readDriverTimeout(
-        env.NEWIDE_COUNCIL_ROLE_INACTIVITY_TIMEOUT_MS,
-      ),
+      roleInactivityTimeoutMs: readDriverTimeout(env.NEWIDE_COUNCIL_ROLE_INACTIVITY_TIMEOUT_MS),
       participantResolver: new AgentBoardCouncilParticipantResolver({
         boardQuery: bCapabilities.boardQuery,
         resolveAllowedAgentIds: agentCatalogProvider,
@@ -505,11 +500,30 @@ export async function createProductionBackendService(
     )
       ? new FileRunTelemetryJsonlSink(runsRoot)
       : new NoopTelemetrySink();
+    // 一次 run 一份 driver-usage.jsonl：driver 侧 usage 观测逐条同步追加，不受
+    // driver-stream.jsonl 的保留上限截断。关掉开关时换成空转 sink，生产行为与接线前
+    // 逐位一致：不建文件、不写盘。
+    const driverUsageSink: DriverUsageSink = readDriverUsageJsonlEnabled(
+      env.NEWIDE_DRIVER_USAGE_JSONL,
+    )
+      ? new FileRunDriverUsageJsonlSink(runsRoot)
+      : new NoopDriverUsageSink();
+    // terminalWriter 的 usage 正源回调要引用 service，而 service 尚在构造中：用可变
+    // 持有对象让回调在 finalize 时（构造早已完成）取到进程内累加器，截断缺尾由此补全。
+    const serviceHolder: { service?: NewideBackendService } = {};
     const service = new NewideBackendService(
       runner,
       new InMemoryRunRegistry(),
       new FileRunAuditWriter(runsRoot),
-      new FileRunTerminalOutputWriter(runsRoot, runLatency),
+      // 第 5 个参数是用量账本：run 收尾时把两条计费腿作为只追加行落库，使累计用量不再
+      // 依赖 runs/ 目录树存活。（第 3 个参数是 Claude session 刮取，用生产默认实现。）
+      new FileRunTerminalOutputWriter(
+        runsRoot,
+        runLatency,
+        undefined,
+        (taskId) => serviceHolder.service?.getAccumulatedDriverUsage(taskId),
+        coordinationStore,
+      ),
       new FileRunRequestStore(runsRoot),
       taskProcessor,
       mailboxService,
@@ -519,16 +533,18 @@ export async function createProductionBackendService(
       new FileDriverStreamAuditWriter(runsRoot),
       taskExecutionLoop,
       systemStatusService,
-      new MailboxDeliveryWorker(
-        mailboxService,
-        agentExecutionFacade,
-        participantSessions,
-      ),
+      new MailboxDeliveryWorker(mailboxService, agentExecutionFacade, participantSessions),
       (input) => agentExecutionFacade.provisionParticipantSession(input),
       new FileRunArtifactContentReader(runsRoot),
       new FileRunEventConsumptionSink(runsRoot),
       runTelemetryJsonlSink,
+      driverUsageSink,
+      new FileRunPayloadReader(runsRoot),
+      // 历史读账本而不是扫目录：目录树没有任何保留策略，往期一旦被清理，重算出来的
+      // 「累计」会变小。首次读会惰性回填一次目录树里已有的用量（幂等）。
+      new LedgerRunUsageHistoryReader(coordinationStore, runsRoot),
     );
+    serviceHolder.service = service;
     await service.recoverMailboxWaits();
     return service;
   } catch (error) {
@@ -562,10 +578,7 @@ export function resolveProductionLlmRuntime(
   env: NodeJS.ProcessEnv,
   driverEnv: NodeJS.ProcessEnv,
 ): ProductionLlmRuntime | undefined {
-  const model = firstNonBlank(
-    env.NEWIDE_AGENT_LLM_MODEL,
-    driverEnv.ANTHROPIC_MODEL,
-  );
+  const model = firstNonBlank(env.NEWIDE_AGENT_LLM_MODEL, driverEnv.ANTHROPIC_MODEL);
   const apiKey = firstNonBlank(
     env.OPENAI_API_KEY,
     driverEnv.ANTHROPIC_AUTH_TOKEN,
@@ -592,9 +605,7 @@ function createProductionToolCallingClient(
     });
   }
   return new LiteLLMToolCallingClient({
-    ...(env.NEWIDE_AGENT_LLM_MODEL?.trim()
-      ? { model: env.NEWIDE_AGENT_LLM_MODEL.trim() }
-      : {}),
+    ...(env.NEWIDE_AGENT_LLM_MODEL?.trim() ? { model: env.NEWIDE_AGENT_LLM_MODEL.trim() } : {}),
   });
 }
 
@@ -663,10 +674,7 @@ function readPackageIdentity(
   const rawName = Reflect.get(value, 'name');
   const rawVersion = Reflect.get(value, 'version');
   return {
-    name:
-      typeof rawName === 'string' && rawName.trim().length > 0
-        ? rawName.trim()
-        : fallbackName,
+    name: typeof rawName === 'string' && rawName.trim().length > 0 ? rawName.trim() : fallbackName,
     version:
       typeof rawVersion === 'string' && rawVersion.trim().length > 0
         ? rawVersion.trim()
@@ -765,9 +773,7 @@ export function parseDriverEnv(content: string): NodeJS.ProcessEnv {
   );
 }
 
-export async function runBackendRpcMain(
-  env: NodeJS.ProcessEnv = process.env,
-): Promise<void> {
+export async function runBackendRpcMain(env: NodeJS.ProcessEnv = process.env): Promise<void> {
   let service: NewideBackendService | undefined;
   let server: BackendRpcServer | undefined;
   let shutdownRequested = false;
@@ -895,7 +901,9 @@ function fallbackDriverInstruction(
   const message = input.messages.find(
     (candidate) => candidate.role === 'user' && typeof candidate.content === 'string',
   )?.content;
-  const match = message?.match(/(?:^|\n)Task:\s*([\s\S]*?)(?:\n\n(?:Retrieved memory|Collaboration brief):|$)/);
+  const match = message?.match(
+    /(?:^|\n)Task:\s*([\s\S]*?)(?:\n\n(?:Retrieved memory|Collaboration brief):|$)/,
+  );
   return match?.[1]?.trim() || 'Execute the assigned production task.';
 }
 
@@ -964,14 +972,29 @@ export function readTelemetryJsonlEnabled(value: string | undefined): boolean {
   throw new Error(`Invalid NEWIDE_TELEMETRY_JSONL: ${value}. Expected 0/1/true/false.`);
 }
 
+/**
+ * NEWIDE_DRIVER_USAGE_JSONL 解析：默认 true；"0"/"false" 关闭。
+ *
+ * 与 `NEWIDE_TELEMETRY_JSONL` 同形，管的是 driver 侧 usage 账本
+ * （`<state-root>/runs/<run_id>/driver-usage.jsonl`）。这条路径是同步追加，写的是每 run
+ * 一两百行的小文件，成本可以忽略；开关留着，是因为「怀疑埋点本身在干扰被测 run」时
+ * 需要一个能一键退回接线前状态的对照手段。关闭路径必须干净：换空转 sink，不建文件、
+ * 不写盘。
+ */
+export function readDriverUsageJsonlEnabled(value: string | undefined): boolean {
+  const raw = value?.trim();
+  if (!raw) return true;
+  if (raw === '0' || raw.toLowerCase() === 'false') return false;
+  if (raw === '1' || raw.toLowerCase() === 'true') return true;
+  throw new Error(`Invalid NEWIDE_DRIVER_USAGE_JSONL: ${value}. Expected 0/1/true/false.`);
+}
+
 export function readCouncilAuctionEnabled(value: string | undefined): boolean {
   const raw = value?.trim();
   if (!raw) return false;
   if (raw === '0' || raw.toLowerCase() === 'false') return false;
   if (raw === '1' || raw.toLowerCase() === 'true') return true;
-  throw new Error(
-    `Invalid NEWIDE_COUNCIL_AUCTION_ENABLED: ${value}. Expected 0/1/true/false.`,
-  );
+  throw new Error(`Invalid NEWIDE_COUNCIL_AUCTION_ENABLED: ${value}. Expected 0/1/true/false.`);
 }
 
 export function readCouncilProposerCount(value: string | undefined): number {

@@ -129,6 +129,28 @@ describe('runFacts · Gate 提取', () => {
 });
 
 describe('runFacts · 产出文件的两种 files_written 形状', () => {
+  it('Windows delivery paths stay clickable without diff artifacts', () => {
+    const file = 'C:\\workspace\\天下\\hello_world.py';
+    const facts = artifactFactsOf(
+      liveRun([], snapshotWith([file], [{ artifact_id: 'result-bundle' }])),
+    );
+    expect(facts).toEqual({ count: 1, files: [{ label: file, absPath: file }] });
+  });
+
+  it('reads the same final-output fallback as the sidebar for a thin snapshot', () => {
+    const snapshot = snapshotWith([]);
+    snapshot.contract_version = undefined;
+    snapshot.delivery_report = undefined;
+    snapshot.final_output = {
+      status: 'completed',
+      artifact_refs: [],
+      files_written: ['/work/main.py'],
+    };
+    expect(artifactFactsOf(liveRun([], snapshot))).toEqual({
+      count: 1,
+      files: [{ label: '/work/main.py', absPath: '/work/main.py' }],
+    });
+  });
   it('快照在：delivery_report.files_written 是 string[]（路径）→ 计数取 length', () => {
     const facts = artifactFactsOf(
       liveRun(

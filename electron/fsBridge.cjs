@@ -13,7 +13,7 @@ const path = require('path');
 
 const WORKSPACE_DIRNAME = 'polaris-workspace';
 
-/** 用户通过原生目录选择器授权过的根目录（会话级；项目数据本身也不跨重启持久化）。 */
+/** 自定义目录授权是会话级的；恢复项目元数据不会给任意磁盘路径授予权限。 */
 const authorizedRoots = new Set();
 
 // 目录树扫描的护栏：演示用 IDE，不做虚拟滚动，超限截断防巨型仓库拖死渲染层
@@ -34,7 +34,15 @@ function safeSegment(name) {
 }
 
 function isAuthorizedRoot(rootPath) {
-  return authorizedRoots.has(path.resolve(String(rootPath || '')));
+  const root = path.resolve(String(rootPath || ''));
+  const relative = path.relative(workspaceRoot(), root);
+  return (
+    authorizedRoots.has(root) ||
+    (relative !== '' &&
+      relative !== '..' &&
+      !path.isAbsolute(relative) &&
+      !relative.includes(path.sep))
+  );
 }
 
 /**
@@ -60,7 +68,7 @@ function resolveTargetPath({ projectName, rootPath, path: relPath }) {
   let root;
   if (rootPath != null && rootPath !== '') {
     root = path.resolve(String(rootPath));
-    if (!authorizedRoots.has(root)) return { error: '目录未经用户授权，拒绝写入' };
+    if (!isAuthorizedRoot(root)) return { error: '目录未经用户授权，拒绝写入' };
   } else {
     root = path.join(workspaceRoot(), safeSegment(projectName));
   }
@@ -172,7 +180,7 @@ function setupFsBridge(getWindow) {
 function resolveProjectRoot({ projectName, rootPath }) {
   if (rootPath != null && rootPath !== '') {
     const root = path.resolve(String(rootPath));
-    if (!authorizedRoots.has(root)) return { error: '目录未经用户授权' };
+    if (!isAuthorizedRoot(root)) return { error: '目录未经用户授权' };
     return { root };
   }
   return { root: path.join(workspaceRoot(), safeSegment(projectName)) };

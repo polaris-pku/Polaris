@@ -8,6 +8,7 @@ const { setupBackendBridge } = require('./backendBridge.cjs');
 const { setupPythonBridge } = require('./pythonBridge.cjs');
 const { setupTerminalBridge } = require('./terminalBridge.cjs');
 const { buildAppMenu } = require('./appMenu.cjs');
+const { cleanupRetiredFiles } = require('./portableFiles.cjs');
 
 const isDev = !app.isPackaged;
 const DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL || 'http://localhost:5173';
@@ -80,6 +81,13 @@ if (!app.requestSingleInstanceLock()) {
     // 这两个必须在 createWindow() 之后：terminalBridge 要挂窗口的 closed 事件做会话清理（I10）。
     setupPythonBridge(() => mainWindow);
     setupTerminalBridge(() => mainWindow);
+    if (process.platform === 'win32') {
+      void cleanupRetiredFiles({
+        directory: path.dirname(process.execPath),
+        desktop: app.getPath('desktop'),
+        retries: 6,
+      }).catch((error) => console.warn('[portable] Desktop cleanup failed:', error));
+    }
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) createWindow();
     });

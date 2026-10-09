@@ -1,6 +1,12 @@
 import { create } from 'zustand';
-import { getRunSnapshot } from '@/api/client';
-import { onBackendStatus, onEvent, onEventChannelStatus, onRunEvent } from '@/api/events';
+import {
+  onBackendStatus,
+  onEvent,
+  onEventChannelStatus,
+  onRunEvent,
+  onRunResync,
+  onRunSyncError,
+} from '@/api/events';
 import type { DemoState } from '@/store/types';
 import { blankState } from '@/store/lib/blankState';
 import { createProjectSlice } from '@/store/slices/projectSlice';
@@ -10,6 +16,12 @@ import { createExecutionSlice } from '@/store/slices/executionSlice';
 import { createInterventionSlice } from '@/store/slices/interventionSlice';
 import { createTerminalSlice, reduceTermEvent } from '@/store/slices/terminalSlice';
 import { onTerminalEvent } from '@/api/terminal';
+import {
+  appendRunEvents,
+  mergeRunSnapshot,
+  snapshotRunStatus,
+  terminalRunStatus,
+} from '@/lib/runTimeline';
 
 // 对外类型与常量保持原路径可用（historical import site: '@/store/useDemoStore'）
 export { PROJECT_TRACE_FORMAT, type ProjectTrace } from '@/store/types';
@@ -88,33 +100,24 @@ onTerminalEvent((event) => {
 });
 
 /**
- * 后端进程掉线 → 把还在跑的 run 如实标成中断。
- *
- * BCD 的 run registry 只活在它自己的进程内存里，进程一死那些 run 就不会再有任何事件了。
- * 没有这条兜底，任何一次后端崩溃/重启都会在界面上留下一个永远转圈的「执行中」——
- * 这正是用户看到的那个症状最阴的一种成因（后端已经死了，前端还在等一个永远不来的事件）。
- *
- * 只在 ready 之外的状态触发。应用刚启动时后端是 stopped/starting，但那时一个 run 都没有，空转无害。
+ * 掉线只表示观测中断。保留订阅，重连后由持久快照决定真正的执行结局。
  */
 onBackendStatus((status) => {
   if (status.state === 'ready') return;
-  const reason =
-    status.state === 'error'
-      ? `后端异常，该 run 已中断：${status.message || '未知原因'}`
-      : '后端进程已重启或退出，该 run 已中断（后端不会再推送它的事件）。';
-  useDemoStore.getState().failLiveRuns(reason);
+  const reason = `后端连接中断，执行状态待同步：${status.message || status.state}`;
+  useDemoStore.setState((state) => ({
+    liveRuns: Object.fromEntries(
+      Object.entries(state.liveRuns).map(([id, run]) => [
+        id,
+        run.status === 'running' ? { ...run, syncError: reason } : run,
+      ]),
+    ),
+  }));
 });
 
 // ── 真实 run 接线（模块级常驻订阅）──
 // mock 模式下传输层不推 RunEvent，这条链路自然静默；有真实后端时它是唯一的事实来源。
 // 注意：与 mock 剧本并存 —— 剧本继续驱动泳道图演示，liveRun 记录后端真发生了什么。
-
-/** run 的终态事件：拿到后去拉一次完整快照（含 flow/delivery_report/errors）。 */
-const TERMINAL_EVENTS: Record<string, 'completed' | 'failed' | 'cancelled'> = {
-  'run.completed': 'completed',
-  'run.failed': 'failed',
-  'run.cancelled': 'cancelled',
-};
 
 /**
  * 事件 → liveRuns[run_id]。
@@ -135,9 +138,8 @@ onRunEvent((event) => {
       snapshot: null,
       error: null,
     };
-    // 后端事件带单调递增的 sequence —— 排序以它为准，不依赖到达顺序。
-    const timeline = [...prev.timeline, event].sort((a, b) => a.sequence - b.sequence);
-    const terminal = TERMINAL_EVENTS[event.type];
+    const timeline = appendRunEvents(prev.timeline, [event]);
+    const terminal = terminalRunStatus(event.type);
     return {
       liveRuns: {
         ...s.liveRuns,
@@ -152,24 +154,52 @@ onRunEvent((event) => {
   if (live) {
     useDemoStore.getState().applyLiveProgress(runId, live.timeline, live.status);
   }
+});
 
-  if (!TERMINAL_EVENTS[event.type]) return;
+onRunResync(({ run_id: runId, snapshot, reason, eventsDuringSync }) => {
+  useDemoStore.setState((state) => {
+    const previous = state.liveRuns[runId];
+    const liveEvents = reason === 'reconnect' ? eventsDuringSync : (previous?.timeline ?? []);
+    const timeline = mergeRunSnapshot(snapshot.timeline, liveEvents);
+    return {
+      liveRuns: {
+        ...state.liveRuns,
+        [runId]: {
+          runId,
+          taskId: snapshot.task_id,
+          status: snapshotRunStatus(snapshot, liveEvents),
+          timeline,
+          snapshot,
+          error: null,
+          syncError: null,
+        },
+      },
+    };
+  });
+  const live = useDemoStore.getState().liveRuns[runId];
+  useDemoStore.getState().applyLiveProgress(runId, live.timeline, live.status);
+  useDemoStore.getState().attachLiveRun(runId, {
+    ...snapshot,
+    timeline: live.timeline,
+    status: live.status,
+  });
+});
 
-  // 终态：拉完整快照。失败不影响已收到的事件时间线。
-  void getRunSnapshot(runId)
-    .then((snapshot) => {
-      useDemoStore.setState((s) => {
-        const cur = s.liveRuns[runId];
-        return cur ? { liveRuns: { ...s.liveRuns, [runId]: { ...cur, snapshot } } } : {};
-      });
-      // 用后端事实接管这个任务：泳道图 / 节点日志 / Inspector / 交付报告不再是 mock 剧本。
-      useDemoStore.getState().attachLiveRun(runId, snapshot);
-    })
-    .catch((err: unknown) => {
-      const message = err instanceof Error ? err.message : String(err);
-      useDemoStore.setState((s) => {
-        const cur = s.liveRuns[runId];
-        return cur ? { liveRuns: { ...s.liveRuns, [runId]: { ...cur, error: message } } } : {};
-      });
-    });
+onRunSyncError(({ run_id: runId, error }) => {
+  useDemoStore.setState((state) => {
+    const task = error ? state.tasks.find((item) => item.contractRunId === runId) : undefined;
+    const run =
+      state.liveRuns[runId] ??
+      (task?.contractTaskId
+        ? {
+            runId,
+            taskId: task.contractTaskId,
+            status: 'running' as const,
+            timeline: [],
+            snapshot: null,
+            error: null,
+          }
+        : undefined);
+    return run ? { liveRuns: { ...state.liveRuns, [runId]: { ...run, syncError: error } } } : {};
+  });
 });

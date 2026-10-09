@@ -18,6 +18,8 @@ import { durationBetween, elapsedSince, formatElapsed } from '@/lib/elapsed';
 import { OWNER_FALLBACK, roleName } from '@/lib/roleNames';
 import { runStateOf, type RunState } from '@/lib/runState';
 import { buildEventGraph, STEPS, type StepKey } from '@/lib/eventGraph';
+import { liveProducedFiles } from '@/lib/liveReplay';
+import { agentActivityLabel, RUN_CURSOR_LABELS } from '@/lib/runObservability';
 
 /** 主句要渲染的一切。`MissionLine.tsx` 只负责把它摆上屏，不做任何取数。 */
 export type MissionLineModel = {
@@ -144,9 +146,9 @@ const baseName = (path: string): string => path.split(/[\\/]/).filter(Boolean).p
  * 一次 run 的完成瞬间（快照还在路上）必然走后一条路，所以两条都必须是活的。
  */
 export function producedFiles(live: LiveRunState | undefined): { count: number; names: string[] } {
-  const delivery = live?.snapshot?.delivery_report;
-  if (delivery) {
-    const paths = delivery.files_written;
+  const snapshot = live?.snapshot;
+  if (snapshot && (snapshot.delivery_report || snapshot.final_output)) {
+    const paths = liveProducedFiles(snapshot);
     return { count: paths.length, names: paths.map(baseName) };
   }
 
@@ -220,11 +222,21 @@ export function missionLineOf({
         retry: true,
       };
 
+    case 'waiting':
+      return {
+        state,
+        headline: '等待协作回复 · 尚未交付',
+        sub:
+          task?.contractWaitingReason ||
+          '当前执行回合已结束，任务仍会续跑；通过审查并写入项目后才算交付。',
+        retry: false,
+      };
+
     case 'blocked': {
       const gate = gateBlock(live);
       return {
         state,
-        headline: `被拦下 · ${gate?.reason ?? '需要人工确认'}`,
+        headline: `被拦下 · ${task?.contractWaitingReason ?? gate?.reason ?? '需要人工确认'}`,
         sub: gate?.requiredAction || undefined,
         retry: true,
       };
@@ -232,6 +244,53 @@ export function missionLineOf({
 
     case 'running': {
       const owner = live ? ownerOf(live.timeline) : OWNER_FALLBACK;
+      if (live?.syncError) {
+        return {
+          state,
+          headline: '观测已中断 · 执行状态待同步',
+          sub: live.syncError,
+          retry: false,
+        };
+      }
+      const agents = live?.snapshot?.activity?.agents;
+      if (agents?.length) {
+        const agent = agents[0];
+        const stale = agents.some(
+          (item) => item.stale || (item.state === 'delegating' && item.driver?.stale),
+        );
+        const since =
+          agent.state === 'delegating' ? (agent.driver?.since ?? agent.since) : agent.since;
+        return {
+          state,
+          headline:
+            agents.length === 1
+              ? `${roleName(agent.role_id)} ${agentActivityLabel(agent)} · ${formatElapsed(elapsedSince(since, now))}`
+              : `${agents.length} 个角色正在协作 · ${formatElapsed(runDuration(live, now))}`,
+          sub: stale
+            ? '部分状态观测已陈旧，展开「当前活动」查看最近活动时间。'
+            : agents.length > 1
+              ? agents
+                  .map((item) => `${roleName(item.role_id)} · ${agentActivityLabel(item)}`)
+                  .join('；')
+              : undefined,
+          retry: false,
+        };
+      }
+      const currentStage = live?.snapshot?.current;
+      if (currentStage?.cursor) {
+        const label = RUN_CURSOR_LABELS[currentStage.cursor];
+        const active = !!currentStage.invocation_id;
+        const elapsed =
+          active && currentStage.stage_started_at
+            ? ` · ${formatElapsed(elapsedSince(currentStage.stage_started_at, now))}`
+            : '';
+        return {
+          state,
+          headline: `${active ? '正在' : ''}${label}${elapsed}`,
+          sub: active ? undefined : '当前没有正在执行的阶段调用。',
+          retry: false,
+        };
+      }
       // run.create 已经受理，但一条事件都还没到（通道刚建立）—— 如实说，不假装有进度。
       if (!live || live.timeline.length === 0) {
         return {

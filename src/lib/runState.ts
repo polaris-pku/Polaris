@@ -13,6 +13,7 @@ import type { DemoTask } from '@/types';
 export type RunState =
   | 'idle'
   | 'running'
+  | 'waiting'
   | 'blocked'
   | 'completed'
   | 'failed'
@@ -23,6 +24,7 @@ export type RunState =
 export const RUN_STATE_LABEL: Record<RunState, string> = {
   idle: '未开始',
   running: '执行中',
+  waiting: '等待协作',
   blocked: '需要你',
   completed: '已交付',
   failed: '失败',
@@ -34,6 +36,7 @@ export const RUN_STATE_LABEL: Record<RunState, string> = {
 export const RUN_STATE_TONE: Record<RunState, 'muted' | 'command' | 'human' | 'ok' | 'danger'> = {
   idle: 'muted',
   running: 'command',
+  waiting: 'command',
   blocked: 'human',
   completed: 'ok',
   failed: 'danger',
@@ -73,9 +76,25 @@ export function runStateOf(task: DemoTask | undefined, live: LiveRunState | unde
 
   if (!live) return 'running';
 
+  const taskStatus = task.contractTaskStatus ?? live.snapshot?.current?.task_status;
+  if (taskStatus === 'completed') return 'completed';
+  if (taskStatus === 'failed') return 'failed';
+  if (taskStatus === 'cancelled') return 'cancelled';
+  if (['blocked', 'waiting_input', 'pending_gate', 'escalated'].includes(taskStatus ?? ''))
+    return 'blocked';
+  if (taskStatus === 'waiting_help') return 'waiting';
+  if (
+    live.status === 'completed' &&
+    live.timeline.some(
+      (event) =>
+        event.type === 'run.completed' && asRecord(event.payload).outcome === 'mailbox_wait',
+    )
+  )
+    return 'waiting';
+
   switch (live.status) {
     case 'completed':
-      return 'completed';
+      return taskStatus && taskStatus !== 'completed' ? 'running' : 'completed';
     case 'failed':
       return 'failed';
     case 'cancelled':

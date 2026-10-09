@@ -4,7 +4,7 @@
  * 「快照是权威，事件只是增量」在 task 通道上的落点就是 `task.subscribe`：
  * 它一次给回 `TaskSnapshot` + 全量重放事件，断号和重连都靠再走一次它来覆盖本地状态。
  */
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { resetEventChannel } from './events';
 import { unwatchAllTasks, watchTask } from './task';
 import { resetTransport } from './transport';
@@ -34,15 +34,18 @@ const READY_STATUS = {
   state: 'ready' as const,
   message: '',
   workspace: '/tmp/ws',
-  modelProxy: {
-    configured: true,
+  auth: {
+    providerId: 'anthropic',
+    hasKey: true,
+    hasLocalCredentials: false,
     incomplete: false,
     ready: true,
-    baseUrl: 'http://127.0.0.1:4000',
-    model: 'copilot-test',
+    baseUrl: '',
+    model: 'test-model',
+    fastModel: 'test-model',
   },
-  bMemory: { configured: true },
   agents: [],
+  providers: [],
 };
 
 function event(id: string, sequence: number, taskId = 'task-1', runId = 'run-1'): RunEvent {
@@ -64,7 +67,12 @@ function snapshotOf(taskId: string): TaskSnapshot {
 }
 
 /** 可编程的假桌面桥（形状对齐 electron/preload.cjs 的 window.desktop.backend）。 */
-function installFakeBackend(options: { replay?: Record<string, RunEvent[]> } = {}) {
+function installFakeBackend(
+  options: {
+    replay?: Record<string, RunEvent[]>;
+    snapshots?: Record<string, TaskSnapshot>;
+  } = {},
+) {
   const rpc: Array<{ method: string; params: unknown }> = [];
   const notificationHandlers = new Set<(notification: unknown) => void>();
   const statusHandlers = new Set<(status: unknown) => void>();
@@ -78,13 +86,17 @@ function installFakeBackend(options: { replay?: Record<string, RunEvent[]> } = {
   const backend = {
     call: vi.fn(async (method: string, params: unknown) => {
       rpc.push({ method, params });
+      if (method === 'task.get') {
+        const taskId = (params as { task_id: string }).task_id;
+        return { ok: true as const, result: options.snapshots?.[taskId] ?? snapshotOf(taskId) };
+      }
       if (method === 'task.subscribe') {
         const taskId = (params as { task_id: string }).task_id;
         return {
           ok: true as const,
           result: {
             subscribed: true,
-            snapshot: snapshotOf(taskId),
+            snapshot: options.snapshots?.[taskId] ?? snapshotOf(taskId),
             replay_events: options.replay?.[taskId] ?? [],
           },
         };
@@ -123,6 +135,68 @@ describe('watchTask', () => {
     resetEventChannel();
     vi.unstubAllGlobals();
   });
+  afterEach(async () => {
+    await unwatchAllTasks();
+    vi.useRealTimers();
+  });
+
+  it('refreshes a waiting Task even without events and stops polling only at Task completion', async () => {
+    vi.useFakeTimers();
+    const snapshots = {
+      'task-1': { ...snapshot, task: { ...snapshot.task, status: 'waiting_help' } },
+    };
+    const fake = installFakeBackend({ snapshots });
+    const observed: TaskSnapshot[] = [];
+    await watchTask('task-1', { onSnapshot: (value) => observed.push(value), onEvent: () => {} });
+    snapshots['task-1'] = {
+      ...snapshot,
+      revision: 2,
+      task: { ...snapshot.task, status: 'completed' },
+    };
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(observed.map((item) => item.task.status)).toEqual(['waiting_help', 'completed']);
+    expect(fake.calls('task.get')).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(fake.calls('task.get')).toHaveLength(1);
+  });
+
+  it('a continuation Run refreshes task identity without waiting for a gap or reconnect', async () => {
+    const snapshots = { 'task-1': snapshot };
+    const fake = installFakeBackend({ snapshots });
+    const observed: TaskSnapshot[] = [];
+    await watchTask('task-1', { onSnapshot: (value) => observed.push(value), onEvent: () => {} });
+    snapshots['task-1'] = {
+      ...snapshot,
+      revision: 2,
+      current_run: {
+        run_id: 'continuation',
+        task_id: 'task-1',
+        status: 'running',
+        mode: 'council',
+        restartable: false,
+      },
+    };
+    fake.emit('task-1', {
+      ...event('continued', 1, 'task-1', 'continuation'),
+      type: 'run.started',
+    });
+    await vi.waitFor(() =>
+      expect(observed[observed.length - 1]?.current_run?.run_id).toBe('continuation'),
+    );
+    expect(fake.calls('task.get')).toHaveLength(1);
+    expect(fake.calls('task.subscribe')).toHaveLength(1);
+  });
+
+  it('does not let an older Task snapshot rewind the current Run', async () => {
+    const snapshots = { 'task-1': { ...snapshot, revision: 3 } };
+    const fake = installFakeBackend({ snapshots });
+    const observed: TaskSnapshot[] = [];
+    await watchTask('task-1', { onSnapshot: (value) => observed.push(value), onEvent: () => {} });
+    snapshots['task-1'] = { ...snapshot, revision: 2 };
+    fake.emit('task-1', { ...event('late', 1), type: 'run.completed' });
+    await vi.waitFor(() => expect(fake.calls('task.get')).toHaveLength(1));
+    expect(observed.map((item) => item.revision)).toEqual([3]);
+  });
 
   it('applies snapshot, replay, then buffered live events', async () => {
     let notification: ((value: unknown) => void) | undefined;
@@ -146,7 +220,7 @@ describe('watchTask', () => {
         return () => undefined;
       }),
       onStatus: vi.fn(() => () => undefined),
-      getStatus: vi.fn(),
+      getStatus: vi.fn(async () => READY_STATUS),
       configure: vi.fn(),
       restart: vi.fn(),
       getSettings: vi.fn(),

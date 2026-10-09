@@ -46,26 +46,57 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
   it('cancels a pending Session initialization and releases its provisioning slot', async () => {
     const driver = new CapturingDriver('succeeded');
     let finish!: (result: DriverRunResult) => void;
-    const send = vi.spyOn(driver, 'sendPrompt').mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const send = vi.spyOn(driver, 'sendPrompt').mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
     const interrupt = vi.spyOn(driver, 'interrupt');
     const sessions = new InMemoryParticipantSessionRegistry();
     const store = new SqliteCoordinationStore(':memory:');
     const facade = new DriverRuntimeAgentExecutionFacade({
-      driver, repository: new InMemoryRepository(), bufferRepository: new InMemoryBufferRepository(), llm: invokeDriverLlm(),
-      mailbox: { service: new PersistentMailboxService(store), allowedRoleIds: ['primary'], sessionRegistry: sessions },
+      driver,
+      repository: new InMemoryRepository(),
+      bufferRepository: new InMemoryBufferRepository(),
+      llm: invokeDriverLlm(),
+      mailbox: {
+        service: new PersistentMailboxService(store),
+        allowedRoleIds: ['primary'],
+        sessionRegistry: sessions,
+      },
     });
     const controller = new AbortController();
-    const { session_id: _existingSession, ...input } = request('task_cancel_init', 'primary', os.tmpdir());
+    const { session_id: _existingSession, ...input } = request(
+      'task_cancel_init',
+      'primary',
+      os.tmpdir(),
+    );
     let error: unknown;
-    const pending = facade.runAgent(input, { signal: controller.signal }).catch((failure) => { error = failure; });
+    const pending = facade.runAgent(input, { signal: controller.signal }).catch((failure) => {
+      error = failure;
+    });
     try {
       await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1));
       controller.abort(new Error('Stop Session initialization'));
       await vi.waitFor(() => expect(error).toBeInstanceOf(Error), { timeout: 500 });
-      expect(interrupt).toHaveBeenCalledWith('Stop Session initialization', `${input.run_id}:session-provision:primary`);
+      expect(interrupt).toHaveBeenCalledWith(
+        'Stop Session initialization',
+        `${input.run_id}:session-provision:primary`,
+      );
       expect(sessions.get(input.task_id, path.resolve(os.tmpdir()), 'primary')).toBeUndefined();
-      send.mockResolvedValueOnce({ ...driverResult(driver, 'succeeded', 'session_after_cancel'), response: 'SESSION_READY' });
-      expect(await facade.provisionParticipantSession({ task_id: input.task_id, run_id: 'run_next', role_id: 'primary', workspace_path: os.tmpdir() })).toBe('session_after_cancel');
+      send.mockResolvedValueOnce({
+        ...driverResult(driver, 'succeeded', 'session_after_cancel'),
+        response: 'SESSION_READY',
+      });
+      expect(
+        await facade.provisionParticipantSession({
+          task_id: input.task_id,
+          run_id: 'run_next',
+          role_id: 'primary',
+          workspace_path: os.tmpdir(),
+        }),
+      ).toBe('session_after_cancel');
       expect(send).toHaveBeenCalledTimes(2);
     } finally {
       finish(driverResult(driver, 'cancelled'));
@@ -77,13 +108,27 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
   it('forwards Session initialization events with the parent run and role', async () => {
     const driver = new CapturingDriver('succeeded');
     const original = driver.sendPrompt.bind(driver);
-    vi.spyOn(driver, 'sendPrompt').mockImplementation(async (input) => ({ ...await original(input), session_id: 'session_ready', response: 'SESSION_READY' }));
+    vi.spyOn(driver, 'sendPrompt').mockImplementation(async (input) => ({
+      ...(await original(input)),
+      session_id: 'session_ready',
+      response: 'SESSION_READY',
+    }));
     const { facade } = createFacade(driver);
     const events: Array<{ run_id?: string; role_id?: string }> = [];
-    await facade.provisionParticipantSession({ task_id: 'task_init', run_id: 'run_parent', role_id: 'primary', workspace_path: os.tmpdir() }, {
-      onDriverEvent: (event) => events.push(event),
-    });
-    expect(events).toContainEqual(expect.objectContaining({ run_id: 'run_parent', role_id: 'primary' }));
+    await facade.provisionParticipantSession(
+      {
+        task_id: 'task_init',
+        run_id: 'run_parent',
+        role_id: 'primary',
+        workspace_path: os.tmpdir(),
+      },
+      {
+        onDriverEvent: (event) => events.push(event),
+      },
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({ run_id: 'run_parent', role_id: 'primary' }),
+    );
   });
   it('lets one real B Agent tool turn send and another role reply through Mailbox', async () => {
     const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-mailbox-agent-'));
@@ -167,9 +212,7 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
         role_id: 'role_sender',
         diagnostics: { driver_status: 'succeeded' },
       });
-      expect(mailbox.getEnvelope(replyDeliveryId as string).delivery.status).toBe(
-        'acknowledged',
-      );
+      expect(mailbox.getEnvelope(replyDeliveryId as string).delivery.status).toBe('acknowledged');
     } finally {
       store.close();
       await fs.rm(workspace, { recursive: true, force: true });
@@ -235,12 +278,32 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
   it('retries a transient Session initialization once and preserves a known Session', async () => {
     const driver = new CapturingDriver('succeeded');
     const send = vi.spyOn(driver, 'sendPrompt');
-    send.mockResolvedValueOnce({ ...driverResult(driver, 'failed', 'session_started'), error: { code: 'EXTERNAL_DRIVER_TRANSPORT_ERROR', message: 'temporary connection loss', retryable: true } });
-    send.mockResolvedValueOnce({ ...driverResult(driver, 'succeeded', 'session_started'), response: 'SESSION_READY' });
+    send.mockResolvedValueOnce({
+      ...driverResult(driver, 'failed', 'session_started'),
+      error: {
+        code: 'EXTERNAL_DRIVER_TRANSPORT_ERROR',
+        message: 'temporary connection loss',
+        retryable: true,
+      },
+    });
+    send.mockResolvedValueOnce({
+      ...driverResult(driver, 'succeeded', 'session_started'),
+      response: 'SESSION_READY',
+    });
     const { facade } = createFacade(driver);
-    expect(await facade.provisionParticipantSession({ task_id: 'task_init', run_id: 'run_init', workspace_path: os.tmpdir(), role_id: 'proposer_a' })).toBe('session_started');
+    expect(
+      await facade.provisionParticipantSession({
+        task_id: 'task_init',
+        run_id: 'run_init',
+        workspace_path: os.tmpdir(),
+        role_id: 'proposer_a',
+      }),
+    ).toBe('session_started');
     expect(send).toHaveBeenCalledTimes(2);
-    expect(send.mock.calls[1]![0]).toMatchObject({ session_id: 'session_started', run_id: expect.stringMatching(/:retry$/) });
+    expect(send.mock.calls[1]![0]).toMatchObject({
+      session_id: 'session_started',
+      run_id: expect.stringMatching(/:retry$/),
+    });
   });
 
   it('uses the real Council turn to create its Session without a warm-up model call', async () => {
@@ -248,7 +311,7 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     const driver = new CapturingDriver('succeeded');
     const original = driver.sendPrompt.bind(driver);
     const send = vi.spyOn(driver, 'sendPrompt').mockImplementation(async (input) => ({
-      ...await original(input),
+      ...(await original(input)),
       session_id: 'session_council_role',
     }));
     const repository = new InMemoryRepository();
@@ -288,43 +351,45 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
   });
 
   it.each(['council_primary_plan', 'council_proposer', 'council_reviewer', 'council_synthesizer'])(
-    'rejects blocking Mailbox requests immediately in %s', async (contextPolicy) => {
-    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-plan-mailbox-'));
-    const repository = new InMemoryRepository();
-    await repository.initializeAgent({ role_id: 'role_primary', name: 'Primary' });
-    await repository.initializeAgent({ role_id: 'role_reviewer', name: 'Reviewer' });
-    const store = new SqliteCoordinationStore(':memory:');
-    const mailbox = new PersistentMailboxService(store);
-    const facade = new DriverRuntimeAgentExecutionFacade({
-      driver: new CapturingDriver('succeeded'),
-      repository,
-      bufferRepository: new InMemoryBufferRepository(),
-      llm: planMailboxThenDriverLlm(),
-      mailbox: {
-        service: mailbox,
-        allowedRoleIds: ['role_primary', 'role_reviewer'],
-      },
-    });
-
-    try {
-      const result = await facade.runAgent({
-        ...request('task_plan_mailbox', 'role_primary', workspace),
-        instruction: 'Write council-plan.md.',
-        driver_instruction: 'Write council-plan.md.',
-        context_policy: contextPolicy,
+    'rejects blocking Mailbox requests immediately in %s',
+    async (contextPolicy) => {
+      const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-plan-mailbox-'));
+      const repository = new InMemoryRepository();
+      await repository.initializeAgent({ role_id: 'role_primary', name: 'Primary' });
+      await repository.initializeAgent({ role_id: 'role_reviewer', name: 'Reviewer' });
+      const store = new SqliteCoordinationStore(':memory:');
+      const mailbox = new PersistentMailboxService(store);
+      const facade = new DriverRuntimeAgentExecutionFacade({
+        driver: new CapturingDriver('succeeded'),
+        repository,
+        bufferRepository: new InMemoryBufferRepository(),
+        llm: planMailboxThenDriverLlm(),
+        mailbox: {
+          service: mailbox,
+          allowedRoleIds: ['role_primary', 'role_reviewer'],
+        },
       });
 
-      expect(result).toMatchObject({
-        status: 'completed',
-        diagnostics: { driver_status: 'succeeded' },
-      });
-      expect(result.diagnostics.mailbox_outcomes).toBeUndefined();
-      expect(mailbox.inbox('task_plan_mailbox', workspace, 'role_reviewer')).toEqual([]);
-    } finally {
-      store.close();
-      await fs.rm(workspace, { recursive: true, force: true });
-    }
-  });
+      try {
+        const result = await facade.runAgent({
+          ...request('task_plan_mailbox', 'role_primary', workspace),
+          instruction: 'Write council-plan.md.',
+          driver_instruction: 'Write council-plan.md.',
+          context_policy: contextPolicy,
+        });
+
+        expect(result).toMatchObject({
+          status: 'completed',
+          diagnostics: { driver_status: 'succeeded' },
+        });
+        expect(result.diagnostics.mailbox_outcomes).toBeUndefined();
+        expect(mailbox.inbox('task_plan_mailbox', workspace, 'role_reviewer')).toEqual([]);
+      } finally {
+        store.close();
+        await fs.rm(workspace, { recursive: true, force: true });
+      }
+    },
+  );
 
   it.each(['council_synthesizer', 'production_task_loop'] as const)(
     'finalizes %s after a successful Driver without another model turn',
@@ -454,9 +519,7 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     });
 
     try {
-      const result = await facade.runAgent(
-        request('task_journal_facade', 'proposer_a', workspace),
-      );
+      const result = await facade.runAgent(request('task_journal_facade', 'proposer_a', workspace));
       expect(result.status).toBe('completed');
 
       // memory_query 事件带 request 同源身份（run / workspace 归一化后）
@@ -1015,11 +1078,7 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
 
   it('keeps Host-only delegation guidance out of the Driver task instruction', async () => {
     const driver = new CapturingDriver('succeeded');
-    const { facade } = createFacade(
-      driver,
-      new InMemoryBufferRepository(),
-      invokeDriverLlm(),
-    );
+    const { facade } = createFacade(driver, new InMemoryBufferRepository(), invokeDriverLlm());
 
     await facade.runAgent({
       ...request('task_clean_driver_instruction', 'proposer_a'),
@@ -1542,12 +1601,12 @@ function invokeDriverLlm(): ToolCallingClient {
 function mailboxConversationLlm(observedPrompts: string[]): ToolCallingClient {
   return {
     async completeWithTools(input) {
-      const userPrompt =
-        input.messages.find((message) => message.role === 'user')?.content ?? '';
+      const userPrompt = input.messages.find((message) => message.role === 'user')?.content ?? '';
       observedPrompts.push(userPrompt);
       const lastMessage = input.messages.at(-1);
       const inboundRequest = userPrompt.includes('- kind: request');
-      const inboundResponse = userPrompt.includes('Mailbox reply') || userPrompt.includes('- kind: notice');
+      const inboundResponse =
+        userPrompt.includes('Mailbox reply') || userPrompt.includes('- kind: notice');
       if (!userPrompt.includes('Inbound mailbox envelope:') && lastMessage?.role !== 'tool') {
         return {
           content: null,
@@ -1555,22 +1614,19 @@ function mailboxConversationLlm(observedPrompts: string[]): ToolCallingClient {
             {
               id: 'mailbox_request',
               type: 'function',
-                function: {
-                  name: 'mailbox_send',
-                  arguments: JSON.stringify({
-                    to_role_id: 'role_reviewer',
-                    kind: 'request',
-                    content: 'Please assess this plan.',
-                  }),
+              function: {
+                name: 'mailbox_send',
+                arguments: JSON.stringify({
+                  to_role_id: 'role_reviewer',
+                  kind: 'request',
+                  content: 'Please assess this plan.',
+                }),
               },
             },
           ],
         };
       }
-      if (
-        (inboundRequest || inboundResponse) &&
-        lastMessage?.role !== 'tool'
-      ) {
+      if ((inboundRequest || inboundResponse) && lastMessage?.role !== 'tool') {
         return driverToolCalls(`mailbox_driver_${String(observedPrompts.length)}`);
       }
       if (
@@ -1589,13 +1645,13 @@ function mailboxConversationLlm(observedPrompts: string[]): ToolCallingClient {
             {
               id: 'mailbox_reply',
               type: 'function',
-                function: {
-                  name: 'mailbox_send',
-                  arguments: JSON.stringify({
-                    to_role_id: 'role_sender',
-                    kind: 'notice',
-                    content: 'The plan is sound.',
-                  }),
+              function: {
+                name: 'mailbox_send',
+                arguments: JSON.stringify({
+                  to_role_id: 'role_sender',
+                  kind: 'notice',
+                  content: 'The plan is sound.',
+                }),
               },
             },
           ],

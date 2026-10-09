@@ -141,7 +141,12 @@ describe('llm-usage-ledger', () => {
           recorded_at: '2026-01-01T00:00:00.000Z',
           stage_cursor: 'execute_agent',
         },
-        { input_tokens: 2, output_tokens: 2, source: 'proxy', recorded_at: '2026-01-01T00:00:00.000Z' },
+        {
+          input_tokens: 2,
+          output_tokens: 2,
+          source: 'proxy',
+          recorded_at: '2026-01-01T00:00:00.000Z',
+        },
       ],
       'stage_cursor',
     );
