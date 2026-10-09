@@ -1,12 +1,7 @@
 import { DatabaseSync, type SQLInputValue, type StatementSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
-import {
-  SCHEMA_VERSION,
-  TASK_STATUSES,
-  type AgentMessageType,
-  type Event,
-} from '../core';
+import { SCHEMA_VERSION, TASK_STATUSES, type AgentMessageType, type Event } from '../core';
 import {
   type CoordinationStateCommit,
   type CoordinationStateStore,
@@ -19,6 +14,13 @@ import {
   parseTaskCursorInput,
   type TaskResumeCursor,
 } from './coordination-state-store';
+import type {
+  TokenUsageLedgerAggregate,
+  TokenUsageLedgerEntry,
+  TokenUsageLedgerQuery,
+  TokenUsageLedgerStore,
+} from './token-usage-ledger';
+import { migrateTokenUsageLedger, SqliteTokenUsageLedger } from './sqlite-token-usage-ledger';
 import type {
   MailboxStateStore,
   PersistedMailboxDelivery,
@@ -34,6 +36,12 @@ import type {
   ParticipantSessionBinding,
   ParticipantSessionPersistence,
 } from '../coordination/participant-session-registry';
+import type {
+  ProtocolDeliveryStore,
+  ProtocolDeliveryTransaction,
+  ProtocolInboxKey,
+} from './protocol-delivery-store';
+import { migrateProtocolDelivery, SqliteProtocolDelivery } from './sqlite-protocol-delivery';
 
 const RUN_STATUSES = [
   'created',
@@ -67,24 +75,29 @@ const MAILBOX_MESSAGE_TYPES = [
   'driver.requested',
   'driver.completed',
 ] as const satisfies readonly AgentMessageType[];
-const MAILBOX_DELIVERY_STATUSES = [
-  'pending',
-  'injected',
-  'acknowledged',
-  'failed',
-] as const;
+const MAILBOX_DELIVERY_STATUSES = ['pending', 'injected', 'acknowledged', 'failed'] as const;
 const MAILBOX_MESSAGE_KINDS = ['request', 'notice'] as const;
 
 type SqlRow = Record<string, unknown>;
 
 export class SqliteCoordinationStore
-  implements CoordinationStateStore, MailboxStateStore, ParticipantSessionPersistence
+  implements
+    CoordinationStateStore,
+    MailboxStateStore,
+    ParticipantSessionPersistence,
+    ProtocolDeliveryStore,
+    TokenUsageLedgerStore
 {
   private readonly database: DatabaseSync;
+  private readonly protocolDelivery: SqliteProtocolDelivery;
+  private protocolTransactionActive = false;
+  private readonly tokenUsageLedger: SqliteTokenUsageLedger;
 
   constructor(databasePath: string) {
     if (databasePath !== ':memory:') mkdirSync(path.dirname(databasePath), { recursive: true });
     this.database = new DatabaseSync(databasePath);
+    this.protocolDelivery = new SqliteProtocolDelivery(this.database);
+    this.tokenUsageLedger = new SqliteTokenUsageLedger(this.database);
     try {
       this.configure();
       this.migrate();
@@ -95,20 +108,160 @@ export class SqliteCoordinationStore
   }
 
   commitState(input: CoordinationStateCommit): PersistedCoordinationEvent[] {
-    validateCommit(input);
+    return this.withProtocolTransaction((transaction) => transaction.commitState(input));
+  }
+
+  withProtocolTransaction<T>(operation: (transaction: ProtocolDeliveryTransaction) => T): T {
+    if (this.protocolTransactionActive) {
+      throw new Error('Use the provided protocol transaction for nested writes');
+    }
     this.database.exec('BEGIN IMMEDIATE');
+    this.protocolTransactionActive = true;
+    let open = true;
+    const ensureOpen = (): void => {
+      if (!open) throw new Error('Protocol transaction is no longer active');
+    };
     try {
-      this.writeTask(input);
-      if (input.run) this.writeRun(input.run);
-      this.writeRuntimeState(input.runtime_state);
-      if (input.checkpoint) this.writeCheckpoint(input.checkpoint);
-      const events = input.events.map((event) => this.writeEvent(event));
+      const transaction: ProtocolDeliveryTransaction = {
+        commitState: (input) => {
+          ensureOpen();
+          return this.writeCoordinationState(input);
+        },
+        enqueueOutbox: (input) => {
+          ensureOpen();
+          return this.protocolDelivery.enqueueOutbox(input);
+        },
+        receiveInbox: (input) => {
+          ensureOpen();
+          return this.protocolDelivery.receiveInbox(input);
+        },
+        completeInbox: (input) => {
+          ensureOpen();
+          return this.protocolDelivery.completeInbox(input);
+        },
+        appendCall: (input) => {
+          ensureOpen();
+          return this.protocolDelivery.appendCall(input);
+        },
+      };
+      const result = operation(transaction);
+      if (result !== null && typeof result === 'object' && 'then' in result) {
+        throw new Error('Protocol transaction callback must be synchronous');
+      }
       this.database.exec('COMMIT');
-      return events;
+      return result;
     } catch (error) {
       this.database.exec('ROLLBACK');
       throw error;
+    } finally {
+      open = false;
+      this.protocolTransactionActive = false;
     }
+  }
+
+  private writeCoordinationState(input: CoordinationStateCommit): PersistedCoordinationEvent[] {
+    validateCommit(input);
+    this.writeTask(input);
+    if (input.run) this.writeRun(input.run);
+    this.writeRuntimeState(input.runtime_state);
+    if (input.checkpoint) this.writeCheckpoint(input.checkpoint);
+    return input.events.map((event) => this.writeEvent(event));
+  }
+
+  getOutbox(id: string) {
+    return this.protocolDelivery.getOutbox(id);
+  }
+  getInbox(key: ProtocolInboxKey) {
+    return this.protocolDelivery.getInbox(key);
+  }
+  listJournal(taskId: string, runId: string, afterSeq?: number) {
+    return this.protocolDelivery.listJournal(taskId, runId, afterSeq);
+  }
+  listRecoverableOutbox(now: string) {
+    return this.protocolDelivery.listRecoverableOutbox(now);
+  }
+  listRecoverableInbox(now: string) {
+    return this.protocolDelivery.listRecoverableInbox(now);
+  }
+  activateOutbox(id: string, expectedRevision: number, at: string) {
+    return this.withProtocolTransaction(() =>
+      this.protocolDelivery.activateOutbox(id, expectedRevision, at),
+    );
+  }
+  claimOutbox(
+    id: string,
+    owner: string,
+    now: string,
+    leaseExpiresAt: string,
+    expectedRevision: number,
+  ) {
+    return this.withProtocolTransaction(() =>
+      this.protocolDelivery.claimOutbox(id, owner, now, leaseExpiresAt, expectedRevision),
+    );
+  }
+  renewOutboxLease(
+    id: string,
+    owner: string,
+    expectedRevision: number,
+    now: string,
+    leaseExpiresAt: string,
+  ) {
+    return this.withProtocolTransaction(() =>
+      this.protocolDelivery.renewOutboxLease(id, owner, expectedRevision, now, leaseExpiresAt),
+    );
+  }
+  markOutboxSent(id: string, owner: string, expectedRevision: number, at: string) {
+    return this.withProtocolTransaction(() =>
+      this.protocolDelivery.markOutboxSent(id, owner, expectedRevision, at),
+    );
+  }
+  retryOutbox(
+    id: string,
+    owner: string,
+    expectedRevision: number,
+    now: string,
+    nextAttemptAt: string,
+  ) {
+    return this.withProtocolTransaction(() =>
+      this.protocolDelivery.retryOutbox(id, owner, expectedRevision, now, nextAttemptAt),
+    );
+  }
+  failOutbox(id: string, owner: string, expectedRevision: number, at: string) {
+    return this.withProtocolTransaction(() =>
+      this.protocolDelivery.failOutbox(id, owner, expectedRevision, at),
+    );
+  }
+  claimInbox(
+    key: ProtocolInboxKey,
+    owner: string,
+    now: string,
+    leaseExpiresAt: string,
+    expectedRevision: number,
+  ) {
+    return this.withProtocolTransaction(() =>
+      this.protocolDelivery.claimInbox(key, owner, now, leaseExpiresAt, expectedRevision),
+    );
+  }
+  renewInboxLease(
+    key: ProtocolInboxKey,
+    owner: string,
+    expectedRevision: number,
+    now: string,
+    leaseExpiresAt: string,
+  ) {
+    return this.withProtocolTransaction(() =>
+      this.protocolDelivery.renewInboxLease(key, owner, expectedRevision, now, leaseExpiresAt),
+    );
+  }
+  archiveSettled(before: string, limit?: number) {
+    return this.protocolDelivery.archiveSettled(before, limit);
+  }
+
+  appendTokenUsage(entries: readonly TokenUsageLedgerEntry[]): void {
+    this.tokenUsageLedger.appendTokenUsage(entries);
+  }
+  aggregateTokenUsage(query: TokenUsageLedgerQuery, asOf: string): TokenUsageLedgerAggregate {
+    return this.tokenUsageLedger.aggregateTokenUsage(query, asOf);
   }
 
   getTaskAggregate(taskId: string): PersistedTaskAggregate | undefined {
@@ -143,6 +296,28 @@ export class SqliteCoordinationStore
       .prepare('SELECT * FROM events WHERE task_id = ? AND sequence > ? ORDER BY sequence ASC')
       .all(taskId, afterSequence)
       .map((row) => readEvent(row));
+  }
+
+  /**
+   * 按 run 统计事件条数与分布，供埋点对账使用。
+   *
+   * 只读，且刻意不解析 payload：对账只需要条数，把整份事件流读出来反序列化一遍纯属浪费。
+   * 走 `events(run_id, sequence)` 索引，不需要新的 schema。
+   */
+  countEvents(runId: string): { total: number; by_type: Record<string, number> } {
+    const rows = this.database
+      .prepare(
+        'SELECT event_type, COUNT(*) AS count FROM events WHERE run_id = ? GROUP BY event_type',
+      )
+      .all(runId);
+    const byType: Record<string, number> = {};
+    let total = 0;
+    for (const row of rows) {
+      const count = readNumber(row, 'count');
+      byType[readString(row, 'event_type')] = count;
+      total += count;
+    }
+    return { total, by_type: byType };
   }
 
   getLatestCheckpoint(taskId: string): PersistedFullCheckpoint | undefined {
@@ -326,7 +501,10 @@ export class SqliteCoordinationStore
 
   recordMailboxDeliveryAttempt(
     deliveryId: string,
-    input: { attempted_at: string; error?: { code: string; message: string; details?: Record<string, unknown> } },
+    input: {
+      attempted_at: string;
+      error?: { code: string; message: string; details?: Record<string, unknown> };
+    },
   ): PersistedMailboxDelivery {
     const result = this.database
       .prepare(
@@ -372,11 +550,13 @@ export class SqliteCoordinationStore
       .map((row) => readMailboxMessage(row));
   }
 
-  listReplayableMailboxDeliveries(scope: {
-    task_id?: string;
-    workspace_path?: string;
-    recipient_role_id?: string;
-  } = {}): PersistedMailboxEnvelope[] {
+  listReplayableMailboxDeliveries(
+    scope: {
+      task_id?: string;
+      workspace_path?: string;
+      recipient_role_id?: string;
+    } = {},
+  ): PersistedMailboxEnvelope[] {
     // Rows migrated from the pre-scoped mailbox remain audit history only.
     // Never guess a Task/workspace and redeliver them.
     const clauses = ["status = 'pending'", "NOT (task_id = 'legacy' AND workspace_path = '.')"];
@@ -479,14 +659,7 @@ export class SqliteCoordinationStore
           session_id = excluded.session_id,
           updated_at = excluded.updated_at`,
       )
-      .run(
-        input.task_id,
-        input.workspace_path,
-        input.role_id,
-        input.session_id,
-        now,
-        now,
-      );
+      .run(input.task_id, input.workspace_path, input.role_id, input.session_id, now, now);
   }
 
   findParticipantSession(
@@ -512,10 +685,7 @@ export class SqliteCoordinationStore
       .run(taskId, workspacePath, roleId);
   }
 
-  listParticipantSessions(
-    taskId: string,
-    workspacePath: string,
-  ): ParticipantSessionBinding[] {
+  listParticipantSessions(taskId: string, workspacePath: string): ParticipantSessionBinding[] {
     return this.database
       .prepare(
         `SELECT task_id, workspace_path, role_id, session_id
@@ -718,6 +888,20 @@ export class SqliteCoordinationStore
       this.database
         .prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)')
         .run(3, new Date().toISOString());
+      migrateProtocolDelivery(this.database);
+      this.database
+        .prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)')
+        .run(4, new Date().toISOString());
+      // version 5: journal 补 session_id / duration_ms 两列（守卫在 migrateProtocolDelivery
+      // 内的 ensureJournalCallColumns，对旧库 ALTER TABLE 补列）
+      this.database
+        .prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)')
+        .run(5, new Date().toISOString());
+      // version 6: 用量账本表。只追加，且刻意不挂 tasks/runs 外键——累计用量必须活过任务清理。
+      migrateTokenUsageLedger(this.database);
+      this.database
+        .prepare('INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)')
+        .run(6, new Date().toISOString());
       this.database.exec('COMMIT');
     } catch (error) {
       this.database.exec('ROLLBACK');
@@ -1220,13 +1404,9 @@ function readCheckpoint(row: SqlRow): PersistedFullCheckpoint {
       RESUME_CURSORS,
     ),
     ...(cursorInput ? { cursor_input: cursorInput } : {}),
-    ...(runtime.participant_sessions
-      ? { participant_sessions: runtime.participant_sessions }
-      : {}),
+    ...(runtime.participant_sessions ? { participant_sessions: runtime.participant_sessions } : {}),
     ...(runtime.mailbox_state ? { mailbox_state: runtime.mailbox_state } : {}),
-    ...(runtime.council_state_ref
-      ? { council_state_ref: runtime.council_state_ref }
-      : {}),
+    ...(runtime.council_state_ref ? { council_state_ref: runtime.council_state_ref } : {}),
     message_thread: runtime.message_thread,
     mechanical_snapshot: readJson<PersistedFullCheckpoint['mechanical_snapshot']>(
       row,
@@ -1248,9 +1428,10 @@ function readMailboxMessage(row: SqlRow): PersistedMailboxMessage {
   const payload = readJson<Record<string, unknown>>(row, 'payload_json');
   const type = readEnum(row, 'type', MAILBOX_MESSAGE_TYPES);
   const rawKind = readOptionalString(row, 'kind');
-  const kind = rawKind && MAILBOX_MESSAGE_KINDS.includes(rawKind as MailboxMessageKind)
-    ? (rawKind as MailboxMessageKind)
-    : undefined;
+  const kind =
+    rawKind && MAILBOX_MESSAGE_KINDS.includes(rawKind as MailboxMessageKind)
+      ? (rawKind as MailboxMessageKind)
+      : undefined;
   const content = readOptionalString(row, 'content');
   return {
     message_id: readString(row, 'message_id'),
@@ -1429,9 +1610,11 @@ function migrateMailboxTables(database: DatabaseSync): void {
   const messageColumns = tableColumns(database, 'messages');
   const deliveryColumns = tableColumns(database, 'deliveries');
   const deliverySql = String(
-    (database
-      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'deliveries'")
-      .get() as SqlRow | undefined)?.sql ?? '',
+    (
+      database
+        .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'deliveries'")
+        .get() as SqlRow | undefined
+    )?.sql ?? '',
   );
   const current =
     messageColumns.has('task_id') &&

@@ -23,12 +23,7 @@ describe('collectClaudeSessionUsage', () => {
     const sandboxHome = await mkdtemp(path.join(os.tmpdir(), 'claude-sandbox-home-'));
     tempDirs.push(sandboxHome);
     const sessionId = 'session-sandbox-usage';
-    const projectDir = path.join(
-      sandboxHome,
-      '.claude',
-      'projects',
-      '-eval-council-primary',
-    );
+    const projectDir = path.join(sandboxHome, '.claude', 'projects', '-eval-council-primary');
     await mkdir(projectDir, { recursive: true });
     await writeFile(
       path.join(projectDir, `${sessionId}.jsonl`),
@@ -64,6 +59,216 @@ describe('collectClaudeSessionUsage', () => {
       call_count: 1,
       session_id: sessionId,
     });
+  });
+
+  it('reports per-session billed detail in by_session', async () => {
+    const sandboxHome = await mkdtemp(path.join(os.tmpdir(), 'claude-sandbox-home-'));
+    tempDirs.push(sandboxHome);
+    const projectDir = path.join(sandboxHome, '.claude', 'projects', '-eval-by-session');
+    await mkdir(projectDir, { recursive: true });
+    const sessionLine = (
+      sessionId: string,
+      input: number,
+      output: number,
+      cacheRead: number,
+    ): string =>
+      JSON.stringify({
+        type: 'assistant',
+        sessionId,
+        message: {
+          id: `msg_${sessionId}`,
+          usage: {
+            input_tokens: input,
+            output_tokens: output,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: cacheRead,
+          },
+        },
+      });
+    await writeFile(
+      path.join(projectDir, 'session-one.jsonl'),
+      `${sessionLine('session-one', 100, 10, 50)}\n`,
+      'utf8',
+    );
+    await writeFile(
+      path.join(projectDir, 'session-two.jsonl'),
+      `${sessionLine('session-two', 200, 20, 80)}\n`,
+      'utf8',
+    );
+
+    process.env.ACP_PROCESS_SANDBOX_HOME = sandboxHome;
+    process.env.HOME = path.join(sandboxHome, 'missing-user-home');
+    delete process.env.USERPROFILE;
+
+    const result = await collectClaudeSessionUsage({
+      sessionIds: ['session-one', 'session-two'],
+      worktreePath: '/tmp/does-not-match-project-encoding/repo',
+    });
+
+    // by_session 是「每个会话实际烧了多少」的细分，与总量同源同规（含 cache 口径）。
+    expect(result.by_session).toEqual({
+      'session-one': {
+        session_id: 'session-one',
+        input_tokens: 100,
+        output_tokens: 10,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 50,
+        total_input_tokens: 150,
+        total_tokens: 160,
+        call_count: 1,
+      },
+      'session-two': {
+        session_id: 'session-two',
+        input_tokens: 200,
+        output_tokens: 20,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 80,
+        total_input_tokens: 280,
+        total_tokens: 300,
+        call_count: 1,
+      },
+    });
+    expect(result.total_tokens).toBe(460);
+    expect(result.call_count).toBe(2);
+  });
+
+  it('counts an assistant message once when Claude Code writes the same message twice', async () => {
+    const sandboxHome = await mkdtemp(path.join(os.tmpdir(), 'claude-sandbox-home-'));
+    tempDirs.push(sandboxHome);
+    const sessionId = 'session-dedup';
+    const projectDir = path.join(sandboxHome, '.claude', 'projects', '-eval-dedup-primary');
+    await mkdir(projectDir, { recursive: true });
+    // 实测形状：同一轮 assistant 消息写两行，message.id 相同、uuid 不同、usage 一模一样。
+    const line = (uuid: string): string =>
+      JSON.stringify({
+        type: 'assistant',
+        uuid,
+        sessionId,
+        message: {
+          id: 'msg_shared',
+          usage: {
+            input_tokens: 100,
+            output_tokens: 5,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 20,
+          },
+        },
+      });
+    await writeFile(
+      path.join(projectDir, `${sessionId}.jsonl`),
+      `${line('uuid-a')}\n${line('uuid-b')}\n`,
+      'utf8',
+    );
+
+    process.env.ACP_PROCESS_SANDBOX_HOME = sandboxHome;
+    process.env.HOME = path.join(sandboxHome, 'missing-user-home');
+    delete process.env.USERPROFILE;
+
+    await expect(
+      collectClaudeSessionUsage({
+        sessionId,
+        worktreePath: '/tmp/does-not-match-project-encoding/repo',
+      }),
+    ).resolves.toMatchObject({
+      source: 'claude_session_jsonl',
+      input_tokens: 100,
+      cache_read_input_tokens: 20,
+      total_tokens: 125,
+      call_count: 1,
+    });
+  });
+
+  it('still counts two different assistant messages separately', async () => {
+    const sandboxHome = await mkdtemp(path.join(os.tmpdir(), 'claude-sandbox-home-'));
+    tempDirs.push(sandboxHome);
+    const sessionId = 'session-distinct';
+    const projectDir = path.join(sandboxHome, '.claude', 'projects', '-eval-distinct-primary');
+    await mkdir(projectDir, { recursive: true });
+    const line = (id: string, input: number): string =>
+      JSON.stringify({
+        type: 'assistant',
+        uuid: `uuid-${id}`,
+        sessionId,
+        message: {
+          id,
+          usage: {
+            input_tokens: input,
+            output_tokens: 1,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+          },
+        },
+      });
+    await writeFile(
+      path.join(projectDir, `${sessionId}.jsonl`),
+      `${line('msg_a', 10)}\n${line('msg_b', 20)}\n`,
+      'utf8',
+    );
+
+    process.env.ACP_PROCESS_SANDBOX_HOME = sandboxHome;
+    process.env.HOME = path.join(sandboxHome, 'missing-user-home');
+    delete process.env.USERPROFILE;
+
+    await expect(
+      collectClaudeSessionUsage({
+        sessionId,
+        worktreePath: '/tmp/does-not-match-project-encoding/repo',
+      }),
+    ).resolves.toMatchObject({
+      input_tokens: 30,
+      output_tokens: 2,
+      total_tokens: 32,
+      call_count: 2,
+    });
+  });
+
+  it('sums every driver session when the run had several', async () => {
+    const sandboxHome = await mkdtemp(path.join(os.tmpdir(), 'claude-sandbox-home-'));
+    tempDirs.push(sandboxHome);
+    const writeSession = async (sessionId: string, projectName: string, input: number) => {
+      const projectDir = path.join(sandboxHome, '.claude', 'projects', projectName);
+      await mkdir(projectDir, { recursive: true });
+      await writeFile(
+        path.join(projectDir, `${sessionId}.jsonl`),
+        `${JSON.stringify({
+          type: 'assistant',
+          uuid: `uuid-${sessionId}`,
+          sessionId,
+          message: {
+            id: `msg_${sessionId}`,
+            usage: {
+              input_tokens: input,
+              output_tokens: 1,
+              cache_creation_input_tokens: 0,
+              cache_read_input_tokens: 0,
+            },
+          },
+        })}\n`,
+        'utf8',
+      );
+    };
+    // council 的形态：每个角色一个 project 目录、一个 session。
+    await writeSession('session-primary', '-eval-council-primary', 100);
+    await writeSession('session-reviewer', '-eval-council-review', 200);
+
+    process.env.ACP_PROCESS_SANDBOX_HOME = sandboxHome;
+    process.env.HOME = path.join(sandboxHome, 'missing-user-home');
+    delete process.env.USERPROFILE;
+
+    const result = await collectClaudeSessionUsage({
+      sessionIds: ['session-primary', 'session-reviewer'],
+      worktreePath: '/tmp/does-not-match-project-encoding/repo',
+    });
+
+    expect(result).toMatchObject({
+      input_tokens: 300,
+      output_tokens: 2,
+      total_tokens: 302,
+      call_count: 2,
+    });
+    // 多会话时没有单一取值，不能随便挑一个冒充「这个 run 的 session」。
+    expect(result.session_id).toBeUndefined();
+    expect(result.session_path).toBeUndefined();
   });
 });
 

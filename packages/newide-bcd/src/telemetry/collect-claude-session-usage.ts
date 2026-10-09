@@ -8,6 +8,7 @@ import {
   emptyTokenUsageSummary,
   type LlmUsageEntry,
   type RunTokenUsageSummary,
+  type SessionBilledUsage,
   toRunTokenUsageSummary,
 } from './llm-usage-ledger';
 
@@ -23,15 +24,27 @@ async function sumUsageFromClaudeJsonl(
   expectedSessionId?: string,
 ): Promise<{ entries: LlmUsageEntry[]; session_id?: string }> {
   const text = await fs.readFile(filePath, 'utf-8');
-  const entries: LlmUsageEntry[] = [];
+  /**
+   * 按 assistant 消息去重。
+   *
+   * Claude Code 会把同一条 assistant 消息写成多行（实测两行：同一个 `message.id`、
+   * 不同 `uuid`、usage 数值完全相同），逐行累加会把这一轮 token 数两遍。实测一次
+   * 真实 run 的 primary session：逐行求和 input=47152，按 messageId 去重后 23576，
+   * 而 ACP 响应自己报的是 23576——正好两倍。
+   *
+   * 键用 `message.id`（同一条 API 消息的唯一标识，`uuid` 在两行里是不同的，去不了重）。
+   * 同键后写覆盖先写，保留首次出现的位置，所以顺序仍按时间。
+   */
+  const byMessageId = new Map<string, LlmUsageEntry>();
   let matchedSessionId = expectedSessionId;
 
   for (const line of text.split(/\r?\n/)) {
     if (!line.trim()) continue;
     let obj: {
       type?: string;
+      uuid?: string;
       sessionId?: string;
-      message?: { usage?: Record<string, unknown> };
+      message?: { id?: string; usage?: Record<string, unknown> };
       usage?: Record<string, unknown>;
     };
     try {
@@ -52,7 +65,15 @@ async function sumUsageFromClaudeJsonl(
     if (![nextInput, nextOutput, nextCacheCreation, nextCacheRead].every(Number.isFinite)) {
       continue;
     }
-    entries.push({
+
+    const messageId = obj.message?.id;
+    // 没有 message.id 的记录（顶层 usage 那种形状）用行 uuid 兜底；两样都没有就按
+    // 行号各自成键，宁可不去重也不能把两轮不同的调用合成一轮。
+    const key =
+      typeof messageId === 'string' && messageId.length > 0
+        ? `message:${messageId}`
+        : `line:${obj.uuid ?? byMessageId.size}`;
+    byMessageId.set(key, {
       input_tokens: nextInput,
       output_tokens: nextOutput,
       cache_creation_input_tokens: nextCacheCreation,
@@ -64,7 +85,7 @@ async function sumUsageFromClaudeJsonl(
   }
 
   return {
-    entries,
+    entries: [...byMessageId.values()],
     ...(matchedSessionId ? { session_id: matchedSessionId } : {}),
   };
 }
@@ -100,73 +121,159 @@ async function findSessionJsonl(claudeRoot: string, sessionId: string): Promise<
 
 export async function collectClaudeSessionUsage(input: {
   sessionId?: string;
+  /**
+   * 一个 run 可能跑过多个 driver 会话——council 每个角色一个，summary 里只留得下
+   * 一个 `session_id`。只刮那一个会漏掉其余角色的全部用量，所以调用方要把
+   * `driver_context_usage.sessions` 里的 id 都传进来。
+   */
+  sessionIds?: readonly string[];
   worktreePath: string;
 }): Promise<RunTokenUsageSummary> {
   const homes = claudeHomeCandidates();
   const claudeRoots = homes
     .map((home) => resolveClaudeRoot(home))
-    .filter((claudeRoot, index, all) => existsSync(claudeRoot) && all.indexOf(claudeRoot) === index);
+    .filter(
+      (claudeRoot, index, all) => existsSync(claudeRoot) && all.indexOf(claudeRoot) === index,
+    );
   if (claudeRoots.length === 0) {
-    return emptyTokenUsageSummary({
-      ...(input.sessionId ? { session_id: input.sessionId } : {}),
-    });
+    return emptyTokenUsageSummary(withKnownSessionId(input));
   }
 
+  const sessionIds = distinctSessionIds([...(input.sessionIds ?? []), input.sessionId]);
   const projectDirs = claudeRoots.flatMap((claudeRoot) =>
     encodeClaudeProjectDirCandidates(input.worktreePath).map((encoded) =>
       path.join(claudeRoot, 'projects', encoded),
     ),
   );
+
   const candidates: string[] = [];
-  if (input.sessionId) {
+  if (sessionIds.length > 0) {
     for (const claudeRoot of claudeRoots) {
-      candidates.push(...(await findSessionJsonl(claudeRoot, input.sessionId)));
-      candidates.push(path.join(claudeRoot, 'sessions', `${input.sessionId}.json`));
+      for (const sessionId of sessionIds) {
+        candidates.push(...(await findSessionJsonl(claudeRoot, sessionId)));
+        candidates.push(path.join(claudeRoot, 'sessions', `${sessionId}.json`));
+      }
     }
     for (const projectDir of projectDirs) {
-      candidates.push(path.join(projectDir, `${input.sessionId}.jsonl`));
-    }
-  }
-
-  for (const projectDir of projectDirs) {
-    if (!existsSync(projectDir)) continue;
-    try {
-      const files = (await fs.readdir(projectDir))
-        .filter((name) => name.endsWith('.jsonl'))
-        .map((name) => path.join(projectDir, name));
-      const ranked = await Promise.all(
-        files.map(async (filePath) => ({
-          filePath,
-          mtimeMs: (await fs.stat(filePath)).mtimeMs,
-        })),
-      );
-      ranked.sort((a, b) => b.mtimeMs - a.mtimeMs);
-      for (const entry of ranked.slice(0, 3)) {
-        if (!candidates.includes(entry.filePath)) candidates.push(entry.filePath);
+      for (const sessionId of sessionIds) {
+        candidates.push(path.join(projectDir, `${sessionId}.jsonl`));
       }
-    } catch {
-      // ignore listing failures
+    }
+  } else {
+    // 没有明确的 session id 时，退回「工作目录对应的 project 目录里最近的三份」。
+    // 只在没有 id 时用：有 id 还扫目录会把同目录下别的会话也算进来。
+    for (const projectDir of projectDirs) {
+      if (!existsSync(projectDir)) continue;
+      try {
+        const files = (await fs.readdir(projectDir))
+          .filter((name) => name.endsWith('.jsonl'))
+          .map((name) => path.join(projectDir, name));
+        const ranked = await Promise.all(
+          files.map(async (filePath) => ({
+            filePath,
+            mtimeMs: (await fs.stat(filePath)).mtimeMs,
+          })),
+        );
+        ranked.sort((a, b) => b.mtimeMs - a.mtimeMs);
+        for (const entry of ranked.slice(0, 3)) candidates.push(entry.filePath);
+      } catch {
+        // ignore listing failures
+      }
     }
   }
 
+  // 同一份文件可能被多条候选路径指到（按 id 全盘找一次、再按工作目录拼一次），
+  // 必须按绝对路径去重，否则同一个会话会被数两遍。
+  const seenPaths = new Set<string>();
+  const entries: LlmUsageEntry[] = [];
+  const contributingPaths: string[] = [];
+  const contributingSessionIds = new Set<string>();
+  // 逐会话计费细分：一个文件一个会话，按会话累计，供 summary 的
+  // driver_billed_usage 把「每个角色实际烧了多少」与 context 占用并排展示。
+  const bySession = new Map<string, SessionBilledUsage>();
   for (const candidate of candidates) {
-    if (!existsSync(candidate) || !candidate.endsWith('.jsonl')) continue;
+    const resolved = path.resolve(candidate);
+    if (seenPaths.has(resolved) || !candidate.endsWith('.jsonl')) continue;
+    seenPaths.add(resolved);
+    if (!existsSync(candidate)) continue;
+    const baseName = path.basename(candidate, '.jsonl');
     try {
-      const usage = await sumUsageFromClaudeJsonl(candidate, input.sessionId);
-      if (usage.entries.length > 0) {
-        return toRunTokenUsageSummary(usage.entries, {
-          session_path: candidate,
-          ...(usage.session_id ? { session_id: usage.session_id } : {}),
-        });
-      }
+      const usage = await sumUsageFromClaudeJsonl(
+        candidate,
+        sessionIds.includes(baseName) ? baseName : undefined,
+      );
+      if (usage.entries.length === 0) continue;
+      entries.push(...usage.entries);
+      contributingPaths.push(candidate);
+      const sessionId = usage.session_id ?? baseName;
+      contributingSessionIds.add(sessionId);
+      bySession.set(
+        sessionId,
+        addSessionBilledUsage(bySession.get(sessionId), sessionId, usage.entries),
+      );
     } catch {
       // try next candidate
     }
   }
 
-  return emptyTokenUsageSummary({
-    ...(input.sessionId ? { session_id: input.sessionId } : {}),
-  });
+  if (entries.length === 0) return emptyTokenUsageSummary(withKnownSessionId(input));
+  return {
+    ...toRunTokenUsageSummary(entries, {
+      // 多会话时这两个字段没有单一取值，留空而不是随便挑一个，免得被当成「这个 run
+      // 的 session」读。
+      ...(contributingPaths.length === 1 ? { session_path: contributingPaths[0]! } : {}),
+      ...(contributingSessionIds.size === 1 ? { session_id: [...contributingSessionIds][0]! } : {}),
+    }),
+    ...(bySession.size > 0
+      ? {
+          by_session: Object.fromEntries(
+            [...bySession.entries()].sort(([left], [right]) => left.localeCompare(right)),
+          ),
+        }
+      : {}),
+  };
+}
+
+/** 把一个会话的一批（已按 messageId 去重的）计费记录累进该会话的细分。 */
+function addSessionBilledUsage(
+  previous: SessionBilledUsage | undefined,
+  sessionId: string,
+  entries: readonly LlmUsageEntry[],
+): SessionBilledUsage {
+  const next: SessionBilledUsage = previous ?? {
+    session_id: sessionId,
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: 0,
+    total_input_tokens: 0,
+    total_tokens: 0,
+    call_count: 0,
+  };
+  for (const entry of entries) {
+    next.input_tokens += entry.input_tokens;
+    next.output_tokens += entry.output_tokens;
+    next.cache_creation_input_tokens += entry.cache_creation_input_tokens ?? 0;
+    next.cache_read_input_tokens += entry.cache_read_input_tokens ?? 0;
+    next.call_count += 1;
+  }
+  next.total_input_tokens =
+    next.input_tokens + next.cache_creation_input_tokens + next.cache_read_input_tokens;
+  next.total_tokens = next.total_input_tokens + next.output_tokens;
+  return next;
+}
+
+function distinctSessionIds(candidates: readonly (string | undefined)[]): string[] {
+  const ids: string[] = [];
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string' || candidate.length === 0) continue;
+    if (!ids.includes(candidate)) ids.push(candidate);
+  }
+  return ids;
+}
+
+function withKnownSessionId(input: { sessionId?: string }): { session_id?: string } {
+  return input.sessionId ? { session_id: input.sessionId } : {};
 }
 
 export function mergeTokenUsageSummaries(
@@ -181,7 +288,10 @@ export function mergeTokenUsageSummaries(
   const by_source: RunTokenUsageSummary['by_source'] = {};
   for (const part of usable) {
     for (const source of part.sources.length > 0 ? part.sources : [part.source]) {
-      if (source !== 'proxy' && source !== 'claude_session_jsonl') continue;
+      // 只挡掉汇总态自己的合成标签（`unavailable` / `mixed`），**不再白名单具体腿名**：
+      // driver 计费腿的名字由 driver 档案声明，白名单会让新 driver 的那条腿在合并时
+      // 被静默丢掉——那正是「口径被写坏」的形态。
+      if (source === 'unavailable' || source === 'mixed' || source.length === 0) continue;
       const slice = part.by_source[source] ?? {
         input_tokens: part.input_tokens,
         output_tokens: part.output_tokens,
@@ -207,10 +317,9 @@ export function mergeTokenUsageSummaries(
     }
   }
 
-  const sources = (Object.keys(by_source) as Array<keyof typeof by_source>).filter(
-    (key): key is 'proxy' | 'claude_session_jsonl' => by_source[key] !== undefined,
-  );
-  sources.sort();
+  const sources = Object.keys(by_source)
+    .filter((key) => by_source[key] !== undefined)
+    .sort();
   const input_tokens = sources.reduce((sum, key) => sum + (by_source[key]?.input_tokens ?? 0), 0);
   const output_tokens = sources.reduce((sum, key) => sum + (by_source[key]?.output_tokens ?? 0), 0);
   const cache_creation_input_tokens = sources.reduce(
@@ -225,6 +334,31 @@ export function mergeTokenUsageSummaries(
   const session = usable.find((part) => part.session_id);
   const sessionPath = usable.find((part) => part.session_path);
 
+  // 逐会话细分同样求和合并；同会话出现在多份里时按字段累加（与 by_source 同规）。
+  const bySession = new Map<string, SessionBilledUsage>();
+  for (const part of usable) {
+    for (const [sessionId, sessionUsage] of Object.entries(part.by_session ?? {})) {
+      const prev = bySession.get(sessionId);
+      bySession.set(
+        sessionId,
+        prev
+          ? {
+              session_id: sessionId,
+              input_tokens: prev.input_tokens + sessionUsage.input_tokens,
+              output_tokens: prev.output_tokens + sessionUsage.output_tokens,
+              cache_creation_input_tokens:
+                prev.cache_creation_input_tokens + sessionUsage.cache_creation_input_tokens,
+              cache_read_input_tokens:
+                prev.cache_read_input_tokens + sessionUsage.cache_read_input_tokens,
+              total_input_tokens: prev.total_input_tokens + sessionUsage.total_input_tokens,
+              total_tokens: prev.total_tokens + sessionUsage.total_tokens,
+              call_count: prev.call_count + sessionUsage.call_count,
+            }
+          : { ...sessionUsage },
+      );
+    }
+  }
+
   return {
     schema_version: 'newide.token_usage.v1',
     source: sources.length === 1 ? (sources[0] ?? 'unavailable') : 'mixed',
@@ -237,6 +371,13 @@ export function mergeTokenUsageSummaries(
     call_count: usable.reduce((sum, part) => sum + part.call_count, 0),
     sources,
     by_source,
+    ...(bySession.size > 0
+      ? {
+          by_session: Object.fromEntries(
+            [...bySession.entries()].sort(([left], [right]) => left.localeCompare(right)),
+          ),
+        }
+      : {}),
     ...(session?.session_id ? { session_id: session.session_id } : {}),
     ...(sessionPath?.session_path ? { session_path: sessionPath.session_path } : {}),
   };

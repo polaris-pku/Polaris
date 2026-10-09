@@ -2,6 +2,9 @@
 // 运行中定时轮询（无需重启即可发现新版），检测到后由渲染层弹窗，用户自行决定是否下载。
 const { app, ipcMain, shell } = require('electron');
 const { autoUpdater } = require('electron-updater');
+const fs = require('node:fs');
+const path = require('node:path');
+const { MANIFEST_NAME } = require('./portableFiles.cjs');
 
 // macOS 未签名构建无法用 Squirrel 自动安装更新，改为引导用户到 Releases 页手动下载 dmg。
 // 该页始终指向最新发布，无需拼版本号。
@@ -11,19 +14,21 @@ const RELEASES_LATEST_URL = 'https://github.com/ExtraZhangYC/Polaris/releases/la
 const CHECK_INTERVAL = 10 * 60 * 1000;
 
 function setupAutoUpdater(getWindow) {
-  // preload 在开发态也会挂载更新 API；handler 必须始终存在，否则渲染层首次
+  const canAutoUpdate =
+    app.isPackaged && !fs.existsSync(path.join(path.dirname(process.execPath), MANIFEST_NAME));
+  // preload 在开发态也会挂载更新 API；handler 必须先注册，否则渲染层首次
   // getState 会触发 "No handler registered" 并污染主进程错误通道。
   let lastState = null;
   ipcMain.handle('update:getState', () => lastState);
   ipcMain.handle('update:download', () => {
-    if (!app.isPackaged) return;
+    if (!canAutoUpdate) return;
     return autoUpdater.downloadUpdate().catch(() => {});
   });
   ipcMain.handle('update:restart', () => {
-    if (app.isPackaged) autoUpdater.quitAndInstall();
+    if (canAutoUpdate) autoUpdater.quitAndInstall();
   });
   ipcMain.handle('update:check', () => {
-    if (!app.isPackaged) return;
+    if (!canAutoUpdate) return;
     return autoUpdater.checkForUpdates().catch(() => {});
   });
   ipcMain.handle('update:openDownload', () => {
@@ -31,8 +36,8 @@ function setupAutoUpdater(getWindow) {
     return shell.openExternal(RELEASES_LATEST_URL);
   });
 
-  // 仅在打包后的应用启用（dev 下没有更新元数据，会直接报错）
-  if (!app.isPackaged) return;
+  // 目录式免安装版由本地发布流程更新，不启动面向安装版的更新器。
+  if (!canAutoUpdate) return;
 
   // 关键：不自动下载，交由用户在弹窗里决定
   autoUpdater.autoDownload = false;

@@ -37,6 +37,7 @@ export interface TaskSnapshot {
     spec: string;
     completion_criteria: string[];
     affected_paths: string[];
+    workspace_path?: string;
     budget?: {
       max_tokens?: number;
       max_wall_clock_seconds?: number;
@@ -61,6 +62,9 @@ export interface TaskSnapshot {
     decision_id?: string;
     verdict?: 'select' | 'needs_human' | 'request_revision' | 'reject';
     result?: {
+      /** 与 CouncilOutcome 同名字段同义（见 ./council）。 */
+      role_failure_count?: number;
+      fallback_used?: boolean;
       quality: 'verified' | 'best_effort';
       final_artifact_ref: string;
       final_artifact_sha256: string;

@@ -10,6 +10,16 @@
  */
 import type { ArtifactContentResult, ArtifactGetContentParams } from './artifact';
 import type {
+  RunActivity,
+  RunCursor,
+  RunGetEventsParams,
+  RunGetEventsResult,
+  RunGetPayloadResult,
+  RunGetUsageParams,
+  RunGetUsageResult,
+  RunUsage,
+} from './observability';
+import type {
   CouncilAuction,
   CouncilFatalError,
   CouncilImplementation,
@@ -28,6 +38,11 @@ import type {
   SystemVersion,
 } from './system';
 import type { TaskCreateParams, TaskSnapshot, TaskSubscribeResult } from './task';
+import type {
+  DriverRoutingSnapshot,
+  ResetDriverRoutingInput,
+  UpdateDriverRoutingInput,
+} from './driverRouting';
 import type {
   MemoryAgentMetaPatch,
   MemoryCapabilities,
@@ -73,7 +88,7 @@ import type {
 /** run.event 的来源方向（由 event.type 前缀推导，见后端 projectRunEventSource）。 */
 export type RunEventSource = 'coordinator' | 'agent' | 'driver' | 'memory' | 'gate' | 'council';
 
-/** 后端推给前端的单条流程事件。`sequence` 单调递增，用于去重与排序。 */
+/** 序号与快照同源，允许并列；按数组顺序展示、按 event_id 去重。 */
 export interface RunEvent {
   event_id: string;
   sequence: number;
@@ -83,7 +98,6 @@ export interface RunEvent {
   source: RunEventSource;
   created_at: string;
   payload: Record<string, unknown>;
-  payload_ref?: string;
   schema_version: string;
 }
 
@@ -140,10 +154,20 @@ export interface RunSnapshot {
   mode: RunMode;
   status: RunStatus;
   quality?: Record<string, unknown>;
+  usage?: RunUsage;
+  activity?: RunActivity;
+  driver_config?: {
+    default_driver: string;
+    drivers: Record<string, string>;
+    roles?: Record<string, string>;
+  };
   current: {
     stage: RunStage;
     active_node_code: string;
     task_status?: string;
+    cursor?: RunCursor;
+    invocation_id?: string;
+    stage_started_at?: string;
   };
   task?: {
     task_id: string;
@@ -262,6 +286,9 @@ export interface RunSnapshot {
      * `TaskSnapshot.council.result` 同形。`quality` 仅审计用，不是完成判定依据。
      */
     result?: {
+      /** 与 CouncilOutcome 同名字段同义（见 ./council）。 */
+      role_failure_count?: number;
+      fallback_used?: boolean;
       quality: 'verified' | 'best_effort';
       final_artifact_ref: string;
       final_artifact_sha256: string;
@@ -312,7 +339,7 @@ export interface RunCreateParams {
   project_id?: string;
   client_task_id?: string;
   title?: string;
-  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
 }
 
 export interface RunCreateResult {
@@ -322,6 +349,9 @@ export interface RunCreateResult {
 }
 
 export interface RpcMethodMap {
+  'driver.getConfig': { params: Record<string, never>; result: DriverRoutingSnapshot };
+  'driver.updateRouting': { params: UpdateDriverRoutingInput; result: DriverRoutingSnapshot };
+  'driver.resetRouting': { params: ResetDriverRoutingInput; result: DriverRoutingSnapshot };
   'system.ping': { params: Record<string, never>; result: PingResult };
   'system.liveness': { params: Record<string, never>; result: SystemLiveness };
   'system.readiness': { params: Record<string, never>; result: SystemReadiness };
@@ -349,6 +379,12 @@ export interface RpcMethodMap {
 
   'run.create': { params: RunCreateParams; result: RunCreateResult };
   'run.getSnapshot': { params: { run_id: string }; result: RunSnapshot };
+  'run.getEvents': { params: RunGetEventsParams; result: RunGetEventsResult };
+  'run.getPayload': {
+    params: { run_id: string; payload_ref: string };
+    result: RunGetPayloadResult;
+  };
+  'run.getUsage': { params: RunGetUsageParams; result: RunGetUsageResult };
   'run.list': { params: Record<string, never>; result: { runs: Record<string, unknown>[] } };
   'run.cancel': { params: { run_id: string }; result: { cancelled: true } };
   'run.restart': {
@@ -360,7 +396,10 @@ export interface RpcMethodMap {
       status: 'running';
     };
   };
-  'run.subscribe': { params: { run_id: string }; result: { subscribed: true } };
+  'run.subscribe': {
+    params: { run_id: string; after_sequence?: number };
+    result: { subscribed: true };
+  };
   'run.unsubscribe': { params: { run_id: string }; result: { unsubscribed: true } };
 
   /**

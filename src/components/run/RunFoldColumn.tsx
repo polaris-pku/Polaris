@@ -9,6 +9,7 @@ import { NeedsYouFold } from '@/components/run/folds/NeedsYouFold';
 import { ProtocolFlowFold } from '@/components/run/folds/ProtocolFlowFold';
 import { RequirementFold } from '@/components/run/folds/RequirementFold';
 import { RunInfoFold } from '@/components/run/folds/RunInfoFold';
+import { RunActivityFold, RunUsageFold } from '@/components/run/folds/RunObservabilityFold';
 import { StepFold } from '@/components/run/folds/StepFold';
 import { isFrontendWorkflowV01 } from '@/api/types/rpc';
 import {
@@ -158,6 +159,7 @@ export function RunFoldColumn() {
             {step && (
               <StepFold node={step} events={byNode[step.id] ?? []} onOpenEvidence={openStep} />
             )}
+            {live && <RunActivityFold live={live} />}
 
             {/*
               「产出文件」原本是这里的一个折叠条 —— 但那是整个产品最重要的事实，
@@ -200,6 +202,8 @@ export function RunFoldColumn() {
               />
             )}
 
+            {live && <RunUsageFold live={live} />}
+
             {machine.length > 0 && (
               <MachineHandshakeFold
                 nodes={machine}
@@ -237,6 +241,7 @@ export function RunFoldColumn() {
             {live && (
               <RunInfoFold
                 meta={runMetaOf(live)}
+                current={live.snapshot?.current}
                 onOpenEvidence={() => {
                   openEvidence(null);
                 }}

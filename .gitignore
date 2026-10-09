@@ -18,6 +18,8 @@ release/
 .env.*
 !.env.example
 *.local
+**/.agent/drivers.local.yaml
+**/.agent/drivers.ui.local.yaml*
 
 # 本地状态 / 会话转储 / 归档
 *.session.json

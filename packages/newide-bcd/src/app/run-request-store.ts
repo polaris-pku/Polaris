@@ -14,6 +14,7 @@ import {
   type Timestamp,
 } from '../core';
 import type { AppRunMode } from './run-registry';
+import type { PersistedDriverConfig } from '../driver';
 import { runSnapshotSchema, type RunSnapshot } from '../protocol/run-snapshot';
 
 export interface PersistedRunRequest {
@@ -25,7 +26,14 @@ export interface PersistedRunRequest {
   session_id?: string;
   task_request?: TaskCreateRequest;
   mode: AppRunMode;
-  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+  /**
+   * 该 Run 创建时**冻结**的 driver 配置投影。
+   *
+   * 冻结而不是每次调用重新解析，是「改动只影响新 Run」的实现：在飞 Run 用自己那一份。
+   * 缺省（老 run）表示当时还是写死的单 driver。
+   */
+  driver_config?: PersistedDriverConfig;
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
   project_id?: string;
   client_task_id?: string;
   title?: string;
@@ -41,7 +49,7 @@ export interface RunHistoryEntry {
   restartable: boolean;
   task_id?: string;
   mode?: AppRunMode;
-  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3';
+  memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
   prompt?: string;
   workspace_path?: string;
   session_id?: string;
@@ -70,6 +78,14 @@ export class FileRunRequestStore implements RunRequestStore {
   constructor(
     private readonly runsRoot = '.newide/runs',
     private readonly now: () => Timestamp = () => new Date().toISOString(),
+    /**
+     * **已废弃**的启动期固定 driver 配置。
+     *
+     * 热更新之后 driver 配置必须在 Run 创建点逐 Run 取得（见 `save` 的 `driver_config`），
+     * 否则所有新 Run 都会共用启动那一刻的映射。这里保留只是为了兼容既有测试；显式传入的
+     * `driver_config` 排在后面，永远赢过它。
+     */
+    private readonly driverConfig?: PersistedDriverConfig,
   ) {}
 
   async save(request: Omit<PersistedRunRequest, 'schema_version' | 'created_at'>): Promise<void> {
@@ -77,6 +93,7 @@ export class FileRunRequestStore implements RunRequestStore {
     await fs.mkdir(runDir, { recursive: true });
     const persisted: PersistedRunRequest = {
       schema_version: SCHEMA_VERSION,
+      ...(this.driverConfig ? { driver_config: this.driverConfig } : {}),
       ...request,
       created_at: this.now(),
     };
@@ -147,9 +164,7 @@ export class FileRunRequestStore implements RunRequestStore {
         ? {
             task_id: request.task_id,
             mode: request.mode,
-            ...(request.memory_ablation
-              ? { memory_ablation: request.memory_ablation }
-              : {}),
+            ...(request.memory_ablation ? { memory_ablation: request.memory_ablation } : {}),
             prompt: request.prompt,
             workspace_path: request.workspace_path,
             created_at: request.created_at,
@@ -241,7 +256,8 @@ function isPersistedRunRequest(value: unknown): value is PersistedRunRequest {
     typeof record.prompt === 'string' &&
     typeof record.workspace_path === 'string' &&
     (record.task_request === undefined || isTaskCreateRequest(record.task_request)) &&
-    (record.memory_ablation === undefined || asMemoryAblation(record.memory_ablation) !== undefined) &&
+    (record.memory_ablation === undefined ||
+      asMemoryAblation(record.memory_ablation) !== undefined) &&
     asRunMode(record.mode) !== undefined
   );
 }
@@ -275,8 +291,8 @@ function asRunMode(value: unknown): AppRunMode | undefined {
   return value === 'single_agent' || value === 'council' ? value : undefined;
 }
 
-function asMemoryAblation(value: unknown): 'B0' | 'B1' | 'B2' | 'B3' | undefined {
-  return value === 'B0' || value === 'B1' || value === 'B2' || value === 'B3'
+function asMemoryAblation(value: unknown): 'B0' | 'B1' | 'B2' | 'B3' | 'B4' | undefined {
+  return value === 'B0' || value === 'B1' || value === 'B2' || value === 'B3' || value === 'B4'
     ? value
     : undefined;
 }

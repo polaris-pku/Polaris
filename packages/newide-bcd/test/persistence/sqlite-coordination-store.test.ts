@@ -17,7 +17,7 @@ afterEach(() => {
 });
 
 describe('SqliteCoordinationStore', () => {
-  it('creates the v3 coordination schema in WAL mode', () => {
+  it('creates the coordination, protocol delivery and token usage ledger schema in WAL mode', () => {
     const { databasePath, store } = createStore();
     store.close();
 
@@ -40,16 +40,30 @@ describe('SqliteCoordinationStore', () => {
         'checkpoints',
         'messages',
         'deliveries',
+        'outbox',
+        'inbox',
+        'journal',
+        'token_usage_ledger',
       ]),
     );
     expect(journalMode).toEqual({ journal_mode: 'wal' });
-    expect(migration).toEqual({ version: 3 });
+    expect(migration).toEqual({ version: 6 });
+
+    // 用量账本刻意不挂 tasks/runs 外键：任务是会被清理的，而累计用量必须活过清理。
+    expect(database.prepare('PRAGMA foreign_key_list(token_usage_ledger)').all()).toEqual([]);
 
     const runtimeColumns = database
       .prepare('PRAGMA table_info(task_runtime_states)')
       .all()
       .map((row) => String(row.name));
     expect(runtimeColumns).toContain('cursor_input_json');
+    // v5：journal 的调用留档列（session_id / duration_ms）
+    const journalColumns = database
+      .prepare('PRAGMA table_info(journal)')
+      .all()
+      .map((row) => String(row.name));
+    expect(journalColumns).toContain('session_id');
+    expect(journalColumns).toContain('duration_ms');
     database.close();
   });
 

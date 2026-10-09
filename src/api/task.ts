@@ -12,7 +12,7 @@
  * 两套编号不通用 —— 跨流对齐只能按 `event_id`，`sequence` 只在同一条实时流内部使用。
  * 一个 task 还可能跑过多个 run，各自的 sequence 都从 1 起，所以游标必须按 run_id 分开记。
  */
-import { onTransportReconnect } from './events';
+import { onTransportReconnect, RUN_OBSERVATION_INTERVAL_MS } from './events';
 import { getTransport } from './transport';
 import type { RunEvent } from './types/rpc';
 import type { TaskCreateParams, TaskSnapshot } from './types/task';
@@ -30,6 +30,7 @@ export const taskApi = {
 export interface TaskStreamHandlers {
   onSnapshot(snapshot: TaskSnapshot): void;
   onEvent(event: RunEvent): void;
+  onError?(message: string): void;
 }
 
 interface TaskWatcher {
@@ -50,6 +51,58 @@ export async function watchTask(
   const applied = new Map<string, number>();
   let live = false;
   let resyncing = false;
+  let disposed = false;
+  let refreshing = false;
+  let refreshAgain = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let latestSnapshot: TaskSnapshot | undefined;
+
+  const reportError = (error: unknown) => {
+    if (disposed) return;
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn(`[task observation] ${taskId}: ${message}`);
+    handlers.onError?.(message);
+  };
+  const acceptSnapshot = (snapshot: TaskSnapshot) => {
+    if (snapshot.task?.task_id !== taskId || !Number.isFinite(snapshot.revision)) {
+      throw new Error('Backend returned an invalid Task snapshot');
+    }
+    if (disposed || (latestSnapshot && snapshot.revision < latestSnapshot.revision)) return;
+    latestSnapshot = snapshot;
+    handlers.onSnapshot(snapshot);
+  };
+  const scheduleRefresh = () => {
+    clearTimeout(timer);
+    if (
+      disposed ||
+      !latestSnapshot ||
+      ['completed', 'failed', 'cancelled'].includes(latestSnapshot.task.status)
+    )
+      return;
+    timer = setTimeout(() => {
+      void refresh();
+    }, RUN_OBSERVATION_INTERVAL_MS);
+  };
+  const refresh = async () => {
+    if (disposed) return;
+    if (refreshing) {
+      refreshAgain = true;
+      return;
+    }
+    refreshing = true;
+    clearTimeout(timer);
+    try {
+      acceptSnapshot(await taskApi.get(taskId));
+    } catch (error) {
+      reportError(error);
+    } finally {
+      refreshing = false;
+      if (refreshAgain && !disposed) {
+        refreshAgain = false;
+        void refresh();
+      } else scheduleRefresh();
+    }
+  };
 
   const apply = (event: RunEvent) => {
     if (seen.has(event.event_id)) return;
@@ -70,6 +123,11 @@ export async function watchTask(
     if (!known && last !== undefined && event.sequence > last + 1) void resync();
     if (last === undefined || event.sequence > last) applied.set(event.run_id, event.sequence);
     apply(event);
+    if (
+      !known &&
+      (/^task\./.test(event.type) || /^run\.(started|completed|failed|cancelled)$/.test(event.type))
+    )
+      void refresh();
   };
 
   const subscribe = async (after?: string) => {
@@ -77,7 +135,7 @@ export async function watchTask(
       task_id: taskId,
       ...(after ? { after_event_id: after } : {}),
     });
-    handlers.onSnapshot(subscribed.snapshot);
+    acceptSnapshot(subscribed.snapshot);
     for (const event of subscribed.replay_events) apply(event);
     return subscribed;
   };
@@ -86,14 +144,14 @@ export async function watchTask(
    * 重新与后端对齐：再走一次 `task.subscribe`（不带游标 —— 断掉的那段在游标**之前**）。
    *
    * 后端 `TaskRpcMethods` 会先注册新订阅再退掉旧的，所以重订阅不会留下两个监听器。
-   * 在途标记保证一串乱序事件只换来一次重拉。失败一律吞掉：后端可能已经不认识这个 task
-   * （进程重启过），把错误抛回事件回调没有意义。
+   * 在途标记保证一串乱序事件只换来一次重拉。失败保留最后一次事实并通知观测错误。
    */
   const resync = async () => {
-    if (resyncing) return;
+    if (resyncing || disposed) return;
     resyncing = true;
-    await subscribe().catch(() => undefined);
+    await subscribe().catch(reportError);
     resyncing = false;
+    scheduleRefresh();
   };
 
   const detach = transport.onNotification((notification) => {
@@ -108,7 +166,10 @@ export async function watchTask(
     for (const event of buffered) ingest(event);
     buffered.length = 0;
     live = true;
+    scheduleRefresh();
   } catch (error) {
+    disposed = true;
+    clearTimeout(timer);
     detach();
     throw error;
   }
@@ -123,9 +184,13 @@ export async function watchTask(
   const dispose = async () => {
     if (taskWatchers.get(taskId)?.dispose !== dispose) return;
     taskWatchers.delete(taskId);
+    disposed = true;
+    clearTimeout(timer);
     stopReconnectWatch();
     detach();
-    await taskApi.unsubscribe(taskId).catch(() => undefined);
+    await taskApi
+      .unsubscribe(taskId)
+      .catch((error) => console.warn(`[task observation] ${taskId}: unsubscribe failed`, error));
   };
   if (previous) await previous.dispose();
   taskWatchers.set(taskId, { dispose });

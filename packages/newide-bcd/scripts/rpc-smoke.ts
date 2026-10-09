@@ -66,20 +66,17 @@ if (usesTemporaryRunner) {
   localServer = startBackendRpcServer({
     input,
     writeLine: (line) => localOutput!.write(`${line}\n`),
-    service: await createProductionBackendService(
-      backendEnv,
-      {
-        agentLlm: invokeDriverLlm(),
-        memoryLlm: deterministicMaintenanceLlm(),
-        bRuntime: {
-          repository: new InMemoryRepository(),
-          bufferRepository: new InMemoryBufferRepository(),
-          app_state_root: process.env.NEWIDE_B_APP_STATE_ROOT ?? path.join(stateRoot, 'b'),
-          market_agent_ids: ['role_fullstack_engineer', 'role_ts_engineer'],
-          close: async () => undefined,
-        },
+    service: await createProductionBackendService(backendEnv, {
+      agentLlm: invokeDriverLlm(),
+      memoryLlm: deterministicMaintenanceLlm(),
+      bRuntime: {
+        repository: new InMemoryRepository(),
+        bufferRepository: new InMemoryBufferRepository(),
+        app_state_root: process.env.NEWIDE_B_APP_STATE_ROOT ?? path.join(stateRoot, 'b'),
+        market_agent_ids: ['role_fullstack_engineer', 'role_ts_engineer'],
+        close: async () => undefined,
       },
-    ),
+    }),
   });
   backendInput = input;
   backendOutput = localOutput;
@@ -129,8 +126,9 @@ try {
   if (cancelled) await waitForCancellationEffects();
   const driverInvocations = usesTemporaryRunner ? await countDriverInvocations() : undefined;
   if (driverInvocations !== undefined) {
-    // Plan-first reuses Primary's initial plan as proposer 0 instead of invoking it twice.
-    const expectedInvocations = smokeMode === 'all' ? 10 : smokeMode === 'single_agent' ? 2 : 8;
+    // Plan-first reuses Primary's initial plan as proposer 0 and each Council
+    // role creates its ACP Session on the real task turn instead of a warm-up.
+    const expectedInvocations = smokeMode === 'all' ? 7 : smokeMode === 'single_agent' ? 2 : 5;
     assert(
       driverInvocations === expectedInvocations,
       `Expected ${expectedInvocations} driver invocations, received ${driverInvocations}`,
@@ -144,6 +142,32 @@ try {
   const unknown = smokeMode === 'all' ? await requestRaw('unknown.method', {}) : undefined;
   if (unknown) assert(unknown.error?.code === -32601, 'Unknown method did not return -32601');
 
+  // driver.* 注册面：`driver.getConfig` 是只读的，直接调用验证返回形状；
+  // update/reset 用**空参数**探测——参数非法返回 -32602 就证明方法已注册，且不会写任何文件
+  // （冒烟脚本跑在真实仓库上，绝不能在这里改 routing）。
+  const driverConfig = smokeMode === 'all' ? await requestRaw('driver.getConfig', {}) : undefined;
+  if (driverConfig) {
+    assert(
+      driverConfig.error === undefined,
+      `driver.getConfig failed: ${JSON.stringify(driverConfig.error)}`,
+    );
+  }
+  const driverUpdateProbe =
+    smokeMode === 'all' ? await requestRaw('driver.updateRouting', {}) : undefined;
+  if (driverUpdateProbe) {
+    assert(
+      driverUpdateProbe.error?.code === -32602,
+      'driver.updateRouting is not registered or did not reject empty params',
+    );
+  }
+  const driverResetProbe =
+    smokeMode === 'all' ? await requestRaw('driver.resetRouting', {}) : undefined;
+  if (driverResetProbe) {
+    assert(
+      driverResetProbe.error?.code === -32602,
+      'driver.resetRouting is not registered or did not reject empty params',
+    );
+  }
   process.stdout.write(
     `${JSON.stringify({
       status: 'ok',
@@ -155,6 +179,9 @@ try {
       ...(cancelled ? { cancelled } : {}),
       ...(parseError ? { malformed_json_error: parseError.error?.code } : {}),
       ...(unknown ? { unknown_method_error: unknown.error?.code } : {}),
+      ...(driverConfig?.result === undefined ? {} : { driver_config: driverConfig.result }),
+      ...(driverUpdateProbe ? { driver_update_invalid_params: driverUpdateProbe.error?.code } : {}),
+      ...(driverResetProbe ? { driver_reset_invalid_params: driverResetProbe.error?.code } : {}),
     })}\n`,
   );
 } finally {
@@ -173,9 +200,7 @@ try {
       ...taskIds.map((taskId) =>
         fs.rm(path.join(stateRoot, 'worktrees', taskId), { recursive: true, force: true }),
       ),
-      ...(usesTemporaryRunner
-        ? generatedFiles.map((file) => fs.rm(file, { force: true }))
-        : []),
+      ...(usesTemporaryRunner ? generatedFiles.map((file) => fs.rm(file, { force: true })) : []),
       ...(usesTemporaryRunner ? [fs.rm(runnerDir, { recursive: true, force: true })] : []),
     ]);
   }
@@ -237,8 +262,7 @@ async function runAndVerify(mode: 'single_agent' | 'council'): Promise<Record<st
       'Council finalization events are incomplete',
     );
     assert(
-      councilCompleted < artifactSelected &&
-        artifactSelected < materializedEvent,
+      councilCompleted < artifactSelected && artifactSelected < materializedEvent,
       'Council finalization event order is invalid',
     );
     assert(
@@ -342,7 +366,12 @@ async function assertRunFiles(runId: string): Promise<void> {
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
     const visible = await Promise.all(
-      files.map((file) => fs.access(file).then(() => true, () => false)),
+      files.map((file) =>
+        fs.access(file).then(
+          () => true,
+          () => false,
+        ),
+      ),
     );
     if (visible.every(Boolean)) return;
     await new Promise((resolve) => setTimeout(resolve, 25));
@@ -476,8 +505,9 @@ async function createFakeAcpRunner(): Promise<string> {
     );
     await fs.writeFile(
       path.join(directory, 'fake-driver.mjs'),
-      `import { appendFileSync } from 'node:fs';
+      `import { appendFileSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
+import { join } from 'node:path';
 let body = '';
 process.stdin.on('data', chunk => body += chunk);
 process.stdin.on('end', () => {
@@ -499,8 +529,14 @@ process.stdin.on('end', () => {
     }
   };
   appendFileSync(new URL('./invocations.log', import.meta.url), 'invoke\\n');
+  // 评审的契约产物是角色工作区根目录里的 reviews.json：只出现在回复里不算交付
+  // （议会取不到评审会让这次 run 失败）。
+  if (input.prompt.includes('Review the isolated proposal inputs') && input.workspace_path) {
+    writeFileSync(join(input.workspace_path, 'reviews.json'), JSON.stringify({ reviews: [...new Set(input.prompt.match(/proposal_[a-z0-9-]+/g) || [])].map(id => ({ proposal_id: id, verdict: 'approve', reason: 'Reviewed staged evidence.', unmet_criteria: [], evidence_refs: [] })) }));
+  }
   const writeResult = () => process.stdout.write(JSON.stringify({
     driver_run_result_id: 'driver_result_' + suffix,
+    response: 'Done.',
     session_id: 'session_' + suffix,
     status: 'succeeded',
     artifacts: [artifact],

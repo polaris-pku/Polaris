@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { createInterface } from 'node:readline';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -15,6 +15,7 @@ import {
   readAuctionEnabled,
   readCouncilAuctionEnabled,
   readCouncilProposerCount,
+  readTelemetryJsonlEnabled,
   resolveProductionLlmRuntime,
   startBackendRpcServer,
 } from '../../src/app/backend-rpc-stdio';
@@ -28,6 +29,7 @@ import {
   type ToolCallingClient,
 } from '../../src/memory';
 import { SqliteCoordinationStore } from '../../src/persistence';
+import { listAgentActivities } from '../../src/telemetry';
 import type { BackendBRuntime } from '../../src/app/production-b-runtime';
 import {
   BMemoryMaintenanceRunner,
@@ -52,6 +54,24 @@ describe('readAuctionEnabled', () => {
 
   it('rejects invalid values', () => {
     expect(() => readAuctionEnabled('maybe')).toThrow('NEWIDE_AUCTION_ENABLED');
+  });
+});
+
+describe('readTelemetryJsonlEnabled', () => {
+  it('defaults to on', () => {
+    expect(readTelemetryJsonlEnabled(undefined)).toBe(true);
+    expect(readTelemetryJsonlEnabled('')).toBe(true);
+  });
+
+  it('parses the off switch', () => {
+    expect(readTelemetryJsonlEnabled('0')).toBe(false);
+    expect(readTelemetryJsonlEnabled('false')).toBe(false);
+    expect(readTelemetryJsonlEnabled('FALSE')).toBe(false);
+    expect(readTelemetryJsonlEnabled('1')).toBe(true);
+  });
+
+  it('rejects invalid values', () => {
+    expect(() => readTelemetryJsonlEnabled('maybe')).toThrow('NEWIDE_TELEMETRY_JSONL');
   });
 });
 
@@ -131,9 +151,7 @@ describe('resolveProductionLlmRuntime', () => {
 describe('ProductionAgentToolCallingClient', () => {
   it('retries one malformed MiniMax function-arguments response', async () => {
     const completeWithTools = vi
-      .fn<
-        ToolCallingClient['completeWithTools']
-      >()
+      .fn<ToolCallingClient['completeWithTools']>()
       .mockRejectedValueOnce(
         new Error('invalid params, invalid function arguments json string (2013)'),
       )
@@ -166,7 +184,9 @@ describe('ProductionAgentToolCallingClient', () => {
   it('falls back to the real Driver after repeated malformed MiniMax tool arguments', async () => {
     const completeWithTools = vi
       .fn<ToolCallingClient['completeWithTools']>()
-      .mockRejectedValue(new Error('invalid params, invalid function arguments json string (2013)'));
+      .mockRejectedValue(
+        new Error('invalid params, invalid function arguments json string (2013)'),
+      );
     const client = new ProductionAgentToolCallingClient({ completeWithTools });
 
     await expect(
@@ -282,6 +302,80 @@ describe('backend RPC stdio entrypoint', () => {
       await service.close();
       expect(close).toHaveBeenCalledOnce();
     } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps driver routing in the selected project and preserves frozen runs', async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'newide-project-driver-routing-'));
+    const workspace = path.join(root, 'project');
+    const stateRoot = path.join(root, 'state');
+    const runner = path.join(root, 'runner');
+    let service: NewideBackendService | undefined;
+    try {
+      mkdirSync(runner, { recursive: true });
+      mkdirSync(path.join(workspace, '.agent'), { recursive: true });
+      writeFileSync(path.join(runner, 'package.json'), '{"scripts":{"driver:run":"exit 0"}}');
+      writeFakeAcpRunnerBuild(runner);
+      writeFileSync(
+        path.join(workspace, '.agent', 'drivers.yaml'),
+        [
+          'version: 1',
+          'drivers:',
+          '  alternate:',
+          '    agent: codex',
+          '    runtime:',
+          '      env:',
+          '        ROUTING_TEST_SECRET: fixture-value-not-for-rpc',
+          'roles:',
+          '  old-role: alternate',
+          '',
+        ].join('\n'),
+      );
+      service = await createProductionBackendService(
+        {
+          ACP_DRIVER_RUNNER_DIR: runner,
+          ACP_WORKSPACE: workspace,
+          NEWIDE_STATE_ROOT: stateRoot,
+          NEWIDE_COORDINATION_DB: ':memory:',
+        },
+        {
+          bRuntime: { ...createInMemoryBRuntime(), app_state_root: stateRoot },
+          agentLlm: invokeDriverLlm(),
+        },
+      );
+      const routing = service.driverRouting!;
+      const before = await routing.getSnapshot();
+      expect(before.default_driver).toBe('acp-external');
+      expect(before.drivers.map((driver) => driver.driver_id)).toContain('alternate');
+      expect(before.orphan_roles).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            role_id: 'old-role',
+            driver_id: 'alternate',
+            known_role: false,
+          }),
+        ]),
+      );
+      expect(JSON.stringify(before)).not.toContain('fixture-value-not-for-rpc');
+      expect(JSON.stringify(before)).not.toContain(runner);
+      const frozen = routing.freezeForRun('before-edit');
+      const saved = await routing.updateRouting({
+        expected_revision: before.revision,
+        default_driver: 'alternate',
+        roles: Object.fromEntries(before.roles.map((role) => [role.role_id, role.driver_id])),
+      });
+      expect(saved.default_driver).toBe('alternate');
+      expect(saved.drivers).toEqual(before.drivers);
+      expect(routing.freezeForRun('before-edit')).toEqual(frozen);
+      expect(routing.freezeForRun('after-edit').default_driver).toBe('alternate');
+      expect(existsSync(path.join(workspace, '.agent', 'drivers.ui.local.yaml'))).toBe(true);
+      expect(existsSync(path.join(stateRoot, '.agent', 'drivers.ui.local.yaml'))).toBe(false);
+      const reset = await routing.resetRouting(saved.revision);
+      expect(reset.default_driver).toBe('acp-external');
+      expect(existsSync(path.join(workspace, '.agent', 'drivers.ui.local.yaml'))).toBe(false);
+    } finally {
+      await service?.close();
       rmSync(root, { recursive: true, force: true });
     }
   });
@@ -540,7 +634,8 @@ describe('backend RPC stdio entrypoint', () => {
       );
       writeFileSync(
         path.join(runnerDir, 'fake-driver.mjs'),
-        `import { appendFileSync, existsSync } from 'node:fs';
+        `import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 	let body='';
 	process.stdin.on('data', chunk => body += chunk);
 	process.stdin.on('end', () => {
@@ -551,9 +646,13 @@ describe('backend RPC stdio entrypoint', () => {
   appendFileSync(new URL('./prompts.log', import.meta.url), input.prompt + '\\n');
   const created_at = new Date().toISOString();
   const reviewerFailed = existsSync(new URL('./fail-reviewer', import.meta.url)) && input.prompt.includes('Review the isolated proposal inputs');
+  const response = input.prompt.includes('Review the isolated proposal inputs') ? JSON.stringify({ reviews: [...new Set(input.prompt.match(/proposal_[a-z0-9-]+/g) || [])].map(id => ({ proposal_id: id, verdict: 'approve', reason: 'Reviewed staged evidence.', unmet_criteria: [], evidence_refs: [] })) }) : 'Fake ACP completed the request.';
   const councilRole = String(input.workspace_path || '').replaceAll('\\\\', '/').includes('.newide/council');
   const artifact = { artifact_id: 'artifact_fake_acp', type: councilRole ? 'diff' : 'driver_result', uri: 'artifact://fake/result', producer_id: 'claude-fake', task_id: input.task_id, ...(councilRole ? { content: { kind: 'text', content_ref: 'data:text/plain,COUNCIL_FINAL%0A', target_path: 'council-output.txt', media_type: 'text/plain' } } : {}), created_at, schema_version: input.schema_version };
-  process.stdout.write(JSON.stringify({ driver_run_result_id: 'driver_result_fake_acp', session_id: 'session_fake_acp', status: reviewerFailed ? 'failed' : 'succeeded', response: reviewerFailed ? '' : 'Fake ACP completed the request.', artifacts: reviewerFailed ? [] : [artifact], transcript_ref: { ...artifact, artifact_id: 'transcript_fake_acp', type: 'transcript' }, tool_events: [], diagnostics: { driver_id: 'claude-fake', duration_ms: 1, notes: ['fake ACP process'] }, ...(reviewerFailed ? { error: { code: 'FAKE_REVIEW_FAILURE', message: 'controlled failure', retryable: false } } : {}), created_at, schema_version: input.schema_version }));
+  if (input.prompt.includes('Review the isolated proposal inputs') && !reviewerFailed && input.workspace_path) {
+    writeFileSync(join(input.workspace_path, 'reviews.json'), response);
+  }
+  process.stdout.write(JSON.stringify({ driver_run_result_id: 'driver_result_fake_acp', session_id: 'session_fake_acp', status: reviewerFailed ? 'failed' : 'succeeded', response: reviewerFailed ? '' : response, artifacts: reviewerFailed ? [] : [artifact], transcript_ref: { ...artifact, artifact_id: 'transcript_fake_acp', type: 'transcript' }, tool_events: [], diagnostics: { driver_id: 'claude-fake', duration_ms: 1, notes: ['fake ACP process'] }, ...(reviewerFailed ? { error: { code: 'FAKE_REVIEW_FAILURE', message: 'controlled failure', retryable: false } } : {}), created_at, schema_version: input.schema_version }));
 });
 `,
       );
@@ -652,7 +751,22 @@ describe('backend RPC stdio entrypoint', () => {
       const unsubscribe = service.subscribe(councilCreated.run_id, (event) =>
         notifications.push(event),
       );
+      // 议会阶段一度是面板的盲区：席位执行拿 `${run_id}_${phaseId}` 当**执行身份**
+      // （相位之间要隔离信箱幂等键与 driver 记账），而在飞状态被写进了那个 key——面板按
+      // run id 读，于是整段议会（一次 run 里最长的一段）看不见，尽管 199 条 driver 事件
+      // 一条不少地流着。这里在下游按住不变量：**一个 run 的在飞状态只许挂在它自己的 run id 上**。
+      const observedActivityKeys = new Set<string>();
+      const activityPoll = setInterval(() => {
+        for (const activity of listAgentActivities()) {
+          observedActivityKeys.add(`${activity.run_id}|${activity.role_id}|${activity.kind}`);
+        }
+      }, 10);
       const councilSnapshot = await waitForTerminal(service, councilCreated.run_id);
+      clearInterval(activityPoll);
+      expect(observedActivityKeys.size).toBeGreaterThan(0);
+      expect(
+        [...observedActivityKeys].every((key) => key.startsWith(`${councilCreated.run_id}|`)),
+      ).toBe(true);
       unsubscribe();
       expect(councilSnapshot.status).toBe('completed');
       const externalCouncilSnapshot = service.getRunSnapshot(councilCreated.run_id);
@@ -671,9 +785,7 @@ describe('backend RPC stdio entrypoint', () => {
       });
       expect(externalCouncilSnapshot.council?.participants).toHaveLength(4);
       expect(
-        externalCouncilSnapshot.council?.participants?.map(
-          (participant) => participant.agent_id,
-        ),
+        externalCouncilSnapshot.council?.participants?.map((participant) => participant.agent_id),
       ).toEqual([
         'role_fullstack_engineer',
         'role_ts_engineer',
@@ -728,16 +840,8 @@ describe('backend RPC stdio entrypoint', () => {
         .trim()
         .split('\n')
         .map((line) => JSON.parse(line) as AppRunEvent);
-      const keyTypes = [
-        'council.completed',
-        'artifact.selected',
-        'worktree.materialized',
-      ];
-      const expectedOrder = [
-        'council.completed',
-        'artifact.selected',
-        'worktree.materialized',
-      ];
+      const keyTypes = ['council.completed', 'artifact.selected', 'worktree.materialized'];
+      const expectedOrder = ['council.completed', 'artifact.selected', 'worktree.materialized'];
       const postCouncilSequence = (types: string[]) =>
         types.slice(types.indexOf('council.completed')).filter((type) => keyTypes.includes(type));
       expect(postCouncilSequence(notifications.map((event) => event.type))).toEqual(expectedOrder);
@@ -745,9 +849,9 @@ describe('backend RPC stdio entrypoint', () => {
       expect(postCouncilSequence(councilEventTypes)).toEqual(expectedOrder);
       expect(
         readFileSync(path.join(runnerDir, 'invocations.log'), 'utf8').trim().split('\n'),
-      ).toHaveLength(10);
+      ).toHaveLength(7);
       expect(readFileSync(path.join(runnerDir, 'b-env.log'), 'utf8').trim().split('\n')).toEqual(
-        Array.from({ length: 10 }, () => 'absent'),
+        Array.from({ length: 7 }, () => 'absent'),
       );
       const driverPrompts = readFileSync(path.join(runnerDir, 'prompts.log'), 'utf8');
       expect(driverPrompts).toContain('Exercise production composition.');
@@ -767,21 +871,21 @@ describe('backend RPC stdio entrypoint', () => {
       );
       const failedSnapshot = await waitForTerminal(service, failedCouncilCreated.run_id);
       unsubscribeFailed();
-      expect(service.getRunSnapshot(failedCouncilCreated.run_id)).toMatchObject({
-        status: 'completed',
-        council: {
-          result: {
-            quality: 'best_effort',
-          },
-          outcome: { status: 'completed' },
-        },
-        errors: [],
-      });
-      expect(failedNotifications.map((event) => event.type)).toEqual(
-        expect.arrayContaining(['council.role.failed', 'council.completed', 'run.completed']),
+      // 审者交付不出 reviews.json 就等于这次没有评审。议会不再降级出一个没被评审过的
+      // 结果（旧行为会伪造 needs_revision 并照常完成），而是让这次 run 直接失败，
+      // 并把原因写进终止错误里。
+      const failedRunSnapshot = service.getRunSnapshot(failedCouncilCreated.run_id);
+      expect(failedRunSnapshot.status).toBe('failed');
+      expect(failedRunSnapshot.errors.map((error) => error.message).join('\n')).toContain(
+        'produced no reviews.json at the workspace root',
       );
-      expect(failedSnapshot.events.map((event) => event.type)).toContain('council.completed');
-      expect(failedSnapshot.events.map((event) => event.type)).toContain('worktree.materialized');
+      expect(failedNotifications.map((event) => event.type)).toEqual(
+        expect.arrayContaining(['council.role.failed', 'council.failed', 'run.failed']),
+      );
+      expect(failedSnapshot.events.map((event) => event.type)).not.toContain('council.completed');
+      expect(failedSnapshot.events.map((event) => event.type)).not.toContain(
+        'worktree.materialized',
+      );
       const failedAudit = readFileSync(
         path.join('.newide', 'runs', failedCouncilCreated.run_id, 'audit.jsonl'),
         'utf8',
@@ -790,7 +894,7 @@ describe('backend RPC stdio entrypoint', () => {
         .split('\n')
         .map((line) => JSON.parse(line) as AppRunEvent);
       expect(failedAudit.map((event) => event.type)).toEqual(
-        expect.arrayContaining(['council.role.failed', 'council.completed', 'run.completed']),
+        expect.arrayContaining(['council.role.failed', 'council.failed', 'run.failed']),
       );
     } finally {
       await service?.close();

@@ -13,16 +13,20 @@ describe('production RPC composition smoke script', () => {
       mode: 'all',
       single_agent: { artifacts: 1 },
       council: { artifacts: 1 },
-      driver_invocations: 10,
+      driver_invocations: 7,
       cancelled: { status: 'cancelled' },
       malformed_json_error: -32700,
       unknown_method_error: -32601,
+      // driver.* 三个方法都注册到了生产 dispatcher 上
+      driver_config: { schema_version: 'driver-routing.v1' },
+      driver_update_invalid_params: -32602,
+      driver_reset_invalid_params: -32602,
     });
   }, 60_000);
 
   it.each([
     ['single_agent', 2],
-    ['council', 8],
+    ['council', 5],
   ] as const)(
     'runs %s as an independent frontend mode',
     async (mode, invocations) => {

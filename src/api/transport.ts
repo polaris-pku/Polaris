@@ -93,8 +93,48 @@ function createIpcTransport(bridge: NonNullable<DesktopBridge['backend']>): Back
 function createWebTransport(baseUrl: string): BackendTransport {
   let nextId = 1;
   const endpoint = baseUrl.replace(/\/$/, '');
+  const notifications = new Set<(notification: RpcNotification) => void>();
+  const statuses = new Set<(status: BackendStatus) => void>();
+  let events: EventSource | undefined;
+  let connectionRevision = 0;
 
-  return {
+  const publishStatus = (status: BackendStatus) => {
+    statuses.forEach((handler) => handler(status));
+  };
+  const connect = () => {
+    if (events) return;
+    const source = new EventSource(`${endpoint}/events`);
+    events = source;
+    source.onopen = () => {
+      if (events !== source) return;
+      const revision = ++connectionRevision;
+      void transport.getStatus().then((status) => {
+        if (events === source && connectionRevision === revision) publishStatus(status);
+      });
+    };
+    source.onerror = () => {
+      if (events !== source) return;
+      connectionRevision += 1;
+      publishStatus(webStatus('error', 'Web 事件连接中断，正在重连。'));
+    };
+    source.onmessage = (event) => {
+      if (events !== source) return;
+      try {
+        const notification: unknown = JSON.parse(event.data);
+        if (isNotification(notification)) notifications.forEach((handler) => handler(notification));
+      } catch (error) {
+        console.warn('[web transport] 无法读取后端事件：', error);
+      }
+    };
+  };
+  const disconnectIfUnused = () => {
+    if (notifications.size || statuses.size) return;
+    events?.close();
+    events = undefined;
+    connectionRevision += 1;
+  };
+
+  const transport: BackendTransport = {
     kind: 'web',
     async call<M extends RpcMethod>(method: M, params: RpcParams<M>): Promise<RpcResult<M>> {
       if (!RPC_METHOD_SET.has(method)) throw new BackendError(`未知 RPC 方法：${method}`, method);
@@ -103,7 +143,7 @@ function createWebTransport(baseUrl: string): BackendTransport {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ jsonrpc: '2.0', id: nextId++, method, params }),
       });
-      if (!response.ok) {
+      if (!response.ok && !response.headers.get('content-type')?.includes('application/json')) {
         throw new BackendError(`Web backend HTTP ${response.status}`, method);
       }
       const envelope = (await response.json()) as {
@@ -118,27 +158,29 @@ function createWebTransport(baseUrl: string): BackendTransport {
           envelope.error.data,
         );
       }
+      if (!response.ok) throw new BackendError(`Web backend HTTP ${response.status}`, method);
       return envelope.result as RpcResult<M>;
     },
     onNotification(handler) {
-      const events = new EventSource(`${endpoint}/events`);
-      events.onmessage = (event) => {
-        try {
-          const notification: unknown = JSON.parse(event.data);
-          if (isNotification(notification)) handler(notification);
-        } catch {
-          // A malformed event is ignored; the connection remains usable.
-        }
+      notifications.add(handler);
+      connect();
+      return () => {
+        notifications.delete(handler);
+        disconnectIfUnused();
       };
-      return () => events.close();
     },
     onStatus(handler) {
+      statuses.add(handler);
+      connect();
       let active = true;
+      const revision = connectionRevision;
       void this.getStatus().then((status) => {
-        if (active) handler(status);
+        if (active && revision === connectionRevision) handler(status);
       });
       return () => {
         active = false;
+        statuses.delete(handler);
+        disconnectIfUnused();
       };
     },
     async getStatus() {
@@ -150,6 +192,7 @@ function createWebTransport(baseUrl: string): BackendTransport {
       }
     },
   };
+  return transport;
 }
 
 function webStatus(state: BackendState, message: string): BackendStatus {

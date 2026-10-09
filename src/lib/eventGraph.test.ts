@@ -21,6 +21,18 @@ const event = (type: string, payload: Record<string, unknown> = {}): RunEvent =>
 const stepOfNode = (nodeId: string) => nodeId.slice('step-'.length).split('|')[0];
 
 describe('eventGraph · council 事件归桶', () => {
+  it('a completed Mailbox leg does not create a delivered step', () => {
+    const { nodes } = buildEventGraph(
+      [
+        event('agent.execution_requested', { role_id: 'role_primary' }),
+        event('agent.execution_completed', { role_id: 'role_primary', status: 'completed' }),
+        event('run.completed', { outcome: 'mailbox_wait' }),
+        event('task.waiting_help'),
+      ],
+      'completed',
+    );
+    expect(nodes.some((node) => stepOfNode(node.id) === 'deliver')).toBe(false);
+  });
   it('proposal / review / synthesis / failed 全部归「议会」，不落「审查」兜底桶', () => {
     const timeline = [
       event('council.started', {}),
@@ -73,6 +85,51 @@ describe('eventGraph · 失败状态判定', () => {
     ];
     const { nodes } = buildEventGraph(timeline, 'failed');
     expect(nodes[0].status).toBe('blocked');
+  });
+
+  describe('eventGraph · driver 状态事件', () => {
+    it('turn/tool 生命周期属于执行步骤，不冒充审查，也不提前结束 Agent 跨度', () => {
+      const role = { role_id: 'role_ts_engineer' };
+      const timeline = [
+        event('agent.execution_requested', role),
+        event('driver.turn_started', role),
+        event('driver.tool_started', { ...role, tool_name: 'Edit' }),
+        event('driver.tool_completed', role),
+        event('driver.turn_completed', role),
+      ];
+      const { nodes } = buildEventGraph(timeline, 'running');
+      expect(nodes).toHaveLength(1);
+      expect(stepOfNode(nodes[0].id)).toBe('execute');
+      expect(nodes[0].status).toBe('active');
+    });
+
+    it('工具失败后 Agent 成功恢复，不把整个执行步骤标成失败', () => {
+      const role = { role_id: 'role_ts_engineer' };
+      const { nodes } = buildEventGraph(
+        [
+          event('agent.execution_requested', role),
+          event('driver.tool_failed', role),
+          event('agent.execution_completed', { ...role, status: 'succeeded' }),
+        ],
+        'completed',
+      );
+      expect(nodes[0].status).toBe('done');
+    });
+
+    it('用量记录留在原始事件流，不凭空生成一个审查步骤', () => {
+      expect(
+        groupEvents([
+          event('proxy.llm_usage_recorded', { input_tokens: 10 }),
+          event('proxy.llm_usage_dropped', { reason: 'missing ledger' }),
+        ]),
+      ).toEqual([]);
+    });
+
+    it('议会角色生命周期仍归议会', () => {
+      const groups = groupEvents([event('council.role.started'), event('council.role.completed')]);
+      expect(groups).toHaveLength(1);
+      expect(stepOfNode(groups[0].nodeId)).toBe('council');
+    });
   });
 
   it('status=succeeded 不受影响，仍是 done', () => {

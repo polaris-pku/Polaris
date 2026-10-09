@@ -34,6 +34,10 @@ const child = spawn(
       ...process.env,
       POLARIS_NODE_BIN: path.join(backendDir, 'runtime', 'node'),
       POLARIS_AGENT_DIR: agentDir,
+      // PGlite 外置在 backend/pglite/node_modules（见 build-backend.mjs），与 backendBridge 同样指过去
+      NODE_PATH: [path.join(backendDir, 'pglite', 'node_modules'), process.env.NODE_PATH]
+        .filter(Boolean)
+        .join(path.delimiter),
       NEWIDE_STATE_ROOT: stateRoot,
       NEWIDE_COORDINATION_DB: path.join(stateRoot, 'coordination.sqlite'),
       NEWIDE_LITELLM_CONFIG_DIR: path.join(backendDir, 'config'),

@@ -341,6 +341,10 @@ export type CouncilResultCard = {
   unmetCriteria: string[];
   verificationRefs: string[];
   decisionRecordRef: string;
+  /** 中途失败的席位数；旧后端不给时为 0 */
+  roleFailureCount: number;
+  /** 综合席位不可用、退回到最佳提案 */
+  fallbackUsed: boolean;
 };
 
 // ══════════════════════════════════════════════════
@@ -995,6 +999,9 @@ export function buildCouncilBoard(
           unmetCriteria: strList(snapResult.unmet_criteria),
           verificationRefs: strList(snapResult.verification_refs),
           decisionRecordRef: str(snapResult.decision_record_ref),
+          roleFailureCount:
+            typeof snapResult.role_failure_count === 'number' ? snapResult.role_failure_count : 0,
+          fallbackUsed: snapResult.fallback_used === true,
         }
       : null;
 

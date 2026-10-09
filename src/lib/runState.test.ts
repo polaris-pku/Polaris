@@ -52,6 +52,32 @@ function live(patch: Partial<LiveRunState> = {}): LiveRunState {
 }
 
 describe('runStateOf —— 全应用唯一的状态判定', () => {
+  it('Task waiting or blocked takes precedence over a completed execution leg', () => {
+    const completed = live({ status: 'completed' });
+    expect(
+      runStateOf(task({ contractRunId: 'run-1', contractTaskStatus: 'waiting_help' }), completed),
+    ).toBe('waiting');
+    expect(
+      runStateOf(task({ contractRunId: 'run-1', contractTaskStatus: 'blocked' }), completed),
+    ).toBe('blocked');
+    expect(
+      runStateOf(task({ contractRunId: 'run-1', contractTaskStatus: 'running' }), completed),
+    ).toBe('running');
+  });
+
+  it('Mailbox completion is a wait even before the refreshed Task snapshot arrives', () => {
+    const event = {
+      ...gateEvent(1, 'allow'),
+      type: 'run.completed',
+      payload: { outcome: 'mailbox_wait' },
+    };
+    expect(
+      runStateOf(
+        task({ contractRunId: 'run-1' }),
+        live({ status: 'completed', timeline: [event] }),
+      ),
+    ).toBe('waiting');
+  });
   it('没有任务 → 未开始', () => {
     expect(runStateOf(undefined, undefined)).toBe<RunState>('idle');
   });
@@ -121,6 +147,7 @@ describe('词表', () => {
   const ALL: RunState[] = [
     'idle',
     'running',
+    'waiting',
     'blocked',
     'completed',
     'failed',
@@ -128,7 +155,7 @@ describe('词表', () => {
     'unsent',
   ];
 
-  it('7 个状态各有唯一中文名，且没有双语注音、没有英文枚举前缀', () => {
+  it('每个状态各有唯一中文名，且没有双语注音、没有英文枚举前缀', () => {
     for (const state of ALL) {
       const label = RUN_STATE_LABEL[state];
       expect(label).toBeTruthy();
@@ -137,7 +164,7 @@ describe('词表', () => {
     expect(new Set(Object.values(RUN_STATE_LABEL)).size).toBe(ALL.length);
   });
 
-  it('7 个状态各有一个色调，且只用 4 个强调色 + 中性', () => {
+  it('每个状态各有一个色调，且只用 4 个强调色 + 中性', () => {
     for (const state of ALL) {
       expect(['muted', 'command', 'human', 'ok', 'danger']).toContain(RUN_STATE_TONE[state]);
     }

@@ -1128,6 +1128,34 @@ describe('councilBoard · 致命错误与终态证据', () => {
     expect(model?.outcome?.participant_role_ids).toEqual(['agent_frontend', 'agent_backend']);
     expect(model?.outcome?.audit_refs).toEqual(['artifact_audit_1']);
     expect(model?.requiredNextActions).toEqual(['post_council_gate']);
+    // 旧后端不带降级字段：按「没有降级」读，不是 undefined
+    expect(model?.result?.roleFailureCount).toBe(0);
+    expect(model?.result?.fallbackUsed).toBe(false);
+  });
+
+  it('result 带出降级字段：失败角色数与综合回退', () => {
+    const council: NonNullable<RunSnapshot['council']> = {
+      enabled: true,
+      status: 'completed',
+      selected_artifact_refs: ['artifact-9'],
+      required_next_actions: [],
+      blocked_by: [],
+      can_create_merge_authorization: false,
+      result: {
+        role_failure_count: 2,
+        fallback_used: true,
+        quality: 'best_effort',
+        final_artifact_ref: 'artifact-9',
+        final_artifact_sha256: 'a'.repeat(64),
+        warnings: ['Council synthesis was unavailable; selected the best available proposal.'],
+        unmet_criteria: [],
+        verification_refs: [],
+        decision_record_ref: 'dec-1',
+      },
+    };
+    const model = buildCouncilBoard([], council);
+    expect(model?.result?.roleFailureCount).toBe(2);
+    expect(model?.result?.fallbackUsed).toBe(true);
   });
 
   it('快照没有 result / outcome 时是 null，不给空壳', () => {
