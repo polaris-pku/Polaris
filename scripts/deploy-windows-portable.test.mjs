@@ -125,7 +125,7 @@ test('publishes the verified new file, updates the entry, and removes only super
   await mkdir(directory);
   await writeFile(path.join(directory, 'personal.txt'), 'keep');
   const data = path.join(f.root, 'settings.json');
-  await writeFile(data, '{"account":"zzh1"}');
+  await writeFile(data, '{"provider":"anthropic"}');
   const unrelatedLink = path.join(f.desktop, 'Polaris-project.lnk');
   await writeFile(unrelatedLink, JSON.stringify({ target: data }));
   const customLink = path.join(f.desktop, 'My-project.lnk');
@@ -142,7 +142,7 @@ test('publishes the verified new file, updates the entry, and removes only super
   assert.deepEqual(result.removed.sort(), [f.old, obsoleteLink].sort());
   assert.equal(await readFile(path.join(f.desktop, 'notes.txt'), 'utf8'), 'keep');
   assert.equal(await readFile(path.join(directory, 'personal.txt'), 'utf8'), 'keep');
-  assert.equal(await readFile(data, 'utf8'), '{"account":"zzh1"}');
+  assert.equal(await readFile(data, 'utf8'), '{"provider":"anthropic"}');
   for (const link of [unrelatedLink, customLink, outsideLink]) {
     assert.ok((await lstat(link)).isFile());
   }

@@ -69,9 +69,9 @@
 
 「用量」分三种口径，互不相加：
 
-- `billed`：按 `proxy` 与 `claude_session_jsonl` 分来源的计费 token。运行中通常只有代理一侧，`pending_sources` 标出尚待收尾结算的来源。
+- `billed`：按 `proxy` 与驱动档案的计费来源（默认 `claude_session_jsonl`）分别展示计费 token。`proxy` 表示后端模型 API 调用，不要求个人调试代理；`pending_sources` 标出尚待收尾结算的来源。
 - `context`：执行器上下文占用，不是计费用量。`complete=false` 会显示观测不完整。
-- `by_stage`：仅模型代理一侧的分阶段计费统计，不是阶段总量。没有 `duration_ms` 时显示「耗时未提供」，不是 0。
+- `by_stage`：仅模型 API 调用一侧的分阶段计费统计，不是阶段总量。没有 `duration_ms` 时显示「耗时未提供」，不是 0。
 
 `run.getUsage` 可按 run、task、system、role 查看持久历史累计。没有用量的运行计入 `runs_without_usage`，不当作 0；查询失败会显示错误与刷新入口。
 
@@ -86,6 +86,20 @@
 超出内联上限的大字段在 `event.payload.payload_ref` 留引用。展开事件流中的对应行，点「读取完整载荷」，由 `run.getPayload` 取回原始事件。
 
 引用对应的文件可能已经截断或清理：`-32017` 会显示不可读取，不返回假空内容。`-32601` 表示后端版本不支持接口。状态事件照常推送，但消息 chunk、工具 progress 和 stderr 不逐条进入状态时间线，也没有独立的流式文字合并通道。
+
+## 驱动路由
+
+设置中的「驱动路由」使用三个接口：`driver.getConfig`、`driver.updateRouting`、`driver.resetRouting`。成功返回均为 `driver-routing.v1` 快照，不另套结果信封。
+
+编辑默认驱动和角色时，保存的是完整角色映射，不是单条 patch。`roles` 已包含目录未确认的显式映射；它们不会因为 `known_role=false` 被当作无效或从请求中删掉。与默认驱动相同的映射由后端规范化合并。
+
+`selectable` 决定选项是否可选。`degraded` 与 `AGENT_CLI_READINESS_NOT_VERIFIABLE` 只表示当前进程无法确认 A 侧 CLI 是否就绪，不是驱动故障。界面不显示运行时环境变量、凭据、runner 路径或启动命令。
+
+保存和恢复文件配置都要带 `expected_revision`。`-32021` 会保留草稿并读取最新快照，由用户决定如何合并，不自动覆盖；`-32026` 可稍后重试同一请求。`-32025` 表示部署锁定了默认驱动，选择器会恢复到 `locked_driver_id`，角色仍可编辑。
+
+`-32022` / `-32023` 按 `field` 定位不可用的驱动选择；`-32024` 展示写入诊断；旧后端的 `-32601` 提示版本限制，不伪造可选驱动。
+
+路由覆盖保存在当前后端工作区的 `.agent/drivers.ui.local.yaml`。保存不重启后端：已创建 Run 使用冻结映射，新 Run 才读取新配置。议会阶段的执行 ID 仍独立，但路由按 `activity_run_id` 所属 Run 的冻结映射解析。新增或移除驱动档案需要重启进程，不由本设置区完成。
 
 ## Gate 与合议
 

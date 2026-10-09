@@ -1,7 +1,15 @@
 import { describe, expect, it } from 'vitest';
-import { isAbsoluteFilePath, relativeProjectFileParts } from './projectPaths';
+import { isAbsoluteFilePath, relativeProjectFileParts, sameProjectPath } from './projectPaths';
 
 describe('project file paths', () => {
+  it('compares routing workspaces using Windows and POSIX path rules', () => {
+    expect(sameProjectPath('C:\\Work\\cook\\', 'c:/work/cook')).toBe(true);
+    expect(sameProjectPath('\\\\SERVER\\Share\\cook', '//server/share/cook/')).toBe(true);
+    expect(sameProjectPath('/work/cook/', '/work/cook')).toBe(true);
+    expect(sameProjectPath('/work/Cook', '/work/cook')).toBe(false);
+    expect(sameProjectPath('/work/cook-other', '/work/cook')).toBe(false);
+    expect(sameProjectPath('', '')).toBe(false);
+  });
   it('maps a Windows delivered file to its actual project root', () => {
     expect(
       relativeProjectFileParts(

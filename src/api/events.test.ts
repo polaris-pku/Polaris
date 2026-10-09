@@ -27,15 +27,18 @@ const READY_STATUS = {
   state: 'ready' as const,
   message: '',
   workspace: '/tmp/ws',
-  modelProxy: {
-    configured: true,
+  auth: {
+    providerId: 'anthropic',
+    hasKey: true,
+    hasLocalCredentials: false,
     incomplete: false,
     ready: true,
-    baseUrl: 'http://127.0.0.1:4000',
-    model: 'copilot-test',
+    baseUrl: '',
+    model: 'test-model',
+    fastModel: 'test-model',
   },
-  bMemory: { configured: true },
   agents: [],
+  providers: [],
 };
 
 /** 一条实时事件。实时流的 sequence 是**逐 run 从 1 开始、连续**的（后端 run-registry）。 */
@@ -142,7 +145,10 @@ function installFakeBackend(
     configure: vi.fn(async () => READY_STATUS),
     restart: vi.fn(async () => READY_STATUS),
     getSettings: vi.fn(async () => ({
-      modelProxy: { baseUrl: 'http://127.0.0.1:4000', model: 'copilot-test' },
+      provider: 'anthropic',
+      configured: {
+        anthropic: { hasKey: true, baseUrl: '', model: 'test-model', fastModel: 'test-model' },
+      },
       bMemory: { configured: true },
     })),
     saveSettings: vi.fn(async () => READY_STATUS),

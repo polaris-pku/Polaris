@@ -34,15 +34,18 @@ const READY_STATUS = {
   state: 'ready' as const,
   message: '',
   workspace: '/tmp/ws',
-  modelProxy: {
-    configured: true,
+  auth: {
+    providerId: 'anthropic',
+    hasKey: true,
+    hasLocalCredentials: false,
     incomplete: false,
     ready: true,
-    baseUrl: 'http://127.0.0.1:4000',
-    model: 'copilot-test',
+    baseUrl: '',
+    model: 'test-model',
+    fastModel: 'test-model',
   },
-  bMemory: { configured: true },
   agents: [],
+  providers: [],
 };
 
 function event(id: string, sequence: number, taskId = 'task-1', runId = 'run-1'): RunEvent {

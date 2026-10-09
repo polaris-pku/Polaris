@@ -39,6 +39,11 @@ import type {
 } from './system';
 import type { TaskCreateParams, TaskSnapshot, TaskSubscribeResult } from './task';
 import type {
+  DriverRoutingSnapshot,
+  ResetDriverRoutingInput,
+  UpdateDriverRoutingInput,
+} from './driverRouting';
+import type {
   MemoryAgentMetaPatch,
   MemoryCapabilities,
   MemoryCreateAgentSpec,
@@ -151,6 +156,11 @@ export interface RunSnapshot {
   quality?: Record<string, unknown>;
   usage?: RunUsage;
   activity?: RunActivity;
+  driver_config?: {
+    default_driver: string;
+    drivers: Record<string, string>;
+    roles?: Record<string, string>;
+  };
   current: {
     stage: RunStage;
     active_node_code: string;
@@ -339,6 +349,9 @@ export interface RunCreateResult {
 }
 
 export interface RpcMethodMap {
+  'driver.getConfig': { params: Record<string, never>; result: DriverRoutingSnapshot };
+  'driver.updateRouting': { params: UpdateDriverRoutingInput; result: DriverRoutingSnapshot };
+  'driver.resetRouting': { params: ResetDriverRoutingInput; result: DriverRoutingSnapshot };
   'system.ping': { params: Record<string, never>; result: PingResult };
   'system.liveness': { params: Record<string, never>; result: SystemLiveness };
   'system.readiness': { params: Record<string, never>; result: SystemReadiness };
