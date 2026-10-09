@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { createInterface } from 'node:readline';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -302,6 +302,80 @@ describe('backend RPC stdio entrypoint', () => {
       await service.close();
       expect(close).toHaveBeenCalledOnce();
     } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps driver routing in the selected project and preserves frozen runs', async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'newide-project-driver-routing-'));
+    const workspace = path.join(root, 'project');
+    const stateRoot = path.join(root, 'state');
+    const runner = path.join(root, 'runner');
+    let service: NewideBackendService | undefined;
+    try {
+      mkdirSync(runner, { recursive: true });
+      mkdirSync(path.join(workspace, '.agent'), { recursive: true });
+      writeFileSync(path.join(runner, 'package.json'), '{"scripts":{"driver:run":"exit 0"}}');
+      writeFakeAcpRunnerBuild(runner);
+      writeFileSync(
+        path.join(workspace, '.agent', 'drivers.yaml'),
+        [
+          'version: 1',
+          'drivers:',
+          '  alternate:',
+          '    agent: codex',
+          '    runtime:',
+          '      env:',
+          '        ROUTING_TEST_SECRET: fixture-value-not-for-rpc',
+          'roles:',
+          '  old-role: alternate',
+          '',
+        ].join('\n'),
+      );
+      service = await createProductionBackendService(
+        {
+          ACP_DRIVER_RUNNER_DIR: runner,
+          ACP_WORKSPACE: workspace,
+          NEWIDE_STATE_ROOT: stateRoot,
+          NEWIDE_COORDINATION_DB: ':memory:',
+        },
+        {
+          bRuntime: { ...createInMemoryBRuntime(), app_state_root: stateRoot },
+          agentLlm: invokeDriverLlm(),
+        },
+      );
+      const routing = service.driverRouting!;
+      const before = await routing.getSnapshot();
+      expect(before.default_driver).toBe('acp-external');
+      expect(before.drivers.map((driver) => driver.driver_id)).toContain('alternate');
+      expect(before.orphan_roles).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            role_id: 'old-role',
+            driver_id: 'alternate',
+            known_role: false,
+          }),
+        ]),
+      );
+      expect(JSON.stringify(before)).not.toContain('fixture-value-not-for-rpc');
+      expect(JSON.stringify(before)).not.toContain(runner);
+      const frozen = routing.freezeForRun('before-edit');
+      const saved = await routing.updateRouting({
+        expected_revision: before.revision,
+        default_driver: 'alternate',
+        roles: Object.fromEntries(before.roles.map((role) => [role.role_id, role.driver_id])),
+      });
+      expect(saved.default_driver).toBe('alternate');
+      expect(saved.drivers).toEqual(before.drivers);
+      expect(routing.freezeForRun('before-edit')).toEqual(frozen);
+      expect(routing.freezeForRun('after-edit').default_driver).toBe('alternate');
+      expect(existsSync(path.join(workspace, '.agent', 'drivers.ui.local.yaml'))).toBe(true);
+      expect(existsSync(path.join(stateRoot, '.agent', 'drivers.ui.local.yaml'))).toBe(false);
+      const reset = await routing.resetRouting(saved.revision);
+      expect(reset.default_driver).toBe('acp-external');
+      expect(existsSync(path.join(workspace, '.agent', 'drivers.ui.local.yaml'))).toBe(false);
+    } finally {
+      await service?.close();
       rmSync(root, { recursive: true, force: true });
     }
   });

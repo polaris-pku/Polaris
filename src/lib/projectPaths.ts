@@ -1,5 +1,13 @@
 const normalize = (value: string): string => value.replace(/\\/g, '/');
 
+export function sameProjectPath(left: string, right: string): boolean {
+  const key = (value: string) => {
+    const path = normalize(value).replace(/\/+$/, '');
+    return /^[a-z]:/i.test(path) || path.startsWith('//') ? path.toLowerCase() : path;
+  };
+  return !!left && !!right && key(left) === key(right);
+}
+
 export function isAbsoluteFilePath(value: string): boolean {
   const path = normalize(value);
   return path.startsWith('/') || /^[a-z]:\//i.test(path);

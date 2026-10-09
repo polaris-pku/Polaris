@@ -129,7 +129,7 @@ describe('observability rendering semantics', () => {
     });
     expect(html).toContain('计费 token · 按来源');
     expect(html).toContain('上下文占用 · 非计费用量');
-    expect(html).toContain('分阶段 · 仅模型代理计费');
+    expect(html).toContain('分阶段 · 仅模型 API 计费');
     expect(html).toContain('三种口径互不相加');
     expect(html).toContain('待结算');
     expect(html).toContain('上下文观测不完整');

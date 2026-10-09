@@ -9,7 +9,8 @@ export type RunCursor =
   | 'mailbox_wait'
   | 'done';
 
-export type RunUsageSource = 'proxy' | 'claude_session_jsonl';
+/** Driver profiles may declare additional billing sources alongside proxy usage. */
+export type RunUsageSource = string;
 
 export interface RunUsageTokens {
   input_tokens: number;

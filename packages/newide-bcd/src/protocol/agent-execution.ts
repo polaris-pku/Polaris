@@ -43,6 +43,7 @@ export interface AgentExecutionRequest {
    *
    * 显式提供观测身份，允许调用方把阶段执行归到同一个面板 run。
    * 不改变 `run_id` 的生成规则；缺省时观测与执行身份相同。
+   * 阶段执行也按此所属 Run 解析冻结的驱动路由，而不以阶段 ID 读取当前配置。
    */
   activity_run_id?: RunId;
   /** RFC §1.2 memory ablation; applied by production Agent execution facade. */

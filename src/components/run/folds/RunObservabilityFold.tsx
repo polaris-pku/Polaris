@@ -21,7 +21,7 @@ import type { LiveRunState } from '@/store/types';
 
 const count = (value: number) => value.toLocaleString('zh-CN');
 const sourceLabel = (source: string) =>
-  source === 'proxy' ? '模型代理' : source === 'claude_session_jsonl' ? '执行器会话账单' : source;
+  source === 'proxy' ? '模型 API' : source === 'claude_session_jsonl' ? '执行器会话账单' : source;
 
 export function RunActivityFold({ live }: { live: LiveRunState }) {
   const agents = live.status === 'running' ? live.snapshot?.activity?.agents : undefined;
@@ -137,8 +137,8 @@ export function UsageBreakdown({ usage }: { usage: RunUsage | undefined }) {
       )}
 
       {usage.by_stage && Object.keys(usage.by_stage).length > 0 && (
-        <section aria-label="分阶段代理用量" className="border-t border-edge pt-2">
-          <h3 className="text-body text-fg-primary">分阶段 · 仅模型代理计费</h3>
+        <section aria-label="分阶段模型 API 用量" className="border-t border-edge pt-2">
+          <h3 className="text-body text-fg-primary">分阶段 · 仅模型 API 计费</h3>
           {Object.entries(usage.by_stage).map(([stage, metrics]) => (
             <div key={stage} className="mt-2">
               <KeyValue k={stageLabel(stage)} v={`${count(metrics.total_tokens)} token`} />
