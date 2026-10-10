@@ -208,9 +208,8 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
 
   return (
     <div>
-      {/* 工作台标题 + 新建项目 */}
       <div className="mb-1 flex items-center justify-between px-2">
-        <span className="text-meta text-fg-faint">工作台</span>
+        <span className="text-meta text-fg-faint">项目</span>
         <button
           onClick={() => setNewProjectOpen(true)}
           title="新建项目"

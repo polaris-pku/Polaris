@@ -4,15 +4,18 @@
 
 ## 环境
 
-- Node `>=20`（见 `.nvmrc`，推荐 `nvm use`）
-- 包管理器 **pnpm `>=9`**（已通过 `packageManager` 锁定，建议 `corepack enable`）
+- Node `>=22.22.1`（见 `.nvmrc`，推荐 `nvm use`）
+- 包管理器 **pnpm**（版本由 `package.json` 的 `packageManager` 锁定，建议 `corepack enable`）
 
 ```bash
 corepack enable
 pnpm install
-pnpm dev          # 本地开发
+pnpm build:backend # 构建后端及执行器运行时
+pnpm electron:dev  # 桌面开发
 pnpm verify       # lint + 类型检查 + 测试（提交前必跑，CI 跑的就是它）
 ```
+
+仅调试渲染层时可使用 `pnpm dev`；后端代码修改后需重新运行 `pnpm build:backend`。
 
 ## 分支与提交
 

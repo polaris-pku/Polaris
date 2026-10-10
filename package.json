@@ -2,7 +2,7 @@
   "name": "polaris",
   "private": true,
   "version": "0.1.0",
-  "description": "Polaris · 多 Agent 协作开发桌面工作台",
+  "description": "Polaris · 面向软件开发的智能协作空间",
   "author": "fangz and zhangyc",
   "repository": {
     "type": "git",
