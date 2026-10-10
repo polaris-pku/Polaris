@@ -67,7 +67,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             onClick={() => {
               setNavCollapsed((v) => !v);
             }}
-            title={navCollapsed ? '展开工作台' : '收起工作台'}
+            title={navCollapsed ? '展开侧栏' : '收起侧栏'}
             className="absolute -right-3 top-7 z-30 flex h-6 w-6 items-center justify-center rounded-full border border-brand-border bg-brand-panel text-fg-muted transition-colors hover:border-brand-purple hover:text-brand-silver"
           >
             {navCollapsed ? (
