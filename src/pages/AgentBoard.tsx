@@ -21,8 +21,8 @@ import { Button } from '@/components/ui/Button';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { Fold } from '@/components/ui/Fold';
 import { IdChip } from '@/components/ui/IdChip';
-import { KeyValue, KeyValueList } from '@/components/ui/KeyValue';
 import { Panel, PanelHeader } from '@/components/ui/Panel';
+import { useDemoStore } from '@/store/useDemoStore';
 import { cn } from '@/lib/utils';
 
 /**
@@ -77,6 +77,19 @@ const STATUS_LABEL: Record<string, string> = {
   retired: '已退休',
 };
 
+/**
+ * 名册里状态徽章的色阶。
+ * 与 `STATUS_LABEL` 解耦：翻译管"叫什么"，这里管"长什么样"。
+ * 已创建/活跃 → 绿(可派活)，收尾中 → 橙(还在处理)，空闲/已退休 → 中性(无可用任务)。
+ */
+const ROSTER_STATUS_TONE: Record<string, BadgeProps['variant']> = {
+  created: 'ok',
+  active: 'ok',
+  draining: 'human',
+  idle: 'default',
+  retired: 'default',
+};
+
 const REVIEW_LABEL: Record<string, string> = {
   pending: '待审核',
   approved: '已通过',
@@ -110,12 +123,6 @@ const MAINTENANCE_STATUS_TONE: Record<MemoryMaintenanceEvidence['status'], Badge
     skipped: 'default',
     failed: 'danger',
   };
-
-/** `verified` = 启动时真调过一次 embedding；`host_managed` = 由宿主保证，未自检。 */
-const READINESS_LABEL: Record<string, string> = {
-  verified: '已自检',
-  host_managed: '宿主托管',
-};
 
 type PersonaTextField = Extract<
   keyof RpcPersonaView,
@@ -292,6 +299,23 @@ export function AgentBoard() {
     }
   };
 
+  /**
+   * 「Agent 名册」是所有任务的横切视图：从任意一个任务跳进来之后，要有一个出口回到自己正
+   * 在跑的那个任务。`selectTask` 内部已经把 `currentPage` 切回 `tasks`，并把活动项目的实时
+   * 态带回来 —— 这是「页面级的关联视图」而不是「切换上下文」，所以复用现有导航动作。
+   *
+   * 没有活动任务时（用户从启动页直接进了控制台）：退回空的 `tasks` 页，靠 TaskBoard 的
+   * 空状态引导，比送回启动页更连贯 —— 用户既然在控制台看过名册，就是带着项目进来的。
+   */
+  const backToTask = useCallback(() => {
+    const state = useDemoStore.getState();
+    if (state.activeTaskId) {
+      state.selectTask(state.activeTaskId);
+    } else {
+      state.setPage('tasks');
+    }
+  }, []);
+
   if (loading) {
     return (
       <div className="flex h-full items-center justify-center text-body text-fg-muted">
@@ -347,27 +371,46 @@ export function AgentBoard() {
               </p>
             </button>
 
-            {agents.map((agent) => (
-              <button
-                key={agent.role_id}
-                type="button"
-                onClick={() => {
-                  setSelectedRoleId(agent.role_id);
-                }}
-                className={cn(
-                  'w-full rounded-panel border bg-surface-panel p-3 text-left transition-colors hover:border-edge-strong',
-                  selectedRoleId === agent.role_id ? 'border-command/60' : 'border-edge',
-                )}
-              >
-                <div className="flex items-center gap-2">
-                  <span className="min-w-0 flex-1 truncate text-body text-fg-primary">
-                    {agent.name}
-                  </span>
-                  <Badge variant={agent.status === 'active' ? 'ok' : 'default'}>
-                    {STATUS_LABEL[agent.status] ?? agent.status}
-                  </Badge>
+              {agents.map((agent) => (
+                <button
+                  key={agent.role_id}
+                  type="button"
+                  onClick={() => {
+                    setSelectedRoleId(agent.role_id);
+                  }}
+                  className={cn(
+                    'w-full rounded-panel border bg-surface-panel p-3 text-left transition-colors hover:border-edge-strong',
+                    selectedRoleId === agent.role_id ? 'border-command/60' : 'border-edge',
+                  )}
+                >
+                  <div className="flex items-center gap-2">
+                    <span className="min-w-0 flex-1 truncate text-body text-fg-primary">
+                      {agent.name}
+                    </span>
+                    {/*
+                      状态徽章:旧版全 13px、created 走 default(灰) —— 在新装上
+                      几乎所有 Agent 都是「已创建」,满屏灰徽章跟「正常状态」混淆。
+                      (a) 字号降到 11px(text-meta) —— 让 Agent 名称做主角,徽章退到
+                          名字右边的次要指示位置,横向扫读时不再被徽章抢眼。
+                      (b) 颜色按状态语义:已创建 / 活跃 = 绿(ok),收尾中 = 橙(human),
+                          空闲 / 退休 / 未知 = 中性(default)。这条不光是「已创建变绿」,
+                          是把名册里的状态条变成一个一眼可读的小信号灯:
+                          「这个角色还在跑 / 还能派活 / 已经收尾 / 不在了」。
+                    */}
+                    <Badge
+                      variant={ROSTER_STATUS_TONE[agent.status] ?? 'default'}
+                      className="text-meta"
+                    >
+                      {STATUS_LABEL[agent.status] ?? agent.status}
+                    </Badge>
+                  </div>
+                {/* role_id 走 brand purple：在名册里它是这个 Agent 唯一稳定的 ID —— 名称会被改名 / 标签会增减，
+                    但 role_id 永远不变。把它染成紫色既能在多 Agent 横向扫读时一眼锁定"这行的归属"，
+                    也跟 Agent Board 顶栏「选中」那枚紫色描边的语义保持一致。选 soft 而不是 DEFAULT：
+                    12px 等宽、n 块并排，DEFAULT 太抢会压过名称那一行。 */}
+                <div className="truncate font-mono text-code text-command-soft">
+                  {agent.role_id}
                 </div>
-                <div className="truncate font-mono text-code text-fg-muted">{agent.role_id}</div>
                 <p className="mt-1 line-clamp-2 text-body text-fg-secondary">
                   {agent.persona_summary || '暂无画像摘要'}
                 </p>
@@ -396,13 +439,68 @@ export function AgentBoard() {
 
       <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <header className="flex shrink-0 items-end justify-between gap-4 border-b border-edge px-6 py-4">
-          <div className="min-w-0">
+          {/*
+            页头。原本在标题下挂了一行「来自 B Memory 的长期角色、技能与经验」——
+            「B Memory」是研发代号,用户从来没见过。删掉之后标题区只剩个孤零零的 15px 标题,
+            视觉上塌下去一半。
+            用「当前视角」chip 补回:选中具体 Agent 时显示它的 role_id 截断;
+            未选中时显示「全局视图 · 跨 Agent」。这两个状态都是**当下真相**,
+            比一句产品话术更值得占这个位置。
+          */}
+          <div className="flex min-w-0 items-center gap-2">
             <h1 className="text-title text-fg-primary">Agent Memory</h1>
-            <p className="mt-0.5 text-body text-fg-muted">来自 B Memory 的长期角色、技能与经验。</p>
+            {selectedRoleId ? (
+              (() => {
+                const selected = agents.find((a) => a.role_id === selectedRoleId);
+                return (
+                  <>
+                    <IdChip value={selectedRoleId} label="查看" />
+                    {selected && (
+                      <Badge variant={selected.status === 'active' ? 'ok' : 'default'}>
+                        {STATUS_LABEL[selected.status] ?? selected.status}
+                      </Badge>
+                    )}
+                  </>
+                );
+              })()
+            ) : (
+              <span className="rounded-chip border border-edge bg-surface-panel px-1.5 text-meta text-fg-muted">
+                全局视图 · 跨 Agent
+              </span>
+            )}
           </div>
+          {/*
+            返回任务界面的唯一全局出口。
+
+            为什么要这一颗 ×：导航栏的「Agent 控制台」按钮把 `currentPage` 切成 `agents`
+            之后，没有任何正面的方式回到正在跑的那个任务 —— 用户得去侧栏里翻项目、点任务、
+            或者干脆先点开「返回启动页」再绕回来。这条路径在「控制台只是一个横切视图」
+            的语义下是错的：用户**没想离开任务**，只是想看一眼名册里有没有合适的角色。
+
+            · 放在主区页头（而不是名册侧栏）的原因：× 的作用对象是**整页**「返回任务」，不是
+              「收起名册」。任务页的 × 历来都钉在主区右上角（设置抽屉、错误条都是这套），这里
+              与它们共处一排，肌肉记忆能复用。
+            · 命中范围：选中某角色 → 只收起名册/切到任务页是不够的，得连同「当前正在干活的
+              任务上下文」一起带回去，所以走 `selectTask(activeTaskId)` 而不是裸 `setPage`。
+              没有活动任务时退化为 setPage('tasks')，让 TaskBoard 的空状态接管。
+          */}
           <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
-            <SkillReviewBadge capabilities={capabilities} />
-            <EmbeddingBadge capabilities={capabilities} />
+            {/*
+              原先挂在这里的 `SkillReviewBadge`(技能需人工审核 / 技能自动通过) 与
+              `EmbeddingBadge`(哈希向量已降级 / 语义向量) 两枚能力徽章已经删除。
+              那是 v2/v4 后端能力声明的反射结果 —— 对名册浏览 / 画像查看 / 技能晋升
+              这些**面向用户**的动作没有可操作含义。能力门控在该处真正被执行
+              的位置(技能晋升、记忆运维等)由各自面板的就近错误提示承担。
+            */}
+            <button
+              type="button"
+              onClick={backToTask}
+              aria-label="返回任务界面"
+              title="返回任务界面"
+              className="ml-1 inline-flex h-7 w-7 items-center justify-center rounded-chip border border-edge bg-surface-panel text-fg-muted transition-colors hover:border-edge-strong hover:bg-surface-raised hover:text-fg-primary"
+            >
+              <X className="h-4 w-4" aria-hidden />
+            </button>
           </div>
         </header>
 
@@ -571,82 +669,185 @@ function OverviewTab({
 
   return (
     <div className="space-y-4">
+      {/*
+        Agent 概况 —— 旧版是一条 7 行的 KeyValueList（创建时间 / 任务量 / 竞标 / 成功率 /
+        库存 / 最近任务 / 开销），所有事实同字号同字色挤在一起，扫一眼只能看到一堵「key：value」
+        的字墙，**哪些是它作为 Agent 的核心数字、哪些只是参考时间戳**完全分不出来。
+        这就是「扁平且冗杂」。
+
+        重排为三档：
+        ① **3 张 metric 卡** —— 总任务 / 成功率 / 活跃度（activity_score）。
+           它们是这页里「值得被一眼记住」的三个数，所以字号提一档、占独立的视觉块。
+        ② **4 条 inline 数据点** —— 竞标 / 库存 / 开销 / 中标率。
+           重要但**不值得独占一格**的事实，挤成一行 monospace 形式。
+        ③ **时间锚** —— 创建时间 + 最近任务。
+           参考信息，不应该再占据主视觉。挪到最底，用 fg-faint，与主数据块分开。
+        标签（tags）从「Panel 抬头下面」上移到「PanelHeader 内、最右」—— 它是身份的一部分，
+        不是数据的一部分。头像 / 标题之后跟着 ID / 状态 / 标签，是名册卡里已经验证过的结构。
+        任务量里那个 `tasks_completed / tasks_succeeded / tasks_failed` 子分布单独提到主指标下方一行
+        —— 它是「总任务」这个数字的拆解，不是另一个独立事实。
+      */}
       <Panel>
         <PanelHeader>
           Agent 概况
           <span className="font-mono text-code text-fg-faint">memory.getAgent</span>
+          <span className="flex-1" />
+          {(agent.tags ?? []).length > 0 && (
+            <span className="flex flex-wrap items-center gap-1">
+              {(agent.tags ?? []).map((tag) => (
+                <span
+                  key={tag}
+                  className="rounded-chip border border-edge px-1.5 font-mono text-code text-fg-muted"
+                >
+                  {tag}
+                </span>
+              ))}
+            </span>
+          )}
           {loading && <Loader2 className="h-3.5 w-3.5 animate-spin text-fg-faint" />}
         </PanelHeader>
-        <div className="mt-2 flex flex-wrap items-center gap-1.5">
-          {(agent.tags ?? []).map((tag) => (
-            <span
-              key={tag}
-              className="rounded-chip border border-edge px-1.5 font-mono text-code text-fg-muted"
-            >
-              {tag}
-            </span>
-          ))}
-          {(agent.tags ?? []).length === 0 && (
-            <span className="text-body text-fg-faint">没有标签</span>
+
+        <div className="mt-3 grid grid-cols-3 gap-2">
+          <MetricCard
+            label="总任务"
+            value={numText(raw.total_tasks)}
+            hint={
+              raw.total_tasks > 0
+                ? `完成 ${numText(raw.tasks_completed)} · 失败 ${numText(raw.tasks_failed)}`
+                : '尚未接过任务'
+            }
+          />
+          <MetricCard
+            label="成功率"
+            value={percent(derived.success_rate)}
+            hint={`中标率 ${percent(derived.bid_win_rate)}`}
+            tone={derived.success_rate >= 0.7 ? 'ok' : derived.success_rate >= 0.4 ? 'idle' : 'danger'}
+          />
+          <MetricCard
+            label="活跃度"
+            value={percent(derived.activity_score)}
+            hint={
+              raw.last_task_at
+                ? `上次任务 ${raw.last_task_at}`
+                : '最近 14 天衰减为半'
+            }
+          />
+        </div>
+
+        {/*
+          第二档：横向数据点。设计成 `<dl>` 是因为每个点本质是"k → v"的定义关系，
+          但 `dl` 不允许把 `<div>` 作为直接子节点 —— 每个 DataPoint 必须直接产出
+          `<dt> + <dd>`，所以这里用 Fragment 包一对兄弟。
+          单点内用了 flex 让 k / v 基线对齐；4 个点之间用外层 `gap-x-4 gap-y-1` 留节奏。
+        */}
+        <dl className="mt-3 flex flex-wrap items-baseline gap-x-4 gap-y-1">
+          <DataPoint k="竞标" v={`${numText(raw.tasks_bid)} 参 / ${numText(raw.tasks_won)} 中`} />
+          <DataPoint
+            k="库存"
+            v={`${numText(agent.skill_count)} 技能 / ${numText(agent.experience_count)} 经验`}
+          />
+          <DataPoint k="均置信" v={fixed2(raw.avg_confidence)} />
+          <DataPoint
+            k="开销"
+            v={
+              typeof raw.token_cost_total === 'number'
+                ? `${numText(raw.token_cost_total)} token`
+                : '—'
+            }
+          />
+        </dl>
+
+        <p className="mt-3 flex flex-wrap items-center gap-x-3 border-t border-edge pt-2 text-meta text-fg-faint">
+          <span>创建于 {agent.created_at || '后端未给出'}</span>
+          <span aria-hidden>·</span>
+          <span>最近任务 {raw.last_task_at ?? '后端未给出'}</span>
+          {typeof raw.persona_drift === 'number' && (
+            <>
+              <span aria-hidden>·</span>
+              <span>画像漂移 {percent(raw.persona_drift)}</span>
+            </>
           )}
-        </div>
-        <div className="mt-2">
-          <KeyValueList>
-            <KeyValue k="创建时间" v={agent.created_at || '后端未给出'} />
-            <KeyValue
-              k="任务量"
-              v={`总 ${numText(raw.total_tasks)} · 完成 ${numText(raw.tasks_completed)} · 成功 ${numText(raw.tasks_succeeded)} · 失败 ${numText(raw.tasks_failed)}`}
-            />
-            <KeyValue
-              k="竞标"
-              v={`参与 ${numText(raw.tasks_bid)} · 中标 ${numText(raw.tasks_won)}`}
-            />
-            <KeyValue
-              k="成功率"
-              v={`${percent(derived.success_rate)} · 中标率 ${percent(derived.bid_win_rate)}`}
-            />
-            <KeyValue
-              k="库存"
-              v={`技能 ${numText(agent.skill_count)} · 经验 ${numText(agent.experience_count)} · 平均置信 ${fixed2(raw.avg_confidence)}`}
-            />
-            <KeyValue k="最近任务" v={raw.last_task_at ?? '后端未给出'} />
-            <KeyValue
-              k="开销"
-              v={
-                typeof raw.token_cost_total === 'number'
-                  ? `累计 ${numText(raw.token_cost_total)} token`
-                  : '用量暂不可用'
-              }
-            />
-          </KeyValueList>
-        </div>
+        </p>
       </Panel>
 
+      {/*
+        画像面板。旧版 5 个 PERSONA_FIELDS 全部用「label (13px muted) / value (13px secondary)、
+        mt-3 上下间距」竖排 —— 整列 5 行同字号同色阶,扫读只能看见一堵字墙,看不出
+        「summary 是这角色的 tagline」和「剩下 4 条是同一画像的 4 个分面」之间
+        差着几个数量级的重要性。
+
+        拆成两档:
+        ① **summary 单独成段** —— 用 `text-fg-primary`(画像里唯一一处 primary)直接上。
+           它的视觉重量是该 Agent 自我介绍的语调,不是又一条参考数据。
+        ② **其余 4 个分面 2×2 网格** —— 每格是紧凑块,label 走 meta(11px) 顶上,
+           value 走 body 紧贴。这样 (a) 信息密度跟一组 KG 指标相当,不占无谓的纵向;
+           (b) 左列「技能 / 经验」、右列「近期 / 备注」在语义上是一对 —— 拥有什么 vs 经历过什么,
+           网格把它们天然按列对齐。
+        PanelHeader 里塞 `persona v{n}` + 「生成于」小注解,生成时间从原来孤悬的
+        一行 muted paragraph 升级到抬头行内 chip —— 跟「Agent 概况」的 `memory.getAgent` 注解
+        是同一档位。
+        底部 footer 用 fg-faint 提示「改写在「生命周期」」并把那个 tab 的 key 写出来,
+        把原版的「见 生命周期 标签页」从纯文字升级成带 tab key 锚点的 hint。
+      */}
       <Panel>
         <PanelHeader>
           画像
           <span className="font-mono text-code text-fg-faint">
             persona v{agent.persona.version}
           </span>
+          {agent.persona.generated_at && (
+            <span className="font-mono text-meta text-fg-faint">
+              · 生成于 {agent.persona.generated_at}
+            </span>
+          )}
         </PanelHeader>
-        <p className="mt-1 text-body text-fg-muted">
-          生成于 {agent.persona.generated_at || '后端未给出'}；改写与重生成在「生命周期」里。
-        </p>
-        <div className="mt-3 space-y-3">
-          {PERSONA_FIELDS.map((field) => {
-            const value = agent.persona[field.key];
-            return (
-              <div key={field.key}>
-                <div className="text-body text-fg-muted">{field.label}</div>
-                {value ? (
-                  <p className="mt-0.5 whitespace-pre-wrap text-body text-fg-secondary">{value}</p>
-                ) : (
-                  <p className="mt-0.5 text-body text-fg-faint">后端未给出</p>
-                )}
-              </div>
-            );
-          })}
-        </div>
+
+        {(() => {
+          const summary = agent.persona.summary;
+          const facets = PERSONA_FIELDS.filter((f) => f.key !== 'summary');
+          return (
+            <>
+              {summary ? (
+                <p className="mt-3 whitespace-pre-wrap text-body text-fg-primary">
+                  {summary}
+                </p>
+              ) : (
+                <p className="mt-3 text-body text-fg-faint">后端没有给出摘要</p>
+              )}
+
+              {facets.length > 0 && (
+                <div className="mt-4 grid grid-cols-2 gap-3">
+                  {facets.map((field) => {
+                    const value = agent.persona[field.key];
+                    return (
+                      <div
+                        key={field.key}
+                        className="rounded-panel border border-edge bg-surface-void px-3 py-2"
+                      >
+                        <div className="text-meta text-fg-muted">{field.label}</div>
+                        {value ? (
+                          <p className="mt-0.5 whitespace-pre-wrap text-body text-fg-secondary">
+                            {value}
+                          </p>
+                        ) : (
+                          <p className="mt-0.5 text-meta text-fg-faint">后端未给出</p>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+
+              <p className="mt-3 flex flex-wrap items-center gap-x-1.5 border-t border-edge pt-2 text-meta text-fg-faint">
+                改写与重生成在「生命周期」标签页
+                <span className="rounded-chip border border-edge bg-surface-panel px-1.5 font-mono text-code text-fg-muted">
+                  lifecycle
+                </span>
+                里。
+              </p>
+            </>
+          );
+        })()}
       </Panel>
 
       <PromoteCard capabilities={capabilities} promoting={promoting} onPromote={onPromote} />
@@ -848,37 +1049,61 @@ function MaintenanceCard({
   );
 }
 
-// ── 页头的两枚能力徽章 ──
+// ── Agent 概况里的小构件 ──
 
-/** `skill_review.mode` 是 v2 新增：它决定晋升出来的技能要不要人工过一遍。 */
-function SkillReviewBadge({ capabilities }: { capabilities?: MemoryCapabilities }) {
-  const mode = capabilities?.skill_review.mode;
-  if (!mode) return null;
+/**
+ * 一格数据卡：标题 + 大数字 + 一行 hint。
+ *
+ * 数字字号 `text-title`（15px）。在 396px 宽的工作台里塞 3 列，每格实际 ~125px，
+ * 24px 的 headline 会让数字和 hint 行都撑出滚动条 ——**字号越显，横向越紧**。
+ * 15px 是这页能承担的最大字阶。
+ *
+ * 边框走 `border-edge`（R5 同一容器只有一种方式与背景区分；用色块填底会让"卡片感"压过"面板感"，
+ * 跟外层 Panel 抢关系）。
+ */
+function MetricCard({
+  label,
+  value,
+  hint,
+  tone = 'idle',
+}: {
+  label: string;
+  value: string;
+  hint?: string;
+  /** 数字本身的色：ok = 强表现，danger = 差，idle / human 走 fg-primary 不额外加色。
+   *  默认 idle：避免 3 个数里有两个被染色，只让真正"偏一边"的数字出彩。 */
+  tone?: 'ok' | 'danger' | 'idle' | 'human';
+}) {
   return (
-    <span className="flex items-center gap-1.5">
-      <Badge variant={mode === 'manual' ? 'human' : 'ok'}>
-        {mode === 'manual' ? '技能需人工审核' : '技能自动通过'}
-      </Badge>
-      <span className="font-mono text-code text-fg-faint">{mode}</span>
-    </span>
+    <div className="rounded-panel border border-edge bg-surface-void px-3 py-2">
+      <div className="text-meta text-fg-muted">{label}</div>
+      <div
+        className={cn(
+          'mt-0.5 tabular text-title',
+          tone === 'ok' && 'text-ok',
+          tone === 'danger' && 'text-danger-soft',
+          tone === 'human' && 'text-human-soft',
+          tone === 'idle' && 'text-fg-primary',
+        )}
+      >
+        {value}
+      </div>
+      {hint && <div className="mt-0.5 text-meta text-fg-faint">{hint}</div>}
+    </div>
   );
 }
 
-function EmbeddingBadge({ capabilities }: { capabilities?: MemoryCapabilities }) {
-  const embedding = capabilities?.embedding;
-  if (!embedding) return null;
-  // 哈希向量是本地跑通链路用的降级实现，语义检索在这一档基本没有意义。
-  const degraded = embedding.provider === 'HashEmbeddingProvider';
+/**
+ * 横向数据点：k / v 同行，v 用 mono 数字 + 紧凑间距 —— 它是参考型数据，不该跟正文一个字号。
+ *
+ * 渲染成 `<dt> + <dd>` 直接节点对（外层 `dl` 要求这两个元素不能被任何包装元素包起来），
+ * 用 inline 排版维持 k / v 同行基线对齐。
+ */
+function DataPoint({ k, v }: { k: string; v: string }) {
   return (
-    <span className="flex items-center gap-1.5">
-      <Badge variant={degraded ? 'human' : 'ok'}>
-        {degraded
-          ? '哈希向量 · 已降级'
-          : `语义向量 · ${READINESS_LABEL[embedding.readiness] ?? embedding.readiness}`}
-      </Badge>
-      <span className="font-mono text-code text-fg-faint">
-        {embedding.provider} · {embedding.readiness}
-      </span>
-    </span>
+    <>
+      <dt className="inline text-meta text-fg-muted">{k}</dt>
+      <dd className="ml-1.5 inline tabular text-code text-fg-secondary">{v}</dd>
+    </>
   );
 }
