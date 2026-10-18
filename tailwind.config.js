@@ -23,7 +23,7 @@ export default {
       colors: {
         brand: {
           void: '#000000',
-          deep: '#0A1B3F',
+          deep: '#000000',
           purple: '#7717FF',
           silver: '#C0C0C3',
           panel: '#1A1A1C',
@@ -31,7 +31,7 @@ export default {
         },
         surface: {
           void: '#000000',
-          deck: '#0A1B3F',
+          deck: '#000000',
           panel: '#1A1A1C',
           raised: '#222226',
         },
