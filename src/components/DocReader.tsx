@@ -129,9 +129,21 @@ export function DocReader({ topicId, anchor }: { topicId: string; anchor: string
  */
 function BlockView({ block }: { block: DocBlock }) {
   switch (block.kind) {
+    /*
+     * 视觉层次（从重到轻）：
+     *   ## 节标题      → Fold D1     `text-title` (15px) `fg-primary`    一道折角图标 + 主句级
+     *   ### 子节标题   → BlockView   `text-title` (15px) `fg-secondary` 与父节同字号但降一档色阶 ——「下面要讲一节」而非「继续讲正文」
+     *   p / ul / ol   → BlockView   `text-body`  (13px) `fg-secondary`  正文基线
+     *   quote         → BlockView   `text-body`  (13px) `fg-secondary` + 左缘 `border-l-human` —— 用边色区分层级而非字色
+     *   pre           → BlockView   `text-code`  (12px) `fg-muted`      代码块本身已是独立视觉块，字色降一档免得它抢走正文
+     *
+     * 旧版 h3 用的是 `text-body text-fg-primary` —— 子节标题和正文同字号、还比正文亮，整页扫读时它**冒不出来**。
+     * 一个「快速开始 / 已知限制 / 常见问题」开头的几行小节在视觉上形同段落，TOC 之外读者压根找不到结构。
+     * 修完之后：父节是 15px primary → 子节是 15px secondary → 正文是 13px secondary，**字号差 + 色阶差两条线同时在用**。
+     */
     case 'h3':
       return (
-        <h3 id={`doc-${block.id}`} className="mt-3 text-body text-fg-primary first:mt-0">
+        <h3 id={`doc-${block.id}`} className="mt-4 text-title text-fg-secondary first:mt-0">
           {block.text}
         </h3>
       );
@@ -175,9 +187,14 @@ function BlockView({ block }: { block: DocBlock }) {
         </ol>
       );
 
+    /*
+     * 代码块：`bg-surface-void` + `border-edge` 已是一个独立视觉块。字色降到 `fg-muted` 让它**退后一步**，
+     * 避免长 .py 例子把读者眼睛吸走 —— 它是参考，不是主讲。上下边距 `mt-3 / first:mt-0` 区分「它是另一类内容」，
+     * 不是「又一段正文」。
+     */
     case 'pre':
       return (
-        <pre className="mt-2 overflow-x-auto rounded-chip border border-edge bg-surface-void px-2 py-1 text-code text-fg-secondary first:mt-0">
+        <pre className="mt-3 overflow-x-auto rounded-chip border border-edge bg-surface-void px-2 py-1 text-code text-fg-muted first:mt-0">
           {block.text}
         </pre>
       );
