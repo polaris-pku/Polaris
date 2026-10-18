@@ -232,6 +232,15 @@ export function missionLineOf({
         retry: false,
       };
 
+    case 'interrupted':
+      return {
+        state,
+        headline: '已中断 · 可尝试继续',
+        sub:
+          task?.contractWaitingReason || '已保存的恢复资源由后端校验；继续时可能回写工作区文件。',
+        retry: false,
+      };
+
     case 'blocked': {
       const gate = gateBlock(live);
       return {
@@ -376,13 +385,21 @@ export type PhaseSegment = {
  * **只表状态，不兼折叠开关** —— 原来的 4 个阶段 chip 身兼二职（「亮 = 已展开」与
  * 「LED = 当前阶段」两种含义挤在同一个符号里），那是它必须死的原因。
  */
-export function phaseSegments(nodes: WorkflowNodeData[], activeNodeId?: string): PhaseSegment[] {
+export function phaseSegments(nodes: WorkflowNodeData[], state?: RunState): PhaseSegment[] {
   return PHASE_ORDER.map((key) => {
     const inPhase = nodes.filter((n) => n.phase === key);
+    // Delivery is a Task result, not a count of finished events in one execution leg.
+    if (key === 'delivery' && state !== undefined) {
+      return {
+        key,
+        labelCn: PHASE_LABEL[key],
+        done: state === 'completed' ? 1 : 0,
+        total: 1,
+        active: state === 'running' && inPhase.some((node) => node.status === 'active'),
+      };
+    }
     const done = inPhase.filter((n) => n.status === 'done').length;
-    const active = inPhase.some((n) =>
-      activeNodeId ? n.id === activeNodeId : n.status === 'active',
-    );
+    const active = inPhase.some((n) => n.status === 'active');
     return { key, labelCn: PHASE_LABEL[key], done, total: inPhase.length, active };
   });
 }

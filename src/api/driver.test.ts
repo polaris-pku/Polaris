@@ -42,17 +42,22 @@ describe('driver routing RPC boundary', () => {
       roles: { orphan: 'acp-external' },
     };
     expect(await driverApi.getConfig()).toEqual(snapshot);
+    expect(await driverApi.refresh()).toEqual(snapshot);
     expect(await driverApi.updateRouting(update)).toEqual(snapshot);
     expect(await driverApi.resetRouting({ expected_revision: snapshot.revision })).toEqual(
       snapshot,
     );
     expect(call.mock.calls).toEqual([
       ['driver.getConfig', {}],
+      ['driver.refresh', { force: true }],
       ['driver.updateRouting', update],
       ['driver.resetRouting', { expected_revision: snapshot.revision }],
     ]);
     for (const method of [
       'driver.getConfig',
+      'driver.refresh',
+      'driver.list',
+      'driver.probe',
       'driver.updateRouting',
       'driver.resetRouting',
     ] as const) {
@@ -60,20 +65,19 @@ describe('driver routing RPC boundary', () => {
     }
   });
 
-  it.each([-32021, -32022, -32023, -32024, -32025, -32026, -32602, -32601])(
-    'preserves error %s and its structured data through IPC',
-    async (code) => {
-      const data = { reason: 'test', field: 'roles.reviewer', locked_driver_id: 'claude' };
-      vi.stubGlobal('window', {
-        desktop: { backend: { call: async () => ({ ok: false, error: 'rejected', code, data }) } },
-      });
-      await expect(driverApi.getConfig()).rejects.toMatchObject({
-        name: 'BackendError',
-        code,
-        data,
-      });
-    },
-  );
+  it.each([
+    -32021, -32022, -32023, -32024, -32025, -32026, -32027, -32028, -32029, -32030, -32602, -32601,
+  ])('preserves error %s and its structured data through IPC', async (code) => {
+    const data = { reason: 'test', field: 'roles.reviewer', locked_driver_id: 'claude' };
+    vi.stubGlobal('window', {
+      desktop: { backend: { call: async () => ({ ok: false, error: 'rejected', code, data }) } },
+    });
+    await expect(driverApi.getConfig()).rejects.toMatchObject({
+      name: 'BackendError',
+      code,
+      data,
+    });
+  });
 
   it('uses the same methods and conflict data over the Web bridge', async () => {
     vi.stubGlobal('window', {});

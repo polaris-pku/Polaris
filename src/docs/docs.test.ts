@@ -31,6 +31,35 @@ type Catalog = {
 const loadCatalog = (): Catalog => JSON.parse(read('electron/python-catalog.json')) as Catalog;
 
 describe('文档不许漂移', () => {
+  it('说明最新主线的后台记忆消费者与默认人工审核边界', () => {
+    for (const channel of [
+      'context_delivery',
+      'driver_feedback',
+      'feedback_reconcile',
+      'skill_promotion',
+      'persona_evolution',
+    ]) {
+      expect(protoDoc).toContain(channel);
+    }
+    expect(protoDoc).toContain('不表示维护消费者一定运行在另一个进程');
+    expect(protoDoc).toContain('NEWIDE_B_DELIVERY_DRAIN_INTERVAL_MS');
+    expect(protoDoc).toContain('NEWIDE_B_SKILL_AUTO_APPROVE');
+    expect(protoDoc).toContain('NEWIDE_B_PERSONA_AUTO_APPROVE');
+    expect(protoDoc).toContain('默认记录待人工审核');
+  });
+
+  it('区分可恢复停止、重连与原生会话恢复的验收边界', () => {
+    for (const method of ['task.interrupt', 'task.resume', 'driver.refresh', 'driver.probe']) {
+      expect(protoDoc).toContain(method);
+    }
+    for (const boundary of ['不新建会话冒充恢复', '-32009', '-32014', 'projectRoot']) {
+      expect(protoDoc).toContain(boundary);
+    }
+    expect(overviewDoc).toContain('尚未完成真实验收');
+    expect(overviewDoc).toContain('无法确认保存时拒绝关闭');
+    expect(overviewDoc).not.toContain('退出应用会终止相关执行进程');
+  });
+
   it('协议参考列出了 eventGraph 的每一个语义步骤', () => {
     for (const step of Object.values(STEPS)) {
       expect(protoDoc).toContain(step.labelCn);
@@ -181,7 +210,7 @@ describe('总览保留操作说明与必要的能力边界', () => {
     ['文件树没有文件系统监听', '文件树不是磁盘实时镜像'],
     ['策略检查不能代替测试', '不代替完整测试或人工审核'],
     ['任务提交包含验收标准', '填写需求与验收标准'],
-    ['不提供文件回滚', '不提供文件回滚'],
+    ['不提供任意历史版本的文件回滚', '不提供任意历史版本的文件回滚'],
     ['合议没有人工裁决通道', '没有人工裁决通道'],
     ['代码会出网', '会发送到配置的模型服务商'],
     ['token 数据不是实际账单', '实际花费以服务商账单为准'],

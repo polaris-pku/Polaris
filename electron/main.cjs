@@ -4,7 +4,7 @@ const { app, BrowserWindow, Menu, shell } = require('electron');
 const path = require('path');
 const { setupAutoUpdater } = require('./updater.cjs');
 const { setupFsBridge } = require('./fsBridge.cjs');
-const { setupBackendBridge } = require('./backendBridge.cjs');
+const { setupBackendBridge, stopBackend } = require('./backendBridge.cjs');
 const { setupPythonBridge } = require('./pythonBridge.cjs');
 const { setupTerminalBridge } = require('./terminalBridge.cjs');
 const { buildAppMenu } = require('./appMenu.cjs');
@@ -75,7 +75,7 @@ if (!app.requestSingleInstanceLock()) {
     Menu.setApplicationMenu(buildAppMenu(() => mainWindow));
 
     createWindow();
-    setupAutoUpdater(() => mainWindow);
+    setupAutoUpdater(() => mainWindow, stopBackend);
     setupFsBridge(() => mainWindow);
     setupBackendBridge(() => mainWindow);
     // 这两个必须在 createWindow() 之后：terminalBridge 要挂窗口的 closed 事件做会话清理（I10）。

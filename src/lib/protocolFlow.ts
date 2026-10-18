@@ -12,7 +12,7 @@
  * TIMELINE_NODE_CODES）的并集换成 dotted 命名。**不发明后端没有的映射**：
  * N0/N1/N4/N7/N12/N15/N17 在两套后端体系里都没有对应事件，永远 pending（见 reachable）。
  */
-import type { RunEvent } from '@/api/types/rpc';
+import type { RunEvent, RunStatus } from '@/api/types/rpc';
 
 export type ProtocolNodeStatus = 'pending' | 'active' | 'done' | 'blocked';
 
@@ -76,6 +76,7 @@ const EVENT_NODE: Record<string, string> = {
   'run.completed': 'N18',
   'run.failed': 'N18',
   'run.cancelled': 'N18',
+  'run.interrupted': 'N18',
 };
 
 const REACHABLE = new Set(Object.values(EVENT_NODE));
@@ -94,10 +95,7 @@ const isFailure = (event: RunEvent): boolean =>
  * - run 进行中时，最近一次点亮事件所在的节点为 active（blocked 不被覆盖）；
  * - 没点亮 → pending。
  */
-export function projectProtocolFlow(
-  timeline: RunEvent[],
-  runStatus: 'running' | 'completed' | 'failed' | 'cancelled',
-): ProtocolNode[] {
+export function projectProtocolFlow(timeline: RunEvent[], runStatus: RunStatus): ProtocolNode[] {
   const byCode = new Map<string, RunEvent[]>();
   let latestCode: string | undefined;
 
@@ -116,7 +114,7 @@ export function projectProtocolFlow(
       return { code, labelCn, ownerCn, reachable: REACHABLE.has(code), status: 'pending' as const };
     }
     const last = events[events.length - 1];
-    const blocked = events.some(isFailure);
+    const blocked = events.some((event) => isFailure(event) || event.type === 'run.interrupted');
     const active = runStatus === 'running' && latestCode === code && !blocked;
     return {
       code,

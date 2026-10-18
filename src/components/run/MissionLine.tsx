@@ -25,6 +25,7 @@ const HEADLINE_TONE: Record<RunState, string> = {
   completed: 'text-fg-primary',
   failed: 'text-danger',
   cancelled: 'text-fg-muted',
+  interrupted: 'text-human',
   unsent: 'text-danger',
 };
 

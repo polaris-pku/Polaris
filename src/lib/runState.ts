@@ -18,6 +18,7 @@ export type RunState =
   | 'completed'
   | 'failed'
   | 'cancelled'
+  | 'interrupted'
   | 'unsent';
 
 /** 唯一的中文词表。别处不许再写第二份。 */
@@ -29,6 +30,7 @@ export const RUN_STATE_LABEL: Record<RunState, string> = {
   completed: '已交付',
   failed: '失败',
   cancelled: '已取消',
+  interrupted: '已中断',
   unsent: '未提交到后端',
 };
 
@@ -41,6 +43,7 @@ export const RUN_STATE_TONE: Record<RunState, 'muted' | 'command' | 'human' | 'o
   completed: 'ok',
   failed: 'danger',
   cancelled: 'muted',
+  interrupted: 'human',
   unsent: 'danger',
 };
 
@@ -76,8 +79,12 @@ export function runStateOf(task: DemoTask | undefined, live: LiveRunState | unde
 
   if (!live) return 'running';
 
+  if (live.status === 'failed') return 'failed';
+  if (live.status === 'cancelled') return 'cancelled';
+  if (live.status === 'interrupted') return 'interrupted';
+
   const taskStatus = task.contractTaskStatus ?? live.snapshot?.current?.task_status;
-  if (taskStatus === 'completed') return 'completed';
+  if (taskStatus === 'completed' && live.status === 'completed') return 'completed';
   if (taskStatus === 'failed') return 'failed';
   if (taskStatus === 'cancelled') return 'cancelled';
   if (['blocked', 'waiting_input', 'pending_gate', 'escalated'].includes(taskStatus ?? ''))
@@ -95,10 +102,6 @@ export function runStateOf(task: DemoTask | undefined, live: LiveRunState | unde
   switch (live.status) {
     case 'completed':
       return taskStatus && taskStatus !== 'completed' ? 'running' : 'completed';
-    case 'failed':
-      return 'failed';
-    case 'cancelled':
-      return 'cancelled';
     case 'running':
       return BLOCKING_GATE_DECISIONS.has(latestGateDecision(live.timeline)) ? 'blocked' : 'running';
   }

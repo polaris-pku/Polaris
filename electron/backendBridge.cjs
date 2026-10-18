@@ -13,6 +13,21 @@ const fs = require('fs');
 const { resolveProjectRoot } = require('./fsBridge.cjs');
 // settings.json 的读写只有这一个入口（串行 + 原子写）。见 electron/settings.cjs 顶部注释。
 const { readSettings, writeSettings } = require('./settings.cjs');
+const { drainBackend } = require('./backendLifecycle.cjs');
+const { readModelProxyConfig, resolveModelProxyConfig } = require('./modelProxy.cjs');
+let resolvedProxy;
+const CREDENTIAL_ENV_NAMES = [
+  'NEWIDE_LLM_API_KEY',
+  'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_PROFILE',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'CLAUDE_CODE_USE_BEDROCK',
+  'CLAUDE_CODE_USE_VERTEX',
+  'CLAUDE_CODE_USE_FOUNDRY',
+  'CLAUDE_CODE_USE_ANTHROPIC_AWS',
+  'CLAUDE_CODE_USE_MANTLE',
+];
 
 const isDev = !app.isPackaged;
 
@@ -43,14 +58,15 @@ const AGENT_DIR = path.join(BACKEND_DIR, 'agent');
 const RPC_METHODS = require('./backend-rpc-methods.json');
 const RPC_METHOD_SET = new Set(RPC_METHODS);
 const RPC_NOTIFICATIONS = new Set(['task.event', 'run.event']);
-const BACKEND_STOP_TIMEOUT_MS = 10_000;
 
 /** @type {import('child_process').ChildProcess | null} */
 let child = null;
 let lifecycle = Promise.resolve();
+const expectedExits = new WeakSet();
 let nextId = 1;
 /** @type {Map<number, {resolve: Function, reject: Function}>} */
 const pending = new Map();
+const activeCalls = new Set();
 /** @type {() => import('electron').BrowserWindow | null} */
 let getWindow = () => null;
 
@@ -111,9 +127,18 @@ function waitForReady(timeoutMs = 30_000) {
     return Promise.reject(new Error(status.message || 'BCD 后端未运行'));
   }
   return new Promise((resolve, reject) => {
-    const waiter = { resolve, reject };
+    const waiter = {
+      resolve: () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      reject: (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    };
     readyWaiters.push(waiter);
-    setTimeout(() => {
+    const timer = setTimeout(() => {
       const i = readyWaiters.indexOf(waiter);
       if (i >= 0) {
         readyWaiters.splice(i, 1);
@@ -142,6 +167,18 @@ function pushNotification(method, params) {
  * 模型名会变（deepseek-v4-pro 之类），所以 defaults 只是预填，用户可改。
  */
 const PROVIDERS = [
+  {
+    id: 'local-proxy',
+    name: '本地代理测试（无凭据）',
+    keyLabel: '无需 API Key',
+    keyHint: '使用本机已登录的模型代理，不发送 API Key。',
+    consoleUrl: '',
+    consoleName: '',
+    baseUrl: '',
+    editableBaseUrl: true,
+    defaultModel: '',
+    defaultFastModel: '',
+  },
   {
     id: 'anthropic',
     name: 'Anthropic（官方）',
@@ -192,7 +229,7 @@ const AGENTS = [{ id: 'claude', name: 'Claude Code' }];
 function currentProvider() {
   const s = readSettings();
   const id = s.provider ?? 'anthropic';
-  const def = PROVIDERS.find((p) => p.id === id) ?? PROVIDERS[0];
+  const def = PROVIDERS.find((p) => p.id === id) ?? PROVIDERS.find((p) => p.id === 'anthropic');
   const cfg = s.providers?.[id] ?? {};
   return {
     def,
@@ -219,6 +256,33 @@ function providerComplete(p) {
 
 /** 认证是否就绪：配置完整，或本机已有登录态。 */
 function authState() {
+  try {
+    const proxy = readModelProxyConfig(readSettings());
+    if (proxy) {
+      return {
+        providerId: 'local-proxy',
+        hasKey: false,
+        incomplete: !resolvedProxy,
+        hasLocalCredentials: false,
+        ready: !!resolvedProxy,
+        baseUrl: proxy.root,
+        model: proxy.model,
+        fastModel: proxy.model,
+      };
+    }
+  } catch (error) {
+    return {
+      providerId: 'local-proxy',
+      hasKey: false,
+      incomplete: true,
+      hasLocalCredentials: false,
+      ready: false,
+      baseUrl: '',
+      model: '',
+      fastModel: '',
+      error: error.message,
+    };
+  }
   const p = currentProvider();
   const local = hasLocalCredentials();
   return {
@@ -243,6 +307,19 @@ function authState() {
  * 而且完全想不到是因为「本机还留着旧凭据」。
  */
 function readAuthEnv() {
+  if (resolvedProxy) {
+    return {
+      set: {
+        POLARIS_MODEL_PROXY_BASE_URL: resolvedProxy.root,
+        POLARIS_MODEL_PROXY_MODEL: resolvedProxy.model,
+        NEWIDE_LLM_PROVIDER: 'anthropic',
+        NEWIDE_LLM_MODEL: resolvedProxy.model,
+        NEWIDE_LLM_BASE_URL: resolvedProxy.apiBase,
+        NEWIDE_LLM_CREDENTIALLESS: '1',
+      },
+      unset: CREDENTIAL_ENV_NAMES,
+    };
+  }
   const p = currentProvider();
   if (!providerComplete(p) && !hasLocalCredentials()) return { set: {}, unset: [] };
 
@@ -432,19 +509,16 @@ async function startNow({ workspace, agentId } = {}, { force = false } = {}) {
     return;
   }
 
-  const stopping = stopChild();
-  // 先记下目标配置，再置 starting —— setStatus 会把 workspace 一起播给渲染层，
-  // 早一步记下，界面在「启动中」阶段就能显示 agent 即将写入哪个目录。
-  currentConfig = { workspace: resolvedWorkspace, agentId: resolvedAgentId };
   setStatus('starting');
   try {
     // PGlite 不允许两个进程同时打开同一数据目录。必须等旧 BCD 完成资源关闭后再启动，
     // 不能只发出终止信号就立刻 spawn 新进程。
-    await stopping;
+    await stopChild({ restarting: true });
   } catch (err) {
-    setStatus('error', `无法停止旧 BCD 后端：${err.message}`);
-    return;
+    throw new Error(`无法停止旧 BCD 后端：${err.message}`, { cause: err });
   }
+  currentConfig = { workspace: resolvedWorkspace, agentId: resolvedAgentId };
+  setStatus('starting');
 
   // agent 的写工具（ACP fs/write_text_file）不会 mkdir 工作区本身 —— 目录不存在时
   // 它的 edit 调用直接失败，最终表现为一个语焉不详的 DRIVER_FAILED。这里先建好。
@@ -472,6 +546,13 @@ async function startNow({ workspace, agentId } = {}, { force = false } = {}) {
     return;
   }
 
+  try {
+    resolvedProxy = await resolveModelProxyConfig(readSettings());
+  } catch (error) {
+    resolvedProxy = undefined;
+    setStatus('error', `本地代理测试不可用：${error.message}`);
+    return;
+  }
   const auth = readAuthEnv();
   if (!authState().ready) {
     setStatus('error', '请先在设置中完成模型与认证配置。');
@@ -509,6 +590,8 @@ async function startNow({ workspace, agentId } = {}, { force = false } = {}) {
     ACP_DRIVER_ENV_FILE: path.join(stateDir, 'driver.env'),
     ACP_AGENT_ID: resolvedAgentId,
     ACP_WORKSPACE: resolvedWorkspace,
+    CLAUDE_CONFIG_DIR: path.join(stateDir, 'claude-config'),
+    NEWIDE_EPHEMERAL_ACP_SESSIONS: '0',
     ...auth.set,
   };
   // Embedding 的凭据与对话模型完全分开：litellm/client.ts 的 openai 嵌入分支只认
@@ -555,7 +638,9 @@ async function startNow({ workspace, agentId } = {}, { force = false } = {}) {
     }
     pending.clear();
     child = null;
-    if (status.state !== 'error') setStatus('stopped', `BCD 已退出（code=${code}）`);
+    if (!expectedExits.has(proc) && status.state !== 'error') {
+      setStatus('error', `BCD 意外退出（code=${code}）`);
+    }
   });
 
   let stderrTail = '';
@@ -593,103 +678,60 @@ async function startNow({ workspace, agentId } = {}, { force = false } = {}) {
 
   // 健康检查：ping 通了才算 ready，避免渲染层对着一个死后端发请求。
   // 这里必须用 send（裸发），不能用 call —— call 会等 ready，而 ready 正由这次 ping 决定。
-  send('system.ping')
-    .then((res) => {
-      if (isCurrent()) setStatus('ready', `protocol ${res?.protocol_version ?? '?'}`);
-    })
-    .catch((err) => {
-      if (isCurrent()) {
-        setStatus('error', `BCD 无响应：${err.message}${stderrTail ? `\n${stderrTail}` : ''}`);
-      }
-    });
+  try {
+    const res = await send('system.ping');
+    const readiness = await send('system.readiness', {});
+    if (!isCurrent()) return;
+    if (!['operational', 'partial'].includes(readiness?.service?.status)) {
+      throw new Error('后端 readiness 不可用，请检查运行配置。');
+    }
+    setStatus(
+      'ready',
+      resolvedProxy
+        ? `本地代理测试：${resolvedProxy.model}（无凭据）`
+        : `protocol ${res?.protocol_version ?? '?'}`,
+    );
+  } catch (err) {
+    if (isCurrent()) {
+      setStatus('error', `BCD 无响应：${err.message}${stderrTail ? `\n${stderrTail}` : ''}`);
+    }
+  }
 }
 
 function start(options = {}, control = {}) {
   const operation = lifecycle.then(() => startNow(options, control));
-  lifecycle = operation.catch(() => {});
+  lifecycle = operation.catch((error) => console.error('[backend] 启动失败：', error));
   return operation;
 }
 
-function forceStopProcessTree(dying) {
-  try {
-    if (process.platform === 'win32' && dying.pid) {
-      const killer = spawn('taskkill', ['/T', '/F', '/PID', String(dying.pid)], {
-        stdio: 'ignore',
-      });
-      killer.on('error', () => dying.kill());
-      killer.on('exit', (code) => {
-        if (code && dying.exitCode === null) dying.kill();
-      });
-    } else if (dying.pid) {
-      process.kill(-dying.pid, 'SIGKILL');
-    } else {
-      dying.kill('SIGKILL');
-    }
-  } catch {
-    dying.kill('SIGKILL');
-  }
-}
-
-function stopChild() {
+async function stopChild({ restarting = false } = {}) {
   if (!child) {
     currentConfig = null;
-    return Promise.resolve();
+    return;
   }
   const dying = child;
-  child = null;
-  currentConfig = null;
-
-  // 未响应的调用必须当场拒绝。
-  //
-  // 不能指望子进程的 exit handler 来做这件事：那个 handler 一开头就是 `if (!isCurrent()) return`，
-  // 而 stopChild() 已经把 child 置空、start() 随后又把 child 指向新进程 —— 等旧进程的 exit
-  // 真正到达时 isCurrent() 早就是 false 了，拒绝逻辑被整段跳过。
-  // 结果是调用方挂满 60 秒，最后拿到一句驴唇不对马嘴的「RPC 超时」，而真相是「后端被重启了」。
-  for (const { reject } of pending.values()) {
-    reject(new Error('BCD 后端已重启或退出，本次调用未完成'));
+  setStatus('starting', '正在停止并保存任务');
+  const inFlight = [...activeCalls];
+  expectedExits.add(dying);
+  try {
+    await drainBackend(dying, async (method, params) => {
+      if (method === 'task.list') await Promise.allSettled(inFlight);
+      return send(method, params);
+    });
+  } catch (error) {
+    setStatus(child === dying ? 'ready' : 'error', `安全关闭未完成：${error.message}`);
+    throw error;
+  } finally {
+    expectedExits.delete(dying);
   }
-  pending.clear();
-
-  return new Promise((resolve, reject) => {
-    let forceTimer;
-    let failureTimer;
-    let settled = false;
-    const finish = (error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(forceTimer);
-      clearTimeout(failureTimer);
-      dying.off('exit', onExit);
-      if (error) reject(error);
-      else resolve();
-    };
-    const onExit = () => finish();
-    dying.once('exit', onExit);
-
-    // 关闭 stdin 会让 BCD 的 readline 收到 EOF，依次关闭 driver、PGlite 和 SQLite。
-    // 若清理卡住，再强制杀整棵进程树，避免留下仍向旧工作区写入的 agent。
-    try {
-      if (dying.stdin?.writable) dying.stdin.end();
-      else forceStopProcessTree(dying);
-    } catch {
-      forceStopProcessTree(dying);
-    }
-
-    forceTimer = setTimeout(() => {
-      forceStopProcessTree(dying);
-      failureTimer = setTimeout(
-        () => finish(new Error(`等待进程退出超过 ${BACKEND_STOP_TIMEOUT_MS + 2_000}ms`)),
-        2_000,
-      );
-    }, BACKEND_STOP_TIMEOUT_MS);
-
-    if (dying.exitCode !== null || dying.signalCode !== null) finish();
-  });
+  if (child === dying) child = null;
+  currentConfig = null;
+  if (!restarting) setStatus('stopped', '后端已保存并退出');
 }
 
 function stopBackend() {
   const operation = lifecycle.then(() => stopChild());
-  lifecycle = operation.catch(() => {});
+  lifecycle = operation.catch((error) => console.error('[backend] 关闭失败：', error));
   return operation;
 }
 
@@ -713,8 +755,18 @@ async function call(method, params) {
   if (!RPC_METHOD_SET.has(method)) {
     throw new Error(`未授权的 RPC 方法：${method}`);
   }
+  const expected = status.state === 'ready' ? child : null;
   await waitForReady();
-  return send(method, params);
+  if (status.state !== 'ready' || !child || (expected && child !== expected)) {
+    throw new Error('后端连接已变化，请等待任务状态同步后重试。');
+  }
+  const request = send(method, params);
+  activeCalls.add(request);
+  try {
+    return await request;
+  } finally {
+    activeCalls.delete(request);
+  }
 }
 
 function setupBackendBridge(windowGetter) {
@@ -743,7 +795,7 @@ function setupBackendBridge(windowGetter) {
         ? 'environment'
         : 'pglite';
     return {
-      provider: s.provider ?? 'anthropic',
+      provider: authState().providerId,
       bMemory: {
         configured: databaseSource !== 'pglite',
         source: databaseSource,
@@ -760,6 +812,17 @@ function setupBackendBridge(windowGetter) {
       // 每个服务商各自的配置（key 一律只回布尔）
       configured: Object.fromEntries(
         PROVIDERS.map((p) => {
+          if (p.id === 'local-proxy') {
+            return [
+              p.id,
+              {
+                hasKey: false,
+                baseUrl: s.modelProxy?.baseUrl ?? '',
+                model: s.modelProxy?.model ?? '',
+                fastModel: s.modelProxy?.model ?? '',
+              },
+            ];
+          }
           const cfg = s.providers?.[p.id] ?? {};
           return [
             p.id,
@@ -784,8 +847,16 @@ function setupBackendBridge(windowGetter) {
   ipcMain.handle('backend:saveSettings', async (_event, next = {}) => {
     const current = readSettings();
     const providers = { ...(current.providers ?? {}) };
+    const modelProxy = { ...(current.modelProxy ?? {}) };
+    if (next.provider !== undefined) modelProxy.enabled = next.provider === 'local-proxy';
+    const proxyPatch = next.providers?.['local-proxy'];
+    if (proxyPatch) {
+      if (typeof proxyPatch.baseUrl === 'string') modelProxy.baseUrl = proxyPatch.baseUrl.trim();
+      if (typeof proxyPatch.model === 'string') modelProxy.model = proxyPatch.model.trim();
+    }
 
     for (const [id, patch] of Object.entries(next.providers ?? {})) {
+      if (id === 'local-proxy') continue;
       if (!PROVIDERS.some((p) => p.id === id)) continue; // 未知服务商：忽略，不写进配置
       const cfg = { ...(providers[id] ?? {}) };
       if (typeof patch.key === 'string') {
@@ -825,6 +896,7 @@ function setupBackendBridge(windowGetter) {
 
     await writeSettings({
       providers,
+      modelProxy,
       bMemory,
       embedding,
       provider: next.provider ?? current.provider ?? 'anthropic',
@@ -866,14 +938,17 @@ function setupBackendBridge(windowGetter) {
     if (quitInProgress) return;
     quitInProgress = true;
     void stopBackend()
-      .catch((err) => console.error(`[backend] 关闭失败：${err.message}`))
-      .finally(() => {
+      .then(() => {
         quitAfterBackendStops = true;
         app.quit();
+      })
+      .catch((err) => {
+        quitInProgress = false;
+        require('electron').dialog.showErrorBox('无法安全退出', err.message);
       });
   });
 
-  void start({});
+  void start({}).catch((error) => setStatus('error', error.message));
 }
 
 module.exports = { setupBackendBridge, stopBackend };

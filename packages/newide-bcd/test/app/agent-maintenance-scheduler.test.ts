@@ -10,11 +10,7 @@ import { randomUUID } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import { nowTimestamp } from '../../src/core';
 import { AgentMaintenanceScheduler } from '../../src/app/agent-maintenance-scheduler';
-import {
-  HashEmbeddingProvider,
-  InMemoryRepository,
-  MARKET_POOL_ROLE_ID,
-} from '../../src/memory';
+import { HashEmbeddingProvider, InMemoryRepository, MARKET_POOL_ROLE_ID } from '../../src/memory';
 import type { RetireOptions, RetireResult, RetirementScanResult } from '../../src/memory';
 
 const embedding = new HashEmbeddingProvider(64);
@@ -58,7 +54,12 @@ describe('AgentMaintenanceScheduler 退休检查', () => {
         embedding,
         retirement: {
           runRetirementScan: async () => [
-            scan({ role_id: 'agent_a', action: 'retire', confidence: 0.8, suggested_reason: 'inactivity' }),
+            scan({
+              role_id: 'agent_a',
+              action: 'retire',
+              confidence: 0.8,
+              suggested_reason: 'inactivity',
+            }),
             scan({ role_id: 'agent_b', action: 'keep', confidence: 0.9 }),
           ],
           retireAgent,
@@ -85,8 +86,18 @@ describe('AgentMaintenanceScheduler 退休检查', () => {
         embedding,
         retirement: {
           runRetirementScan: async () => [
-            scan({ role_id: 'agent_high', action: 'retire', confidence: 0.8, suggested_reason: 'inactivity' }),
-            scan({ role_id: 'agent_low', action: 'retire', confidence: 0.4, suggested_reason: 'inactivity' }),
+            scan({
+              role_id: 'agent_high',
+              action: 'retire',
+              confidence: 0.8,
+              suggested_reason: 'inactivity',
+            }),
+            scan({
+              role_id: 'agent_low',
+              action: 'retire',
+              confidence: 0.4,
+              suggested_reason: 'inactivity',
+            }),
           ],
           retireAgent,
         },
@@ -104,7 +115,10 @@ describe('AgentMaintenanceScheduler 退休检查', () => {
     expect(report.retirement.items.find((item) => item.role_id === 'agent_low')).toMatchObject({
       retired: false,
     });
-    expect(retireAgent).toHaveBeenCalledWith('agent_high', expect.objectContaining({ reason: 'inactivity' }));
+    expect(retireAgent).toHaveBeenCalledWith(
+      'agent_high',
+      expect.objectContaining({ reason: 'inactivity' }),
+    );
     expect(retireAgent).not.toHaveBeenCalledWith('agent_low', expect.anything());
   });
 });
@@ -113,9 +127,11 @@ describe('AgentMaintenanceScheduler 市场自学习', () => {
   it('存活 Agent 扫描市场并引入匹配技能', async () => {
     const repository = new InMemoryRepository(embedding);
     await repository.initializeAgent({ role_id: 'learner', name: 'Learner', tags: ['typescript'] });
+    // v2 而不是 v1：版本历史是 append-only 的，种子那一版（v1）落下之后不许原地改写，换正文
+    // 只能换新的版本号
     await repository.savePersona('learner', {
       role_id: 'learner',
-      version: 1,
+      version: 2,
       summary: 'typescript service expert',
       skills_overview: 'building typescript services',
       experience_coverage: 'api design',
@@ -185,7 +201,9 @@ describe('AgentMaintenanceScheduler 市场自学习', () => {
 
 describe('AgentMaintenanceScheduler start/stop', () => {
   it('使用注入的调度/取消函数', async () => {
-    const schedule = vi.fn((_handler: () => void, _ms: number) => 42 as unknown as ReturnType<typeof setInterval>);
+    const schedule = vi.fn(
+      (_handler: () => void, _ms: number) => 42 as unknown as ReturnType<typeof setInterval>,
+    );
     const cancel = vi.fn();
     const scheduler = new AgentMaintenanceScheduler(
       {

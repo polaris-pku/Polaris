@@ -10,8 +10,137 @@ import type {
 import type { CouncilParticipantBinding } from '../../src/council';
 import { councilRunDirName } from '../../src/council/council-workspace';
 import { SynthesisAgentCouncilProvider } from '../../src/council/providers/synthesis-agent-provider';
+import { SapTaskBridge } from '../../src/coordination';
+import { SqliteCoordinationStore, type CoordinationStateCommit } from '../../src/persistence';
 
 describe('SynthesisAgentCouncilProvider', () => {
+  it.each([false, true])(
+    'handles interruption before a session ID exists (dispatched=%s)',
+    async (dispatched) => {
+      const councilRoot = await fs.mkdtemp(
+        path.join(os.tmpdir(), 'newide-council-before-session-'),
+      );
+      const controller = new AbortController();
+      let workspace: string | undefined;
+      const first = new SynthesisAgentCouncilProvider({
+        councilRoot,
+        agentExecutionFacade: {
+          async runAgent(input, options) {
+            if (input.council_seat === 'reviewer') {
+              workspace = input.workspace_path;
+              await fs.writeFile(path.join(workspace!, 'prepared.txt'), 'keep');
+              if (dispatched)
+                options?.onDriverEvent?.({
+                  schema_version: 'driver-event.v1',
+                  event_type: 'driver.prompt_dispatching',
+                  task_id: input.task_id,
+                  run_id: input.run_id,
+                });
+              controller.abort(new Error('backend stopped before session ID'));
+              throw controller.signal.reason;
+            }
+            return completedExecution(input);
+          },
+        },
+      });
+      const resumed: AgentExecutionRequest[] = [];
+      const second = new SynthesisAgentCouncilProvider({
+        councilRoot,
+        agentExecutionFacade: {
+          async runAgent(input) {
+            resumed.push(input);
+            expect(input.session_id).toBeUndefined();
+            if (input.council_seat === 'reviewer') {
+              expect(input.workspace_path).toBe(workspace);
+              expect(await fs.readFile(path.join(workspace!, 'prepared.txt'), 'utf8')).toBe('keep');
+            }
+            return completedExecution(input);
+          },
+        },
+      });
+      try {
+        await expect(
+          first.runCouncilRound(baseInput(), {
+            recovery_key: 'original',
+            signal: controller.signal,
+          }),
+        ).rejects.toThrow('backend stopped before session ID');
+        const resume = second.runCouncilRound(
+          { ...baseInput(), run_id: 'resumed' },
+          { recovery_key: 'original' },
+        );
+        if (dispatched) {
+          await expect(resume).rejects.toThrow('no durable native session ID');
+          expect(resumed).toEqual([]);
+        } else {
+          await expect(resume).resolves.toMatchObject({ decision: { verdict: 'select' } });
+          expect(resumed.map((r) => r.council_seat)).toEqual(['reviewer', 'synthesizer']);
+        }
+      } finally {
+        await fs.rm(councilRoot, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each(['reviewer', 'synthesizer'] as const)(
+    'reloads interrupted %s without rerunning completed roles',
+    async (seat) => {
+      const councilRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-council-reload-'));
+      const controller = new AbortController();
+      let interrupted: AgentExecutionRequest | undefined;
+      const first = new SynthesisAgentCouncilProvider({
+        councilRoot,
+        agentExecutionFacade: {
+          async runAgent(input, options) {
+            if (input.council_seat === seat) {
+              interrupted = input;
+              await fs.writeFile(path.join(input.workspace_path!, 'partial.txt'), 'keep');
+              options?.onDriverEvent?.({
+                event_type: 'driver.turn_started',
+                session_id: 'persisted-session',
+                task_id: input.task_id,
+                run_id: input.run_id,
+                schema_version: 'driver-event.v1',
+                created_at: new Date().toISOString(),
+              });
+              controller.abort(new Error('backend stopped'));
+              throw controller.signal.reason;
+            }
+            return completedExecution(input);
+          },
+        },
+      });
+      await expect(
+        first.runCouncilRound(baseInput(), { recovery_key: 'original', signal: controller.signal }),
+      ).rejects.toThrow('backend stopped');
+      const resumed: AgentExecutionRequest[] = [];
+      const second = new SynthesisAgentCouncilProvider({
+        councilRoot,
+        agentExecutionFacade: {
+          async runAgent(input) {
+            resumed.push(input);
+            if (input.council_seat === seat) {
+              expect(input.session_id).toBe('persisted-session');
+              expect(input.workspace_path).toBe(interrupted!.workspace_path);
+              expect(
+                await fs.readFile(path.join(input.workspace_path!, 'partial.txt'), 'utf8'),
+              ).toBe('keep');
+            }
+            return completedExecution(input);
+          },
+        },
+      });
+      const result = await second.runCouncilRound(
+        { ...baseInput(), run_id: 'resumed' },
+        { recovery_key: 'original' },
+      );
+      expect(resumed.map((r) => r.council_seat)).toEqual(
+        seat === 'reviewer' ? ['reviewer', 'synthesizer'] : ['synthesizer'],
+      );
+      expect(result.decision.verdict).toBe('select');
+    },
+  );
+
   it('runs plan-first roles without allowing product-file changes', async () => {
     const councilRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-council-plan-'));
     const requests: AgentExecutionRequest[] = [];
@@ -57,6 +186,8 @@ describe('SynthesisAgentCouncilProvider', () => {
     expect(requests[0]?.driver_instruction).toContain('council-plan.md');
     expect(requests[0]?.driver_instruction).not.toContain('invoke_driver');
     expect(requests[2]?.instruction).toContain('Review the staged Council Plan inputs');
+    expect(requests[2]?.instruction).toContain('isolated snapshot of the task repository');
+    expect(requests[2]?.instruction).toContain('Treat repository files as read-only');
     expect(requests[3]?.instruction).toContain('final-plan.md');
     expect(requests[3]?.instruction).toContain('Do not implement');
     expect(result.reviews).toHaveLength(2);
@@ -248,6 +379,74 @@ describe('SynthesisAgentCouncilProvider', () => {
       'council.synthesis.completed',
     ]);
     await fs.rm(councilRoot, { recursive: true, force: true });
+  });
+
+  it('persists every Council seat execution through SAP', async () => {
+    const councilRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-council-sap-'));
+    const store = new SqliteCoordinationStore(':memory:');
+    store.commitState(councilSapCommit());
+    const bridge = new SapTaskBridge({
+      store,
+      now: () => '2026-09-27T12:00:00.000Z',
+    });
+    const agentExecutionFacade: AgentExecutionFacade = {
+      async runAgent(input) {
+        return completedExecution(input);
+      },
+    };
+    const provider = new SynthesisAgentCouncilProvider({
+      agentExecutionFacade,
+      councilRoot,
+      sapBridge: bridge,
+    });
+    const dispatched: string[] = [];
+    const received: string[] = [];
+
+    const result = await provider.runCouncilRound(
+      {
+        ...baseInput(),
+        run_id: 'run_council_sap',
+        task_id: 'task_council_sap',
+        question: 'Verify every Council seat uses SAP.',
+      },
+      {
+        onSapDispatch: (dispatch) => {
+          dispatched.push(dispatch.frame.exchange_id);
+          bridge.persistExecute(dispatch);
+        },
+        onSapResult: ({ frame, admission }) => {
+          received.push(frame.exchange_id);
+          return bridge.acceptResult(admission, frame);
+        },
+      },
+    );
+
+    expect(result.selected_artifact_refs).not.toEqual([]);
+    expect(dispatched).toHaveLength(4);
+    expect(received).toHaveLength(4);
+    const expected = [
+      ['proposal', 'participant_proposer_0'],
+      ['proposal', 'participant_proposer_1'],
+      ['review', 'participant_reviewer_0'],
+      ['synthesis', 'participant_synthesizer_0'],
+    ] as const;
+    for (const [phase, participantId] of expected) {
+      const exchangeId = `sap_council:run_council_sap:${phase}:${participantId}:attempt:1`;
+      expect(store.getOutbox(`outbox_${exchangeId}`)).toMatchObject({ status: 'complete' });
+      expect(store.getOutbox(`outbox_sap_result_${exchangeId}`)).toMatchObject({ status: 'sent' });
+    }
+    const sapExchangeIds = new Set(
+      store
+        .listJournal('task_council_sap', 'run_council_sap')
+        .filter((entry) => entry.kind === 'sap')
+        .map((entry) => entry.frame?.exchange_id),
+    );
+    for (const [phase, participantId] of expected) {
+      const exchangeId = `sap_council:run_council_sap:${phase}:${participantId}:attempt:1`;
+      expect(sapExchangeIds).toContain(exchangeId);
+      expect(sapExchangeIds).toContain(`sap_result_${exchangeId}`);
+    }
+    store.close();
   });
 
   it('runs independent proposer roles concurrently', async () => {
@@ -653,8 +852,10 @@ describe('SynthesisAgentCouncilProvider', () => {
     ).rejects.toThrow('observer unavailable');
   });
 
-  it('pins activity to the panel run without changing existing execution identities', async () => {
-    // 执行身份保留上游的阶段隔离；只有活动观测归到同一个面板 run。
+  it('hands the facade the panel-visible run id alongside the phase-scoped execution id', async () => {
+    // 席位执行拿 `${run_id}_${phaseId}` 当执行身份（相位之间要隔离信箱幂等键与 driver 记账），
+    // 而面板按**任务那个 run** 读在飞状态。两个 id 都要传下去——只传执行身份时，议会阶段的
+    // 状态点会被写到谁也读不到的 key 上（一次真实 council run 里，整段 370 秒都是盲区）。
     const requests: AgentExecutionRequest[] = [];
     const provider = new SynthesisAgentCouncilProvider({
       agentExecutionFacade: {
@@ -670,7 +871,8 @@ describe('SynthesisAgentCouncilProvider', () => {
     expect(requests.length).toBeGreaterThan(0);
     for (const request of requests) {
       expect(request.activity_run_id).toBe('run_observer');
-      expect(request.run_id).toMatch(/^run_observer_council_phase_[0-9a-f-]+$/);
+      expect(request.run_id).not.toBe('run_observer');
+      expect(request.run_id.startsWith('run_observer_')).toBe(true);
     }
   });
 });
@@ -685,6 +887,60 @@ function baseInput() {
     participants: participantBindings(),
     proposals: [],
     schema_version: SCHEMA_VERSION,
+  };
+}
+
+function councilSapCommit(): CoordinationStateCommit {
+  const at = '2026-09-27T11:59:00.000Z';
+  return {
+    task: {
+      task_id: 'task_council_sap',
+      status: 'running',
+      risk_level: 'low',
+      spec: 'Verify every Council seat uses SAP.',
+      completion_criteria: ['Council completes'],
+      affected_paths: [],
+      workspace_path: '/workspace',
+      warnings: [],
+      revision: 1,
+      created_at: at,
+      updated_at: at,
+      schema_version: SCHEMA_VERSION,
+    },
+    run: {
+      run_id: 'run_council_sap',
+      task_id: 'task_council_sap',
+      status: 'running',
+      mode: 'council',
+      workspace_path: '/workspace',
+      revision: 1,
+      created_at: at,
+      updated_at: at,
+      schema_version: SCHEMA_VERSION,
+    },
+    runtime_state: {
+      task_id: 'task_council_sap',
+      current_run_id: 'run_council_sap',
+      resume_cursor: 'council',
+      cursor_input: { cursor: 'council', trigger: 'explicit_mode' },
+      waiting_on: [],
+      artifact_refs: [],
+      diagnostics: {},
+      updated_at: at,
+      schema_version: SCHEMA_VERSION,
+    },
+    events: [
+      {
+        event_id: 'event_council_sap',
+        event_type: 'run.started',
+        subject_id: 'run_council_sap',
+        task_id: 'task_council_sap',
+        run_id: 'run_council_sap',
+        payload: {},
+        created_at: at,
+        schema_version: SCHEMA_VERSION,
+      },
+    ],
   };
 }
 

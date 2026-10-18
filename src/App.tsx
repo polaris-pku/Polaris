@@ -12,6 +12,7 @@ import { useDemoStore } from '@/store/useDemoStore';
 import { bootstrapBackend } from '@/api/system';
 import { taskApi } from '@/api/task';
 import { recoverBackendTasks } from '@/store/lib/backendRecovery';
+import { onBackendStatus } from '@/api/events';
 
 export default function App() {
   const activeProjectId = useDemoStore((s) => s.activeProjectId);
@@ -26,35 +27,57 @@ export default function App() {
    * 这正是「用户根本不知道自己需要哪些认证 token」的根源。
    */
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [recoveryError, setRecoveryError] = useState<string>();
 
   useEffect(() => {
     if (!window.desktop?.backend) return;
-    const subscriptions: Array<() => Promise<void>> = [];
+    const subscriptions = new Map<string, () => Promise<void>>();
     let cancelled = false;
+    let generation = 0;
+    let lastState = '';
 
-    void bootstrapBackend()
-      .then(() => taskApi.list())
-      .then(async ({ tasks: snapshots }) => {
-        if (cancelled) return;
-        useDemoStore.setState((state) => recoverBackendTasks(state, snapshots));
+    const offStatus = onBackendStatus((status) => {
+      if (status.state === lastState) return;
+      lastState = status.state;
+      const ticket = ++generation;
+      if (status.state !== 'ready') return;
+      setRecoveryError(undefined);
+      void bootstrapBackend()
+        .then((readiness) => {
+          if (readiness.service.status === 'unavailable')
+            throw new Error('后端尚未就绪，请检查运行配置。');
+          if (cancelled || ticket !== generation) return null;
+          return taskApi.list();
+        })
+        .then(async (result) => {
+          if (!result || cancelled || ticket !== generation) return;
+          const snapshots = result.tasks;
+          useDemoStore.setState((state) => recoverBackendTasks(state, snapshots));
 
-        for (const snapshot of snapshots) {
-          if (cancelled) return;
-          const unsubscribe = await useDemoStore.getState().observeTask(snapshot.task.task_id);
-          if (cancelled) {
-            await unsubscribe();
-            return;
+          for (const snapshot of snapshots) {
+            if (cancelled || ticket !== generation) return;
+            const unsubscribe = await useDemoStore.getState().observeTask(snapshot.task.task_id);
+            if (cancelled || ticket !== generation) {
+              await unsubscribe();
+              return;
+            }
+            subscriptions.set(snapshot.task.task_id, unsubscribe);
           }
-          subscriptions.push(unsubscribe);
-        }
-      })
-      .catch((error: unknown) => {
-        console.warn('[backend] RPC bootstrap failed:', error);
-      });
+        })
+        .catch((error: unknown) => {
+          if (cancelled || ticket !== generation) return;
+          console.warn('[backend] RPC bootstrap failed:', error);
+          setRecoveryError(
+            `任务恢复未完成：${error instanceof Error ? error.message : String(error)}。请检查后端配置并重新连接。`,
+          );
+        });
+    });
 
     return () => {
       cancelled = true;
-      for (const unsubscribe of subscriptions) void unsubscribe();
+      generation += 1;
+      offStatus();
+      for (const unsubscribe of subscriptions.values()) void unsubscribe();
     };
   }, []);
 
@@ -79,6 +102,15 @@ export default function App() {
           setSettingsOpen(true);
         }}
       />
+
+      {recoveryError && (
+        <div
+          role="alert"
+          className="border-b border-edge bg-surface-void px-4 py-2 text-body text-human"
+        >
+          {recoveryError}
+        </div>
+      )}
 
       <div className="min-h-0 flex-1">
         {!activeProjectId ? (

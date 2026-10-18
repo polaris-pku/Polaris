@@ -4,6 +4,7 @@ dotenv.config();
 
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { AcpClientBuilder } from "../client/builder.js";
+import { startCredentiallessProxyRelay } from "./credentialless-proxy-relay.js";
 import {
   SCHEMA_VERSION,
   createId,
@@ -120,6 +121,7 @@ async function runContractPrompt(
   const events: ConnectionEvent[] = [];
   let sessionId: string | undefined;
   let client: ReturnType<AcpClientBuilder["build"]> | undefined;
+  let relay: Awaited<ReturnType<typeof startCredentiallessProxyRelay>> | undefined;
   let cancelRequested = false;
   let eventSequence = 0;
   let onTerminate: (() => void) | undefined;
@@ -175,12 +177,40 @@ async function runContractPrompt(
 
   try {
     // 先落到 const：闭包里要用到收窄后的类型，而外层 `client` 只留给 finally 收尾。
-    const acpClient = new AcpClientBuilder()
+    const builder = new AcpClientBuilder()
       .withAgent(options.agentId)
       .withVerbose(false)
       .withAutoApprove(process.env.AUTO_APPROVE === "1")
-      .withSandboxDir(workspace)
-      .build();
+      .withSandboxDir(workspace);
+    const proxyBaseUrl = process.env.POLARIS_MODEL_PROXY_BASE_URL?.trim();
+    const proxyModel = process.env.POLARIS_MODEL_PROXY_MODEL?.trim();
+    if (proxyBaseUrl || proxyModel) {
+      if (!proxyBaseUrl || !proxyModel) {
+        throw new Error("Local proxy requires both base URL and model");
+      }
+      for (const name of [
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_PROFILE",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_USE_VERTEX",
+        "CLAUDE_CODE_USE_FOUNDRY",
+        "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+        "CLAUDE_CODE_USE_MANTLE",
+      ]) {
+        delete process.env[name];
+      }
+      process.env.ANTHROPIC_MODEL = proxyModel;
+      process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = proxyModel;
+      process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = proxyModel;
+      process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL = proxyModel;
+      process.env.CLAUDE_CODE_SUBAGENT_MODEL = proxyModel;
+      process.env.CLAUDE_MODEL_CONFIG = JSON.stringify({ availableModels: [proxyModel] });
+      relay = await startCredentiallessProxyRelay(proxyBaseUrl);
+      builder.withAnthropicGateway(relay.baseUrl);
+    }
+    const acpClient = builder.build();
     client = acpClient;
 
     await runPhase("initialize", {}, () => acpClient.initialize());
@@ -283,6 +313,7 @@ async function runContractPrompt(
         process.stderr.write(`[driver:run] shutdown failed: ${errorMessage(shutdownError)}\n`);
       }
     }
+    await relay?.close();
   }
 }
 

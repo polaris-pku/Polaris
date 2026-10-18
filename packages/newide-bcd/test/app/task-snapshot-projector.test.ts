@@ -7,6 +7,7 @@ describe('projectTaskSnapshot', () => {
   it('projects a running task from its immutable definition and current run fact', () => {
     const snapshot = projectTaskSnapshot({
       task_id: 'task_1',
+      workspace_path: '/workspace',
       task_request: {
         spec: 'Build task-first RPC',
         role_id: 'role_backend_engineer',
@@ -32,6 +33,7 @@ describe('projectTaskSnapshot', () => {
       revision: 5,
       task: {
         task_id: 'task_1',
+        workspace_path: '/workspace',
         status: 'running',
         spec: 'Build task-first RPC',
         role_id: 'role_backend_engineer',

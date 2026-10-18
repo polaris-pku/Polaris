@@ -13,6 +13,7 @@ import type {
 } from '../persistence';
 import {
   TaskProcessorStageCommitError,
+  TaskInterruptedError,
   type TaskProcessor,
   type TaskRunExecutionState,
   type TaskStageCommitResult,
@@ -26,6 +27,13 @@ import {
   withRunLatencySpan,
   type RunLatencyRecorder,
 } from '../telemetry';
+import type {
+  SapExecuteDispatch,
+  SapExecutionAdmission,
+  SapResultFrame,
+  SapResultDisposition,
+  SapTaskBridge,
+} from './sap-task-bridge';
 
 type CursorInput<TCursor extends TaskResumeCursor> = Extract<TaskCursorInput, { cursor: TCursor }>;
 
@@ -58,7 +66,6 @@ export interface TaskStageExecutionContext<TCursor extends TaskResumeCursor> {
   memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
   task_request: TaskCreateRequest;
   workspace_path: string;
-  delivery_workspace_path?: string;
   session_id?: string;
   cursor_input: CursorInput<TCursor>;
   /**
@@ -66,9 +73,17 @@ export interface TaskStageExecutionContext<TCursor extends TaskResumeCursor> {
    * 续跑 run 需要据此回溯读取上一 run 已完成 stage 的产物。
    */
   restarted_from_run_id?: string;
+  native_task_prompt_dispatched?: boolean;
   signal?: AbortSignal;
   on_driver_event?: DriverStreamEventListener;
   on_event?: (event: Event) => void;
+  on_sap_dispatch?: (dispatch: SapExecuteDispatch) => void | Promise<void>;
+  on_sap_result?: (input: {
+    admission: SapExecutionAdmission;
+    frame: SapResultFrame;
+    phase: 'proposal' | 'review' | 'synthesis';
+    participant_id: string;
+  }) => SapResultDisposition | Promise<SapResultDisposition>;
 }
 
 export interface CouncilEscalationRequest {
@@ -87,6 +102,7 @@ interface StageAdvanceMetadata {
   final_output?: PersistedTaskFinalOutput;
   warnings?: string[];
   council_override_input?: Extract<TaskCursorInput, { cursor: 'council' }>;
+  sap_result?: { admission: SapExecutionAdmission; frame: SapResultFrame };
 }
 
 export interface SelectAgentStageResult extends StageResult {
@@ -175,6 +191,7 @@ export interface TaskExecutionLoopOptions {
    * 不注入时全部埋点自动退化为空操作，单测与 example 无需改动。
    */
   create_latency_recorder?: (input: { run_id: string; task_id: string }) => RunLatencyRecorder;
+  sap_bridge?: SapTaskBridge;
 }
 
 export interface RunTaskExecutionInput {
@@ -197,6 +214,7 @@ export class TaskExecutionLoop {
   private readonly createLatencyRecorder:
     | ((input: { run_id: string; task_id: string }) => RunLatencyRecorder)
     | undefined;
+  private readonly sapBridge: SapTaskBridge | undefined;
 
   constructor(options: TaskExecutionLoopOptions) {
     this.processor = options.processor;
@@ -205,6 +223,7 @@ export class TaskExecutionLoop {
     this.createInvocationId =
       options.create_invocation_id ?? ((cursor) => createId(`invocation_${cursor}`));
     this.createLatencyRecorder = options.create_latency_recorder;
+    this.sapBridge = options.sap_bridge;
   }
 
   async run(input: RunTaskExecutionInput): Promise<TaskSnapshot> {
@@ -240,7 +259,15 @@ export class TaskExecutionLoop {
         return this.processor.getTaskSnapshot(input.task_id);
       }
 
-      const result = await this.executeStage(state, cursorInput, input);
+      let result: TaskStageCommitResult;
+      try {
+        result = await this.executeStage(state, cursorInput, input);
+      } catch (error) {
+        if (error instanceof SapExecutionAlreadyClaimedError) {
+          return this.processor.getTaskSnapshot(input.task_id);
+        }
+        throw error;
+      }
       if (result.snapshot.task.status !== 'running') return result.snapshot;
     }
   }
@@ -259,12 +286,18 @@ export class TaskExecutionLoop {
     >,
   ): Promise<TaskStageCommitResult> {
     const invocationId = this.createInvocationId(cursorInput.cursor);
+    const sapDispatch = this.createSapDispatch(state, cursorInput, invocationId);
     const started = this.processor.startStage({
       run_id: state.run_id,
       expected_cursor: cursorInput.cursor,
       invocation_id: invocationId,
+      ...(sapDispatch ? { sap_execute: sapDispatch } : {}),
     });
     this.notifyCommittedEvents(controls, started.committed_events);
+    const sapAdmission = sapDispatch ? this.sapBridge!.beginExecute(sapDispatch) : undefined;
+    if (sapAdmission && !sapAdmission.should_execute) {
+      throw new SapExecutionAlreadyClaimedError(sapAdmission.execute_inbox.exchange_id);
+    }
 
     try {
       switch (cursorInput.cursor) {
@@ -331,6 +364,14 @@ export class TaskExecutionLoop {
                     },
                   }
                 : {}),
+              ...(sapDispatch && sapAdmission
+                ? {
+                    sap_result: {
+                      admission: sapAdmission,
+                      frame: this.createSapResult(sapDispatch, result),
+                    },
+                  }
+                : {}),
             },
           );
           this.notifyCommittedEvents(controls, committed.committed_events);
@@ -338,7 +379,24 @@ export class TaskExecutionLoop {
         }
         case 'council': {
           const result = await runStageWithAttribution('council', () =>
-            this.executors.council.execute(stageContext(state, cursorInput, controls)),
+            this.executors.council.execute(
+              stageContext(
+                state,
+                cursorInput,
+                controls,
+                async (dispatch) => {
+                  await this.processor.recordCouncilSapDispatch(state.run_id, dispatch);
+                },
+                async (result) =>
+                  this.processor.recordCouncilSapResult(
+                    state.run_id,
+                    result.admission,
+                    result.frame,
+                    result.phase,
+                    result.participant_id,
+                  ),
+              ),
+            ),
           );
           assertChangesetResult(result, 'Council');
           return await this.persistAndAdvance(
@@ -418,6 +476,20 @@ export class TaskExecutionLoop {
       }
     } catch (error) {
       if (error instanceof TaskProcessorStageCommitError) throw error;
+      if (isTaskInterrupted(controls.signal?.reason)) {
+        const interrupted = this.processor.interruptRun(state.run_id, {
+          source: controls.signal?.reason.source ?? 'user',
+          reason: controls.signal?.reason.message ?? 'Task interrupted by user',
+        });
+        return { snapshot: interrupted, committed_events: [] };
+      }
+      if (controls.signal?.aborted) {
+        const cancelled = this.processor.finishRun({
+          run_id: state.run_id,
+          status: 'cancelled',
+        });
+        return { snapshot: cancelled, committed_events: [] };
+      }
       const failureError = error instanceof StageAdvanceError ? error.originalError : error;
       const failure = stageFailure(failureError, cursorInput.cursor);
       const resultEvidence = error instanceof StageAdvanceError ? error.evidenceRef : undefined;
@@ -437,6 +509,14 @@ export class TaskExecutionLoop {
         error: failure,
         ...(failureEvidence ? { evidence_ref: failureEvidence } : {}),
         ...(resultEvidence ? { artifact_refs: [resultEvidence.uri] } : {}),
+        ...(sapDispatch
+          ? {
+              sap_cancel: {
+                dispatch: sapDispatch,
+                frame: this.sapBridge!.createCancel({ execute: sapDispatch.frame }),
+              },
+            }
+          : {}),
       });
       this.notifyCommittedEvents(controls, committed.committed_events);
       return committed;
@@ -504,6 +584,7 @@ export class TaskExecutionLoop {
         ...(metadata.session_id ? { session_id: metadata.session_id } : {}),
         ...(metadata.final_output ? { final_output: metadata.final_output } : {}),
         ...(metadata.warnings ? { warnings: metadata.warnings } : {}),
+        ...(metadata.sap_result ? { sap_result: metadata.sap_result } : {}),
         ...(result.artifact_refs ? { artifact_refs: result.artifact_refs } : {}),
       });
     } catch (error) {
@@ -522,6 +603,46 @@ export class TaskExecutionLoop {
       .catch((error: unknown) => {
         throw new StageEvidenceWriteError(error);
       });
+  }
+
+  private createSapDispatch(
+    state: TaskRunExecutionState,
+    cursorInput: Exclude<TaskCursorInput, { cursor: 'done' | 'mailbox_wait' }>,
+    invocationId: string,
+  ): SapExecuteDispatch | undefined {
+    if (!this.sapBridge || cursorInput.cursor !== 'execute_agent') return undefined;
+    return this.sapBridge.createExecute({
+      task_id: state.task_id,
+      run_id: state.run_id,
+      role_id: cursorInput.winner_agent_id,
+      instruction: state.task_request.spec,
+      exchange_id: `sap_${invocationId}`,
+    });
+  }
+
+  private createSapResult(
+    dispatch: SapExecuteDispatch,
+    result: ExecuteAgentStageResult,
+  ): SapResultFrame {
+    const status = sapStatus(result.evidence.status);
+    return this.sapBridge!.createResult({
+      execute: dispatch.frame,
+      status,
+      summary:
+        status === 'completed'
+          ? 'Agent execution completed and the Task cursor advanced.'
+          : `Agent execution ended with status ${status}.`,
+      ...(status === 'failed'
+        ? {
+            error: {
+              code: 'agent_execution_failed',
+              message: 'Agent execution returned a failed result.',
+              retryable: false,
+            },
+          }
+        : {}),
+      exchange_id: `sap_result_${dispatch.frame.exchange_id}`,
+    });
   }
 
   private async writeFailureEvidence(
@@ -546,6 +667,10 @@ export class TaskExecutionLoop {
   }
 }
 
+function isTaskInterrupted(error: unknown): error is TaskInterruptedError {
+  return error instanceof TaskInterruptedError;
+}
+
 function assertRunTaskIdentity(state: TaskRunExecutionState, taskId: string): void {
   if (state.task_id !== taskId) {
     throw new Error(`Run ${state.run_id} does not belong to Task ${taskId}`);
@@ -556,6 +681,13 @@ class StageEvidenceWriteError extends Error {
   constructor(readonly originalError: unknown) {
     super(errorMessage(originalError));
     this.name = 'StageEvidenceWriteError';
+  }
+}
+
+class SapExecutionAlreadyClaimedError extends Error {
+  constructor(readonly exchangeId: string) {
+    super(`SAP execute ${exchangeId} is already active or complete`);
+    this.name = 'SapExecutionAlreadyClaimedError';
   }
 }
 
@@ -576,6 +708,8 @@ function stageContext<TCursor extends Exclude<TaskResumeCursor, 'done' | 'mailbo
     RunTaskExecutionInput,
     'memory_ablation' | 'session_id' | 'signal' | 'on_driver_event' | 'on_event'
   >,
+  onSapDispatch?: (dispatch: SapExecuteDispatch) => void | Promise<void>,
+  onSapResult?: TaskStageExecutionContext<TCursor>['on_sap_result'],
 ): TaskStageExecutionContext<TCursor> {
   return {
     task_id: state.task_id,
@@ -584,16 +718,18 @@ function stageContext<TCursor extends Exclude<TaskResumeCursor, 'done' | 'mailbo
     ...(state.memory_ablation ? { memory_ablation: state.memory_ablation } : {}),
     task_request: state.task_request,
     workspace_path: state.workspace_path,
-    ...(state.delivery_workspace_path
-      ? { delivery_workspace_path: state.delivery_workspace_path }
-      : {}),
     ...(controls.memory_ablation ? { memory_ablation: controls.memory_ablation } : {}),
     ...(controls.session_id ? { session_id: controls.session_id } : {}),
     cursor_input: cursorInput,
     ...(state.restarted_from_run_id ? { restarted_from_run_id: state.restarted_from_run_id } : {}),
+    ...(state.native_task_prompt_dispatched !== undefined
+      ? { native_task_prompt_dispatched: state.native_task_prompt_dispatched }
+      : {}),
     ...(controls.signal ? { signal: controls.signal } : {}),
     ...(controls.on_driver_event ? { on_driver_event: controls.on_driver_event } : {}),
     ...(controls.on_event ? { on_event: controls.on_event } : {}),
+    ...(onSapDispatch ? { on_sap_dispatch: onSapDispatch } : {}),
+    ...(onSapResult ? { on_sap_result: onSapResult } : {}),
   };
 }
 
@@ -634,6 +770,10 @@ function assertGateResultIdentity(result: GateStageResult, input: CursorInput<'g
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function sapStatus(value: unknown): SapResultFrame['status'] {
+  return value === 'failed' || value === 'cancelled' ? value : 'completed';
 }
 
 function stageFailure(

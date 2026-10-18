@@ -57,9 +57,7 @@ describe('startup recovery', () => {
       expect(next.currentPage).toBe(initial.currentPage);
       expect(next.taskText).toBe('');
       expect(next.tasks[0].contractTaskId).toBe('previous-task');
-      expect(next.liveRuns['previous-run'].status).toBe(
-        status === 'interrupted' ? 'failed' : status,
-      );
+      expect(next.liveRuns['previous-run'].status).toBe(status);
     },
   );
 
@@ -103,7 +101,8 @@ describe('startup recovery', () => {
     };
     const recovered = recoverBackendTasks(current, [snapshot]);
     expect(recovered.tasks).toHaveLength(1);
-    expect(recovered.tasks[0]).toEqual(initial.tasks[0]);
+    expect(recovered.tasks[0]).toMatchObject(initial.tasks[0]);
+    expect(recovered.tasks[0].contractTaskStatus).toBe('completed');
     expect(recovered.liveRuns['previous-run']).toBe(current.liveRuns['previous-run']);
     expect(recovered.liveTasks[snapshot.task.task_id]).toBe(
       current.liveTasks[snapshot.task.task_id],

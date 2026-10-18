@@ -60,6 +60,8 @@ import { councilResultEvidenceSchema, type TaskSnapshot } from '../protocol/task
 import {
   TaskProcessorRunNotFoundError,
   TaskProcessorTaskNotFoundError,
+  TaskInterruptedError,
+  type AapMailboxBridge,
   type BeginTaskRunIntent,
   type ParticipantSessionProvisioner,
   type TaskProcessor,
@@ -77,6 +79,8 @@ import type {
 } from '../mailbox';
 import type { DriverStreamEvent } from '../driver/contract';
 import type { DriverRoutingPort } from '../driver';
+import type { DriverProbeService } from '../driver';
+import type { PersistedDriverConfig } from '../driver';
 import type {
   AgentBoardAgentView,
   AgentBoardListItem,
@@ -101,15 +105,28 @@ import type {
   MemoryOverview,
   DeadLetterEntry,
   ReindexMemoryResult,
+  ContextDeliveryFilter,
+  DriverFeedbackFilter,
+  DeliveryChannel,
+  DeliveryClaimRequest,
+  DeliveryRecordLocator,
+  PendingBufferRead,
 } from '../memory';
 import type {
   SkillRecord,
   BufferMeta,
-  BufferSnapshot,
-  AgentContextSnapshot,
+  ContextDeliveryItem,
+  DriverFeedbackRecord,
 } from '../memory/schemas';
 import type { BMemoryMaintenanceEvidence } from './b-memory-maintenance-runner';
-import type { AgentMetaPatch, BMemoryBackendService } from './b-memory-backend-service';
+import type {
+  AgentMetaPatch,
+  AckDeliveryPayload,
+  BMemoryBackendService,
+  ContextDeliveryPayload,
+  DeliveryRecordPayload,
+  DeliveryStateSummary,
+} from './b-memory-backend-service';
 import type { ReviewedSkill } from './b-public-capabilities';
 import {
   FileDriverStreamAuditWriter,
@@ -272,6 +289,8 @@ interface RunLineage {
    * falls back to the default select_agent cursor and silently restarts.
    */
   cursor_input?: TaskCursorInput;
+  /** Driver routing frozen by the interrupted Run; checkpoint resume must inherit it. */
+  driver_config?: PersistedDriverConfig;
 }
 
 interface PendingRunStart {
@@ -296,6 +315,8 @@ export class NewideBackendService {
    * 缺省（测试与历史装配）时不做冻结，行为与接线前逐字段一致。
    */
   readonly driverRouting: DriverRoutingPort | undefined;
+  /** ACP-owned local driver probe exposed through the frontend RPC surface. */
+  readonly driverProbe: DriverProbeService | undefined;
   private closing = false;
   private closePromise?: Promise<void>;
 
@@ -334,6 +355,7 @@ export class NewideBackendService {
      * 别接反。
      */
     private readonly runTelemetryJsonlSink: TelemetrySink = new NoopTelemetrySink(),
+    private readonly aapBridge?: AapMailboxBridge,
     /**
      * driver usage 观测的独立账本。默认空转，生产注入按 run 落文件的 sink。
      *
@@ -375,8 +397,10 @@ export class NewideBackendService {
      * `driver_config`；执行期的 facade 解析同一份，于是「保存只影响新 Run」有据可依。
      */
     driverRouting?: DriverRoutingPort,
+    driverProbe?: DriverProbeService,
   ) {
     this.driverRouting = driverRouting;
+    this.driverProbe = driverProbe;
   }
 
   /**
@@ -534,7 +558,14 @@ export class NewideBackendService {
 
   async replyMailboxMessage(input: MailboxReplyInput): Promise<SaveMailboxReplyResult> {
     await this.mailboxRecovery;
-    return this.requireMailboxService().reply(input);
+    const result = await this.requireMailboxService().reply(input);
+    // A persisted reply is the only business wake-up signal for a waiting
+    // Task. Continue it after the reply transaction commits; a recovery pass
+    // will retry the same deterministic exchange if this process stops here.
+    await this.continueMailboxWait(result.source_delivery.task_id).catch((error: unknown) => {
+      process.stderr.write(`[mailbox] reply continuation failed: ${toError(error).message}\n`);
+    });
+    return result;
   }
 
   listMemoryAgents(status?: string): Promise<AgentBoardListItem[]> {
@@ -655,19 +686,79 @@ export class NewideBackendService {
     pending_seqs: number[];
     dead_letter_seqs: number[];
     dead_letters: DeadLetterEntry[];
+    delivery: DeliveryStateSummary;
   }> {
     return this.requireBMemoryService().getBufferState(roleId);
   }
 
-  getMemoryPendingBuffer(
-    roleId: string,
-    seq: number,
-  ): Promise<{ snapshot: BufferSnapshot; agent_context?: AgentContextSnapshot } | undefined> {
+  getMemoryPendingBuffer(roleId: string, seq: number): Promise<PendingBufferRead | undefined> {
     return this.requireBMemoryService().getPendingBuffer(roleId, seq);
   }
 
   retryMemoryExtraction(roleId: string, seq: number): Promise<BMemoryMaintenanceEvidence> {
     return this.requireBMemoryService().retryExtraction(roleId, seq);
+  }
+
+  listMemoryContextDeliveries(filter?: ContextDeliveryFilter): Promise<ContextDeliveryItem[]> {
+    return this.requireBMemoryService().listContextDeliveries(filter);
+  }
+
+  getMemoryContextDelivery(
+    roleId: string,
+    deliveryId: string,
+  ): Promise<ContextDeliveryPayload | undefined> {
+    return this.requireBMemoryService().getContextDelivery(roleId, deliveryId);
+  }
+
+  listMemoryDriverFeedback(filter?: DriverFeedbackFilter): Promise<DriverFeedbackRecord[]> {
+    return this.requireBMemoryService().listDriverFeedback(filter);
+  }
+
+  claimMemoryDelivery(
+    input: DeliveryClaimRequest & { id?: string | undefined },
+  ): Promise<DeliveryRecordPayload | undefined> {
+    return this.requireBMemoryService().claimDelivery(input);
+  }
+
+  renewMemoryDeliveryClaim(
+    input: DeliveryRecordLocator & {
+      claim_token: string;
+      owner?: string | undefined;
+      lease_ms?: number | undefined;
+    },
+  ): Promise<DeliveryRecordPayload | undefined> {
+    return this.requireBMemoryService().renewDeliveryClaim(input);
+  }
+
+  ackMemoryDelivery(
+    input: DeliveryRecordLocator & {
+      claim_token: string;
+      owner?: string | undefined;
+      outcome: 'processed' | 'failed';
+      error?: string | undefined;
+      retryable?: boolean | undefined;
+      processor_version?: string | undefined;
+    },
+  ): Promise<AckDeliveryPayload | undefined> {
+    return this.requireBMemoryService().ackDelivery(input);
+  }
+
+  retryMemoryDelivery(input: DeliveryRecordLocator): Promise<DeliveryRecordPayload | undefined> {
+    return this.requireBMemoryService().retryDelivery(input);
+  }
+
+  restoreExpiredMemoryDeliveries(options?: {
+    channel?: DeliveryChannel | undefined;
+    role_id?: string | undefined;
+  }): Promise<DeliveryRecordPayload[]> {
+    return this.requireBMemoryService().restoreExpiredDeliveries(options ?? {});
+  }
+
+  listRetryableMemoryDeliveries(options?: {
+    channel?: DeliveryChannel | undefined;
+    role_id?: string | undefined;
+  }): Promise<DeliveryRecordPayload[]> {
+    return this.requireBMemoryService().listRetryableDeliveries(options ?? {});
   }
 
   searchAgentMemory(
@@ -742,6 +833,22 @@ export class NewideBackendService {
     return this.getTask(taskId);
   }
 
+  async interruptTask(taskId: string): Promise<TaskSnapshot> {
+    await this.getTask(taskId);
+    if (!this.taskProcessor) {
+      throw new Error('Task interruption requires the persistent Task processor');
+    }
+    const current = this.registry
+      .listSnapshots()
+      .find((run) => run.task_id === taskId && run.status === 'running');
+    if (!current) throw new TaskNotRunningError(taskId);
+    await this.interruptRun(current.run_id, {
+      code: 'TASK_INTERRUPTED',
+      message: 'Task interrupted by user',
+    });
+    return this.getTask(taskId);
+  }
+
   async startCouncil(taskId: string): Promise<TaskSnapshot> {
     const task = await this.getTask(taskId);
     if (task.current_run) {
@@ -808,6 +915,9 @@ export class NewideBackendService {
     }
     const resumePackage = this.taskProcessor.buildResumePackage(taskId);
     const resume = this.taskProcessor.getTaskResumeContext(taskId);
+    const interruptedRequest = await this.requestStore
+      .load(resume.interrupted_run_id)
+      .catch(() => undefined);
     const restore = this.restoreResumeWorkspace(taskId, resumePackage);
     if (restore.status !== 'restored') {
       throw new TaskResumeAnchorError(
@@ -832,6 +942,9 @@ export class NewideBackendService {
         resume_checkpoint_id: resume.checkpoint_id,
         requested_resume_cursor: resume.resume_cursor,
         cursor_input: resume.cursor_input,
+        ...(interruptedRequest?.driver_config
+          ? { driver_config: interruptedRequest.driver_config }
+          : {}),
       },
     );
     return this.getTask(taskId);
@@ -951,6 +1064,7 @@ export class NewideBackendService {
         run_intent: { type: 'create' },
         restarted_from_run_id: runId,
         persist_restarted_from_run_id: persistRestartLineage,
+        ...(request.driver_config ? { driver_config: request.driver_config } : {}),
       },
     );
     return { ...created, restarted_from_run_id: runId };
@@ -981,7 +1095,7 @@ export class NewideBackendService {
     this.registry.create({ ...identity, mode, controller });
     this.runWorkspaces.set(identity.run_id, workspacePath);
     // 在本 Run 的第一个阶段跑起来之前冻结 routing：此后无论 UI 怎么改，本 Run 都用这一份。
-    const driverConfig = this.driverRouting?.freezeForRun(identity.run_id);
+    const driverConfig = this.freezeDriverConfig(identity.run_id, lineage?.driver_config);
     this.registry.subscribe(identity.run_id, (event) => {
       void this.auditWriter.append(event).catch(() => undefined);
       this.notifyTaskListeners(identity.task_id, event);
@@ -1011,6 +1125,11 @@ export class NewideBackendService {
       }
       await this.requestStore.save({
         ...identity,
+        recovery_parent_run_id:
+          lineage?.run_intent?.type === 'checkpoint_resume' ||
+          lineage?.run_intent?.type === 'mailbox_continuation'
+            ? (lineage.restarted_from_run_id ?? null)
+            : null,
         ...(driverConfig ? { driver_config: driverConfig } : {}),
         prompt: params.prompt,
         workspace_path: workspacePath,
@@ -1187,6 +1306,14 @@ export class NewideBackendService {
       }
       if (taskSnapshot.task.status === 'completed') {
         this.registry.complete(input.identity.run_id);
+      } else if (taskSnapshot.task.status === 'blocked') {
+        for (const event of processor.listTaskEvents(input.identity.task_id)) {
+          if (event.run_id === input.identity.run_id) this.mirrorTaskAuthorityEvent(event);
+        }
+        this.registry.interrupt(input.identity.run_id, {
+          code: 'TASK_INTERRUPTED',
+          message: 'Task interrupted before the current stage reached a terminal result',
+        });
       } else if (taskSnapshot.task.status === 'cancelled') {
         this.registry.cancel(input.identity.run_id);
       } else {
@@ -1203,29 +1330,52 @@ export class NewideBackendService {
       await this.auditWriter.flush(input.identity.run_id).catch(() => undefined);
     } catch (error) {
       const normalized = toError(error);
+      const interruptReason =
+        input.controller.signal.reason instanceof TaskInterruptedError
+          ? input.controller.signal.reason
+          : undefined;
+      let interruptionPersistenceError: Error | undefined;
       try {
         const current = processor.getTaskSnapshot(input.identity.task_id);
         if (current.current_run?.run_id === input.identity.run_id) {
-          processor.finishRun({
-            run_id: input.identity.run_id,
-            status: input.controller.signal.aborted ? 'cancelled' : 'failed',
-            ...(input.controller.signal.aborted
-              ? {}
-              : {
-                  error: {
-                    code: 'TASK_LOOP_FAILED',
-                    message: normalized.message,
-                  },
-                }),
-          });
+          if (interruptReason) {
+            processor.interruptRun(input.identity.run_id, {
+              source: interruptReason.source,
+              reason: interruptReason.message,
+            });
+          } else {
+            processor.finishRun({
+              run_id: input.identity.run_id,
+              status: input.controller.signal.aborted ? 'cancelled' : 'failed',
+              ...(input.controller.signal.aborted
+                ? {}
+                : {
+                    error: {
+                      code: 'TASK_LOOP_FAILED',
+                      message: normalized.message,
+                    },
+                  }),
+            });
+          }
         }
         for (const event of processor.listTaskEvents(input.identity.task_id)) {
           if (event.run_id === input.identity.run_id) this.mirrorTaskAuthorityEvent(event);
         }
-      } catch {
-        // The persistent terminal transition is best-effort after a commit failure.
+      } catch (persistenceError) {
+        if (interruptReason) interruptionPersistenceError = toError(persistenceError);
       }
-      if (input.controller.signal.aborted) {
+      if (interruptionPersistenceError) {
+        this.registry.fail(
+          input.identity.run_id,
+          'INTERRUPT_PERSIST_FAILED',
+          interruptionPersistenceError.message,
+        );
+      } else if (interruptReason) {
+        this.registry.interrupt(input.identity.run_id, {
+          code: 'TASK_INTERRUPTED',
+          message: interruptReason.message,
+        });
+      } else if (input.controller.signal.aborted) {
         this.registry.cancel(input.identity.run_id);
       } else {
         this.registry.fail(input.identity.run_id, 'TASK_LOOP_FAILED', normalized.message);
@@ -1270,18 +1420,54 @@ export class NewideBackendService {
 
       const sourceDeliveryId = context.delivery_ids[0]!;
       const source = mailbox.getEnvelope(sourceDeliveryId);
-      // Council plan_first writes Mailbox messages from the council workspace,
-      // which can differ from the Task worktree. Continuation must resume in
-      // the same workspace the request was sent from, or startRun fails and
-      // the Task stays waiting_help forever.
-      const continuationWorkspace = source.message.workspace_path;
+      // Mailbox sessions stay in their execution sandbox; the Run must retain
+      // the Task's user workspace so gate/deliver never target that sandbox.
+      const continuationWorkspace = context.workspace_path;
       let reply = mailbox.findReplyDelivery(sourceDeliveryId, context.sender_role_id);
+      if (
+        !reply &&
+        source.delivery.deadline_at &&
+        Date.parse(source.delivery.deadline_at) <= Date.now()
+      ) {
+        mailbox.markFailed(sourceDeliveryId, {
+          code: 'MAILBOX_DEADLINE_EXCEEDED',
+          message: 'Mailbox request reached its local deadline without a reply',
+        });
+        processor.expireMailboxWait(
+          taskId,
+          'Mailbox request reached its local deadline without a matching reply',
+        );
+        return;
+      }
+      const aapDispatch = this.aapBridge?.createAsk({
+        task_id: source.message.task_id,
+        run_id: context.run_id,
+        from_role_id: source.message.from_role_id,
+        to_role_id: source.delivery.recipient_role_id,
+        message_id: source.message.message_id,
+        delivery_id: source.delivery.delivery_id,
+        content:
+          source.message.content?.trim() ||
+          (typeof source.message.payload.content === 'string'
+            ? source.message.payload.content
+            : JSON.stringify(source.message.payload)),
+        ...(source.delivery.deadline_at ? { deadline_at: source.delivery.deadline_at } : {}),
+        exchange_id: `aap_ask_${source.message.message_id}`,
+      });
+      // Upgrade a wait created before AAP wiring without changing its Mailbox
+      // identity. The deterministic exchange makes this idempotent.
+      if (aapDispatch) this.aapBridge!.persistAsk(aapDispatch);
+      const aapAdmission = aapDispatch ? this.aapBridge!.beginAsk(aapDispatch) : undefined;
       if (!reply) {
+        // A previous process may still own the AAP inbox lease. Preserve the
+        // durable wait; retry after lease expiry or let a matching reply wake
+        // the Task. Never turn an in-flight lease into a deadlock.
+        if (aapAdmission?.should_execute === false) return;
         if (this.participantSessionProvisioner) {
           try {
             await this.participantSessionProvisioner({
               task_id: source.message.task_id,
-              workspace_path: continuationWorkspace,
+              workspace_path: source.message.workspace_path,
               role_id: source.delivery.recipient_role_id,
               run_id: context.run_id,
             });
@@ -1291,11 +1477,37 @@ export class NewideBackendService {
             return;
           }
         }
-        const handled = await worker.process({
-          delivery_id: sourceDeliveryId,
-          run_id: context.run_id,
-        });
+        const waitController = new AbortController();
+        const deadlineMs = source.delivery.deadline_at
+          ? Math.max(0, Date.parse(source.delivery.deadline_at) - Date.now())
+          : undefined;
+        const deadlineTimer =
+          deadlineMs === undefined
+            ? undefined
+            : setTimeout(() => waitController.abort(), deadlineMs);
+        let handled;
+        try {
+          handled = await worker.process({
+            delivery_id: sourceDeliveryId,
+            run_id: context.run_id,
+            signal: waitController.signal,
+          });
+        } finally {
+          if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+        }
+        if (waitController.signal.aborted) {
+          mailbox.markFailed(sourceDeliveryId, {
+            code: 'MAILBOX_DEADLINE_EXCEEDED',
+            message: 'Mailbox request reached its local deadline without a reply',
+          });
+          processor.expireMailboxWait(
+            taskId,
+            'Mailbox request reached its local deadline without a matching reply',
+          );
+          return;
+        }
         if (
+          handled &&
           handled.status === 'retryable_failure' &&
           handled.error?.startsWith('COLLABORATION_DEADLOCK')
         ) {
@@ -1303,11 +1515,32 @@ export class NewideBackendService {
           return;
         }
         reply =
-          handled.status === 'replied' && handled.reply
+          handled && handled.status === 'replied' && handled.reply
             ? mailbox.getEnvelope(handled.reply.delivery_id)
             : mailbox.findReplyDelivery(sourceDeliveryId, context.sender_role_id);
         if (!reply) {
+          // A recipient may have completed a turn without producing its
+          // business reply. Keep the durable wait until the local deadline;
+          // the AAP lease makes a later recovery attempt idempotent.
+          if (source.delivery.deadline_at) return;
           deadlock('MAILBOX_REPLY_MISSING');
+          return;
+        }
+      }
+      if (reply && aapDispatch && aapAdmission) {
+        const replyContent =
+          reply.message.content?.trim() ||
+          (typeof reply.message.payload.content === 'string'
+            ? reply.message.payload.content
+            : JSON.stringify(reply.message.payload));
+        const replyFrame = this.aapBridge!.createReply({
+          ask: aapDispatch.frame,
+          status: 'completed',
+          summary: replyContent,
+          exchange_id: `aap_reply_${reply.message.message_id}`,
+        });
+        if (this.aapBridge!.acceptReply(aapAdmission, replyFrame) === 'late') {
+          processor.expireMailboxWait(taskId, 'Mailbox reply arrived after the local deadline');
           return;
         }
       }
@@ -1434,7 +1667,10 @@ export class NewideBackendService {
             identity = created;
             settlePendingStart();
             // legacy 路径同样在 Run 创建点冻结 routing：编排器与 facade 共用这一份投影。
-            const legacyDriverConfig = this.driverRouting?.freezeForRun(created.run_id);
+            const legacyDriverConfig = this.freezeDriverConfig(
+              created.run_id,
+              lineage?.driver_config,
+            );
             this.terminalRuns.set(created.run_id, terminalRun);
             this.runWorkspaces.set(created.run_id, workspacePath);
             this.registry.create({ ...created, mode, controller });
@@ -1574,6 +1810,22 @@ export class NewideBackendService {
     });
   }
 
+  private freezeDriverConfig(
+    runId: string,
+    persisted?: PersistedDriverConfig,
+  ): PersistedDriverConfig | undefined {
+    if (!this.driverRouting) return undefined;
+    if (persisted) {
+      if (!this.driverRouting.freezeForRunSnapshot) {
+        throw new Error(
+          'Checkpoint resume cannot preserve driver routing: the routing port lacks snapshot rehydration',
+        );
+      }
+      return this.driverRouting.freezeForRunSnapshot(runId, persisted);
+    }
+    return this.driverRouting.freezeForRun(runId);
+  }
+
   private async closeGracefully(): Promise<void> {
     const pendingStarts = [...this.pendingRunStarts];
     const closeReason = new Error('Backend service is closing');
@@ -1584,7 +1836,17 @@ export class NewideBackendService {
       this.registry
         .listSnapshots()
         .filter((run) => run.status === 'running')
-        .map((run) => this.cancelRun(run.run_id)),
+        .map((run) =>
+          this.taskProcessor
+            ? this.interruptRun(run.run_id, {
+                code: 'BACKEND_SHUTDOWN',
+                message: 'Backend service is shutting down',
+              })
+            : this.cancelRun(run.run_id, {
+                code: 'BACKEND_SHUTDOWN',
+                message: 'Backend service is shutting down',
+              }),
+        ),
     );
     await Promise.allSettled(pendingStarts.map((pendingStart) => pendingStart.settled));
     await Promise.allSettled([...this.terminalRuns.values()]);
@@ -1721,10 +1983,7 @@ export class NewideBackendService {
     if (snapshot.status === 'running') return undefined;
     try {
       return this.runUsageHistoryReader?.readRun(snapshot.run_id);
-    } catch (error) {
-      process.stderr.write(
-        `[usage] Failed to read ${snapshot.run_id}: ${toError(error).message}\n`,
-      );
+    } catch {
       return undefined;
     }
   }
@@ -1767,6 +2026,23 @@ export class NewideBackendService {
       throw new Error(snapshot.error?.message ?? `Run ${runId} already reached ${snapshot.status}`);
     }
     return { cancelled: true };
+  }
+
+  async interruptRun(runId: string, reason: RunCancellationReason): Promise<{ interrupted: true }> {
+    this.registry.requestAbort(
+      runId,
+      new TaskInterruptedError(
+        reason.code === 'BACKEND_SHUTDOWN' ? 'shutdown' : 'user',
+        reason.message,
+      ),
+    );
+    const terminal = this.terminalRuns.get(runId);
+    if (terminal) await terminal;
+    const snapshot = this.registry.getSnapshot(runId);
+    if (snapshot.status !== 'interrupted') {
+      throw new Error(snapshot.error?.message ?? `Run ${runId} did not reach interrupted state`);
+    }
+    return { interrupted: true };
   }
 
   /**
@@ -1828,7 +2104,10 @@ export class NewideBackendService {
     const history = await this.requestStore.listHistory();
     const registryRuns = this.registry.listSnapshots();
     const registryRunIds = new Set(registryRuns.map((run) => run.run_id));
-    const requestFacts = new Map<string, { task_request: TaskCreateRequest; created_at: string }>();
+    const requestFacts = new Map<
+      string,
+      { task_request: TaskCreateRequest; created_at: string; workspace_path?: string }
+    >();
     const runFacts = new Map<string, TaskRunFact[]>();
 
     for (const entry of history) {
@@ -1839,6 +2118,7 @@ export class NewideBackendService {
         requestFacts.set(entry.task_id, {
           task_request: entry.task_request,
           created_at: entry.created_at,
+          ...(entry.workspace_path ? { workspace_path: entry.workspace_path } : {}),
         });
       }
     }
@@ -1868,6 +2148,7 @@ export class NewideBackendService {
         task_id: taskId,
         task_request: request.task_request,
         created_at: request.created_at,
+        ...(request.workspace_path ? { workspace_path: request.workspace_path } : {}),
         runs: runFacts.get(taskId) ?? [],
       }),
     );
@@ -1952,6 +2233,15 @@ export class NewideBackendService {
   private persistRunEvent(identity: { run_id: string; task_id: string }, event: Event): void {
     const processor = this.taskProcessor;
     if (!processor) return;
+    if (
+      event.event_type === 'driver.prompt_dispatching' ||
+      event.event_type === 'driver.session_initializing'
+    ) {
+      // These are recovery facts, not optional observations. They are emitted
+      // synchronously before launch, so a failed commit must prevent execution.
+      processor.recordRunEvent(identity.run_id, { ...event, ...identity });
+      return;
+    }
     try {
       processor.recordRunEvent(identity.run_id, {
         ...event,
@@ -2209,7 +2499,9 @@ function toDomainEvent(event: AppRunEvent): Event {
 }
 
 function terminalStatus(status: AppRunSnapshot['status']): 'completed' | 'failed' | 'cancelled' {
-  if (status === 'running') throw new Error('Cannot persist a running snapshot as terminal');
+  if (status === 'running' || status === 'interrupted') {
+    throw new Error('Cannot persist an interrupted snapshot as terminal output');
+  }
   return status;
 }
 

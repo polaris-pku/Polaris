@@ -218,9 +218,21 @@ const NAMED_CASES: DriverStreamCase[] = [
 
 /**
  * 走投影默认分支的输入：投影器原样透传 driver 自产的名字。实测生产者来自外部
- * ACP 仓的 `contract-runner`。
+ * ACP 仓的 `contract-runner`，以及 Host 的 session/dispatch 边界。
  */
 const PASS_THROUGH_CASES: DriverStreamCase[] = [
+  {
+    input: 'driver.prompt_dispatching',
+    payload: {},
+    projected: 'driver.prompt_dispatching',
+    channel: 'coordination',
+  },
+  {
+    input: 'driver.session_initializing',
+    payload: {},
+    projected: 'driver.session_initializing',
+    channel: 'coordination',
+  },
   {
     input: 'driver.phase',
     payload: { phase: 'session' },

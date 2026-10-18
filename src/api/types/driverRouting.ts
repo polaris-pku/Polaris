@@ -36,3 +36,29 @@ export interface UpdateDriverRoutingInput {
 export interface ResetDriverRoutingInput {
   expected_revision: string;
 }
+
+export interface DriverProbeParams {
+  agent_ids?: string[];
+  timeout_ms?: number;
+  concurrency?: number;
+  force?: boolean;
+}
+
+export interface DriverProbeResult {
+  schema_version: 'driver-probe.v1';
+  generated_at: string;
+  drivers: Array<{
+    agentId: string;
+    displayName: string;
+    launch: { command: string; args: string[] };
+    provenance: 'env-override' | 'local-entry' | 'path' | 'npx-on-demand';
+    connectionType: 'acp' | 'pty';
+    initialize?: {
+      protocolVersion: number;
+      authMethods: number;
+      agentVersion?: string;
+      agentCapabilities?: string[];
+    };
+    probedAt: string;
+  }>;
+}

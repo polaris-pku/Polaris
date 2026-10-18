@@ -17,6 +17,7 @@ import { insertFileNode } from '@/store/lib/fileTree';
 import { buildTimelineEvent, getNodeLog } from '@/store/lib/timeline';
 import { extractTaskFields, pickProjectTask, syncTasks, taskToState } from '@/store/lib/taskSync';
 import { applyTaskSnapshot } from '@/store/lib/taskObservation';
+import { changeTaskExecution } from '@/store/lib/taskExecution';
 
 /**
  * 工作区被**别的项目**的 run 占着时的拒绝理由。
@@ -29,9 +30,7 @@ function workspaceBlockedMessage(projects: Project[], blocker: DemoTask): string
   return (
     `「${blockerProject?.name ?? '另一个项目'}」里的需求「${blocker.title}」还在执行中。\n` +
     'agent 的工作区是后端的全局状态，换项目要重启后端 —— 那会把正在跑的 agent 一起杀掉。\n' +
-    // 不许写「或先取消它」：驱动没实现中断，全应用没有取消按钮（cancelRun 零调用）。
-    // 指一条用户按不到的路，比不指更糟。
-    '请等它跑完，或退出应用（会杀掉正在干活的 agent），再在本项目提交。'
+    '请等它跑完，或先在原任务停止并确认状态已保存，再在本项目提交。'
   );
 }
 
@@ -52,6 +51,8 @@ export const selectStartCouncil = (state: DemoState): TaskCouncilSlice['startCou
 
 /** 任务域：任务生命周期（新建/开始/切换/删除）与页面导航。 */
 export const createTaskSlice: SliceCreator<TaskSlice & TaskCouncilSlice> = (set, get) => ({
+  interruptTask: (taskId) => changeTaskExecution(taskId, 'interrupt', get, set),
+  resumeTask: (taskId) => changeTaskExecution(taskId, 'resume', get, set),
   observeTask: async (taskId) => {
     let observedRunId: string | undefined;
     const reportError = (message: string) =>
@@ -82,7 +83,7 @@ export const createTaskSlice: SliceCreator<TaskSlice & TaskCouncilSlice> = (set,
       onEvent(event) {
         set((state) => {
           const task = state.liveTasks[taskId];
-          if (!task) return {};
+          if (!task || task.events.some((item) => item.event_id === event.event_id)) return {};
           return {
             liveTasks: {
               ...state.liveTasks,
@@ -206,9 +207,7 @@ export const createTaskSlice: SliceCreator<TaskSlice & TaskCouncilSlice> = (set,
     try {
       const snapshot = await taskApi.get(backendTaskId);
       if (snapshot.task.status === 'blocked') {
-        const resumed = await taskApi.resume(backendTaskId);
-        set((current) => applyTaskSnapshot(current, resumed));
-        if (resumed.current_run) await watchRun(resumed.current_run.run_id);
+        return get().resumeTask(taskId);
       } else {
         const restartable = snapshot.run_history.find(
           (run) =>
@@ -261,15 +260,7 @@ export const createTaskSlice: SliceCreator<TaskSlice & TaskCouncilSlice> = (set,
     }
   },
 
-  /**
-   * 后端进程没了 → 把所有还挂着 running 的 run 如实标成失败。
-   *
-   * BCD 的 run registry 只活在它自己的进程内存里。进程一死（崩溃、被杀、切工作区重启），
-   * 那些 run 就再也不会有任何事件到达了 —— 而且新起的 BCD 对它们一无所知，重新订阅只会得到
-   * RUN_NOT_FOUND。此时界面若还显示「执行中」，就是在撒谎：它会一直转圈到用户放弃。
-   *
-   * 所以：宁可如实说「后端中断了，这次 run 没了」，也不要让一个永远不会到来的事件吊着用户。
-   */
+  /** Legacy action name: disconnection invalidates observation, not durable execution. */
   failLiveRuns: (reason) => {
     const state = get();
     const stalled = Object.values(state.liveRuns).filter((r) => r.status === 'running');
@@ -277,16 +268,9 @@ export const createTaskSlice: SliceCreator<TaskSlice & TaskCouncilSlice> = (set,
 
     const liveRuns = { ...state.liveRuns };
     for (const run of stalled) {
-      liveRuns[run.runId] = { ...run, status: 'failed', error: reason };
-      void unwatchRun(run.runId);
+      liveRuns[run.runId] = { ...run, syncError: reason };
     }
     set({ liveRuns });
-
-    // 把每个受影响的任务推到终态 —— 走的是和 run.failed 事件完全相同的投影路径，
-    // 所以泳道图/时间线/交付页的表现与「后端明确报失败」一致，没有第二套特例逻辑。
-    for (const run of stalled) {
-      get().applyLiveProgress(run.runId, run.timeline, 'failed');
-    }
   },
 
   /**

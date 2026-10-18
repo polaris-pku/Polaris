@@ -40,12 +40,9 @@ describePostgres('backend RPC PostgreSQL acceptance', () => {
             ACP_DRIVER_ENV_FILE: path.join(runnerDir, '.env'),
             ACP_DRIVER_RUNNER_DIR: runnerDir,
             NEWIDE_B_DATABASE_URL: postgresUrl,
-            // This acceptance test validates the real PostgreSQL composition, not a paid
-            // embedding provider. Keep startup deterministic and offline; otherwise the
-            // production runtime performs its default LiteLLM readiness probe before ping.
+            // Exercise real PostgreSQL readiness without a paid embedding-provider probe.
             NEWIDE_B_EMBEDDING_PROVIDER: 'hash',
             NEWIDE_B_EMBEDDING_DIMENSIONS: '32',
-            // Isolate FileBufferRepository and every other runtime file from the checkout.
             NEWIDE_STATE_ROOT: path.join(tempRoot, 'state'),
             NEWIDE_COORDINATION_DB: path.join(tempRoot, 'coordination.sqlite'),
           },
@@ -56,7 +53,9 @@ describePostgres('backend RPC PostgreSQL acceptance', () => {
         stderr += String(chunk);
       });
 
-      const responsePromise = readFirstResponse(child, 20_000);
+      const responsePromise = readFirstResponse(child, 20_000, () =>
+        redact(stderr, connectionSecrets(postgresUrl)),
+      );
       child.stdin.write('{"jsonrpc":"2.0","id":1,"method":"system.ping"}\n');
 
       await expect(responsePromise).resolves.toEqual({
@@ -83,6 +82,7 @@ describePostgres('backend RPC PostgreSQL acceptance', () => {
 async function readFirstResponse(
   child: ChildProcessWithoutNullStreams,
   timeoutMs: number,
+  diagnostics: () => string,
 ): Promise<unknown> {
   const lines = createInterface({ input: child.stdout });
   try {
@@ -91,7 +91,7 @@ async function readFirstResponse(
         once(lines, 'line').then(([value]) => String(value)),
         once(child, 'close').then(([code, signal]) => {
           throw new Error(
-            `Backend closed before replying to system.ping (code=${String(code)}, signal=${String(signal)})`,
+            `Backend closed before replying to system.ping (code=${String(code)}, signal=${String(signal)})\n${diagnostics()}`,
           );
         }),
       ]),

@@ -39,6 +39,8 @@ import type {
 } from './system';
 import type { TaskCreateParams, TaskSnapshot, TaskSubscribeResult } from './task';
 import type {
+  DriverProbeParams,
+  DriverProbeResult,
   DriverRoutingSnapshot,
   ResetDriverRoutingInput,
   UpdateDriverRoutingInput,
@@ -121,7 +123,7 @@ export type RpcTaskStatus =
   | 'cancelled';
 
 export type RunMode = 'single_agent' | 'council';
-export type RunStatus = 'running' | 'completed' | 'failed' | 'cancelled';
+export type RunStatus = 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted';
 export type RunStage = 'executing' | 'council' | 'delivery' | 'intervention';
 
 /** 流程图节点态（N0–N18 固定 19 项）。 */
@@ -350,6 +352,9 @@ export interface RunCreateResult {
 
 export interface RpcMethodMap {
   'driver.getConfig': { params: Record<string, never>; result: DriverRoutingSnapshot };
+  'driver.refresh': { params: DriverProbeParams; result: DriverRoutingSnapshot };
+  'driver.list': { params: DriverProbeParams; result: DriverProbeResult };
+  'driver.probe': { params: DriverProbeParams; result: DriverProbeResult };
   'driver.updateRouting': { params: UpdateDriverRoutingInput; result: DriverRoutingSnapshot };
   'driver.resetRouting': { params: ResetDriverRoutingInput; result: DriverRoutingSnapshot };
   'system.ping': { params: Record<string, never>; result: PingResult };
@@ -366,6 +371,7 @@ export interface RpcMethodMap {
   'task.get': { params: { task_id: string }; result: TaskSnapshot };
   'task.list': { params: Record<string, never>; result: { tasks: TaskSnapshot[] } };
   'task.cancel': { params: { task_id: string }; result: TaskSnapshot };
+  'task.interrupt': { params: { task_id: string }; result: TaskSnapshot };
   'task.resume': { params: { task_id: string }; result: TaskSnapshot };
   'task.startCouncil': { params: { task_id: string }; result: TaskSnapshot };
   'task.subscribe': {

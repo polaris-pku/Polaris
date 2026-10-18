@@ -54,16 +54,17 @@ export {
   type PgMemoryRepositoryOptions,
 } from './adapters/pg-memory-repository';
 export { ensurePgMemorySchema } from './adapters/pg-memory-schema';
-export {
-  createPGlitePool,
-  PGlitePool,
-  type PGlitePoolOptions,
-} from './adapters/pglite-pool';
+export { createPGlitePool, PGlitePool, type PGlitePoolOptions } from './adapters/pglite-pool';
 export type { SqlPool, SqlClient, SqlQueryResult } from './ports/sql-pool';
 export {
   FileBufferRepository,
   type FileBufferRepositoryOptions,
 } from './adapters/file-buffer-repository';
+export { InMemoryMemoryDeliveryRepository } from './adapters/in-memory-memory-delivery';
+export {
+  FileMemoryDeliveryRepository,
+  type FileMemoryDeliveryRepositoryOptions,
+} from './adapters/file-memory-delivery';
 
 // ════════════════════════════════════════════════════════
 //  3. LLM 客户端适配器
@@ -121,11 +122,7 @@ export {
   type PersonaPatch,
   type PersonaInducer,
 } from './services/persona-update';
-export {
-  applyUserRating,
-  type RateTaskInput,
-  type UserRatingResult,
-} from './services/feedback';
+export { applyUserRating, type RateTaskInput, type UserRatingResult } from './services/feedback';
 export {
   applyUsageFeedback,
   type UsageReference,
@@ -133,9 +130,17 @@ export {
   type UsageFeedbackResult,
 } from './services/usage-feedback';
 export {
-  computeMemoryOverview,
-  type MemoryOverview,
-} from './services/memory-overview';
+  buildContextDeliveryItem,
+  buildDriverUsageFeedbackRecords,
+  contextDeliveryId,
+  contextDeliveryKey,
+  driverFeedbackId,
+  driverFeedbackKey,
+  type ContextDeliveryInput,
+  type DriverFeedbackInput,
+  type DriverReferencedExperience,
+} from './services/context-delivery';
+export { computeMemoryOverview, type MemoryOverview } from './services/memory-overview';
 export { repositoryRetrieveMemoryForTask } from './adapters/repository-memory-retrieval';
 export {
   resolveMemoryAblationPolicy,
@@ -167,6 +172,10 @@ export {
   ingestTaskBuffer,
   processPendingBuffer,
   extractBuffer,
+  persistExtractedExperiences,
+  stableExperienceId,
+  type PersistedExtraction,
+  type MemoryScopeFactory,
   promoteExperiences,
   extractBufferForAgent,
   promoteExperiencesForAgent,
@@ -189,6 +198,7 @@ export {
 export {
   disposeRetiredAssets,
   createReplacementAgent,
+  replacementRoleIdFor,
   type RetireOptions,
   type RetireResult,
   type RetireAssetDisposition,
@@ -207,12 +217,19 @@ export {
   type MarketSearchQuery,
 } from './services/skill-market';
 export type {
+  ExperienceFeedbackApplication,
+  ExperienceFeedbackOutcome,
+  ExperienceFeedbackResult,
+  ExperienceSaveResult,
   MarketSearchOptions,
   MarketImportResult,
+  SkillSaveResult,
   TransferSkillToMarketOptions,
 } from './ports/memory-repository';
 /** 技能市场池 Agent 的固定 role_id（退休技能迁移至此名下） */
 export { MARKET_POOL_ROLE_ID } from './schemas';
+/** 某个字符串能不能命名一条经验（引用准入判据，见 schemas.canNameExperience） */
+export { canNameExperience } from './schemas';
 
 // ════════════════════════════════════════════════════════
 //  8.7 三重门控退休检测（week3 RFC §8.2 触发机制）
@@ -364,10 +381,173 @@ export { createMockCompetitionClaimEvaluator } from './adapters/mock-competition
 // ════════════════════════════════════════════════════════
 
 export type {
+  AgentContextReadStatus,
+  BufferArchiveOutcome,
+  BufferLocation,
   BufferRepository,
   DeadLetterEntry,
+  PendingBufferRead,
   SaveBufferResult,
+  StoredBuffer,
 } from './ports/buffer-repository';
+export type {
+  MemoryDeliveryRepository,
+  ContextDeliveryFilter,
+  DriverFeedbackFilter,
+  PendingFeedbackFilter,
+  DeliverySubmitResult,
+  DeliveryChannel,
+  DeliveryClaimRequest,
+  DeliveryRecordLocator,
+  DeliveryRepositoryPolicy,
+  ClaimedDelivery,
+  ClaimedContextDelivery,
+  ClaimedDriverFeedback,
+  ClaimedPendingFeedback,
+} from './ports/memory-delivery';
+export {
+  DEFAULT_DELIVERY_LEASE_MS,
+  DEFAULT_DELIVERY_LOCK_TTL_MS,
+  DEFAULT_DELIVERY_RETRY_POLICY,
+  DEFAULT_FEEDBACK_CONSUME_RETRY_POLICY,
+  DEFAULT_PENDING_FEEDBACK_RETRY_POLICY,
+  DEFAULT_PROMOTION_RETRY_POLICY,
+  newClaimToken,
+  resolveChannelRetryPolicy,
+  type DeliveryChannelKind,
+  type DeliveryRetryPolicy,
+} from './services/delivery-lifecycle';
+
+// ════════════════════════════════════════════════════════
+//  2b. Memory Maintenance：交付/反馈以外的维护侧持久化
+//      维护 run 是观测与审计实体；文件与内存两种后端共用同一套转移规则。
+// ════════════════════════════════════════════════════════
+
+export {
+  classifyDeliveryFailure,
+  isRetryableDeliveryFailure,
+  knownDeliveryFailure,
+  type DeliveryFailureClassification,
+} from './services/delivery-error-classification';
+export { InMemoryMaintenanceRunStore } from './adapters/in-memory-maintenance-run-store';
+export {
+  FileMaintenanceRunStore,
+  type FileMaintenanceRunStoreOptions,
+} from './adapters/file-maintenance-run-store';
+export type {
+  MaintenanceRunStore,
+  StartMaintenanceRunInput,
+  FinishMaintenanceRunInput,
+  MaintenanceRunQuery,
+} from './ports/maintenance-run-store';
+export type {
+  ExperiencePromotion,
+  MaintenanceFailure,
+  MaintenanceFailureCode,
+  MaintenanceJobType,
+  MaintenanceRun,
+  MaintenanceRunAudit,
+  MaintenanceRunCandidateAudit,
+  MaintenanceRunCounts,
+  MaintenanceRunInputSnapshotAudit,
+  MaintenanceRunParentVersionRange,
+  MaintenanceRunStatus,
+  PendingFeedbackRecord,
+  PromotionOutcome,
+} from './schemas';
+// 晋升状态的读取面返回的就是这两个实体：`listPromotionCandidates` / `listExperiences` 给
+// `ExperienceRecord`，`listSkills` / `saveSkillIfAbsent` 给 `SkillRecord`。外部维护 runner
+// 要能接住这两个返回值，所以它们必须是一等导出，而不是只能绕 `schemas` 命名空间拿
+export type { ExperienceRecord, SkillRecord } from './schemas';
+export {
+  EMPTY_MAINTENANCE_RUN_COUNTS,
+  applyMaintenanceRunLimit,
+  compareMaintenanceRuns,
+  completeMaintenanceRun,
+  createMaintenanceRun,
+  createMaintenanceRunId,
+  failMaintenanceRun,
+  isMaintenanceRunTerminal,
+  mergeMaintenanceRunAudit,
+  mergeMaintenanceRunCounts,
+  selectMaintenanceRuns,
+} from './services/maintenance-run-lifecycle';
+
+// ════════════════════════════════════════════════════════
+//  2c. Memory Maintenance：上下文消费（Phase 1）
+//      交付项 → Experience 的消费内核 + 批量运行外壳。它只吃 context 通道，
+//      不晋升 Skill、不演化 Persona —— 那两件事是后续独立的 job。
+// ════════════════════════════════════════════════════════
+
+export {
+  DefaultContextDeliveryProcessor,
+  type ContextDeliveryProcessOutcome,
+  type ContextDeliveryProcessContext,
+  type ContextDeliveryProcessStatus,
+  type ContextDeliveryProcessor,
+  type ContextDeliveryProcessorOptions,
+} from './runtime/context-delivery-processor';
+export {
+  ContextDeliveryWorker,
+  DEFAULT_CONTEXT_DELIVERY_BATCH_SIZE,
+  DEFAULT_CONTEXT_DELIVERY_MAX_DURATION_MS,
+  type ContextDeliveryRestoreResult,
+  type ContextDeliveryRunOptions,
+  type ContextDeliveryRunResult,
+  type ContextDeliveryStopReason,
+  type ContextDeliveryWorkerOptions,
+} from './runtime/context-delivery-worker';
+export {
+  SYSTEM_LEASE_TIMERS,
+  leaseRenewIntervalMs,
+  startLeaseHeartbeat,
+  type LeaseHeartbeat,
+  type LeaseHeartbeatOptions,
+  type LeaseTimers,
+} from './services/lease-heartbeat';
+export {
+  applyFeedbackToExperience,
+  averageConfidence,
+  isFeedbackApplied,
+  nextConfidenceAfterFeedback,
+  recomputeAvgConfidence,
+} from './services/usage-feedback';
+export {
+  buildPendingFeedbackRecord,
+  describePendingFeedbackBindingMismatch,
+  feedbackApplicationOf,
+  isSupportedFeedbackVersion,
+  pendingFeedbackBindingMismatches,
+  pendingFeedbackId,
+} from './services/pending-feedback';
+
+// ════════════════════════════════════════════════════════
+//  2d. Memory Maintenance：反馈消费与归并（Phase 2）
+//      outbox 里的 Driver 反馈 → 写进 Experience；经验还没出现就寄存进待归并队列，
+//      由独立的归并 run 等它出现。它不调 scheduleBuffer、不晋升 Skill、不演化 Persona，
+//      也不参与在线任务流程——在线流程只负责把反馈写进 outbox。
+// ════════════════════════════════════════════════════════
+
+export {
+  DefaultDriverFeedbackProcessor,
+  type DriverFeedbackApplicationOutcome,
+  type DriverFeedbackProcessContext,
+  type DriverFeedbackProcessOutcome,
+  type DriverFeedbackProcessStatus,
+  type DriverFeedbackProcessor,
+  type DriverFeedbackProcessorOptions,
+} from './runtime/driver-feedback-processor';
+export {
+  DriverFeedbackWorker,
+  DEFAULT_DRIVER_FEEDBACK_BATCH_SIZE,
+  DEFAULT_DRIVER_FEEDBACK_MAX_DURATION_MS,
+  type DriverFeedbackJob,
+  type DriverFeedbackRestoreResult,
+  type DriverFeedbackRunOptions,
+  type DriverFeedbackRunResult,
+  type DriverFeedbackStopReason,
+  type DriverFeedbackWorkerOptions,
+} from './runtime/driver-feedback-worker';
 export type { MemoryRepository, MemoryVectorSearchOptions } from './ports/memory-repository';
 export type { AgentMemoryScope } from './ports/agent-memory-scope';
 export type { ExperienceExtractor } from './ports/experience-extractor';
@@ -388,6 +568,253 @@ export type {
   SkillListFilter,
   ExperienceListFilter,
 } from './ports/agent-board-query';
+export type { RoleTokenUsageReader } from './ports/role-token-usage';
+
+// ════════════════════════════════════════════════════════
+//  2e. Memory Maintenance：技能晋升（Phase 3）
+//      独立的 Job：按可配置、可版本化的策略扫出候选，逐条判定，把结论落到经验自己的
+//      晋升标记上（claim/lease/fencing 与交付通道共用同一套状态机）。它不从 Context
+//      consumer、Feedback consumer、scheduleBuffer() 或在线 Driver 流程里被调用，也不
+//      调用它们中的任何一个。
+//      三段各自的落点：契约、策略、持久化状态（3-A）；单条候选的执行内核（3-B：原子幂等写
+//      Skill + 回写经验 + 失败分类）；批量外壳（3-C：claim 循环、批大小与墙钟上限、run
+//      记录与收尾、启动恢复、dry-run）。因为 Profile/Persona 归 Phase 4，这里没有任何
+//      Persona 相关入口；而把 job 接进调度器（谁在什么时候跑它）归 Phase 5。
+// ════════════════════════════════════════════════════════
+
+export {
+  DefaultPromotionStrategy,
+  DEFAULT_PROMOTION_STRATEGY_CONFIG,
+  DEFAULT_PROMOTION_STRATEGY_VERSION,
+} from './adapters/default-promotion-strategy';
+export {
+  PROMOTION_APPROVAL_MODES,
+  PROMOTION_BLOCKER_RULES,
+  PROMOTION_VERDICTS,
+} from './ports/promotion-strategy';
+export type {
+  PromotionApprovalMode,
+  PromotionBlockerRule,
+  PromotionDecision,
+  PromotionEvaluationInput,
+  PromotionStrategy,
+  PromotionStrategyConfig,
+  PromotionVerdict,
+} from './ports/promotion-strategy';
+export {
+  comparePromotionCandidates,
+  initialPromotionMarker,
+  isPromotedExperience,
+  planPromotionCandidate,
+  promotionInputSnapshotHash,
+  promotionStateLabel,
+  reevaluatePromotionMarker,
+  selectPromotionCandidates,
+  type PromotionCandidateInput,
+  type PromotionCandidatePlan,
+  type PromotionSkipReason,
+  type PromotionStateLabel,
+} from './services/promotion-candidates';
+export type {
+  ClaimedPromotionCandidate,
+  PromotionCandidateQuery,
+  PromotionClaimRequest,
+  PromotionCompletionRequest,
+  PromotionFailureRequest,
+  PromotionRestoreOptions,
+} from './ports/memory-repository';
+export {
+  AGENT_MISSING_PREFIX,
+  PROMOTION_DECISION_CONTRACT_CODE,
+  PromotionDecisionContractError,
+  assertPromotionDecisionConsistent,
+  auditPromotionDecision,
+  buildPromotedSkill,
+  classifyPromotionFailure,
+  describeContractFailure,
+  executePromotionCandidate,
+  isPromotionDecisionContractError,
+  type PromotionDecisionViolation,
+  type PromotionExecutionOptions,
+  type PromotionExecutionResult,
+  type PromotionExecutionStatus,
+  type PromotionExecutorDeps,
+} from './services/promotion-executor';
+export {
+  DefaultSkillPromotionJob,
+  DEFAULT_SKILL_PROMOTION_BATCH_SIZE,
+  DEFAULT_SKILL_PROMOTION_MAX_DURATION_MS,
+} from './runtime/skill-promotion-job';
+export type {
+  PromotionCandidateOutcome,
+  PromotionCandidateStatus,
+  PromotionRestoreResult,
+  SkillPromotionJob,
+  SkillPromotionJobOptions,
+  SkillPromotionRunOptions,
+  SkillPromotionRunResult,
+  SkillPromotionStopReason,
+} from './ports/skill-promotion-job';
+
+// ════════════════════════════════════════════════════════
+//  20b. Memory Maintenance：Persona 演化（Phase 4）
+//      独立的 Persona 演化通道：策略端口与 job 契约、版本模型与演化标记、选候选与输入快照
+//      的纯规则、判定契约与失败分类（4-A），持久化状态面与条件写（4-B），执行内核与批量
+//      外壳（4-C）。跑一次用 `DefaultPersonaEvolutionJob`：它按角色 claim、逐条隔离、
+//      写出一条 `persona_evolution` 的 maintenance run。
+//
+//      它只读已批准 / 已生效的技能与晋升状态已落定的经验，由外部调度器独立触发；在线
+//      Driver、Context consumer、Feedback consumer 与 Skill Promotion 都不调用它，它也
+//      不调用它们中的任何一个。
+// ════════════════════════════════════════════════════════
+
+export {
+  DEFAULT_PERSONA_EVOLUTION_STRATEGY_CONFIG,
+  DEFAULT_PERSONA_EVOLUTION_STRATEGY_VERSION,
+  DefaultPersonaEvolutionStrategy,
+} from './adapters/default-persona-evolution-strategy';
+export {
+  PERSONA_EVOLUTION_APPROVAL_MODES,
+  PERSONA_EVOLUTION_BLOCKER_RULES,
+  PERSONA_EVOLUTION_VERDICTS,
+} from './ports/persona-evolution-strategy';
+export type {
+  PersonaEvolutionApprovalMode,
+  PersonaEvolutionBlockerRule,
+  PersonaEvolutionDecision,
+  PersonaEvolutionEvaluationInput,
+  PersonaEvolutionExperienceSnapshot,
+  PersonaEvolutionFeedbackSummary,
+  PersonaEvolutionInputSnapshot,
+  PersonaEvolutionLastRun,
+  PersonaEvolutionPersonaDraft,
+  PersonaEvolutionSkillSnapshot,
+  PersonaEvolutionStrategy,
+  PersonaEvolutionStrategyConfig,
+  PersonaEvolutionVerdict,
+} from './ports/persona-evolution-strategy';
+export type {
+  PersonaEvolutionCandidateOutcome,
+  PersonaEvolutionCandidateStatus,
+  PersonaEvolutionJob,
+  PersonaEvolutionJobOptions,
+  PersonaEvolutionRestoreResult,
+  PersonaEvolutionRunOptions,
+  PersonaEvolutionRunResult,
+  PersonaEvolutionStopReason,
+} from './ports/persona-evolution-job';
+export { DEFAULT_PERSONA_EVOLUTION_RETRY_POLICY } from './services/delivery-lifecycle';
+export {
+  buildPersonaEvolutionSnapshot,
+  compareRecordsById,
+  initialPersonaEvolutionMarker,
+  isApprovedSkill,
+  isEligibleExperience,
+  personaEvolutionBatchSnapshotDigest,
+  personaEvolutionIdempotencyKey,
+  personaEvolutionInputSnapshotHash,
+  personaEvolutionLastRun,
+  personaEvolutionStateLabel,
+  planPersonaEvolutionCandidate,
+  reevaluatePersonaEvolutionMarker,
+  selectApprovedSkills,
+  selectEligibleExperiences,
+  type PersonaEvolutionCandidateInput,
+  type PersonaEvolutionCandidatePlan,
+  type PersonaEvolutionFeedbackSummaryInput,
+  type PersonaEvolutionSkipReason,
+  type PersonaEvolutionStateLabel,
+} from './services/persona-evolution-candidates';
+export {
+  PERSONA_EVOLUTION_DECISION_CONTRACT_CODE,
+  PERSONA_EVOLUTION_FAILURE_KINDS,
+  PersonaEvolutionDecisionContractError,
+  assertPersonaEvolutionDecisionConsistent,
+  auditPersonaEvolutionDecision,
+  buildEvolvedPersona,
+  describePersonaEvolutionContractFailure,
+  isPersonaEvolutionDecisionContractError,
+  isRetryablePersonaEvolutionFailure,
+  personaEvolutionFailure,
+  resolvePersonaEvolutionWrite,
+  summarizePersonaEvolutionChange,
+  type PersonaEvolutionFailureClassification,
+  type PersonaEvolutionFailureKind,
+  type PersonaEvolutionViolation,
+  type PersonaEvolutionWriteResolution,
+} from './services/persona-evolution-decision';
+export type { PersonaEvolutionMarker, PersonaEvolutionOutcome } from './schemas';
+export type {
+  ClaimedPersonaEvolutionCandidate,
+  PersonaEvolutionClaimRequest,
+  PersonaEvolutionCompletionRequest,
+  PersonaEvolutionCompletionResult,
+  PersonaEvolutionFailureRequest,
+  PersonaEvolutionRestoreOptions,
+  RestoredPersonaEvolutionClaim,
+} from './ports/memory-repository';
+export { personaEvolutionFeedbackSummary } from './services/persona-evolution-candidates';
+export { personaEvolutionSettlement } from './services/persona-evolution-decision';
+export {
+  AUTO_APPROVAL_REVIEWER,
+  classifyPersonaEvolutionFailure,
+  executePersonaEvolutionCandidate,
+  type PersonaEvolutionExecutionOptions,
+  type PersonaEvolutionExecutionResult,
+  type PersonaEvolutionExecutionStatus,
+  type PersonaEvolutionExecutorDeps,
+  type PersonaEvolutionFailureLayer,
+} from './services/persona-evolution-executor';
+export {
+  DEFAULT_PERSONA_EVOLUTION_BATCH_SIZE,
+  DEFAULT_PERSONA_EVOLUTION_MAX_DURATION_MS,
+  DefaultPersonaEvolutionJob,
+} from './runtime/persona-evolution-job';
+
+// ════════════════════════════════════════════════════════
+//  20c. Memory Maintenance：Persona 版本历史与回滚（Phase 4 修复 B）
+//      「每一版 Persona 的正文」本身：演化、手工写入（`savePersona`）与回滚各追加一行，
+//      迁移为老 Agent 补一行 `baseline`。
+//
+//      读端口（`listPersonaVersions` / `getPersonaVersion` / `getCurrentPersonaVersion`）
+//      与回滚端口（`rollbackPersona`）都在 `MemoryRepository` 上——**必须**在那里：写下一版
+//      Persona 与登记这一版的历史是同一笔写，分成两个 store 就等于承认存在「Persona 已经是
+//      v5、历史里没有 v5」的窗口，而那个窗口正是回滚与审计唯一依赖的东西。
+//
+//      历史是 **append-only** 的：`(role_id, persona_version)` 已经有行时，同一份内容重放
+//      幂等成功、不同内容一律拒绝（`resolvePersonaVersionAppend` 是三条写入路径共用的判据，
+//      两个后端逐字相同）。冲突时当前 Persona、Handle 与历史一起停在原处。
+//
+//      回滚是**再写一版**而不是擦掉一版：正文抄自目标版本，版本号是当前版本 +1，旧历史一行
+//      不动；条件写落在当前版本上，并发回滚只有一个赢家，输的那个拿到明确的 version_conflict。
+// ════════════════════════════════════════════════════════
+
+export type { PersonaVersionRecord, PersonaVersionSource } from './schemas';
+export type {
+  PersonaRollbackRequest,
+  PersonaRollbackResult,
+  PersonaVersionQuery,
+} from './ports/memory-repository';
+export {
+  applyPersonaVersionLimit,
+  assertPersonaRoleId,
+  assertPersonaVersionMonotonic,
+  assertPersonaVersionRecordIdentity,
+  buildRolledBackPersona,
+  evolvedPersonaVersionRecord,
+  isSamePersonaVersionWrite,
+  manualPersonaVersionRecord,
+  personaRollbackRecord,
+  personaVersionConflictMessage,
+  personaVersionRecord,
+  resolvePersonaRollback,
+  resolvePersonaVersionAppend,
+  seedPersonaVersionRecord,
+  summarizePersonaRollback,
+  type PersonaRollbackResolution,
+  type PersonaVersionAppendResolution,
+  type PersonaVersionRecordInput,
+} from './services/persona-version-history';
 
 // ════════════════════════════════════════════════════════
 //  21. Agent 运行时类型

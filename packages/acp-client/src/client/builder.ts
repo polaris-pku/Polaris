@@ -35,6 +35,7 @@ export class AcpClientBuilder {
   private autoApprove: boolean = false;
   private sandboxDir: string = process.cwd();
   private interceptors?: ClientInterceptors;
+  private gateway?: { baseUrl: string; headers: Record<string, string> };
 
   withAgent(agentId: string): this {
     this.agentId = agentId;
@@ -116,6 +117,11 @@ export class AcpClientBuilder {
     return this;
   }
 
+  withAnthropicGateway(baseUrl: string, headers: Record<string, string> = {}): this {
+    this.gateway = { baseUrl, headers };
+    return this;
+  }
+
   build(): AcpClient {
     if (!this.agentId) {
       throw new ConfigurationError("Agent ID must be specified using 'withAgent()'");
@@ -181,6 +187,7 @@ export class AcpClientBuilder {
       verbose: this.verbose,
       experimentalCapabilities,
       extensionMethods,
+      gateway: this.gateway,
     };
 
     return new AcpClient(options);

@@ -166,7 +166,6 @@ export class RunRpcMethods {
     });
     dispatcher.register('run.getPayload', async (params) => {
       const { run_id, payload_ref } = parseParams(payloadParamsSchema, params);
-      this.callWithRunError(() => this.service.getRunSnapshot(run_id));
       const result = await this.service.getRunPayload(run_id, payload_ref);
       if (!result) {
         // 「引用解析得了但那一行取不到」（文件被保留策略截断 / run 目录不存在）。

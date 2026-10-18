@@ -44,17 +44,19 @@ export function applyTaskSnapshot(state: DemoState, snapshot: TaskSnapshot): Par
         error: undefined,
       },
     },
-    ...(run && !state.liveRuns[run.run_id]
+    ...(run
       ? {
           liveRuns: {
             ...state.liveRuns,
             [run.run_id]: {
+              ...state.liveRuns[run.run_id],
               runId: run.run_id,
               taskId,
-              status: run.status === 'interrupted' ? 'failed' : run.status,
-              timeline: [],
-              snapshot: null,
+              status: run.status,
+              timeline: state.liveRuns[run.run_id]?.timeline ?? [],
+              snapshot: state.liveRuns[run.run_id]?.snapshot ?? null,
               error: run.error?.message ?? null,
+              syncError: null,
             },
           },
         }

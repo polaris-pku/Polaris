@@ -10,7 +10,7 @@ import {
   type RunLatencyTraceSink,
 } from '../telemetry';
 import { CommandDriverTransport, DRIVER_EVENT_PREFIX } from './command-driver-transport';
-import type { DriverPrompt } from './contract';
+import type { DriverPrompt, DriverStreamEvent } from './contract';
 
 const PROMPT: DriverPrompt = {
   task_id: 'task_command',
@@ -37,7 +37,7 @@ class CollectingLatencySink implements RunLatencyTraceSink {
 
 function createLatencyRecorder(
   sink: RunLatencyTraceSink,
-  runId = 'run_driver_spans'
+  runId = 'run_driver_spans',
 ): RunLatencyRecorder {
   return new RunLatencyRecorder({ run_id: runId, task_id: 'task_driver_spans', sink });
 }
@@ -66,6 +66,51 @@ function driverEventsBody(events: string): string {
 }
 
 describe('CommandDriverTransport', () => {
+  it.each([false, true])(
+    'binds concurrent child tool environments to their invocation workspaces (configured env=%s)',
+    async (configured) => {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), 'driver-workspaces-'));
+      const project = path.join(root, 'project');
+      const sandboxes = [path.join(root, 'primary'), path.join(root, 'reviewer')];
+      for (const directory of [project, ...sandboxes]) await fs.mkdir(directory);
+      vi.stubEnv('ACP_WORKSPACE', project);
+      const transport = new CommandDriverTransport({
+        ...nodeCommand(`
+          const fs = require('node:fs');
+          const path = require('node:path');
+          readInput((raw) => {
+            const input = JSON.parse(raw);
+            fs.writeFileSync(path.join(process.env.ACP_WORKSPACE, 'proof.txt'), input.run_id);
+            const result = driverRunResult(input.task_id);
+            result.response = process.env.ACP_WORKSPACE;
+            process.stdout.write(JSON.stringify(result));
+          });
+        `),
+        ...(configured ? { env: { ACP_WORKSPACE: project } } : {}),
+      });
+      try {
+        const results = await Promise.all(
+          sandboxes.map((workspace_path, index) =>
+            transport.run({ ...PROMPT, run_id: `run_${String(index)}`, workspace_path }),
+          ),
+        );
+        expect(results.map((result) => result.response)).toEqual(sandboxes);
+        for (const [index, sandbox] of sandboxes.entries()) {
+          expect(await fs.readFile(path.join(sandbox, 'proof.txt'), 'utf8')).toBe(
+            `run_${String(index)}`,
+          );
+        }
+        await expect(fs.access(path.join(project, 'proof.txt'))).rejects.toThrow();
+        expect(process.env.ACP_WORKSPACE).toBe(project);
+        expect((await transport.run(PROMPT)).response).toBe(project);
+      } finally {
+        await transport.shutdown();
+        vi.unstubAllEnvs();
+        await fs.rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
   it('sends DriverPrompt through stdin and returns DriverRunResult from stdout JSON', async () => {
     const transport = new CommandDriverTransport(
       nodeCommand(`
@@ -99,6 +144,7 @@ describe('CommandDriverTransport', () => {
   });
 
   it('times out and kills child processes that keep stdio open', async () => {
+    const sink = new CollectingLatencySink();
     const transport = new CommandDriverTransport({
       ...nodeCommand(`
         const { spawn } = require('node:child_process');
@@ -112,7 +158,13 @@ describe('CommandDriverTransport', () => {
       timeoutMs: 50,
     });
 
-    await expect(transport.run(PROMPT)).rejects.toThrow(/Command driver timed out after 50ms/);
+    await expect(
+      runWithRunLatencyRecorder(createLatencyRecorder(sink), () => transport.run(PROMPT)),
+    ).rejects.toThrow(/Command driver timed out after 50ms/);
+    expect(sink.spans.find((span) => span.name === 'driver.cleanup')).toMatchObject({
+      ok: false,
+      meta: { reason: 'timeout' },
+    });
   });
 
   it('kills a Driver only after it stops producing output', async () => {
@@ -169,7 +221,7 @@ describe('CommandDriverTransport', () => {
       } finally {
         await fs.rm(dir, { recursive: true, force: true });
       }
-    }
+    },
   );
 
   it('records the driver phase spans of a run inside a latency recorder', async () => {
@@ -179,11 +231,15 @@ describe('CommandDriverTransport', () => {
         driverEventsBody(`
           emit('driver.phase', { phase: 'initialize', boundary: 'started' });
           emit('driver.phase', { phase: 'initialize', boundary: 'completed', ok: true });
+          emit('driver.phase', { phase: 'authenticate', boundary: 'started' });
+          emit('driver.phase', { phase: 'authenticate', boundary: 'completed', ok: true });
           emit('driver.phase', { phase: 'session', boundary: 'started', mode: 'create' });
           emit('driver.phase', { phase: 'session', boundary: 'completed', ok: true });
           emit('driver.turn_started', { prompt_length: 1 });
           emit('driver.turn_completed', { stop_reason: 'done' });
-        `)
+          emit('driver.phase', { phase: 'shutdown', boundary: 'started' });
+          emit('driver.phase', { phase: 'shutdown', boundary: 'completed', ok: true });
+        `),
       ),
     );
 
@@ -194,11 +250,17 @@ describe('CommandDriverTransport', () => {
     // no-op，而流回调未必继承 run 的上下文——真取不到的话这里一条都不会出现。
     for (const expected of [
       'driver.invoke',
+      'driver.spawn',
+      'driver.prompt_written',
+      'driver.first_output',
+      'driver.event_channel',
       'driver.handshake',
       'driver.turn',
       'driver.shutdown',
       'driver.phase.initialize',
+      'driver.phase.authenticate',
       'driver.phase.session',
+      'driver.phase.shutdown',
     ]) {
       expect(names).toContain(expected);
     }
@@ -209,6 +271,49 @@ describe('CommandDriverTransport', () => {
     expect(sink.spans.every((span) => span.run_id === 'run_driver_spans')).toBe(true);
     expect(sink.spans.every((span) => span.layer === 'driver')).toBe(true);
     expect(sink.spans.every((span) => span.ok)).toBe(true);
+  });
+
+  it('closes phase spans as failed when ACP reports a failed phase', async () => {
+    const sink = new CollectingLatencySink();
+    const transport = new CommandDriverTransport(
+      nodeCommand(
+        driverEventsBody(`
+          emit('driver.phase', { phase: 'initialize', boundary: 'started' });
+          emit('driver.phase', {
+            phase: 'initialize',
+            boundary: 'completed',
+            ok: false,
+            error: 'agent handshake failed',
+          });
+        `),
+      ),
+    );
+
+    await runWithRunLatencyRecorder(createLatencyRecorder(sink), () => transport.run(PROMPT));
+
+    expect(sink.spans.find((span) => span.name === 'driver.phase.initialize')).toMatchObject({
+      ok: false,
+      error: 'agent handshake failed',
+    });
+  });
+
+  it('publishes diagnostic stderr and disconnect as auditable driver events', async () => {
+    const events: DriverStreamEvent[] = [];
+    const transport = new CommandDriverTransport({
+      ...nodeCommand(`
+        readInput(() => {
+          process.stderr.write('runner diagnostic\\n');
+          process.stdout.write(JSON.stringify(driverRunResult('task_command')));
+        });
+      `),
+      onEvent: (event) => events.push(event),
+    });
+
+    await transport.run(PROMPT);
+
+    expect(events.map((event) => event.event_type)).toEqual(['stderr', 'disconnect']);
+    expect(events[0]?.payload).toBe('runner diagnostic\n');
+    expect(events[1]?.payload).toEqual({ code: 0, signal: null });
   });
 
   it('attributes concurrent driver spans to the run that invoked them', async () => {
@@ -224,10 +329,10 @@ describe('CommandDriverTransport', () => {
 
     await Promise.all([
       runWithRunLatencyRecorder(createLatencyRecorder(sinkA, 'run_a'), () =>
-        new CommandDriverTransport(nodeCommand(driverEventsBody(events))).run(PROMPT)
+        new CommandDriverTransport(nodeCommand(driverEventsBody(events))).run(PROMPT),
       ),
       runWithRunLatencyRecorder(createLatencyRecorder(sinkB, 'run_b'), () =>
-        new CommandDriverTransport(nodeCommand(driverEventsBody(events))).run(PROMPT)
+        new CommandDriverTransport(nodeCommand(driverEventsBody(events))).run(PROMPT),
       ),
     ]);
 
@@ -482,7 +587,7 @@ async function readPid(pidFile: string): Promise<number> {
 async function waitFor(
   condition: () => boolean | Promise<boolean>,
   message = '条件未在预期时间内成立',
-  timeoutMs = 5_000
+  timeoutMs = 5_000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   for (;;) {

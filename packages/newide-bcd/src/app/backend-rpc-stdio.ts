@@ -16,8 +16,21 @@ import {
   readCouncilStrategy,
   SynthesisAgentCouncilProvider,
 } from '../council';
-import { createDriverRegistry, DriverRoutingService, loadDriverConfig } from '../driver';
-import { LiteLLMToolCallingClient, type LlmClient, type ToolCallingClient } from '../memory';
+import {
+  AcpDriverProbeService,
+  createDriverDiscoveryRuntime,
+  createDriverRegistry,
+  DriverRoutingService,
+  loadDriverConfig,
+  loadManualDriverConfig,
+} from '../driver';
+import {
+  LlmContextCleaner,
+  LiteLLMToolCallingClient,
+  type AgentContextCleaner,
+  type LlmClient,
+  type ToolCallingClient,
+} from '../memory';
 import { BAgentProjectionAdapter, FileMarketEvidenceStore } from '../market';
 import { JsonRpcDispatcher, JsonRpcLineSession } from '../rpc/json-rpc-dispatcher';
 import { RunRpcMethods } from '../rpc/run-methods';
@@ -44,6 +57,8 @@ import { FileRunRequestStore } from './run-request-store';
 import { FileRunTerminalOutputWriter } from './run-terminal-output-writer';
 import {
   PersistentParticipantSessionRegistry,
+  AapMailboxBridge,
+  SapTaskBridge,
   TaskExecutionLoop,
   TaskProcessor,
 } from '../coordination';
@@ -53,8 +68,14 @@ import {
   BMemoryMaintenanceRunner,
   FileBMemoryMaintenanceEvidenceStore,
 } from './b-memory-maintenance-runner';
+import {
+  MemoryDeliveryConsumers,
+  type MemoryDeliveryDrainOptions,
+  type MemoryDeliveryDrainReport,
+} from './b-memory-delivery-consumers';
+import { FileMaintenanceRunStore } from '../memory';
 import { BMemoryBackendService } from './b-memory-backend-service';
-import { createBPublicCapabilities } from './b-public-capabilities';
+import { createBPublicCapabilities, createLedgerRoleTokenUsage } from './b-public-capabilities';
 import { createAgentCatalogProvider } from './agent-catalog';
 import { createProductionStageExecutors } from './production-stage-executors';
 import {
@@ -65,7 +86,10 @@ import {
 import { SystemRpcMethods } from '../rpc/system-methods';
 import { ArtifactRpcMethods } from '../rpc/artifact-methods';
 import { DriverRpcMethods, createDriverMethodsService } from '../rpc/driver-methods';
-import { createProductionSystemStatusService } from './system-status-service';
+import {
+  createProductionSystemStatusService,
+  systemStatusDriverStatus,
+} from './system-status-service';
 import { AgentMaintenanceScheduler } from './agent-maintenance-scheduler';
 import { FileRunArtifactContentReader } from './run-artifact-content-reader';
 import { FileRunPayloadReader } from './run-payload-reader';
@@ -91,8 +115,11 @@ export interface BackendRpcServer {
 }
 
 export interface ProductionBackendServiceDependencies {
+  projectRoot?: string;
   agentLlm?: ToolCallingClient;
   memoryLlm?: LlmClient;
+  /** 顶层上下文清理器覆盖（测试缝）；缺省用 B 侧文本 LLM 构造 LlmContextCleaner */
+  contextCleaner?: AgentContextCleaner;
   memoryMaintenance?: BMemoryMaintenanceRunner;
   bRuntime?: BackendBRuntime;
   gateExecutor?: IntegrationV0GateExecutor;
@@ -146,15 +173,48 @@ export async function createProductionBackendService(
   // driver 可配置化：可用 driver 是一份数据体（默认 <repoRoot>/.agent/drivers.yaml），
   // 每个档案各建一个 runtime。基础环境里**不含** ACP_AGENT_ID——它由档案的 agent 决定，
   // 于是「换 driver」就是换 spawn 时的 agent，A 侧无需改动（进程本就是每次调用一次性）。
-  // Packaged hosts keep cwd in application state; routing belongs to the selected project.
-  const driverProjectRoot = path.resolve(env.ACP_WORKSPACE?.trim() || repoRoot);
+  //
+  // 自动发现（driver 自动发现）插在这里：先探测、把结果落成一层配置，再 loadDriverConfig，
+  // 这样「探测到的 driver」与「手工配的 driver」在同一份配置里合并，registry 与 routing 都
+  // 只看这一份。顺序不能反——先建 registry 再改 config 会让 registry 与 routing 各执一份真相。
+  const driverProjectRoot = path.resolve(
+    dependencies.projectRoot ?? (env.ACP_WORKSPACE?.trim() || repoRoot),
+  );
+  const driverProbeService = new AcpDriverProbeService({ runnerDir });
+  // 「配置事实」只取手工层：自动发现层是后端自己写的，拿它当配置事实会让 stale 判定永远不成立。
+  const configuredDriverProfiles = () =>
+    Object.entries(loadManualDriverConfig({ projectRoot: driverProjectRoot, env }).drivers).map(
+      ([driverId, profile]) => ({ driver_id: driverId, agent: profile.agent }),
+    );
+  const driverDiscoveryRuntime = createDriverDiscoveryRuntime({
+    projectRoot: driverProjectRoot,
+    stateRoot,
+    probe: driverProbeService,
+    configuredProfiles: configuredDriverProfiles,
+  });
+  const discoveryCatalog = driverDiscoveryRuntime.service.catalog();
+  // 启动探测失败不阻塞后端：服务内部只记原因码、保留历史 driver（降级为 stale）。
+  await driverDiscoveryRuntime.service.startup();
+
   const driverConfig = loadDriverConfig({ projectRoot: driverProjectRoot, env });
+  // 只有**探测生成**的那些才走动态注册：它们的装配失败不该拦住启动（见 registry 文件头）。
+  const discoveredDriverIds = Object.keys(driverConfig.drivers).filter(
+    (driverId) => discoveryCatalog.recordOf(driverId)?.source === 'discovered',
+  );
   const driverRegistry = createDriverRegistry({
     config: driverConfig,
+    discoveredDriverIds,
+    connectionTypeOf: (driverId) => discoveryCatalog.recordOf(driverId)?.connection_type,
     runnerDir,
     defaultEntryRelative: DRIVER_RUNNER_ENTRY_RELATIVE,
     baseEnv: {
       ...driverEnv,
+      ...(env.POLARIS_MODEL_PROXY_BASE_URL
+        ? { POLARIS_MODEL_PROXY_BASE_URL: env.POLARIS_MODEL_PROXY_BASE_URL }
+        : {}),
+      ...(env.POLARIS_MODEL_PROXY_MODEL
+        ? { POLARIS_MODEL_PROXY_MODEL: env.POLARIS_MODEL_PROXY_MODEL }
+        : {}),
       COREPACK_ENABLE_PROJECT_SPEC: env.COREPACK_ENABLE_PROJECT_SPEC ?? '0',
       PNPM_CONFIG_PM_ON_FAIL: env.PNPM_CONFIG_PM_ON_FAIL ?? 'ignore',
       ACP_WORKSPACE: env.ACP_WORKSPACE ?? path.join(stateRoot, 'test-workspace'),
@@ -209,18 +269,27 @@ export async function createProductionBackendService(
       env.ACP_DRIVER_INACTIVITY_TIMEOUT_MS ?? env.ACP_DRIVER_TIMEOUT_MS,
     ),
   });
+  // registry 就绪后把自动发现的 runtime 补注册进去。放在这里而不是 startup() 里面，是因为
+  // registry 需要先读到「含自动 profile 的配置」，而那一步在探测落盘之后。
+  driverDiscoveryRuntime.service.attachRegistry(driverRegistry);
+  driverDiscoveryRuntime.service.syncRuntimes();
   // 未配置任何 driver 档案时，这里拿到的是唯一那个 acp-external，与历史装配一致。
   const driver = driverRegistry.get(driverConfig.default_driver);
   let bRuntime: BackendBRuntime | undefined;
   let memoryMaintenance: BMemoryMaintenanceRunner | undefined;
   let coordinationStore: SqliteCoordinationStore | undefined;
   let maintenanceScheduler: AgentMaintenanceScheduler | undefined;
+  let memoryDeliveryConsumers: MemoryDeliveryConsumers | undefined;
   const closeRuntime = onceAsync(async () => {
     const failures: unknown[] = [];
+    // 两个定时器先停，再等在途的那一轮跑完，最后才关存储：反过来的话，在途的维护轮次会写到
+    // 已经关掉的存储上。
     for (const close of [
       () => maintenanceScheduler?.stop(),
+      () => memoryDeliveryConsumers?.stop(),
       () => driverRegistry.shutdown(),
       () => memoryMaintenance?.waitForIdle(),
+      () => memoryDeliveryConsumers?.waitForIdle(),
       () => bRuntime?.close(),
       () => coordinationStore?.close(),
     ]) {
@@ -254,21 +323,28 @@ export async function createProductionBackendService(
         ? configuredDatabasePath
         : path.resolve(configuredDatabasePath);
     coordinationStore = new SqliteCoordinationStore(databasePath);
+    const sapBridge = new SapTaskBridge({ store: coordinationStore });
+    const aapBridge = new AapMailboxBridge({ store: coordinationStore });
     const mailboxService = new PersistentMailboxService(coordinationStore);
     const participantSessions = new PersistentParticipantSessionRegistry(coordinationStore);
     const protocolCallJournal = new ProtocolCallJournal({
       store: coordinationStore,
       sessionRegistry: participantSessions,
     });
+    // 维护 evidence 的落点由 runner 与消费端共用：交付时写下的那条 `scheduled` evidence，
+    // 要由消费端就地改写成 `experience_extraction / completed`（见消费端模块的文件头），
+    // 两边指向同一个目录才谈得上「就地」。
+    const maintenanceEvidenceStore = new FileBMemoryMaintenanceEvidenceStore(
+      path.join(bRuntime.app_state_root ?? path.join(repoRoot, '.newide'), 'b', 'maintenance'),
+    );
     memoryMaintenance =
       dependencies.memoryMaintenance ??
       new BMemoryMaintenanceRunner({
         repository: bRuntime.repository,
         bufferRepository: bRuntime.bufferRepository,
+        deliveryRepository: bRuntime.deliveryRepository,
         llm: memoryLlm,
-        evidenceStore: new FileBMemoryMaintenanceEvidenceStore(
-          path.join(bRuntime.app_state_root ?? path.join(repoRoot, '.newide'), 'b', 'maintenance'),
-        ),
+        evidenceStore: maintenanceEvidenceStore,
         runsRoot,
         // dependencies.memoryMaintenance 覆盖路径会绕过留档（测试缝，接受）
         callJournal: protocolCallJournal,
@@ -277,12 +353,39 @@ export async function createProductionBackendService(
           autoApprove: env.NEWIDE_B_SKILL_AUTO_APPROVE === '1',
         },
       });
+    // 消费端（Phase 1–4）：把在线登记的两条 outbox 真的消费成 Experience 与置信度回写，
+    // 再把经验与反馈真的变成 Skill 与 Persona 版本（后两条是独立 job，见文件头）。
+    // 构造在这里、启动在维护定时器旁边（见下面的 start），因此关停仍是一条路径。
+    memoryDeliveryConsumers = new MemoryDeliveryConsumers({
+      repository: bRuntime.repository,
+      bufferRepository: bRuntime.bufferRepository,
+      deliveryRepository: bRuntime.deliveryRepository,
+      runStore: new FileMaintenanceRunStore({
+        root: path.join(
+          bRuntime.app_state_root ?? path.join(repoRoot, '.newide'),
+          'b',
+          'maintenance-runs',
+        ),
+      }),
+      evidenceStore: maintenanceEvidenceStore,
+      llm: memoryLlm,
+      ...readMemoryJobOptions(env),
+      logger: (message) => {
+        process.stderr.write(`[newide] ${message}\n`);
+      },
+    });
     try {
       await memoryMaintenance.replayPending();
     } catch {
       throw new Error('Production B Agent manager readiness check failed');
     }
-    const bCapabilities = createBPublicCapabilities(bRuntime, memoryMaintenance);
+    // Agent Board 上角色的「累计消耗」取自用量账本（按 role_id 求和），而不是档案里的
+    // `token_cost_total`——那个字段只有种子把它置 0，全仓没有写入方。只读投影，不回写档案。
+    const bCapabilities = createBPublicCapabilities(
+      bRuntime,
+      memoryMaintenance,
+      createLedgerRoleTokenUsage(coordinationStore),
+    );
     // 动态 Agent 目录：选人 / 议会 / 邮箱协作每次使用时查询当前注册 Agent，
     // 使 memory.createAgent 新增的 Agent 无需重启即可进入协作流程。
     const agentCatalogProvider = createAgentCatalogProvider(
@@ -297,6 +400,11 @@ export async function createProductionBackendService(
       registry: driverRegistry,
       // 可协作 role 用同一条动态目录：运行时新增/退休的 Agent 立即反映在路由快照里。
       knownRoleIds: agentCatalogProvider,
+      // 探测事实与刷新入口：`driver.getConfig` 的 drivers[] 与 `system.capabilities` 共用这份投影。
+      catalog: discoveryCatalog,
+      discovery: {
+        refresh: (probeOptions) => driverDiscoveryRuntime.service.refresh(probeOptions),
+      },
     });
     const agentExecutionFacade = new DriverRuntimeAgentExecutionFacade({
       driver,
@@ -307,6 +415,12 @@ export async function createProductionBackendService(
         driverRoutingService.resolveForRunRole(runId, roleId).handle,
       repository: bCapabilities.repository,
       bufferRepository: bCapabilities.bufferRepository,
+      // 角色创建/删除时一并管理下游交付存储的生命周期
+      deliveryRepository: bRuntime.deliveryRepository,
+      // 顶层上下文清理：任务结束时把该次 tool-calling 对话压成 AgentContextSnapshot，
+      // 与 DriverReturn 成对落进同一条 Buffer，经验提取才看得到「为什么这么做」。
+      // 复用 B 侧那个文本 LLM（与 memoryMaintenance 同一个），失败只是降级不留痕变留痕。
+      contextCleaner: dependencies.contextCleaner ?? new LlmContextCleaner(memoryLlm),
       ...(bRuntime.embedding ? { embedding: bRuntime.embedding } : {}),
       llm:
         dependencies.agentLlm ??
@@ -315,6 +429,13 @@ export async function createProductionBackendService(
       // B1 调用留档与 mailbox.sessionRegistry 无关：journal 用自己持有的注册表引用，
       // ephemeral 会话下注册表为空 → session_id 记 null（规定回退）。
       callJournal: protocolCallJournal,
+      // A1 / issue #149:生产路径的驱动调用经 System 内代理 A/D 的 ADP endpoint
+      // 走 invoke/result/cancel;unknown 永不自动重跑,failed 的自动重试只看
+      // 部署级 auto_retry[side_effect](.env.example)。
+      adp: {
+        store: coordinationStore,
+        side_effect: 'workspace_write',
+      },
       evidenceStore: new FileAgentExecutionEvidenceStore({
         root: path.join(stateRoot, 'b', 'context-packs'),
       }),
@@ -340,6 +461,7 @@ export async function createProductionBackendService(
     const councilProposerCount = readCouncilProposerCount(env.NEWIDE_COUNCIL_PROPOSERS);
     const baseCouncilProvider = new SynthesisAgentCouncilProvider({
       agentExecutionFacade,
+      sapBridge,
       councilRoot: path.join(stateRoot, 'council'),
       roleInactivityTimeoutMs: readDriverTimeout(env.NEWIDE_COUNCIL_ROLE_INACTIVITY_TIMEOUT_MS),
       participantResolver: new AgentBoardCouncilParticipantResolver({
@@ -459,11 +581,28 @@ export async function createProductionBackendService(
       },
     );
     maintenanceScheduler.start(readIntEnv(env.NEWIDE_MAINTENANCE_INTERVAL_MS, 3600_000));
+    // 消费端的定时器与维护定时器共用同一条关停路径（见 closeRuntime），但周期是独立的一个开关：
+    // 「多久扫一次退休/自学习」与「多久把离线半场抽干一次（两条 outbox + 两条 job）」是两件事，
+    // 缺省取维护周期只是为了让部署里只配一个值也能跑。新开关必须是正整数——0 会让 start() 安静地
+    // 什么都不做，配置错误不该长得像「已经配好了」。
+    memoryDeliveryConsumers.start(
+      readPositiveIntEnv(
+        'NEWIDE_B_DELIVERY_DRAIN_INTERVAL_MS',
+        env.NEWIDE_B_DELIVERY_DRAIN_INTERVAL_MS,
+        readIntEnv(env.NEWIDE_MAINTENANCE_INTERVAL_MS, 3600_000),
+      ),
+    );
 
     const taskProcessor = new TaskProcessor(coordinationStore, {
       runsRoot,
       mailboxStore: coordinationStore,
-      participantSessions,
+      // Ephemeral Driver sessions are intentionally not recoverable across a
+      // backend restart. Checkpoint resume must still restore the Task and
+      // workspace, but it must not reject the package because the old ACP
+      // session is absent from the new process.
+      ...(ephemeralAcpSessions ? {} : { participantSessions }),
+      sapBridge,
+      aapBridge,
     });
     taskProcessor.recoverInterruptedTasks();
     // 工厂必须活到 run 结束：`snapshot(runId)` 要拿内存缓冲算聚合，写进 summary 的
@@ -473,6 +612,7 @@ export async function createProductionBackendService(
       processor: taskProcessor,
       evidence_store: new FileRunEvidenceStore({ root: runsRoot }),
       create_latency_recorder: runLatency.createRecorder,
+      sap_bridge: sapBridge,
       executors: createProductionStageExecutors({
         selectAgentHandler,
         agentExecutionFacade,
@@ -506,12 +646,24 @@ export async function createProductionBackendService(
       coordination_durable: databasePath !== ':memory:',
       driver_provider_id: runnerPackageIdentity.name,
       driver_provider_version: runnerPackageIdentity.version,
-      // 「有哪些 driver 可用」的对外出口：逐档案带上 agent 与档案自报的限制。
-      driver_profiles: Object.entries(driverConfig.drivers).map(([driverId, profile]) => ({
-        driver_id: driverId,
-        agent: profile.agent,
-        ...(profile.limitations ? { limitations: profile.limitations } : {}),
-      })),
+      // 「有哪些 driver 可用」的对外出口：与 `driver.getConfig.drivers[]` **同一份投影**。
+      // 每次查询重新取（函数而不是数组）：刷新后新增的 driver 必须立刻出现在能力里，
+      // 否则前端会把「探测到了但 system.capabilities 里没有」读成不可用。
+      driver_status: () =>
+        driverRoutingService.driverProjection().map((entry) => {
+          const record = discoveryCatalog.recordOf(entry.driver_id);
+          return systemStatusDriverStatus({
+            driver_id: entry.driver_id,
+            agent: entry.agent,
+            selectable: entry.selectable,
+            status: entry.status,
+            ...(entry.reason_code ? { reason_code: entry.reason_code } : {}),
+            ...(entry.limitations ? { limitations: entry.limitations } : {}),
+            ...(entry.display_name ? { display_name: entry.display_name } : {}),
+            source: record?.source ?? 'configured',
+            probe_verified: record?.status === 'ready',
+          });
+        }),
       b_repository_mode: dependencies.bRuntime ? 'host-injected' : 'postgresql',
       b_embedding: bRuntime.embedding_info ?? {
         provider: 'host-managed repository',
@@ -565,6 +717,7 @@ export async function createProductionBackendService(
       new FileRunArtifactContentReader(runsRoot),
       new FileRunEventConsumptionSink(runsRoot),
       runTelemetryJsonlSink,
+      aapBridge,
       driverUsageSink,
       new FileRunPayloadReader(runsRoot),
       // 历史读账本而不是扫目录：目录树没有任何保留策略，往期一旦被清理，重算出来的
@@ -575,6 +728,10 @@ export async function createProductionBackendService(
         DEFAULT_DRIVER_BILLED_SOURCE,
       // Run 创建时冻结 routing 快照；`startBackendRpcServer` 也从 service 上取它注册 driver.* 方法。
       driverRoutingService,
+      // ACP owns adapter metadata and the initialize handshake. Keep the probe behind the same
+      // service so the frontend can call it through JSON-RPC (`driver.list` / `driver.probe`),
+      // and the same instance the startup probe used (`driver.refresh`)。
+      driverProbeService,
     );
     serviceHolder.service = service;
     await service.recoverMailboxWaits();
@@ -582,6 +739,76 @@ export async function createProductionBackendService(
   } catch (error) {
     await closeRuntime().catch(() => undefined);
     throw error;
+  }
+}
+
+/**
+ * 两条 job 通道（Skill 晋升、Persona 演化）的审核配置。抽成一处，是因为 boot 与手动补跑必须
+ * 给出同一个答案：同一个库、同一条经验，因为「这次是 CLI 跑的」而判出不一样的结论，是最难查的
+ * 那类分歧。两个开关缺省都关，于是接上以后两条通道先只记结论，不写 Skill、不新增 Persona 版本。
+ */
+function readMemoryJobOptions(env: NodeJS.ProcessEnv): {
+  promotion: { min_confidence: number; auto_approve: boolean };
+  personaEvolution: { auto_approve: boolean };
+} {
+  return {
+    promotion: {
+      // 与 BMemoryMaintenanceRunner 的 promotion.confidenceThreshold 同源同值。
+      min_confidence: readNumberEnv(env.NEWIDE_B_PROMOTION_CONFIDENCE_THRESHOLD, 0.95),
+      auto_approve: env.NEWIDE_B_SKILL_AUTO_APPROVE === '1',
+    },
+    personaEvolution: { auto_approve: env.NEWIDE_B_PERSONA_AUTO_APPROVE === '1' },
+  };
+}
+
+/**
+ * 手动补跑口（CLI：`newide memory drain`）。
+ *
+ * 用与 boot 相同的装配把五条通道各跑一轮，然后关掉存储——因此它跑的是**同一套** worker / job、
+ * 同一个 run store、同一份 evidence 落点，而不是另写一条「近似」的路径。存在的理由：定时消费的
+ * 周期缺省与维护周期一致（1 小时），而「刚跑完一个任务、想立刻看到经验入库」不该只能等。
+ *
+ * 与一个正在运行的后端互斥：经验那条腿是 PGlite（单写者），后端开着时这里打不开库。补跑的
+ * 正确用法是后端已停，或本就没起。缺省没配 LLM 也不会白跑——提取器调用失败会自己降级到规则版。
+ */
+export async function drainMemoryDeliveriesOnce(
+  env: NodeJS.ProcessEnv = process.env,
+  options: MemoryDeliveryDrainOptions = {},
+): Promise<MemoryDeliveryDrainReport> {
+  const repoRoot = process.cwd();
+  const stateRoot = path.resolve(env.NEWIDE_STATE_ROOT?.trim() || path.join(repoRoot, '.newide'));
+  // 与 boot 同源：B 侧文本 LLM 复用 ACP runner 的模型档案。这里**不**检查 runner 目录存不存在
+  // ——补跑不该因为「driver runner 没构建」而起不来，缺配置时 LLM 腿失败了照样有规则版兜底。
+  const runnerDir = path.resolve(
+    env.ACP_DRIVER_RUNNER_DIR ?? path.join(repoRoot, '..', 'acp-client-prototype'),
+  );
+  const driverEnv = loadEnvFile(
+    env.ACP_DRIVER_ENV_FILE
+      ? path.resolve(repoRoot, env.ACP_DRIVER_ENV_FILE)
+      : path.join(runnerDir, '.env'),
+  );
+  const memoryLlm = new ProductionTextLlmAdapter(
+    createProductionToolCallingClient(resolveProductionLlmRuntime(env, driverEnv), env),
+  );
+  let bRuntime: BackendBRuntime | undefined;
+  try {
+    bRuntime = await createProductionBRuntime(env, { repoRoot, appStateRoot: stateRoot });
+    const consumers = new MemoryDeliveryConsumers({
+      repository: bRuntime.repository,
+      bufferRepository: bRuntime.bufferRepository,
+      deliveryRepository: bRuntime.deliveryRepository,
+      runStore: new FileMaintenanceRunStore({
+        root: path.join(bRuntime.app_state_root, 'b', 'maintenance-runs'),
+      }),
+      evidenceStore: new FileBMemoryMaintenanceEvidenceStore(
+        path.join(bRuntime.app_state_root, 'b', 'maintenance'),
+      ),
+      llm: memoryLlm,
+      ...readMemoryJobOptions(env),
+    });
+    return await consumers.runOnce(options);
+  } finally {
+    await bRuntime?.close().catch(() => undefined);
   }
 }
 
@@ -679,6 +906,27 @@ function readIntEnv(value: string | undefined, fallback: number): number {
   return Number(value.trim());
 }
 
+/**
+ * 读取必须为正整数的环境变量：未设置（或只有空白）用缺省，其余（含 `0`、负数、非整数串）
+ * 一律抛错，错误信息点名变量。
+ *
+ * 刻意不并进 `readIntEnv`——那个允许 `0`（`NEWIDE_B_LEARN_MAX_PER_CYCLE=0` 是合法配置）。
+ * 但「周期」这类配置的 `0` 是另一回事：调用方会把它当成「不启动」，于是运维看到的是
+ * 「配了但什么都不干」。这类值必须在启动时就把人拦住，而不是安静地退化成关闭。
+ */
+export function readPositiveIntEnv(
+  name: string,
+  value: string | undefined,
+  fallback: number,
+): number {
+  if (value === undefined || value.trim() === '') return fallback;
+  const trimmed = value.trim();
+  if (!/^\d+$/.test(trimmed) || Number(trimmed) === 0) {
+    throw new Error(`${name} must be a positive integer (>= 1); got "${value}"`);
+  }
+  return Number(trimmed);
+}
+
 function readJson(filePath: string): unknown {
   if (!existsSync(filePath)) return undefined;
   try {
@@ -737,7 +985,15 @@ export function startBackendRpcServer(options: BackendRpcServerOptions): Backend
   // driver 读写 RPC 只在组装点注入了 routing service 时注册：测试里的裸 service 不会凭空
   // 多出三个方法，生产装配则自动带上（`system.*` 的只读语义不受影响）。
   if (service.driverRouting) {
-    const driverMethods = new DriverRpcMethods(createDriverMethodsService(service.driverRouting));
+    const routing = service.driverRouting;
+    const driverMethods = new DriverRpcMethods(
+      createDriverMethodsService(routing),
+      service.driverProbe,
+      // `driver.refresh` 只在 routing 端口真的支持重新探测时注册：桩实现不该凭空多出这个方法。
+      typeof routing.refreshDriverDiscovery === 'function'
+        ? { refresh: (options) => routing.refreshDriverDiscovery(options) }
+        : undefined,
+    );
     driverMethods.register(dispatcher);
   }
 

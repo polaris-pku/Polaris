@@ -42,7 +42,11 @@ describe('memory RPC market and retire wiring', () => {
     const embedding = new HashEmbeddingProvider(32);
     const repository = new InMemoryRepository(embedding);
     const bufferRepository = new InMemoryBufferRepository();
-    await repository.initializeAgent({ role_id: 'role_alpha', name: 'Alpha', tags: ['typescript'] });
+    await repository.initializeAgent({
+      role_id: 'role_alpha',
+      name: 'Alpha',
+      tags: ['typescript'],
+    });
     await repository.initializeAgent({ role_id: 'role_beta', name: 'Beta', tags: [] });
 
     const manager = await AgentManager.create(repository, bufferRepository, {
@@ -61,11 +65,7 @@ describe('memory RPC market and retire wiring', () => {
 
     // role_alpha 的技能始终不退休，用于验证"未退休技能不可被市场检索"
     await seedSkill(repository, 'role_alpha', 'TypeScript service contract patterns');
-    const betaSkill = await seedSkill(
-      repository,
-      'role_beta',
-      'TypeScript compiler optimization',
-    );
+    const betaSkill = await seedSkill(repository, 'role_beta', 'TypeScript compiler optimization');
 
     const service = new BMemoryBackendService(
       {
@@ -199,13 +199,12 @@ describe('memory RPC market and retire wiring', () => {
 
     // marketSearch（退休后）：betaSkill 已入池可检索；role_alpha（未退休）技能不可检索；
     // exclude_agent_id 仅对市场池本身生效（排除 __market__ → 空），排除未退休 Agent 无影响
-    const [searchAllAfter, searchExcludedAfter, searchTop1After, searchExcludeMarket] =
-      await send(
-        '{"jsonrpc":"2.0","id":10,"method":"memory.marketSearch","params":{"query":"typescript","min_similarity":0}}',
-        '{"jsonrpc":"2.0","id":11,"method":"memory.marketSearch","params":{"query":"typescript","min_similarity":0,"exclude_agent_id":"role_alpha"}}',
-        '{"jsonrpc":"2.0","id":12,"method":"memory.marketSearch","params":{"query":"typescript","min_similarity":0,"top_k":1}}',
-        '{"jsonrpc":"2.0","id":13,"method":"memory.marketSearch","params":{"query":"typescript","min_similarity":0,"exclude_agent_id":"__market__"}}',
-      );
+    const [searchAllAfter, searchExcludedAfter, searchTop1After, searchExcludeMarket] = await send(
+      '{"jsonrpc":"2.0","id":10,"method":"memory.marketSearch","params":{"query":"typescript","min_similarity":0}}',
+      '{"jsonrpc":"2.0","id":11,"method":"memory.marketSearch","params":{"query":"typescript","min_similarity":0,"exclude_agent_id":"role_alpha"}}',
+      '{"jsonrpc":"2.0","id":12,"method":"memory.marketSearch","params":{"query":"typescript","min_similarity":0,"top_k":1}}',
+      '{"jsonrpc":"2.0","id":13,"method":"memory.marketSearch","params":{"query":"typescript","min_similarity":0,"exclude_agent_id":"__market__"}}',
+    );
     expect(skillIds(searchAllAfter!)).toEqual([betaSkill.id]);
     expect(skillIds(searchExcludedAfter!)).toEqual([betaSkill.id]);
     expect(skillIds(searchTop1After!)).toHaveLength(1);
@@ -343,11 +342,7 @@ describe('memory RPC market and retire wiring', () => {
     const bufferRepository = new InMemoryBufferRepository();
     await repository.initializeAgent({ role_id: 'role_alpha', name: 'Alpha', tags: [] });
     await repository.initializeAgent({ role_id: 'role_beta', name: 'Beta', tags: [] });
-    const betaSkill = await seedSkill(
-      repository,
-      'role_beta',
-      'TypeScript compiler optimization',
-    );
+    const betaSkill = await seedSkill(repository, 'role_beta', 'TypeScript compiler optimization');
 
     const facade = new DriverRuntimeAgentExecutionFacade({
       driver: new CapturingDriver(),
@@ -394,7 +389,9 @@ describe('memory RPC market and retire wiring', () => {
     );
 
     const output: string[] = [];
-    const session = new JsonRpcLineSession(memoryDispatcherFor(service), (line) => output.push(line));
+    const session = new JsonRpcLineSession(memoryDispatcherFor(service), (line) =>
+      output.push(line),
+    );
     const send = async (...lines: string[]) => {
       output.length = 0;
       for (const line of lines) await session.handleLine(line);
@@ -581,8 +578,7 @@ function dispatcherFor(service: BMemoryBackendService): JsonRpcDispatcher {
     promoteMemoryExperience: (roleId, experienceId) =>
       service.promoteExperience(roleId, experienceId),
     marketSearchMemorySkills: (query) => service.marketSearch(query),
-    marketImportMemorySkill: (roleId, sourceSkillId) =>
-      service.marketImport(roleId, sourceSkillId),
+    marketImportMemorySkill: (roleId, sourceSkillId) => service.marketImport(roleId, sourceSkillId),
     retireMemoryAgent: (roleId, options) => service.retireAgent(roleId, options),
     runRetirementScan: (roleId) => service.runRetirementScan(roleId),
     approveMemorySkill: (roleId, skillId, reviewedBy) =>
@@ -606,6 +602,7 @@ function fakeMaintenance(): BMemoryMaintenanceCapabilities {
     scheduleBuffer: async () => {
       throw new Error('maintenance is not used in this test');
     },
+    recordDriverUsageFeedback: async () => [],
     listEvidence: async () => [],
     promoteSkills: async () => {
       throw new Error('maintenance is not used in this test');

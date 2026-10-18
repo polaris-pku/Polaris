@@ -21,10 +21,12 @@ import {
   AgentManager,
   InvokeDriverTool,
   LlmRetirementEvaluator,
+  canNameExperience,
   createAgentMemoryScope,
   repositoryRetrieveMemoryForTask,
   resolveMemoryAblationPolicy,
   runWithMemoryAblationPolicy,
+  type AgentContextCleaner,
   type AgentTaskRequest,
   type AgentHandle,
   type BufferRepository,
@@ -34,11 +36,14 @@ import {
   type CreateAgentSpec,
   type DispatchTaskResult,
   type DriverContext,
+  type DriverReferencedExperience,
   type DriverTask,
   type EmbeddingProvider,
   type LlmClient,
+  type MemoryDeliveryRepository,
   type MemoryRetrievalResult,
   type MemoryRepository,
+  type MemoryCycleResult,
   type RetireOptions,
   type RetireResult,
   type RetirementEvaluator,
@@ -76,6 +81,10 @@ import {
   createDriverRuntimeInvoker,
   type DriverRuntimeInvokerInput,
 } from '../driver/driver-runtime-invoker';
+import { AdpDriverEndpoint, type AdpReceiptDelivery } from '../driver/adp-driver-endpoint';
+import type { AdpSideEffect } from '../core';
+import type { AdpRetryPolicy } from '../driver/adp-retry-policy';
+import type { ProtocolDeliveryStore } from '../persistence';
 import { runWithLlmUsageAttribution } from '../telemetry';
 import type {
   AgentContextPackEvidence,
@@ -85,6 +94,7 @@ import type {
   BMemoryMaintenanceEvidence,
   BMemoryMaintenancePort,
 } from './b-memory-maintenance-runner';
+import type { DriverFeedbackRecord } from '../memory/schemas';
 
 export interface DriverRuntimeAgentExecutionFacadeOptions {
   driver: DriverRuntimeHandle;
@@ -96,18 +106,47 @@ export interface DriverRuntimeAgentExecutionFacadeOptions {
    * 投递都从同一个入口进，所以解析点只需收敛在这里一处，调用方不必各自叠一层。
    * driver 是 per-role 的无状态工具：换 driver 不影响 B 侧记忆（它绑在 role_id 上）。
    *
-   * `runId` 是 Run 隔离的关键：同一个 Run 的每个席位都必须解析到同一份 routing 快照，
-   * 否则会出现「第一个席位用旧映射、第二个席位用刚保存的新映射」。
+   * `runId` 必须是**任务 run id**（{@link routingRunId}）：同一个 Run 的每个席位都必须解析
+   * 到同一份 routing 快照，否则会出现「第一个席位用旧映射、第二个席位用刚保存的新映射」。
+   * council 席位执行身份是 `${run_id}_${phaseId}`，拿它来查会查不到冻结快照、静默回落到
+   * 当前全局配置——所以这里一律经过 `routingRunId`，调用方不要直接传执行身份。
    */
   resolveDriver?: (roleId: string, runId?: string) => DriverRuntimeHandle;
   repository: MemoryRepository;
   bufferRepository: BufferRepository;
   llm: ToolCallingClient;
+  /**
+   * 顶层上下文清理器（可选）：注入后每次任务结束时把该次 tool-calling 对话清理成
+   * AgentContextSnapshot，与 DriverReturn 成对落进同一条 Buffer。
+   *
+   * 生产组合根注入 LlmContextCleaner；不注入则 Buffer 只落 DriverReturn，经验提取
+   * 走既有的无上下文降级路径——那条路径仍然能跑，但下游看不到「为什么这么做」。
+   */
+  contextCleaner?: AgentContextCleaner;
   embedding?: EmbeddingProvider;
+  /** 下游交付存储：交给基座 AgentManager 做角色创建/删除的生命周期清理 */
+  deliveryRepository?: MemoryDeliveryRepository;
   evidenceStore?: AgentExecutionEvidenceStore;
   memoryMaintenance?: BMemoryMaintenancePort;
   /** 进程内调用留档（B1）：注入后 memory_query 调用收尾写 P1 journal；缺省不留档 */
   callJournal?: CallJournalPort;
+  /**
+   * ADP 接入（A1 / issue #149）：配置后 invoke_driver 经 System 内代理 A/D 的
+   * ADP endpoint 走 invoke/result/cancel，unknown 永不自动重跑、failed 的自动
+   * 重试只看部署级 auto_retry[side_effect]。缺省保持历史行为（不走协议）。
+   */
+  adp?: {
+    store: ProtocolDeliveryStore;
+    /** 应用装配声明的副作用分级（进 invoke 帧），缺省 workspace_write */
+    side_effect?: AdpSideEffect;
+    retryPolicy?: AdpRetryPolicy;
+    maxAutoRetries?: number;
+    deadlineSeconds?: number;
+    /** 回执经宿主内回调交还 Agent 的观察口 */
+    onReceipt?: (delivery: AdpReceiptDelivery) => void;
+    /** 外层 SAP execute 的 exchange_id 解析（C1 接入点）；缺省恒 null */
+    resolveCausationId?: (context: { task_id: string; run_id: string }) => string | null;
+  };
   mailbox?: {
     service: PersistentMailboxService;
     /** 协作名册：静态数组或动态提供者（每次使用时查询，支持运行时新增 Agent） */
@@ -119,8 +158,10 @@ export interface DriverRuntimeAgentExecutionFacadeOptions {
 
 interface InvocationContext {
   task_id: string;
+  /** 执行身份：council 席位是 `${任务run_id}_${phaseId}`。 */
   run_id: string;
-  routing_run_id: string;
+  /** 本次执行归属的**任务 run**（冻结快照与在飞状态的键）；单 agent 路径与 `run_id` 同值。 */
+  activity_run_id?: string;
   role_id: string;
   context_policy: string;
   instruction: string;
@@ -128,6 +169,7 @@ interface InvocationContext {
   driver_instruction_locked: boolean;
   workspace_path?: string;
   session_id?: string;
+  resume_session?: boolean;
   signal?: AbortSignal;
   onDriverEvent?: AgentExecutionOptions['onDriverEvent'];
   execution?: DriverRunResult;
@@ -141,6 +183,14 @@ interface InvocationContext {
   collaboration_brief?: string;
   driver_attempts: number;
   abortObserved: boolean;
+}
+
+/** Driver 使用反馈的提交结果；`error` 只进诊断，不影响任务状态。 */
+interface DriverFeedbackOutcome {
+  recorded: DriverFeedbackRecord[];
+  /** Driver 报了、但压根不是经验 id 的引用条数（见 toMemoryItems 与 recordDriverFeedback） */
+  ignored: number;
+  error?: string;
 }
 
 const AGENT_RUNTIME_POLICY_ID = 'b-persona-tools-v1';
@@ -169,13 +219,41 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     string,
     ReturnType<typeof createDriverRuntimeInvoker>
   >();
+  private readonly adpEndpoint?: AdpDriverEndpoint;
+
   constructor(private readonly options: DriverRuntimeAgentExecutionFacadeOptions) {
     this.driverFor = options.resolveDriver ?? (() => options.driver);
+    if (options.adp) {
+      this.adpEndpoint = new AdpDriverEndpoint({
+        store: options.adp.store,
+        side_effect: options.adp.side_effect ?? 'workspace_write',
+        ...(options.adp.retryPolicy ? { retryPolicy: options.adp.retryPolicy } : {}),
+        ...(options.adp.maxAutoRetries !== undefined
+          ? { maxAutoRetries: options.adp.maxAutoRetries }
+          : {}),
+        ...(options.adp.deadlineSeconds !== undefined
+          ? { deadlineSeconds: options.adp.deadlineSeconds }
+          : {}),
+        ...(options.adp.onReceipt ? { onReceipt: options.adp.onReceipt } : {}),
+      });
+    }
     this.manager = this.createManager();
   }
 
   async ready(): Promise<void> {
     await this.manager;
+  }
+
+  /**
+   * Run 作用域查询（冻结 routing、会话归属、留档外键）用的键：**任务 run id**。
+   *
+   * council 每次席位执行的身份是 `${run_id}_${phaseId}`（相位隔离需要），而冻结快照是按任务
+   * run id 存的——拿相位 id 去查必然落空，于是席位会静默回落到「当前全局配置」，让「运行中的
+   * Run 不受保存影响」在议会阶段失效。`activity_run_id` 表示的就是「本次执行属于哪个 Run」，
+   * `src/memory/runtime/agent.ts` 的在飞状态点已经在用同一条 `activity_run_id ?? run_id`。
+   */
+  private routingRunId(runId: string, activityRunId?: string): string {
+    return activityRunId ?? runId;
   }
 
   /** 取（并按 driver_id 缓存）某个 driver 的 invoker。 */
@@ -200,8 +278,12 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         tools,
         maxToolCalls: this.options.mailbox ? 6 : 4,
         ...(this.options.callJournal ? { callJournal: this.options.callJournal } : {}),
+        ...(this.options.contextCleaner ? { contextCleaner: this.options.contextCleaner } : {}),
       },
       ...(this.options.embedding ? { embedding: this.options.embedding } : {}),
+      ...(this.options.deliveryRepository
+        ? { deliveryRepository: this.options.deliveryRepository }
+        : {}),
       // 三重门控退休检测的 LLM 层：把 ToolCallingClient 适配为 LlmClient
       retirementEvaluator: createToolRetirementEvaluator(this.options.llm),
     });
@@ -241,7 +323,10 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     await this.ensureRole(input.role_id);
     throwIfAborted(options?.signal);
     // 会话 provisioning 也必须按 role + Run 快照选 driver：否则会把某个 agent 的会话发给另一个。
-    const driver = this.driverFor(input.role_id, input.run_id);
+    const driver = this.driverFor(
+      input.role_id,
+      this.routingRunId(input.run_id, input.activity_run_id),
+    );
     const prompt = {
       task_id: input.task_id,
       run_id: `${input.run_id}:session-provision:${input.role_id}`,
@@ -259,6 +344,13 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       ? (event) =>
           options.onDriverEvent?.({ ...event, run_id: input.run_id, role_id: input.role_id })
       : undefined;
+    onDriverEvent?.({
+      schema_version: 'driver-event.v1',
+      event_type: 'driver.session_initializing',
+      task_id: input.task_id,
+      run_id: input.run_id,
+      created_at: nowTimestamp(),
+    });
     let result = await runDriverPromptWithSignal(driver, prompt, options?.signal, onDriverEvent);
     if (
       isArtifactFreeRetryableFailure(result) &&
@@ -391,7 +483,10 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
           task_id: normalizedInput.task_id,
           workspace_path: normalizedInput.workspace_path,
           role_id: normalizedInput.role_id,
-          run_id: normalizedInput.activity_run_id ?? normalizedInput.run_id,
+          run_id: normalizedInput.run_id,
+          ...(normalizedInput.activity_run_id
+            ? { activity_run_id: normalizedInput.activity_run_id }
+            : {}),
         },
         options,
       );
@@ -459,20 +554,22 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
   ): Promise<AgentExecutionResult> {
     throwIfAborted(options?.signal);
     const ablationPolicy = resolveMemoryAblationPolicy(input.memory_ablation);
-    // Council phase IDs identify executions; routing is frozen on the owning Run.
-    const routingRunId = input.activity_run_id ?? input.run_id;
     const task: AgentTaskRequest = {
       spec: input.instruction,
       task_id: input.task_id,
       // 进程内调用留档（B1）的 journal 外键与 Session 绑定键：与 invocationContext
       // 同源（workspace_path 已在上面 path.resolve 归一化）。
       run_id: input.run_id,
-      ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
-      // 透传面板 run，避免阶段执行的观测被归到面板无法查询的身份下。
+      // 观测用的 run 与执行身份分开：council 下后者是 `${run_id}_${phaseId}`，而在飞状态
+      // 必须按面板看得见的那个 run 归集（否则议会阶段整段没有 `activity`）。
       ...(input.activity_run_id ? { activity_run_id: input.activity_run_id } : {}),
+      ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
       call_id: createId('call'),
       // 归属到本 role 实际会用的 driver（按本 Run 冻结的 routing 解析），与真正下发的那一个保持一致。
-      source_driver: this.driverFor(runtimeRoleId, routingRunId).driver_id,
+      source_driver: this.driverFor(
+        runtimeRoleId,
+        this.routingRunId(input.run_id, input.activity_run_id),
+      ).driver_id,
     };
     const inboundMailbox = input.mailbox_delivery_id
       ? this.requireInboundMailbox(input)
@@ -509,7 +606,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       const invocation: InvocationContext = {
         task_id: input.task_id,
         run_id: input.run_id,
-        routing_run_id: routingRunId,
+        ...(input.activity_run_id ? { activity_run_id: input.activity_run_id } : {}),
         role_id: runtimeRoleId,
         context_policy: input.context_policy,
         instruction: input.instruction,
@@ -518,6 +615,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
         ...(input.session_id ? { session_id: input.session_id } : {}),
         retrieval,
+        ...(input.resume_session ? { resume_session: true } : {}),
         ...(inboundMailbox ? { inbound_mailbox: inboundMailbox } : {}),
         notice_mailboxes: noticeMailboxes,
         mailbox_outcomes: [],
@@ -525,18 +623,32 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         driver_attempts: 0,
         abortObserved: false,
         ...(options?.signal ? { signal: options.signal } : {}),
-        ...(options?.onDriverEvent
-          ? {
-              onDriverEvent: (event: DriverStreamEvent) =>
-                options.onDriverEvent?.({ ...event, role_id: input.role_id }),
-            }
-          : {}),
+        onDriverEvent: (event: DriverStreamEvent) => {
+          if (
+            event.event_type === 'driver.turn_started' &&
+            event.session_id &&
+            input.workspace_path &&
+            this.driverFor(runtimeRoleId, this.routingRunId(input.run_id, input.activity_run_id))
+              .capabilities.supports_session_load
+          ) {
+            this.options.mailbox?.sessionRegistry?.register({
+              task_id: input.task_id,
+              workspace_path: input.workspace_path,
+              role_id: input.role_id,
+              session_id: event.session_id,
+            });
+          }
+          options?.onDriverEvent?.({ ...event, role_id: input.role_id });
+        },
       };
       const workspaceBefore = input.workspace_path
         ? await snapshotWorkspaceFiles(input.workspace_path)
         : undefined;
       const rawDispatch = await this.invocationContext.run(invocation, () =>
-        manager.dispatchTask(runtimeRoleId, task),
+        // retrieval 随任务一起交给 Agent：Agent 自己不检索（记忆是经 driver_context
+        // 直达 Driver 的），但它要如实把这批结果填进 MemoryCycleResult——否则那个
+        // 返回值无论真假都是一对空数组，读的人分不出「没检索到」和「没检索」。
+        manager.dispatchTask(runtimeRoleId, { ...task, retrieval }),
       );
       const dispatched = withRetrievedMemory(rawDispatch, retrieval, input.instruction);
       const workspaceArtifacts = await collectWorkspaceArtifacts(
@@ -925,24 +1037,37 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     }
     throwIfAborted(invocation.signal);
     // 解析点收敛在这里：role 与 run 都来自 ALS，任何进入 invoke_driver 的路径都经过它。
-    const driver = this.driverFor(invocation.role_id, invocation.routing_run_id);
+    const driver = this.driverFor(
+      invocation.role_id,
+      this.routingRunId(invocation.run_id, invocation.activity_run_id),
+    );
     try {
-      const driverInvocationContext: DriverRuntimeInvokerInput['driver_context'] = {
-        task_instruction: invocation.driver_instruction,
-        skills: deduplicateMemoryItems([
-          ...toDriverMemoryItems(invocation.retrieval.skills),
-          ...toMemoryItems('skill', task.context?.skills),
-        ]),
-        experiences: deduplicateMemoryItems([
-          ...toDriverMemoryItems(invocation.retrieval.experiences),
-          ...toMemoryItems('experience', task.context?.experiences),
-          ...(invocation.driver_instruction_locked
-            ? []
-            : delegationContext(invocation.driver_instruction, task.instruction)),
-        ]),
-      };
+      const driverInvocationContext: DriverRuntimeInvokerInput['driver_context'] =
+        invocation.resume_session
+          ? {
+              task_instruction: invocation.driver_instruction,
+              skills: [],
+              experiences: [],
+            }
+          : {
+              task_instruction: invocation.driver_instruction,
+              skills: deduplicateMemoryItems([
+                ...toDriverMemoryItems(invocation.retrieval.skills),
+                ...toMemoryItems('skill', task.context?.skills),
+              ]),
+              experiences: deduplicateMemoryItems([
+                ...toDriverMemoryItems(invocation.retrieval.experiences),
+                ...toMemoryItems('experience', task.context?.experiences),
+                ...(invocation.driver_instruction_locked
+                  ? []
+                  : delegationContext(invocation.driver_instruction, task.instruction)),
+              ]),
+            };
       invocation.driver_invocation_context = driverInvocationContext;
-      const invoke = () => {
+      const invokeRuntime = (hooks?: {
+        onDispatch?: () => void;
+        onLateResult?: (execution: DriverRunResult) => void;
+      }) => {
         invocation.driver_attempts += 1;
         return this.invokerFor(driver)(
           {
@@ -950,22 +1075,56 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
             run_id: invocation.run_id,
             ...(invocation.workspace_path ? { workspace_path: invocation.workspace_path } : {}),
             ...(invocation.session_id ? { session_id: invocation.session_id } : {}),
+            ...(invocation.resume_session ? { resume_session: true } : {}),
             call_id: createId('call'),
             source_driver: driver.driver_id,
             driver_context: driverInvocationContext,
           },
-          invocation.signal || invocation.onDriverEvent
+          invocation.signal || invocation.onDriverEvent || hooks
             ? {
                 ...(invocation.signal ? { signal: invocation.signal } : {}),
                 ...(invocation.onDriverEvent ? { onDriverEvent: invocation.onDriverEvent } : {}),
+                ...(hooks?.onDispatch ? { onDispatch: hooks.onDispatch } : {}),
+                ...(hooks?.onLateResult ? { onLateResult: hooks.onLateResult } : {}),
               }
             : undefined,
         );
       };
-      let result = await invoke();
+
+      if (this.adpEndpoint) {
+        // A1 / issue #149:经 ADP endpoint 走 invoke/result/cancel。unknown 永不
+        // 自动重跑,failed 的自动重试只看部署级 auto_retry[side_effect];
+        // error.retryable 仅作提示,不驱动任何重试。
+        const outcome = await this.adpEndpoint.invoke({
+          task_id: invocation.task_id,
+          run_id: invocation.run_id,
+          workspace_path: invocation.workspace_path ?? process.cwd(),
+          instruction: invocation.driver_instruction,
+          causation_id:
+            this.options.adp?.resolveCausationId?.({
+              task_id: invocation.task_id,
+              run_id: invocation.run_id,
+            }) ?? null,
+          execute: (execInput) =>
+            invokeRuntime({
+              onDispatch: execInput.control.markDispatched,
+              ...(execInput.onLateResult ? { onLateResult: execInput.onLateResult } : {}),
+            }),
+          ...(invocation.onDriverEvent ? { onEvent: invocation.onDriverEvent } : {}),
+        });
+        if (outcome.state === 'in_flight') {
+          throw new Error(`driver invocation ${outcome.exchange_id} is already in flight`);
+        }
+        if (outcome.thrown !== undefined) throw outcome.thrown;
+        if (outcome.execution) invocation.execution = outcome.execution;
+        if (outcome.report) return outcome.report;
+        throw new Error(`driver invocation ${outcome.exchange_id} settled without a report`);
+      }
+
+      let result = await invokeRuntime();
       if (isArtifactFreeRetryableFailure(result.execution)) {
         throwIfAborted(invocation.signal);
-        result = await invoke();
+        result = await invokeRuntime();
       }
       invocation.execution = result.execution;
       return result.report;
@@ -991,6 +1150,14 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       runtimeRoleId,
       dispatched.cycle.buffer_seq,
     );
+    // 反馈与上下文交付走两条独立通道：交付是给下游做提取的输入，反馈是给下游
+    // 判断 Skill 晋升的输入。两者都不拦任务，也都不等待下游。
+    const driverFeedback = await this.recordDriverFeedback(
+      input,
+      runtimeRoleId,
+      dispatched.cycle.buffer_seq,
+      dispatched.cycle.buffer_snapshot.driver_return.referenced_experiences,
+    );
     if (!execution) {
       return this.buildNoExecutionResult(
         input,
@@ -1001,6 +1168,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         workspaceArtifacts,
         memoryMaintenance,
         mailboxOutcomes,
+        driverFeedback,
       );
     }
 
@@ -1051,6 +1219,8 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         },
         promotion: dispatched.cycle.promotion.check,
         agent_runtime: agentRuntime,
+        ...memoryContextDiagnostics(dispatched.cycle),
+        ...driverFeedbackDiagnostics(driverFeedback),
         ...(mailboxOutcomes.length > 0
           ? { mailbox_outcomes: mailboxOutcomes.map((outcome) => ({ ...outcome })) }
           : {}),
@@ -1079,10 +1249,14 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     workspaceArtifacts: ArtifactRef[],
     memoryMaintenance: BMemoryMaintenanceEvidence | undefined,
     mailboxOutcomes: readonly MailboxToolOutcome[],
+    driverFeedback: DriverFeedbackOutcome,
   ): Promise<AgentExecutionResult> {
     const created_at = nowTimestamp();
     // 无执行结果的路径也要按 role 归属，否则 transcript / session 会记到别的 driver 上。
-    const driver = this.driverFor(input.role_id, input.activity_run_id ?? input.run_id);
+    const driver = this.driverFor(
+      input.role_id,
+      this.routingRunId(input.run_id, input.activity_run_id),
+    );
     const mailboxWait = mailboxOutcomes.find(
       (outcome) => outcome.kind === 'request' && outcome.wait_for_reply,
     );
@@ -1140,6 +1314,8 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
           skills: dispatched.cycle.retrieval.skills.length,
         },
         agent_runtime: agentRuntime,
+        ...memoryContextDiagnostics(dispatched.cycle),
+        ...driverFeedbackDiagnostics(driverFeedback),
         ...(mailboxOutcomes.length > 0
           ? { mailbox_outcomes: mailboxOutcomes.map((outcome) => ({ ...outcome })) }
           : {}),
@@ -1163,11 +1339,14 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
     runtimeRoleId: string,
     bufferSeq: number,
   ): Promise<BMemoryMaintenanceEvidence | undefined> {
-    if (!this.options.memoryMaintenance) return undefined;
-    const ablationPolicy = resolveMemoryAblationPolicy(input.memory_ablation);
-    if (!ablationPolicy.schedule_extraction) return undefined;
+    const maintenance = this.options.memoryMaintenance;
+    if (!maintenance) return undefined;
+    // 消融标签**不在这里分流**：这条路径无论 B0–B4 都只把 Buffer 登记成一条交付项交出去。
+    // 曾经 `schedule_extraction` 为假（B0/B4）就整个跳过——那等于让一个请求字段把生产路径
+    // 的输出掐掉，Buffer 会永远留在 pending、下游根本不知道有这条输入。标签只影响检索
+    // （include_skills / include_recent_experience），不影响「任务流程照常生产输入」。
     try {
-      return await this.options.memoryMaintenance.scheduleBuffer({
+      return await maintenance.scheduleBuffer({
         task_id: input.task_id,
         run_id: input.run_id,
         role_id: runtimeRoleId,
@@ -1180,7 +1359,10 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       const completedAt = nowTimestamp();
       return {
         maintenance_ref: createId('b_maintenance'),
-        kind: 'experience_extraction',
+        // 这条路径只做交付（scheduleBuffer 在两种 mode 下都只登记交付项），失败的是
+        // 「交付」而不是「本进程提取」。报成 experience_extraction 就等于在说任务流程
+        // 在提取——那正是这条边界要拆掉的说法。
+        kind: 'context_delivery',
         status: 'failed',
         task_id: input.task_id,
         run_id: input.run_id,
@@ -1193,6 +1375,58 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
         created_at: completedAt,
         completed_at: completedAt,
         schema_version: SCHEMA_VERSION,
+      };
+    }
+  }
+
+  /**
+   * 把 Driver 对既有经验的使用反馈写进下游 outbox。
+   *
+   * 与提取解耦：不查经验是否存在、不调 scheduleBuffer、更不在本进程改置信度。
+   * 引用一条还不存在的经验是正常情况（跨 agent / 已处置 / 下游尚未提取），
+   * 反馈先落 outbox，等下游按 feedback_id 归并。
+   *
+   * best-effort：写失败只记进 diagnostics，绝不让一个已经完成的 Agent 任务
+   * 因为下游的事变成失败。但「没写」这件事必须看得见——Driver 自报了引用却因为
+   * 本进程没配 outbox 而丢弃，是配置错误，不是「本次没有反馈」；两者都报成空
+   * 就等于把丢数据伪装成没数据。
+   */
+  private async recordDriverFeedback(
+    input: AgentExecutionRequest,
+    runtimeRoleId: string,
+    bufferSeq: number,
+    references: readonly DriverReferencedExperience[],
+  ): Promise<DriverFeedbackOutcome> {
+    if (references.length === 0) return { recorded: [], ignored: 0 };
+    // 只有能命名一条经验的引用才是反馈。Driver 分不清「发给它的经验 id」与「上下文占位条目的
+    // 编号」，误读会把它报成引用（见 toMemoryItems）——那类条目在这里就丢掉并计数：它不是
+    // 「还没出现的经验」，等多久都不会出现，存进 outbox 只会让下游白等一轮保留期。
+    const usable = references.filter((reference) => canNameExperience(reference.experience_id));
+    const ignored = references.length - usable.length;
+    // 消融标签同样不改这条边界：Driver 自报了引用却因为「这一臂是 B0/B4」而把反馈丢掉，
+    // 就是静默丢数据——反馈必须幂等且不能悄无声息地少。标签只影响检索。
+    if (!this.options.memoryMaintenance) {
+      return {
+        recorded: [],
+        ignored,
+        error: 'B memory maintenance is not configured; driver feedback was not recorded.',
+      };
+    }
+    if (usable.length === 0) return { recorded: [], ignored };
+    try {
+      const recorded = await this.options.memoryMaintenance.recordDriverUsageFeedback({
+        task_id: input.task_id,
+        run_id: input.run_id,
+        role_id: runtimeRoleId,
+        ...(bufferSeq > 0 ? { buffer_seq: bufferSeq } : {}),
+        references: usable,
+      });
+      return { recorded, ignored };
+    } catch (error) {
+      return {
+        recorded: [],
+        ignored,
+        error: error instanceof Error ? error.message : String(error),
       };
     }
   }
@@ -1229,6 +1463,7 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       agent_runtime: buildAgentRuntimeEvidence(dispatched, agentSystemPromptSha256),
     });
     const contextPackRef = `context_pack_${createHash('sha256').update(identity).digest('hex').slice(0, 24)}`;
+    const contextWarnings = memoryContextWarnings(dispatched.cycle);
     const evidence: AgentContextPackEvidence = {
       context_pack_id: contextPackRef,
       task_id: input.task_id,
@@ -1250,6 +1485,10 @@ export class DriverRuntimeAgentExecutionFacade implements AgentExecutionFacade {
       driver_context: dispatched.cycle.driver_context,
       ...(driverInvocationContext ? { driver_invocation_context: driverInvocationContext } : {}),
       agent_runtime: buildAgentRuntimeEvidence(dispatched, agentSystemPromptSha256),
+      // 配对与否由真正写盘的那一侧决定：cycle 里 Buffer 快照带 context_snapshot_ref
+      // 才说明 context_{seq}.json 确实落下了，而不是「我们打算清理」。
+      context_snapshot_paired: contextSnapshotPaired(dispatched.cycle),
+      ...(contextWarnings ? { context_snapshot_warnings: contextWarnings } : {}),
       created_at: nowTimestamp(),
       schema_version: SCHEMA_VERSION,
     };
@@ -1369,9 +1608,17 @@ function mapStatus(
   )[driverStatus];
 }
 
+/**
+ * `invoke_driver` 的 context 只有正文（`string[]`），这些条目没有落库身份。
+ *
+ * 给它们编号时**刻意避开经验 id 的形状**：过去这里是 `experience_1` / `skill_1`，与真检索来的
+ * UUID 混在同一个数组里下发给 Driver。Driver 无从分辨哪个编号是可引用的经验，于是把占位编号
+ * 照抄进 `referenced_experiences`，反馈链路再拿它当外键去查一条不存在的经验——生产路径上
+ * 「经验还没出现」的绝大多数就是这样来的。`context-` 前缀一望可知是占位条目。
+ */
 function toMemoryItems(prefix: string, values: string[] | undefined) {
   return (values ?? []).map((content, index) => ({
-    id: `${prefix}_${String(index + 1)}`,
+    id: `context-${prefix}-${String(index + 1)}`,
     description: `B runtime ${prefix} context`,
     content,
   }));
@@ -1410,6 +1657,53 @@ function withRetrievedMemory(
       },
       driver_context: driverContext,
     },
+  };
+}
+
+/**
+ * AgentContextSnapshot 是否真的和这次 Buffer 成对落了盘。
+ *
+ * 判据是 Buffer 快照自己的 context_snapshot_ref——那是写入侧在真写下了 context 文件
+ * 才会填的字段。写在这里而不是另记一个「清理成功」标志，是为了不让「打算清理」和
+ * 「清理结果落了盘」在证据里长得一样。
+ */
+function contextSnapshotPaired(cycle: MemoryCycleResult): boolean {
+  return cycle.buffer_snapshot.context_snapshot_ref !== undefined;
+}
+
+/** cycle.warnings 中属于上下文清理的那些；没有则返回 undefined（调用方据此省略字段）。 */
+function memoryContextWarnings(cycle: MemoryCycleResult): string[] | undefined {
+  const warnings = cycle.warnings?.filter((warning) => warning.startsWith('context_cleaning'));
+  return warnings && warnings.length > 0 ? warnings : undefined;
+}
+
+/** 把上下文降级原因放进执行诊断：任务照样完成，但现场要留一句为什么。 */
+function memoryContextDiagnostics(cycle: MemoryCycleResult): Record<string, unknown> {
+  const warnings = memoryContextWarnings(cycle);
+  if (!warnings) return {};
+  return {
+    context_snapshot_paired: contextSnapshotPaired(cycle),
+    memory_context_warnings: warnings,
+  };
+}
+
+/**
+ * 把反馈提交结果放进执行诊断。
+ *
+ * 只在真有反馈可报时才出现这两个键——「这次没有引用任何经验」和「报了但没写进去」
+ * 是两件事，混成同一个空值就分不出来了。
+ */
+function driverFeedbackDiagnostics(outcome: DriverFeedbackOutcome): Record<string, unknown> {
+  if (outcome.error === undefined && outcome.recorded.length === 0 && outcome.ignored === 0) {
+    return {};
+  }
+  return {
+    driver_feedback_recorded: outcome.recorded.length,
+    // 报了却不是经验 id 的引用条数：>0 说明 Driver 在拿占位编号当经验引用，是上游该修的迹象
+    ...(outcome.ignored > 0 ? { driver_feedback_ignored: outcome.ignored } : {}),
+    ...(outcome.error === undefined
+      ? { driver_feedback_ids: outcome.recorded.map((record) => record.feedback_id) }
+      : { driver_feedback_error: outcome.error }),
   };
 }
 

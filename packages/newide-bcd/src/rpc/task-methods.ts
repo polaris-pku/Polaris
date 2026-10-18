@@ -26,6 +26,7 @@ export interface TaskMethodsService {
   getTask(taskId: string): Promise<TaskSnapshot>;
   listTasks(): Promise<TaskListResult>;
   cancelTask(taskId: string): Promise<TaskSnapshot>;
+  interruptTask(taskId: string): Promise<TaskSnapshot>;
   resumeTask(taskId: string): Promise<TaskSnapshot>;
   startCouncil(taskId: string): Promise<TaskSnapshot>;
   subscribeTask(
@@ -96,6 +97,10 @@ export class TaskRpcMethods {
       const { task_id } = parseParams(taskIdParamsSchema, params);
       return this.callWithTaskError(() => this.service.cancelTask(task_id));
     });
+    dispatcher.register('task.interrupt', (params) => {
+      const { task_id } = parseParams(taskIdParamsSchema, params);
+      return this.callWithTaskError(() => this.service.interruptTask(task_id));
+    });
     dispatcher.register('task.resume', (params) => {
       const { task_id } = parseParams(taskIdParamsSchema, params);
       return this.callWithTaskError(() => this.service.resumeTask(task_id));
@@ -156,11 +161,9 @@ export class TaskRpcMethods {
         });
       }
       if (error instanceof TaskNotBlockedError) {
-        throw new JsonRpcMethodError(
-          JSON_RPC_ERROR_CODES.TASK_NOT_BLOCKED,
-          'Task not blocked',
-          { task_id: error.taskId },
-        );
+        throw new JsonRpcMethodError(JSON_RPC_ERROR_CODES.TASK_NOT_BLOCKED, 'Task not blocked', {
+          task_id: error.taskId,
+        });
       }
       if (error instanceof TaskResumeAnchorError) {
         throw new JsonRpcMethodError(

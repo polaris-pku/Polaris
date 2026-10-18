@@ -13,7 +13,7 @@ const RELEASES_LATEST_URL = 'https://github.com/ExtraZhangYC/Polaris/releases/la
 // 运行中轮询间隔（10 分钟）。GitHub 未认证请求限流 60 次/时，此频率很安全。
 const CHECK_INTERVAL = 10 * 60 * 1000;
 
-function setupAutoUpdater(getWindow) {
+function setupAutoUpdater(getWindow, beforeInstall = async () => {}) {
   const canAutoUpdate =
     app.isPackaged && !fs.existsSync(path.join(path.dirname(process.execPath), MANIFEST_NAME));
   // preload 在开发态也会挂载更新 API；handler 必须先注册，否则渲染层首次
@@ -24,8 +24,14 @@ function setupAutoUpdater(getWindow) {
     if (!canAutoUpdate) return;
     return autoUpdater.downloadUpdate().catch(() => {});
   });
-  ipcMain.handle('update:restart', () => {
-    if (canAutoUpdate) autoUpdater.quitAndInstall();
+  ipcMain.handle('update:restart', async () => {
+    if (!canAutoUpdate) return;
+    try {
+      await beforeInstall();
+      autoUpdater.quitAndInstall();
+    } catch (error) {
+      send('error', { message: `无法安全重启更新：${error.message}` });
+    }
   });
   ipcMain.handle('update:check', () => {
     if (!canAutoUpdate) return;

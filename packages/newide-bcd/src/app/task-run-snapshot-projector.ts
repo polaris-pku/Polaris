@@ -142,7 +142,9 @@ export function projectPersistedRunSnapshot(
         ? {
             outcome: filesWritten.length > 0 ? 'completed_files' : 'completed_response',
           }
-        : { outcome: 'failed' }),
+        : status === 'interrupted'
+          ? {}
+          : { outcome: 'failed' }),
       response,
       ...(sessionId ? { session_id: sessionId } : {}),
       tool_events: [],
@@ -156,7 +158,7 @@ export function projectPersistedRunSnapshot(
     ...(projectedMarket ? { market: projectedMarket } : {}),
     ...(run.mode === 'council' ? { council: councilProjection(events, status) } : {}),
     errors: run.error ? [{ ...run.error }] : [],
-    ...(status !== 'running'
+    ...(status !== 'running' && status !== 'interrupted'
       ? {
           final_output: {
             status,
@@ -178,9 +180,10 @@ export function projectPersistedRunSnapshot(
   });
 }
 
-function runStatus(run: PersistedRunState): 'running' | 'completed' | 'failed' | 'cancelled' {
+function runStatus(
+  run: PersistedRunState,
+): 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted' {
   if (run.status === 'created' || run.status === 'running') return 'running';
-  if (run.status === 'interrupted') return 'failed';
   return run.status;
 }
 
@@ -245,7 +248,7 @@ function marketProjection(event: PersistedCoordinationEvent): RunSnapshot['marke
 
 function councilProjection(
   events: readonly PersistedCoordinationEvent[],
-  status: 'running' | 'completed' | 'failed' | 'cancelled',
+  status: 'running' | 'completed' | 'failed' | 'cancelled' | 'interrupted',
 ): NonNullable<RunSnapshot['council']> {
   const completed = lastEvent(events, 'council.completed');
   const started = lastEvent(events, 'council.started');

@@ -5,8 +5,8 @@
  * 它一次给回 `TaskSnapshot` + 全量重放事件，断号和重连都靠再走一次它来覆盖本地状态。
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { resetEventChannel } from './events';
-import { unwatchAllTasks, watchTask } from './task';
+import { onRunEvent, resetEventChannel } from './events';
+import { taskApi, unwatchAllTasks, watchTask } from './task';
 import { resetTransport } from './transport';
 import type { RunEvent } from './types/rpc';
 import type { TaskSnapshot } from './types/task';
@@ -84,25 +84,30 @@ function installFakeBackend(
   };
 
   const backend = {
-    call: vi.fn(async (method: string, params: unknown) => {
-      rpc.push({ method, params });
-      if (method === 'task.get') {
-        const taskId = (params as { task_id: string }).task_id;
-        return { ok: true as const, result: options.snapshots?.[taskId] ?? snapshotOf(taskId) };
-      }
-      if (method === 'task.subscribe') {
-        const taskId = (params as { task_id: string }).task_id;
-        return {
-          ok: true as const,
-          result: {
-            subscribed: true,
-            snapshot: options.snapshots?.[taskId] ?? snapshotOf(taskId),
-            replay_events: options.replay?.[taskId] ?? [],
-          },
-        };
-      }
-      return { ok: true as const, result: { unsubscribed: true } };
-    }),
+    call: vi.fn(
+      async (
+        method: string,
+        params: unknown,
+      ): Promise<{ ok: true; result: unknown } | { ok: false; error: string; code: number }> => {
+        rpc.push({ method, params });
+        if (method === 'task.get') {
+          const taskId = (params as { task_id: string }).task_id;
+          return { ok: true as const, result: options.snapshots?.[taskId] ?? snapshotOf(taskId) };
+        }
+        if (method === 'task.subscribe') {
+          const taskId = (params as { task_id: string }).task_id;
+          return {
+            ok: true as const,
+            result: {
+              subscribed: true,
+              snapshot: options.snapshots?.[taskId] ?? snapshotOf(taskId),
+              replay_events: options.replay?.[taskId] ?? [],
+            },
+          };
+        }
+        return { ok: true as const, result: { unsubscribed: true } };
+      },
+    ),
     onNotification: vi.fn((handler: (notification: unknown) => void) => {
       notificationHandlers.add(handler);
       return () => notificationHandlers.delete(handler);
@@ -120,6 +125,7 @@ function installFakeBackend(
   vi.stubGlobal('window', { desktop: { isDesktop: true, platform: 'linux', backend } });
 
   return {
+    backend,
     emit,
     setStatus: (state: 'ready' | 'starting' | 'stopped' | 'error') => {
       statusHandlers.forEach((handler) => handler({ ...READY_STATUS, state }));
@@ -138,6 +144,123 @@ describe('watchTask', () => {
   afterEach(async () => {
     await unwatchAllTasks();
     vi.useRealTimers();
+  });
+
+  it('sends only task_id when stopping recoverably, without calling cancel', async () => {
+    const fake = installFakeBackend();
+    await taskApi.interrupt('task-1');
+    expect(fake.calls('task.interrupt')).toEqual([
+      { method: 'task.interrupt', params: { task_id: 'task-1' } },
+    ]);
+    expect(fake.calls('task.cancel')).toHaveLength(0);
+  });
+
+  it('removes the previous server subscription before installing a replacement watcher', async () => {
+    const fake = installFakeBackend();
+    const first = await watchTask('task-1', { onSnapshot() {}, onEvent() {} });
+    await watchTask('task-1', { onSnapshot() {}, onEvent() {} });
+    const methods = fake.backend.call.mock.calls.map(([method]) => method);
+    expect(methods).toEqual(['task.subscribe', 'task.unsubscribe', 'task.subscribe']);
+    await first();
+    expect(fake.calls('task.unsubscribe')).toHaveLength(1);
+  });
+
+  it('recovers an expired cursor by subscribing without it, never by rerunning', async () => {
+    const fake = installFakeBackend();
+    fake.backend.call.mockResolvedValueOnce({
+      ok: false,
+      error: 'cursor expired',
+      code: -32009,
+    });
+    await watchTask('task-1', { onSnapshot() {}, onEvent() {} }, 'expired');
+    expect(fake.backend.call.mock.calls.slice(0, 2)).toEqual([
+      ['task.subscribe', { task_id: 'task-1', after_event_id: 'expired' }],
+      ['task.subscribe', { task_id: 'task-1' }],
+    ]);
+  });
+
+  it('deduplicates Task replay and live events at the shared Run projection boundary', async () => {
+    const shared = event('shared', 1);
+    const fake = installFakeBackend({ replay: { 'task-1': [shared] } });
+    const received: string[] = [];
+    const stop = onRunEvent((value) => received.push(value.event_id));
+    await watchTask('task-1', { onSnapshot() {}, onEvent() {} });
+    fake.emit('task-1', shared);
+    expect(received).toEqual(['shared']);
+    stop();
+  });
+
+  it('buffers reconnect events until the new authoritative snapshot and replay are applied', async () => {
+    const fake = installFakeBackend();
+    const order: string[] = [];
+    await watchTask('task-1', {
+      onSnapshot: (value) => order.push(`snapshot-${value.revision}`),
+      onEvent: (value) => order.push(value.event_id),
+    });
+    let resolve!: (value: { ok: true; result: unknown }) => void;
+    fake.backend.call.mockImplementationOnce(
+      () =>
+        new Promise((done) => {
+          resolve = done;
+        }),
+    );
+    fake.setStatus('starting');
+    fake.setStatus('ready');
+    fake.emit('task-1', event('new-live', 2));
+    expect(order).toEqual(['snapshot-1']);
+    resolve({
+      ok: true,
+      result: {
+        subscribed: true,
+        snapshot: { ...snapshot, revision: 2 },
+        replay_events: [event('new-replay', 1), event('new-live', 2)],
+      },
+    });
+    await vi.waitFor(() =>
+      expect(order).toEqual(['snapshot-1', 'snapshot-2', 'new-replay', 'new-live']),
+    );
+  });
+
+  it('cleans up a watcher whose initial subscription is still pending', async () => {
+    const fake = installFakeBackend();
+    let resolve!: (value: { ok: true; result: unknown }) => void;
+    fake.backend.call.mockImplementationOnce(
+      () =>
+        new Promise((done) => {
+          resolve = done;
+        }),
+    );
+    const starting = watchTask('task-1', { onSnapshot() {}, onEvent() {} });
+    await vi.waitFor(() =>
+      expect(fake.backend.call).toHaveBeenCalledWith('task.subscribe', { task_id: 'task-1' }),
+    );
+    const cleanup = unwatchAllTasks();
+    resolve({ ok: true, result: { subscribed: true, snapshot, replay_events: [] } });
+    await Promise.all([starting, cleanup]);
+    expect(fake.calls('task.unsubscribe')).toHaveLength(1);
+  });
+
+  it('ignores an old connection reply even when it has a larger revision', async () => {
+    const fake = installFakeBackend();
+    const observed: number[] = [];
+    await watchTask('task-1', {
+      onSnapshot: (value) => observed.push(value.revision),
+      onEvent() {},
+    });
+    let resolve!: (value: { ok: true; result: TaskSnapshot }) => void;
+    fake.backend.call.mockImplementationOnce(
+      () =>
+        new Promise((done) => {
+          resolve = done;
+        }),
+    );
+    fake.emit('task-1', { ...event('trigger', 1), type: 'run.interrupted' });
+    fake.setStatus('starting');
+    fake.setStatus('ready');
+    await vi.waitFor(() => expect(fake.calls('task.subscribe')).toHaveLength(2));
+    resolve({ ok: true, result: { ...snapshot, revision: 999 } });
+    await Promise.resolve();
+    expect(observed).not.toContain(999);
   });
 
   it('refreshes a waiting Task even without events and stops polling only at Task completion', async () => {
@@ -269,8 +392,8 @@ describe('watchTask', () => {
     fake.emit('task-1', event('e5', 5));
 
     await vi.waitFor(() => expect(applied).toContain('e2'));
-    // 快照重新覆盖了一次，断掉的 e2 也补了回来；已投递过的 e1/e3 靠 event_id 去重挡住。
-    expect(applied).toEqual(['snapshot', 'e1', 'e3', 'e5', 'snapshot', 'e2']);
+    // 重同步期间的 e5 缓存到快照与重放之后；e1/e3 按 event_id 去重。
+    expect(applied).toEqual(['snapshot', 'e1', 'e3', 'snapshot', 'e2', 'e5']);
     expect(fake.calls('task.subscribe')).toHaveLength(2);
   });
 

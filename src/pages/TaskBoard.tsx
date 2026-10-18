@@ -55,12 +55,17 @@ function TaskBoardInner() {
   const startTask = useDemoStore((s) => s.startTask);
   const useRecommendedWorkflow = useDemoStore((s) => s.useRecommendedWorkflow);
   const retrySubmit = useDemoStore((s) => s.retrySubmit);
+  const interruptTask = useDemoStore((s) => s.interruptTask);
+  const resumeTask = useDemoStore((s) => s.resumeTask);
+  const liveTask = useDemoStore((s) =>
+    activeTask?.contractTaskId ? s.liveTasks[activeTask.contractTaskId] : undefined,
+  );
 
   const activeProject = projects.find((p) => p.id === activeProjectId);
   const state = runStateOf(activeTask, liveRun);
 
   // 秒表只在 run 还活着时走 —— 终态之后每秒重渲染整块运行屏是白烧电。
-  const now = useNow(1000, state === 'running' || state === 'blocked');
+  const now = useNow(1000, liveRun?.status === 'running' && !liveRun.syncError);
   const mission = missionLineOf({ task: activeTask, live: liveRun, now });
 
   // agent 的工作区（文件真正写到哪）。它是后端的**全局状态** —— 界面上看不见的话，
@@ -105,6 +110,10 @@ function TaskBoardInner() {
 
   // 产出（agent 真写出来的文件）—— 舞台的主角。右栏不再重复渲染它（一个事实只有一个宿主）。
   const artifacts = artifactFactsOf(liveRun);
+  const resumable =
+    liveTask?.snapshot.task.status === 'blocked' &&
+    !liveTask.snapshot.current_run &&
+    liveTask.snapshot.run_history.some((run) => run.status === 'interrupted');
 
   return (
     <div className="flex h-full overflow-hidden">
@@ -132,7 +141,9 @@ function TaskBoardInner() {
               {liveRun.syncError}
             </p>
           )}
-          <ProgressRibbon phases={phaseSegments(nodes, activeNodeId ?? undefined)} />
+          <ProgressRibbon
+            phases={phaseSegments(nodes, activeTask?.contractRunId ? mission.state : undefined)}
+          />
         </div>
 
         <div className="flex min-h-0 flex-1 flex-col">
@@ -183,12 +194,29 @@ function TaskBoardInner() {
         </div>
 
         <PrimaryAction
+          key={activeTaskId}
           state={state}
           retrying={retrying}
-          error={retryError}
+          error={retryError ?? liveTask?.error}
           onStart={startTask}
           onUseRecommended={useRecommendedWorkflow}
           onRetry={onRetry}
+          connected={eventChannelStatus === 'connected'}
+          pendingAction={liveTask?.pendingAction}
+          onInterrupt={
+            liveTask?.snapshot.current_run && activeTask
+              ? () => {
+                  void interruptTask(activeTask.id);
+                }
+              : undefined
+          }
+          onResume={
+            resumable && activeTask
+              ? () => {
+                  void resumeTask(activeTask.id);
+                }
+              : undefined
+          }
         />
       </div>
 

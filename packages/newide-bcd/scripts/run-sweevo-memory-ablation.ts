@@ -17,10 +17,7 @@ import { createInterface } from 'node:readline';
 import { ensureRepoMirror, resolveMirrorsRoot } from '../eval/ensure-repo-mirror';
 import { getInstanceOrThrow, indexDatasetById, loadDataset } from '../eval/load-dataset';
 import { loadDatasetSubset, loadManifest, resolveDatasetJsonl } from '../eval/paths';
-import {
-  prepareEphemeralWorktree,
-  removeEphemeralWorktree,
-} from '../eval/prepare-worktree';
+import { prepareEphemeralWorktree, removeEphemeralWorktree } from '../eval/prepare-worktree';
 import { runEvalInstance } from '../eval/run-instance-core';
 import { resolveHarnessTimeoutSeconds } from '../eval/sweevo-harness-adapter';
 import type { MemoryAblation, SweEvoInstance } from '../eval/types';
@@ -34,10 +31,7 @@ import {
   isPopulatedRunTokenUsage,
   type RunTokenUsageSummary,
 } from '../src/telemetry';
-import {
-  prepareAblationArmIsolation,
-  waitForRunMaintenance,
-} from './ablation-arm-isolation';
+import { prepareAblationArmIsolation, waitForRunMaintenance } from './ablation-arm-isolation';
 
 interface JsonRpcMessage {
   jsonrpc: '2.0';
@@ -120,9 +114,7 @@ for (const [key, value] of Object.entries(fileEnv)) {
 // Set ACCEPTANCE_RUN_TIMEOUT_MS=0 for no wall-clock cancel (wait until terminal).
 const runTimeoutRaw = process.env.ACCEPTANCE_RUN_TIMEOUT_MS ?? fileEnv.ACCEPTANCE_RUN_TIMEOUT_MS;
 const unlimitedRunTimeout = runTimeoutRaw === '0';
-const runTimeoutMs = unlimitedRunTimeout
-  ? 0
-  : readPositiveInt(runTimeoutRaw, 2_700_000);
+const runTimeoutMs = unlimitedRunTimeout ? 0 : readPositiveInt(runTimeoutRaw, 2_700_000);
 // Wait slightly longer than the driver budget so the driver timeout (clean
 // terminal state) fires before this script force-cancels the run.
 // Unlimited: never force-cancel; driver still needs a finite ACP_DRIVER_TIMEOUT_MS.
@@ -171,8 +163,7 @@ for (const id of instanceIds) {
   getInstanceOrThrow(instancesById, id);
 }
 
-const driverRunnerRaw =
-  process.env.ACP_DRIVER_RUNNER_DIR ?? fileEnv.ACP_DRIVER_RUNNER_DIR;
+const driverRunnerRaw = process.env.ACP_DRIVER_RUNNER_DIR ?? fileEnv.ACP_DRIVER_RUNNER_DIR;
 const driverEnvFileRaw = process.env.ACP_DRIVER_ENV_FILE ?? fileEnv.ACP_DRIVER_ENV_FILE;
 const sweEvoRootRaw = process.env.NEWIDE_SWE_EVO_ROOT ?? fileEnv.NEWIDE_SWE_EVO_ROOT;
 const baseEnv: NodeJS.ProcessEnv = {
@@ -182,9 +173,7 @@ const baseEnv: NodeJS.ProcessEnv = {
     repoRoot,
     driverRunnerRaw ?? path.join('..', 'acp-client-prototype'),
   ),
-  ...(driverEnvFileRaw
-    ? { ACP_DRIVER_ENV_FILE: path.resolve(repoRoot, driverEnvFileRaw) }
-    : {}),
+  ...(driverEnvFileRaw ? { ACP_DRIVER_ENV_FILE: path.resolve(repoRoot, driverEnvFileRaw) } : {}),
   ...(sweEvoRootRaw ? { NEWIDE_SWE_EVO_ROOT: path.resolve(repoRoot, sweEvoRootRaw) } : {}),
 };
 // 全自动化测评：无人审核 → 晋升即批准（替代人工 reviewSkill）。
@@ -196,7 +185,10 @@ baseEnv.NEWIDE_B_SKILL_AUTO_APPROVE ??= '1';
 // killed early and the arm comparison becomes a timeout comparison.
 if (unlimitedRunTimeout) {
   baseEnv.ACP_DRIVER_TIMEOUT_MS ??= String(unlimitedDriverTimeoutMs);
-  if (readPositiveInt(baseEnv.ACP_DRIVER_TIMEOUT_MS, unlimitedDriverTimeoutMs) < unlimitedDriverTimeoutMs) {
+  if (
+    readPositiveInt(baseEnv.ACP_DRIVER_TIMEOUT_MS, unlimitedDriverTimeoutMs) <
+    unlimitedDriverTimeoutMs
+  ) {
     log(
       `warn: ACP_DRIVER_TIMEOUT_MS=${String(baseEnv.ACP_DRIVER_TIMEOUT_MS)} too low for unlimited run; raising to ${String(unlimitedDriverTimeoutMs)}ms`,
     );
@@ -279,27 +271,21 @@ if (baseEnv.NEWIDE_EVAL_FS_JAIL === '1') {
   baseEnv.CLAUDE_CLI_ARGS ??= `${claudeAcpEntry} acp`;
 }
 if (sandboxExtraRoBinds.size > 0) {
-  baseEnv.ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON = JSON.stringify([
-    ...sandboxExtraRoBinds,
-  ]);
+  baseEnv.ACP_PROCESS_SANDBOX_EXTRA_RO_BINDS_JSON = JSON.stringify([...sandboxExtraRoBinds]);
 }
 
 log(`experiment root: ${experimentRoot}`);
 log(`mirrors root: ${mirrorsRoot}`);
-log(`subset=${subsetId} instances=${instanceIds.length} ablations=${ablations.join(',')} mode=${runMode}`);
-log(`ACP_DRIVER_RUNNER_DIR: ${baseEnv.ACP_DRIVER_RUNNER_DIR}`);
 log(
-  `ACCEPTANCE_RUN_TIMEOUT_MS: ${unlimitedRunTimeout ? '0 (unlimited)' : String(runTimeoutMs)}`,
+  `subset=${subsetId} instances=${instanceIds.length} ablations=${ablations.join(',')} mode=${runMode}`,
 );
+log(`ACP_DRIVER_RUNNER_DIR: ${baseEnv.ACP_DRIVER_RUNNER_DIR}`);
+log(`ACCEPTANCE_RUN_TIMEOUT_MS: ${unlimitedRunTimeout ? '0 (unlimited)' : String(runTimeoutMs)}`);
 log(`ACP_DRIVER_TIMEOUT_MS: ${baseEnv.ACP_DRIVER_TIMEOUT_MS}`);
 log(`NEWIDE_SWE_EVO_BLOCK_INTERNET: ${baseEnv.NEWIDE_SWE_EVO_BLOCK_INTERNET}`);
 log(`NEWIDE_SWE_EVO_PYTHON: ${process.env.NEWIDE_SWE_EVO_PYTHON?.trim() || 'python (default)'}`);
-log(
-  `NEWIDE_B_EMBEDDING_PROVIDER: ${baseEnv.NEWIDE_B_EMBEDDING_PROVIDER ?? 'hash'}`,
-);
-log(
-  `NEWIDE_B_EMBEDDING_DIMENSIONS: ${baseEnv.NEWIDE_B_EMBEDDING_DIMENSIONS ?? '32'}`,
-);
+log(`NEWIDE_B_EMBEDDING_PROVIDER: ${baseEnv.NEWIDE_B_EMBEDDING_PROVIDER ?? 'hash'}`);
+log(`NEWIDE_B_EMBEDDING_DIMENSIONS: ${baseEnv.NEWIDE_B_EMBEDDING_DIMENSIONS ?? '32'}`);
 const harnessTimeoutEnv = process.env.NEWIDE_SWE_EVO_HARNESS_TIMEOUT?.trim();
 log(
   `NEWIDE_SWE_EVO_HARNESS_TIMEOUT: ${harnessTimeoutEnv && harnessTimeoutEnv.length > 0 ? harnessTimeoutEnv : 'default 1800; dask__dask_2024.1.0_2024.1.1 -> 10800'}`,
@@ -464,8 +450,7 @@ for (const ablation of ablations) {
             baseEnv.NEWIDE_COUNCIL_SEATS ??
             'role_fullstack_engineer,role_ts_engineer,role_code_reviewer,role_synthesis_engineer',
           NEWIDE_AUCTION_ENABLED: baseEnv.NEWIDE_AUCTION_ENABLED ?? '0',
-          NEWIDE_PRIMARY_AGENT_ID:
-            baseEnv.NEWIDE_PRIMARY_AGENT_ID ?? 'role_fullstack_engineer',
+          NEWIDE_PRIMARY_AGENT_ID: baseEnv.NEWIDE_PRIMARY_AGENT_ID ?? 'role_fullstack_engineer',
         }
       : {}),
   };
@@ -592,9 +577,7 @@ async function runOneInstance(input: {
     p2p_regression: false,
   };
 
-  let prepared:
-    | Awaited<ReturnType<typeof prepareEphemeralWorktree>>
-    | undefined;
+  let prepared: Awaited<ReturnType<typeof prepareEphemeralWorktree>> | undefined;
   const wallStartedAt = Date.now();
   row.wall_started_at = new Date(wallStartedAt).toISOString();
 
@@ -689,6 +672,8 @@ async function runOneInstance(input: {
     row.token_usage = await resolveInstanceTokenUsage({
       summary,
       sessionId: row.session_id,
+      // 顺序有依赖：会话清单来自上面刚折好的 usage 账本，先解析账本再刮 transcript。
+      sessionIds: driverSessionIds(row.driver_usage, row.session_id),
       worktreePath: prepared.worktreePath,
     });
 
@@ -733,8 +718,7 @@ async function runOneInstance(input: {
         row.applied = evalResult.summary.applied_count > 0;
         row.p2p_regression = evalResult.summary.p2p_regression_count > 0;
       }
-      const snapshotOk =
-        row.snapshot_status === 'succeeded' || row.snapshot_status === 'completed';
+      const snapshotOk = row.snapshot_status === 'succeeded' || row.snapshot_status === 'completed';
       // With --run-harness, a run only counts as ok when it was actually scored;
       // snapshot success alone must not masquerade as an evaluated result.
       row.status = snapshotOk && (!runHarness || scored) ? 'ok' : 'failed';
@@ -880,7 +864,18 @@ function readSummaryTokenUsage(summary: unknown): TokenUsage | undefined {
 
 function readSummaryDriverUsage(summary: unknown): TaskDriverUsage | undefined {
   if (!summary || typeof summary !== 'object') return undefined;
-  const obj = summary as { driver_usage?: unknown; token_usage?: unknown };
+  // 三个键名是三代产物，按新到旧认：`driver_context_usage` 是后端现在写的
+  // （run-terminal-output-writer 的 buildBackendSummary），`driver_usage` 与 `token_usage`
+  // 是旧块名，只为读得动历史 run 才留着。只认旧名的话，新 summary 里的成本会被当成
+  // 不存在，静默掉回文件兜底——这条路径曾长期无人发现。
+  const obj = summary as {
+    driver_context_usage?: unknown;
+    driver_usage?: unknown;
+    token_usage?: unknown;
+  };
+  if (isDriverStreamUsage(obj.driver_context_usage)) {
+    return obj.driver_context_usage;
+  }
   if (isDriverStreamUsage(obj.driver_usage)) {
     return obj.driver_usage;
   }
@@ -898,25 +893,42 @@ async function resolveInstanceDriverUsage(input: {
   const fromSummary = readSummaryDriverUsage(input.summary);
   if (fromSummary) return fromSummary;
   if (!input.taskId) return undefined;
-  const projected = await projectTaskDriverUsage(
-    path.join(input.stateRoot, 'runs'),
-    input.taskId,
-  );
+  const projected = await projectTaskDriverUsage(path.join(input.stateRoot, 'runs'), input.taskId);
   return projected.available ? projected : undefined;
 }
 
 async function resolveInstanceTokenUsage(input: {
   summary: unknown;
   sessionId?: string;
+  /** 这个 run 跑过的全部 driver 会话；council 每个角色一个，只刮 primary 会漏掉其余四个。 */
+  sessionIds?: readonly string[];
   worktreePath: string;
 }): Promise<TokenUsage> {
   const fromSummary = readSummaryTokenUsage(input.summary);
   if (fromSummary) return fromSummary;
   const scraped = await collectClaudeSessionUsage({
     ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+    ...(input.sessionIds && input.sessionIds.length > 0 ? { sessionIds: input.sessionIds } : {}),
     worktreePath: input.worktreePath,
   });
   return toAblationTokenUsage(scraped);
+}
+
+/**
+ * 汇总这个 run 见过的 driver 会话 id，primary 在前。
+ *
+ * 会话清单以 usage 账本折出来的 `sessions` 为准，而不是 summary 的 `session_id`：council
+ * 四个角色各占一个 session，summary 只留得下 primary 一个，实测一次四角色 run 有三分之三
+ * 的 token 从刮 transcript 这条路漏掉。账本还有一层好处——summary 缺失时（run 死在终态
+ * 之前）它照样齐全。
+ */
+function driverSessionIds(usage: TaskDriverUsage | undefined, primary?: string): string[] {
+  const ids: string[] = [];
+  if (primary) ids.push(primary);
+  for (const session of usage?.sessions ?? []) {
+    if (session.session_id && !ids.includes(session.session_id)) ids.push(session.session_id);
+  }
+  return ids;
 }
 
 function summarizeTiming(rows: InstanceRow[]): {
@@ -1198,7 +1210,10 @@ function loadEnvFile(filePath: string): NodeJS.ProcessEnv {
         if (separator <= 0) return [];
         const key = line.slice(0, separator).trim();
         if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) return [];
-        const value = line.slice(separator + 1).trim().replace(/^(["'])(.*)\1$/, '$2');
+        const value = line
+          .slice(separator + 1)
+          .trim()
+          .replace(/^(["'])(.*)\1$/, '$2');
         return [[key, value]];
       }),
   );
@@ -1236,7 +1251,6 @@ function readPositiveInt(raw: string | undefined, fallback: number): number {
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
-
 
 function log(message: string): void {
   process.stderr.write(`${message}\n`);

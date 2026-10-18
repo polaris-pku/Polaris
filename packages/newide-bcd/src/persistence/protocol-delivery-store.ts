@@ -100,13 +100,35 @@ export interface AppendProtocolCall {
 /** All writes on this port use the same SQLite transaction and connection. */
 export interface ProtocolDeliveryTransaction {
   commitState(input: CoordinationStateCommit): PersistedCoordinationEvent[];
+  getOutbox(id: string): ProtocolOutboxRecord | undefined;
+  getInbox(key: ProtocolInboxKey): ProtocolInboxRecord | undefined;
   enqueueOutbox(input: EnqueueProtocolOutbox): ProtocolOutboxRecord;
-  receiveInbox(input: {
-    consumer_id: string;
-    frame: ProtocolFrame;
-    received_at: string;
-  }): { inbox: ProtocolInboxRecord; inserted: boolean };
+  activateOutbox(id: string, expectedRevision: number, at: string): ProtocolOutboxRecord;
+  receiveInbox(input: { consumer_id: string; frame: ProtocolFrame; received_at: string }): {
+    inbox: ProtocolInboxRecord;
+    inserted: boolean;
+  };
   completeInbox(input: CompleteProtocolInbox): ProtocolInboxRecord;
+  claimOutbox(
+    id: string,
+    owner: string,
+    now: string,
+    leaseExpiresAt: string,
+    expectedRevision: number,
+  ): ProtocolOutboxRecord | undefined;
+  markOutboxSent(
+    id: string,
+    owner: string,
+    expectedRevision: number,
+    at: string,
+  ): ProtocolOutboxRecord;
+  claimInbox(
+    key: ProtocolInboxKey,
+    owner: string,
+    now: string,
+    leaseExpiresAt: string,
+    expectedRevision: number,
+  ): ProtocolInboxRecord | undefined;
   appendCall(input: AppendProtocolCall): ProtocolJournalRecord;
 }
 
@@ -132,7 +154,12 @@ export interface ProtocolDeliveryStore {
     now: string,
     leaseExpiresAt: string,
   ): ProtocolOutboxRecord;
-  markOutboxSent(id: string, owner: string, expectedRevision: number, at: string): ProtocolOutboxRecord;
+  markOutboxSent(
+    id: string,
+    owner: string,
+    expectedRevision: number,
+    at: string,
+  ): ProtocolOutboxRecord;
   retryOutbox(
     id: string,
     owner: string,

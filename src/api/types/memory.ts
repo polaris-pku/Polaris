@@ -3,7 +3,7 @@
  *
  * ContextPack 是 Coordinator → Agent 之间传递记忆信息的数据载体。
  *
- * 本文件同时是 32 个 `memory.*` JSON-RPC 方法的**线上形状**镜像。权威源逐字对齐：
+ * 本文件同时描述界面使用的 `memory.*` JSON-RPC **线上形状**。权威源：
  *   - `packages/newide-bcd/src/rpc/memory-methods.ts`（参数 zod schema + result 信封键）
  *   - `packages/newide-bcd/src/app/b-memory-backend-service.ts`（capabilities / buffer / search）
  *   - `packages/newide-bcd/src/memory/ports/*`（AgentBoard / Buffer / Repository DTO）
@@ -198,12 +198,10 @@ export type MemoryOperationName = keyof MemoryOperations;
 /**
  * `memory.getCapabilities` 的能力清单（`BMemoryCapabilities`）。
  *
- * `schema_version` 刻意钉死成字面量：后端升版时这里必须编译报错，而不是悄悄漏读新字段。
- * v1 → v2 的变化是新增了 `skill_review` 块，并把 operations 补齐到 31 个键；
- * 上游随后又加了 `promote_experience` 与 `reindex`，现为 33 个键。
+ * 同时接收 v2 与 v4；v4 声明交付与认领能力。
+ * external 描述在线执行与记忆维护的业务边界，不表示消费者必须位于宿主进程之外。
  */
-export interface MemoryCapabilities {
-  schema_version: 'newide.b-memory-capabilities.v2';
+interface MemoryCapabilitiesBase {
   embedding: MemoryEmbeddingRuntime;
   /** `auto_approve` = 晋升出来的技能直接 approved（NEWIDE_B_SKILL_AUTO_APPROVE），无需人工审核队列。 */
   skill_review: {
@@ -211,6 +209,24 @@ export interface MemoryCapabilities {
   };
   operations: MemoryOperations;
 }
+
+export type MemoryCapabilities = MemoryCapabilitiesBase &
+  (
+    | { schema_version: 'newide.b-memory-capabilities.v2' }
+    | {
+        schema_version: 'newide.b-memory-capabilities.v4';
+        memory_maintenance: {
+          ownership: 'external';
+          context_delivery: MemoryOperationCapability;
+          driver_feedback_outbox: MemoryOperationCapability;
+          claim: MemoryOperationCapability & {
+            isolation: 'process_mutex' | 'exclusive_lock_file' | 'unavailable';
+            lease_ms: number;
+            max_attempts: number;
+          };
+        };
+      }
+  );
 
 // ── Agent Board 视图（memory.listAgents / getAgent / createAgent / updateAgent） ──
 
@@ -243,7 +259,7 @@ export interface RpcAgentMetrics {
   promoted_skill_count: number;
   /** 所有经验的平均置信度（0~1）。 */
   avg_confidence: number;
-  token_cost_total: number;
+  token_cost_total?: number;
   first_task_at?: string;
   last_task_at?: string;
   last_won_at?: string;
@@ -448,6 +464,32 @@ export interface RpcBufferState {
   pending_seqs: number[];
   dead_letter_seqs: number[];
   dead_letters: RpcDeadLetterEntry[];
+  delivery?: {
+    available: boolean;
+    context: RpcDeliveryStatusCounts;
+    feedback: RpcDeliveryStatusCounts;
+    dead_letters: Array<{
+      channel: 'context' | 'feedback' | 'pending_feedback';
+      id: string;
+      task_id: string;
+      attempt_count: number;
+      last_error?: string;
+      updated_at: string;
+    }>;
+    archive_backlog: Array<{
+      delivery_id: string;
+      task_id: string;
+      buffer_seq: number;
+      updated_at: string;
+    }>;
+  };
+}
+
+export interface RpcDeliveryStatusCounts {
+  pending: number;
+  processing: number;
+  processed: number;
+  dead_letter: number;
 }
 
 /** Driver 6 字段报告中的产出制品。 */
@@ -540,11 +582,8 @@ export interface RpcAgentContextSnapshot {
 /**
  * `memory.getPendingBuffer` 的 result.buffer。
  *
- * ⚠️ 线上键名是驼峰的 `agentContext`，不是 snake_case。后端 `MemoryMethodsService` 与
- * `BMemoryBackendService` 都把它声明成 `agent_context`，但值是从
- * `BufferRepository.getPendingBuffer` 原样透传的，两个适配器（file / in-memory）都发
- * `agentContext`；TS 因为可选属性的多余属性检查不作用于非字面量返回值而没咬住。
- * 以实际线上键为准，这里不跟着后端的错误声明走。
+ * 上下文使用驼峰 agentContext。新版用 agentContextStatus 区分缺席与读取失败；
+ * 状态可选仅为兼容当前内嵌旧版后端，不以 undefined 推断读取出错。
  *
  * seq 不存在 / 已处理 / 已进死信时后端返回 undefined，`JSON.stringify` 会把整个键丢掉，
  * 于是 result 序列化成 `{}` —— RPC 映射里的 `buffer` 必须是可选的。
@@ -552,6 +591,8 @@ export interface RpcAgentContextSnapshot {
 export interface RpcPendingBuffer {
   snapshot: RpcBufferSnapshot;
   agentContext?: RpcAgentContextSnapshot;
+  agentContextStatus?: 'present' | 'absent' | 'unreadable';
+  agentContextError?: string;
 }
 
 // ── 退休（memory.retirementScan / retireAgent） ──

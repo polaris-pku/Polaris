@@ -12,6 +12,7 @@ import {
 import { buildResumePackage, buildSafepointCheckpoint, type ResumePackage } from '../checkpoint';
 import {
   parseTaskCursorInput,
+  type CoordinationStateCommit,
   type CoordinationStateStore,
   type MailboxStateStore,
   type PersistedRunMode,
@@ -32,12 +33,23 @@ import type { AppRunEvent } from '../app/run-registry';
 import { projectPersistedRunSnapshot } from '../app/task-run-snapshot-projector';
 import { projectTaskSnapshot, type TaskRunFact } from '../app/task-snapshot-projector';
 import type { ParticipantSessionRegistry } from './participant-session-registry';
+import type {
+  SapCancelFrame,
+  SapExecuteDispatch,
+  SapExecutionAdmission,
+  SapResultDisposition,
+  SapResultFrame,
+  SapTaskBridge,
+} from './sap-task-bridge';
+import type { AapAskDispatch, AapMailboxBridge } from './aap-mailbox-bridge';
 
 export interface TaskProcessorOptions {
   now?: () => string;
   createEventId?: () => string;
   runsRoot?: string;
   participantSessions?: ParticipantSessionRegistry;
+  sapBridge?: SapTaskBridge;
+  aapBridge?: AapMailboxBridge;
 }
 
 export interface BeginTaskRunInput {
@@ -72,6 +84,7 @@ export interface StartTaskStageInput {
   expected_cursor: TaskResumeCursor;
   invocation_id: string;
   event?: Event;
+  sap_execute?: SapExecuteDispatch;
 }
 
 export interface AdvanceTaskStageInput extends StartTaskStageInput {
@@ -83,6 +96,7 @@ export interface AdvanceTaskStageInput extends StartTaskStageInput {
   session_id?: string;
   final_output?: PersistedTaskFinalOutput;
   warnings?: string[];
+  sap_result?: { admission: SapExecutionAdmission; frame: SapResultFrame };
 }
 
 export interface FailTaskStageInput extends StartTaskStageInput {
@@ -91,6 +105,8 @@ export interface FailTaskStageInput extends StartTaskStageInput {
   artifact_refs?: string[];
   owner_agent_id?: string;
   session_id?: string;
+  sap_result?: { admission: SapExecutionAdmission; frame: SapResultFrame };
+  sap_cancel?: { dispatch: SapExecuteDispatch; frame: SapCancelFrame };
 }
 
 export interface TaskStageCommitResult {
@@ -105,8 +121,6 @@ export interface TaskRunExecutionState {
   memory_ablation?: 'B0' | 'B1' | 'B2' | 'B3' | 'B4';
   task_request: TaskCreateRequest;
   workspace_path: string;
-  /** Stable user destination; Mailbox Runs may execute in a Council scratch workspace. */
-  delivery_workspace_path?: string;
   resume_cursor: TaskResumeCursor;
   cursor_input?: TaskCursorInput;
   council_override: boolean;
@@ -116,6 +130,8 @@ export interface TaskRunExecutionState {
    * 拿不到 gate/execute 阶段的产物。
    */
   restarted_from_run_id?: string;
+  /** False means the saved session only reached initialization, not its task prompt. */
+  native_task_prompt_dispatched?: boolean;
 }
 
 export interface FinishTaskRunInput {
@@ -150,6 +166,22 @@ export interface TaskMailboxWaitContext extends TaskLaunchContext {
   sender_role_id: string;
   delivery_ids: string[];
   waiting_reason: string;
+}
+
+export interface TaskInterruptRequest {
+  reason: string;
+  source: 'user' | 'shutdown';
+}
+
+/** Abort reason carried from the application interrupt API into the stage loop. */
+export class TaskInterruptedError extends Error {
+  constructor(
+    readonly source: TaskInterruptRequest['source'],
+    reason: string,
+  ) {
+    super(reason);
+    this.name = 'TaskInterruptedError';
+  }
 }
 
 export class TaskProcessorTaskNotFoundError extends Error {
@@ -195,6 +227,8 @@ export class TaskProcessor {
         Partial<Pick<MailboxStateStore, 'getMailboxHighWatermark' | 'listMailboxDeliveriesAfter'>>)
     | undefined;
   private readonly participantSessions?: ParticipantSessionRegistry;
+  private readonly sapBridge?: SapTaskBridge;
+  private readonly aapBridge?: AapMailboxBridge;
 
   constructor(
     private readonly store: CoordinationStateStore,
@@ -210,6 +244,8 @@ export class TaskProcessor {
     this.createEventId = options.createEventId ?? (() => createId('event'));
     this.runsRoot = options.runsRoot ?? '.newide/runs';
     if (options.participantSessions) this.participantSessions = options.participantSessions;
+    if (options.sapBridge) this.sapBridge = options.sapBridge;
+    if (options.aapBridge) this.aapBridge = options.aapBridge;
     this.mailboxStore = options.mailboxStore;
   }
 
@@ -221,13 +257,7 @@ export class TaskProcessor {
     }
     const runIntent = input.run_intent ?? { type: 'create' as const };
     if (existing) {
-      // A Council participant may resume in its isolated Run workspace while
-      // the parent Task keeps its user workspace immutable.
-      const taskWorkspacePath =
-        runIntent.type === 'mailbox_continuation'
-          ? existing.task.workspace_path
-          : input.workspace_path;
-      assertImmutableTaskDefinition(existing.task, input.task_request, taskWorkspacePath);
+      assertImmutableTaskDefinition(existing.task, input.task_request, input.workspace_path);
     }
     const cursorInput = input.cursor_input ?? defaultCursorInput(input.run_id);
     assertBeginRunIntent(
@@ -361,7 +391,7 @@ export class TaskProcessor {
         invocation_id: input.invocation_id,
       });
     assertStageEvent(event, 'handler.started', aggregate.task.task_id, input.run_id);
-    const committed = this.store.commitState({
+    const commit: CoordinationStateCommit = {
       expected_task_revision: aggregate.task.revision,
       task: {
         ...aggregate.task,
@@ -382,16 +412,168 @@ export class TaskProcessor {
             invocation_id: input.invocation_id,
             started_at: timestamp,
             started_event_id: event.event_id,
+            ...(input.sap_execute
+              ? {
+                  sap_outbox_id: input.sap_execute.outbox_id,
+                  sap_exchange_id: input.sap_execute.frame.exchange_id,
+                }
+              : {}),
           },
         },
         updated_at: timestamp,
       },
       events: [event],
-    });
+    };
+    const committed = input.sap_execute
+      ? this.requireSapBridge().commitDispatch(commit, input.sap_execute)
+      : this.store.commitState(commit);
     return {
       snapshot: this.getTaskSnapshot(aggregate.task.task_id),
       committed_events: committed,
     };
+  }
+
+  /**
+   * Persist one Council seat dispatch together with the current Task stage.
+   * Seats may be dispatched concurrently; each attempt rereads the aggregate
+   * and retries the existing optimistic revision boundary.
+   */
+  recordCouncilSapDispatch(runId: string, dispatch: SapExecuteDispatch): void {
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const aggregate = this.requireAggregateForRun(runId);
+      const run = requireRun(aggregate, runId);
+      const activeStage = readActiveStage(aggregate.runtime_state.diagnostics);
+      if (!activeStage || activeStage.cursor !== 'council') {
+        throw new Error(`Council SAP dispatch requires an active council stage for ${runId}`);
+      }
+      const rawActiveStage =
+        aggregate.runtime_state.diagnostics.active_stage &&
+        typeof aggregate.runtime_state.diagnostics.active_stage === 'object'
+          ? (aggregate.runtime_state.diagnostics.active_stage as Record<string, unknown>)
+          : {};
+      const storedExchangeIds = Array.isArray(rawActiveStage.council_sap_exchange_ids)
+        ? (rawActiveStage.council_sap_exchange_ids as unknown[]).filter(
+            (value): value is string => typeof value === 'string',
+          )
+        : [];
+      if (storedExchangeIds.includes(dispatch.frame.exchange_id)) return;
+      const timestamp = dispatch.frame.created_at;
+      const event = this.createEvent(
+        'council.sap.dispatched',
+        dispatch.frame.exchange_id,
+        aggregate.task.task_id,
+        runId,
+        {
+          cursor: 'council',
+          exchange_id: dispatch.frame.exchange_id,
+          role_id: dispatch.frame.consumer.role_id,
+          council_seat: dispatch.frame.council_seat,
+        },
+      );
+      const commit: CoordinationStateCommit = {
+        expected_task_revision: aggregate.task.revision,
+        task: { ...aggregate.task, revision: aggregate.task.revision + 1, updated_at: timestamp },
+        run: { ...run, revision: run.revision + 1, updated_at: timestamp },
+        runtime_state: {
+          ...aggregate.runtime_state,
+          diagnostics: {
+            ...aggregate.runtime_state.diagnostics,
+            active_stage: {
+              ...(rawActiveStage as Record<string, unknown>),
+              council_sap_exchange_ids: [...storedExchangeIds, dispatch.frame.exchange_id],
+            },
+          },
+          updated_at: timestamp,
+        },
+        events: [event],
+      };
+      try {
+        this.requireSapBridge().commitDispatch(commit, dispatch);
+        return;
+      } catch (error) {
+        if (!isRevisionConflict(error) || attempt === 3) throw error;
+      }
+    }
+  }
+
+  /** Persist an accepted Council seat receipt with the active Task stage. */
+  recordCouncilSapResult(
+    runId: string,
+    admission: SapExecutionAdmission,
+    result: SapResultFrame,
+    phase: 'proposal' | 'review' | 'synthesis',
+    participantId: string,
+  ): SapResultDisposition {
+    const bridge = this.requireSapBridge();
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      const disposition = bridge.classifyResult(admission, result);
+      if (disposition !== 'accepted') {
+        return bridge.acceptResult(admission, result);
+      }
+      const aggregate = this.requireAggregateForRun(runId);
+      const run = requireRun(aggregate, runId);
+      const activeStage = readActiveStage(aggregate.runtime_state.diagnostics);
+      if (!activeStage || activeStage.cursor !== 'council') {
+        throw new Error(`Council SAP result requires an active council stage for ${runId}`);
+      }
+      const rawActiveStage =
+        aggregate.runtime_state.diagnostics.active_stage &&
+        typeof aggregate.runtime_state.diagnostics.active_stage === 'object'
+          ? (aggregate.runtime_state.diagnostics.active_stage as Record<string, unknown>)
+          : {};
+      const storedResults = Array.isArray(rawActiveStage.council_sap_result_exchange_ids)
+        ? (rawActiveStage.council_sap_result_exchange_ids as unknown[]).filter(
+            (value): value is string => typeof value === 'string',
+          )
+        : [];
+      if (storedResults.includes(result.exchange_id)) return 'duplicate';
+      const timestamp = result.created_at;
+      const event = this.createEvent(
+        'council.sap.result.received',
+        result.exchange_id,
+        aggregate.task.task_id,
+        runId,
+        {
+          cursor: 'council',
+          phase,
+          participant_id: participantId,
+          exchange_id: result.exchange_id,
+          causation_id: result.causation_id,
+          status: result.status,
+        },
+      );
+      const commit: CoordinationStateCommit = {
+        expected_task_revision: aggregate.task.revision,
+        task: { ...aggregate.task, revision: aggregate.task.revision + 1, updated_at: timestamp },
+        run: { ...run, revision: run.revision + 1, updated_at: timestamp },
+        runtime_state: {
+          ...aggregate.runtime_state,
+          diagnostics: {
+            ...aggregate.runtime_state.diagnostics,
+            active_stage: {
+              ...rawActiveStage,
+              council_sap_result_exchange_ids: [...storedResults, result.exchange_id],
+            },
+          },
+          updated_at: timestamp,
+        },
+        events: [event],
+      };
+      try {
+        bridge.commitResult(commit, admission, result);
+        return 'accepted';
+      } catch (error) {
+        if (
+          attempt < 3 &&
+          error instanceof Error &&
+          /SAP result .* is (duplicate|late)/.test(error.message)
+        ) {
+          continue;
+        }
+        throw error;
+      }
+    }
+    throw new Error(`Council SAP result ${result.exchange_id} could not be committed`);
   }
 
   advanceStage(input: AdvanceTaskStageInput): TaskStageCommitResult {
@@ -500,15 +682,29 @@ export class TaskProcessor {
     };
     if (completing) delete runtimeState.current_run_id;
 
+    const aapDispatch =
+      nextInput.cursor === 'mailbox_wait'
+        ? this.createAapMailboxDispatch(aggregate, run, input, nextInput)
+        : undefined;
+
     let committed: PersistedCoordinationEvent[];
     try {
-      committed = this.store.commitState({
+      const commit = {
         expected_task_revision: aggregate.task.revision,
         task,
         run: nextRun,
         runtime_state: runtimeState,
         events: [event, ...(terminalEvent ? [terminalEvent] : [])],
-      });
+      };
+      committed = input.sap_result
+        ? this.requireSapBridge().commitResult(
+            commit,
+            input.sap_result.admission,
+            input.sap_result.frame,
+          )
+        : aapDispatch
+          ? this.requireAapBridge().commitWait(commit, aapDispatch)
+          : this.store.commitState(commit);
     } catch (error) {
       throw new TaskProcessorStageCommitError('handler.completed', error);
     }
@@ -525,6 +721,42 @@ export class TaskProcessor {
       snapshot: this.getTaskSnapshot(aggregate.task.task_id),
       committed_events: committed,
     };
+  }
+
+  private createAapMailboxDispatch(
+    aggregate: PersistedTaskAggregate,
+    run: PersistedRunState,
+    input: AdvanceTaskStageInput,
+    nextInput: Extract<TaskCursorInput, { cursor: 'mailbox_wait' }>,
+  ): AapAskDispatch | undefined {
+    if (!this.aapBridge || !this.mailboxStore) return undefined;
+    if (nextInput.delivery_ids.length !== 1) {
+      throw new Error('AAP mailbox wait requires exactly one delivery');
+    }
+    const deliveryId = nextInput.delivery_ids[0]!;
+    const envelope = this.mailboxStore.getMailboxEnvelope(deliveryId);
+    if (!envelope) throw new Error(`Mailbox delivery ${deliveryId} was not found`);
+    const fromRoleId = input.owner_agent_id ?? aggregate.task.owner_agent_id;
+    if (!fromRoleId) throw new Error('AAP mailbox wait requires the sender Agent role');
+    const content =
+      envelope.message.content?.trim() ||
+      (typeof envelope.message.payload.content === 'string'
+        ? envelope.message.payload.content
+        : JSON.stringify(envelope.message.payload));
+    const activeStage = readActiveStage(aggregate.runtime_state.diagnostics);
+    const causationId = activeStage ? readPayloadString(activeStage, 'sap_exchange_id') : undefined;
+    return this.aapBridge.createAsk({
+      task_id: envelope.message.task_id,
+      run_id: run.run_id,
+      from_role_id: fromRoleId,
+      to_role_id: envelope.delivery.recipient_role_id,
+      message_id: envelope.message.message_id,
+      delivery_id: envelope.delivery.delivery_id,
+      content,
+      ...(envelope.delivery.deadline_at ? { deadline_at: envelope.delivery.deadline_at } : {}),
+      ...(causationId ? { causation_id: causationId } : {}),
+      exchange_id: `aap_ask_${envelope.message.message_id}`,
+    });
   }
 
   failStage(input: FailTaskStageInput): TaskStageCommitResult {
@@ -559,7 +791,7 @@ export class TaskProcessor {
       ...(input.evidence_ref ? [input.evidence_ref.uri] : []),
       ...(input.artifact_refs ?? []),
     ]);
-    const committed = this.store.commitState({
+    const commit: CoordinationStateCommit = {
       expected_task_revision: aggregate.task.revision,
       task: {
         ...aggregate.task,
@@ -593,7 +825,20 @@ export class TaskProcessor {
         updated_at: timestamp,
       },
       events: [event, terminalEvent],
-    });
+    };
+    const committed = input.sap_cancel
+      ? this.requireSapBridge().commitCancel(
+          commit,
+          input.sap_cancel.dispatch,
+          input.sap_cancel.frame,
+        )
+      : input.sap_result
+        ? this.requireSapBridge().commitResult(
+            commit,
+            input.sap_result.admission,
+            input.sap_result.frame,
+          )
+        : this.store.commitState(commit);
     return {
       snapshot: this.getTaskSnapshot(aggregate.task.task_id),
       committed_events: committed,
@@ -603,11 +848,38 @@ export class TaskProcessor {
   getRunExecutionState(runId: string): TaskRunExecutionState {
     const aggregate = this.requireAggregateForRun(runId);
     const run = requireRun(aggregate, runId);
+    const lineage = new Set<string>();
+    let ancestor: PersistedRunState | undefined = run;
+    while (ancestor && !lineage.has(ancestor.run_id)) {
+      lineage.add(ancestor.run_id);
+      ancestor = ancestor.restarted_from_run_id
+        ? aggregate.runs.find((candidate) => candidate.run_id === ancestor?.restarted_from_run_id)
+        : undefined;
+    }
+    const primaryRole =
+      aggregate.runtime_state.cursor_input?.cursor === 'execute_agent'
+        ? aggregate.runtime_state.cursor_input.winner_agent_id
+        : (aggregate.task.owner_agent_id ?? aggregate.task.role_id);
+    const nativeEvents = aggregate.events.filter(
+      (event) =>
+        event.run_id &&
+        lineage.has(event.run_id) &&
+        (!primaryRole || event.payload.role_id === primaryRole),
+    );
+    const taskPromptDispatched = nativeEvents.some(
+      (event) => event.event_type === 'driver.prompt_dispatching',
+    );
+    const sessionInitializing = nativeEvents.some(
+      (event) => event.event_type === 'driver.session_initializing',
+    );
     const memoryAblation = readMemoryAblation(aggregate.runtime_state.diagnostics.memory_ablation);
     return {
       task_id: aggregate.task.task_id,
       run_id: runId,
       mode: run.mode,
+      ...(taskPromptDispatched || sessionInitializing
+        ? { native_task_prompt_dispatched: taskPromptDispatched }
+        : {}),
       ...(memoryAblation ? { memory_ablation: memoryAblation } : {}),
       task_request: {
         spec: aggregate.task.spec,
@@ -619,7 +891,6 @@ export class TaskProcessor {
         ...(aggregate.task.budget ? { budget: { ...aggregate.task.budget } } : {}),
       },
       workspace_path: run.workspace_path,
-      delivery_workspace_path: aggregate.task.workspace_path,
       resume_cursor: aggregate.runtime_state.resume_cursor,
       ...(aggregate.runtime_state.cursor_input
         ? { cursor_input: aggregate.runtime_state.cursor_input }
@@ -746,6 +1017,64 @@ export class TaskProcessor {
         updated_at: timestamp,
       },
       events: [taskBlocked],
+    });
+    return this.getTaskSnapshot(taskId);
+  }
+
+  /**
+   * Release a Mailbox wait at its local deadline without inventing a reply
+   * from the recipient. The Task becomes terminal with an explicit timeout
+   * error; a later Mailbox reply remains an auditable late message.
+   */
+  expireMailboxWait(taskId: string, reason: string): TaskSnapshot {
+    const aggregate = this.store.getTaskAggregate(taskId);
+    if (!aggregate) throw new TaskProcessorTaskNotFoundError(taskId);
+    if (aggregate.task.status === 'failed' && aggregate.task.error?.code === 'mailbox_timeout') {
+      return projectAggregate(aggregate, this.runsRoot);
+    }
+    assertTaskStatusTransition(aggregate.task.status, 'failed');
+    const runId =
+      readPayloadString(aggregate.runtime_state.diagnostics, 'mailbox_wait_run_id') ??
+      readPayloadString(aggregate.runtime_state.interrupt_state ?? {}, 'interrupted_run_id') ??
+      aggregate.runs.at(-1)?.run_id;
+    if (!runId || !aggregate.runs.some((run) => run.run_id === runId)) {
+      throw new Error(`Cannot expire mailbox wait for ${taskId}: no associated Run`);
+    }
+    const timestamp = this.now();
+    const taskFailed = this.createEvent('task.failed', taskId, taskId, runId, {
+      code: 'mailbox_timeout',
+      reason,
+    });
+    const { current_run_id: _currentRunId, ...runtimeWithoutCurrentRun } = aggregate.runtime_state;
+    this.store.commitState({
+      expected_task_revision: aggregate.task.revision,
+      task: {
+        ...aggregate.task,
+        status: 'failed',
+        error: { code: 'mailbox_timeout', message: reason },
+        revision: aggregate.task.revision + 1,
+        updated_at: timestamp,
+      },
+      runtime_state: {
+        ...runtimeWithoutCurrentRun,
+        resume_cursor: 'done',
+        cursor_input: { cursor: 'done' },
+        waiting_on: [],
+        interrupt_state: {
+          type: 'mailbox_timeout',
+          reason,
+          ...(aggregate.runtime_state.cursor_input?.cursor === 'mailbox_wait'
+            ? { delivery_ids: [...aggregate.runtime_state.cursor_input.delivery_ids] }
+            : {}),
+        },
+        diagnostics: {
+          ...aggregate.runtime_state.diagnostics,
+          mailbox_timeout: true,
+          mailbox_timeout_code: 'mailbox_timeout',
+        },
+        updated_at: timestamp,
+      },
+      events: [taskFailed],
     });
     return this.getTaskSnapshot(taskId);
   }
@@ -917,6 +1246,28 @@ export class TaskProcessor {
       .map((aggregate) => this.recoverInterruptedTask(aggregate));
   }
 
+  /**
+   * Persist a user/shutdown interruption at the current stage boundary.
+   *
+   * The active stage is intentionally left as the resume cursor: a driver turn
+   * may have produced partial workspace changes, and resume must re-enter that
+   * stage with the captured workspace rather than silently restarting the Task.
+   */
+  interruptRun(runId: string, input: TaskInterruptRequest): TaskSnapshot {
+    const aggregate = this.requireAggregateForRun(runId);
+    const run = requireRun(aggregate, runId);
+    if (!isActiveRun(run)) return this.getTaskSnapshot(aggregate.task.task_id);
+    return this.commitInterruptedRun(aggregate, run, {
+      trigger: input.source === 'shutdown' ? 'shutdown' : 'manual',
+      interrupt_state: {
+        type: 'user_interrupted',
+        source: input.source,
+        reason: input.reason,
+        interrupted_run_id: run.run_id,
+      },
+    });
+  }
+
   finishRun(input: FinishTaskRunInput): TaskSnapshot {
     const aggregate = this.requireAggregateForRun(input.run_id);
     const run = requireRun(aggregate, input.run_id);
@@ -966,7 +1317,7 @@ export class TaskProcessor {
     const { active_stage: _activeStage, ...diagnosticsWithoutActiveStage } =
       aggregate.runtime_state.diagnostics;
 
-    this.store.commitState({
+    const commit: CoordinationStateCommit = {
       expected_task_revision: aggregate.task.revision,
       task: {
         ...taskWithoutTerminalOutput,
@@ -1003,7 +1354,22 @@ export class TaskProcessor {
         updated_at: timestamp,
       },
       events: [terminalEvent],
-    });
+    };
+    const activeStage = readActiveStage(aggregate.runtime_state.diagnostics);
+    const sapOutboxId =
+      input.status === 'cancelled'
+        ? readPayloadString(activeStage ?? {}, 'sap_outbox_id')
+        : undefined;
+    const sapDispatch = sapOutboxId ? this.requireSapBridge().getDispatch(sapOutboxId) : undefined;
+    if (sapDispatch) {
+      this.requireSapBridge().commitCancel(
+        commit,
+        sapDispatch,
+        this.requireSapBridge().createCancel({ execute: sapDispatch.frame }),
+      );
+    } else {
+      this.store.commitState(commit);
+    }
     return this.getTaskSnapshot(aggregate.task.task_id);
   }
 
@@ -1240,38 +1606,56 @@ export class TaskProcessor {
     return aggregate;
   }
 
+  private requireSapBridge(): SapTaskBridge {
+    if (!this.sapBridge) throw new Error('SAP bridge is not configured');
+    return this.sapBridge;
+  }
+
+  private requireAapBridge(): AapMailboxBridge {
+    if (!this.aapBridge) throw new Error('AAP bridge is not configured');
+    return this.aapBridge;
+  }
+
   private recoverInterruptedTask(aggregate: PersistedTaskAggregate): TaskSnapshot {
     const run = aggregate.runs.find((candidate) => isActiveRun(candidate));
     if (!run) return projectAggregate(aggregate, this.runsRoot);
+    return this.commitInterruptedRun(aggregate, run, {
+      trigger: 'blocked',
+      inherit_mechanical_snapshot: true,
+      interrupt_state: {
+        type: 'process_interrupted',
+        reason: 'The backend process ended before the active run reached a terminal state.',
+        interrupted_run_id: run.run_id,
+      },
+    });
+  }
+
+  private commitInterruptedRun(
+    aggregate: PersistedTaskAggregate,
+    run: PersistedRunState,
+    input: {
+      trigger: PersistedFullCheckpoint['trigger'];
+      interrupt_state: Record<string, unknown>;
+      inherit_mechanical_snapshot?: boolean;
+    },
+  ): TaskSnapshot {
     assertTaskStatusTransition(aggregate.task.status, 'blocked');
 
     const timestamp = this.now();
-    const reason = 'The backend process ended before the active run reached a terminal state.';
-    const interruptState = {
-      type: 'process_interrupted',
-      reason,
-      interrupted_run_id: run.run_id,
-    };
     const latestCheckpoint = this.store.getLatestCheckpoint(aggregate.task.task_id);
-    // Built through buildSafepointCheckpoint so the interrupt captures a real workspace
-    // anchor. This path used to hardcode base_commit 'unknown' with no snapshot, which
-    // made every recovery checkpoint undeployable for content restore.
     const checkpoint = buildSafepointCheckpoint({
       aggregate,
       run_id: run.run_id,
-      trigger: 'blocked',
-      ...(latestCheckpoint
+      trigger: input.trigger,
+      ...(input.inherit_mechanical_snapshot && latestCheckpoint
         ? {
             parent_checkpoint_id: latestCheckpoint.checkpoint_id,
-            // Recovery happens after the crash, so the disk is no longer authoritative.
-            // Carry the last safepoint's snapshot forward instead of pinning this
-            // checkpoint to whatever the crash (or anything since) left behind.
             inherit_mechanical_snapshot: latestCheckpoint.mechanical_snapshot,
           }
         : {}),
       ...(this.mailboxStore ? { mailboxStore: this.mailboxStore } : {}),
       ...(this.participantSessions ? { participantSessions: this.participantSessions } : {}),
-      interrupt_state: interruptState,
+      interrupt_state: input.interrupt_state,
       now: timestamp,
     });
     const checkpointId = checkpoint.checkpoint_id;
@@ -1280,21 +1664,31 @@ export class TaskProcessor {
       run.run_id,
       aggregate.task.task_id,
       run.run_id,
-      { reason, resume_cursor: aggregate.runtime_state.resume_cursor },
+      {
+        reason: String(input.interrupt_state.reason ?? 'Task interrupted'),
+        resume_cursor: aggregate.runtime_state.resume_cursor,
+      },
     );
     const taskBlocked = this.createEvent(
       'task.blocked',
       aggregate.task.task_id,
       aggregate.task.task_id,
       run.run_id,
-      { reason, interrupted_run_id: run.run_id },
+      {
+        reason: String(input.interrupt_state.reason ?? 'Task interrupted'),
+        interrupted_run_id: run.run_id,
+      },
     );
     const checkpointSaved = this.createEvent(
       'checkpoint.saved',
       checkpointId,
       aggregate.task.task_id,
       run.run_id,
-      { checkpoint_id: checkpointId, resume_cursor: aggregate.runtime_state.resume_cursor },
+      {
+        checkpoint_id: checkpointId,
+        resume_cursor: aggregate.runtime_state.resume_cursor,
+        trigger: input.trigger,
+      },
     );
     const { current_run_id: _currentRunId, ...runtimeWithoutCurrentRun } = aggregate.runtime_state;
 
@@ -1316,7 +1710,7 @@ export class TaskProcessor {
       runtime_state: {
         ...runtimeWithoutCurrentRun,
         ...(checkpoint.cursor_input ? { cursor_input: checkpoint.cursor_input } : {}),
-        interrupt_state: interruptState,
+        interrupt_state: input.interrupt_state,
         diagnostics: {
           ...aggregate.runtime_state.diagnostics,
           interrupted_run_id: run.run_id,
@@ -1353,6 +1747,7 @@ export class TaskProcessor {
 function projectAggregate(aggregate: PersistedTaskAggregate, runsRoot: string): TaskSnapshot {
   const projected = projectTaskSnapshot({
     task_id: aggregate.task.task_id,
+    workspace_path: aggregate.task.workspace_path,
     task_request: {
       spec: aggregate.task.spec,
       ...(aggregate.task.role_id ? { role_id: aggregate.task.role_id } : {}),
@@ -1374,7 +1769,6 @@ function projectAggregate(aggregate: PersistedTaskAggregate, runsRoot: string): 
     task: {
       ...projected.task,
       status: aggregate.task.status,
-      workspace_path: aggregate.task.workspace_path,
       ...(aggregate.task.owner_agent_id ? { owner_agent_id: aggregate.task.owner_agent_id } : {}),
       updated_at: aggregate.task.updated_at,
     },
@@ -1563,7 +1957,7 @@ function assertBeginRunIntent(
     if (
       source.message.task_id !== input.task_id ||
       reply.message.task_id !== input.task_id ||
-      input.workspace_path !== source.message.workspace_path ||
+      input.workspace_path !== existing.task.workspace_path ||
       reply.message.workspace_path !== source.message.workspace_path ||
       source.message.from_role_id !== existing.task.owner_agent_id ||
       reply.message.from_role_id !== source.delivery.recipient_role_id ||

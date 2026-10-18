@@ -235,6 +235,7 @@ describe('driver usage 账本的服务级接线', () => {
       undefined,
       undefined,
       undefined,
+      undefined,
       new FileRunDriverUsageJsonlSink(runsRoot),
     );
 

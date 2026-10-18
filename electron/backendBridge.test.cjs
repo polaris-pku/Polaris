@@ -9,6 +9,7 @@ test('serializes restarts, preserves API authentication and reports B Memory set
   const handlers = new Map();
   const appHandlers = new Map();
   const processes = [];
+  const statuses = [];
   let appQuitCalls = 0;
   const settings = {
     provider: 'anthropic',
@@ -26,6 +27,7 @@ test('serializes restarts, preserves API authentication and reports B Memory set
     proc.pid = 10_000 + processes.length;
     proc.exitCode = null;
     proc.signalCode = null;
+    proc.requests = [];
     proc.stdout = new PassThrough();
     proc.stderr = new PassThrough();
     proc.stdin = {
@@ -33,12 +35,26 @@ test('serializes restarts, preserves API authentication and reports B Memory set
       ended: false,
       write(line) {
         const request = JSON.parse(String(line));
-        queueMicrotask(() => {
+        proc.requests.push(request);
+        queueMicrotask(async () => {
+          let result;
+          if (request.method === 'system.ping') result = { protocol_version: 'test' };
+          else if (request.method === 'system.readiness') {
+            result = { service: { status: 'operational' } };
+          } else if (request.method === 'task.list') {
+            result = { tasks: [{ task: { task_id: 'active-task' }, current_run: {} }] };
+          } else if (request.method === 'task.interrupt') {
+            await proc.interruptWait;
+            result = { task: { task_id: 'active-task', status: 'blocked' } };
+          } else if (request.method === 'task.create') {
+            await proc.createWait;
+            result = { task: { task_id: 'active-task', status: 'executing' }, current_run: {} };
+          } else assert.fail(`Unexpected RPC: ${request.method}`);
           proc.stdout.write(
             `${JSON.stringify({
               jsonrpc: '2.0',
               id: request.id,
-              result: { protocol_version: 'test' },
+              result,
             })}\n`,
           );
         });
@@ -127,7 +143,13 @@ test('serializes restarts, preserves API authentication and reports B Memory set
     else process.env.NEWIDE_B_DATABASE_URL = originalDatabaseUrl;
   });
 
-  bridge.setupBackendBridge(() => null);
+  bridge.setupBackendBridge(() => ({
+    webContents: {
+      send(channel, payload) {
+        if (channel === 'backend:status') statuses.push(payload);
+      },
+    },
+  }));
   await new Promise(setImmediate);
   assert.equal(processes.length, 1);
   const env = processes[0].spawnOptions.env;
@@ -136,6 +158,8 @@ test('serializes restarts, preserves API authentication and reports B Memory set
   assert.equal(env.NEWIDE_LLM_PROVIDER, 'anthropic');
   assert.equal(env.NEWIDE_LLM_CREDENTIALLESS, undefined);
   assert.equal(env.POLARIS_MODEL_PROXY_BASE_URL, undefined);
+  assert.equal(env.NEWIDE_EPHEMERAL_ACP_SESSIONS, '0');
+  assert.ok(env.CLAUDE_CONFIG_DIR.endsWith('backend-state/rpc-v1/claude-config'));
   const publicSettings = await handlers.get('backend:getSettings')();
   assert.equal(publicSettings.provider, 'anthropic');
   assert.equal(publicSettings.configured.anthropic.hasKey, true);
@@ -149,13 +173,52 @@ test('serializes restarts, preserves API authentication and reports B Memory set
     model: 'custom-model',
     fastModel: 'custom-fast-model',
   };
+  let confirmInterrupt;
+  processes[0].interruptWait = new Promise((resolve) => {
+    confirmInterrupt = resolve;
+  });
+  let finishCreate;
+  processes[0].createWait = new Promise((resolve) => {
+    finishCreate = resolve;
+  });
+  const creating = handlers.get('backend:call')(null, { method: 'task.create', params: {} });
+  await new Promise(setImmediate);
   const restart = handlers.get('backend:restart')();
+  const racingCreate = handlers.get('backend:call')(null, { method: 'task.create', params: {} });
+  await new Promise(setImmediate);
+  const waitingForReady = handlers.get('backend:call')(null, { method: 'system.ping' });
+  assert.equal(processes[0].stdin.ended, false, 'closed before interruption was confirmed');
+  assert.equal((await racingCreate).ok, false);
+  assert.equal(
+    processes[0].requests.filter((request) => request.method === 'task.create').length,
+    1,
+  );
+  assert.equal(
+    processes[0].requests.some((request) => request.method === 'task.list'),
+    false,
+  );
+  finishCreate();
+  assert.equal((await creating).ok, true);
+  await new Promise(setImmediate);
+  assert.equal(processes[0].requests.at(-1).method, 'task.interrupt');
+  assert.equal(processes[0].stdin.ended, false);
+  confirmInterrupt();
   await new Promise(setImmediate);
   assert.equal(processes[0].stdin.ended, true);
   assert.equal(processes.length, 1, 'replacement spawned before the old backend exited');
 
   processes[0].finish();
   await restart;
+  assert.equal(
+    (await waitingForReady).ok,
+    true,
+    'planned exit rejected a replacement readiness waiter',
+  );
+  assert.equal(
+    statuses.some((entry) => entry.state === 'stopped'),
+    false,
+    'normal replacement was broadcast as a stopped backend',
+  );
   assert.equal(processes.length, 2);
   const customEnv = processes[1].spawnOptions.env;
   assert.equal(customEnv.ANTHROPIC_API_KEY, undefined);
@@ -191,6 +254,46 @@ test('serializes restarts, preserves API authentication and reports B Memory set
     environmentConfigured: true,
   });
 
+  const originalFetch = global.fetch;
+  t.after(() => {
+    global.fetch = originalFetch;
+  });
+  global.fetch = async (url) => {
+    assert.equal(url, 'http://127.0.0.1:4143/accounts/test/v1/models');
+    return new Response(JSON.stringify({ data: [{ id: 'proxy-model' }] }));
+  };
+  settings.modelProxy = { baseUrl: 'http://127.0.0.1:4143/accounts/test', model: 'proxy-model' };
+  const localRestart = handlers.get('backend:restart')();
+  await new Promise(setImmediate);
+  processes[1].finish();
+  await localRestart;
+  assert.equal(processes.length, 3);
+  const localEnv = processes[2].spawnOptions.env;
+  assert.equal(localEnv.POLARIS_MODEL_PROXY_BASE_URL, settings.modelProxy.baseUrl);
+  assert.equal(localEnv.POLARIS_MODEL_PROXY_MODEL, 'proxy-model');
+  assert.equal(localEnv.NEWIDE_LLM_CREDENTIALLESS, '1');
+  assert.equal(localEnv.NEWIDE_LLM_API_KEY, undefined);
+  assert.equal(localEnv.ANTHROPIC_AUTH_TOKEN, undefined);
+  assert.equal(localEnv.ANTHROPIC_API_KEY, undefined);
+  const localStatus = handlers.get('backend:getStatus')();
+  assert.equal(localStatus.auth.providerId, 'local-proxy');
+  assert.equal(localStatus.auth.model, 'proxy-model');
+  assert.equal(localStatus.auth.ready, true);
+  assert.equal((await handlers.get('backend:getSettings')()).provider, 'local-proxy');
+
+  processes[2].finish();
+  const unexpectedExit = handlers.get('backend:getStatus')();
+  assert.equal(unexpectedExit.state, 'error');
+  assert.match(unexpectedExit.message, /意外退出.*code=0/);
+  assert.equal(
+    (await handlers.get('backend:call')(null, { method: 'system.ping' })).ok,
+    false,
+    'unexpected exits must remain explicit failures',
+  );
+  await handlers.get('backend:restart')();
+  assert.equal(processes.length, 4);
+  assert.equal(handlers.get('backend:getStatus')().state, 'ready');
+
   let quitPrevented = false;
   appHandlers.get('before-quit')({
     preventDefault() {
@@ -199,10 +302,10 @@ test('serializes restarts, preserves API authentication and reports B Memory set
   });
   await new Promise(setImmediate);
   assert.equal(quitPrevented, true);
-  assert.equal(processes[1].stdin.ended, true);
+  assert.equal(processes[3].stdin.ended, true);
   assert.equal(appQuitCalls, 0, 'app quit before the backend exited');
 
-  processes[1].finish();
+  processes[3].finish();
   await new Promise(setImmediate);
   assert.equal(appQuitCalls, 1);
 });

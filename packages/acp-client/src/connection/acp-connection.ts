@@ -2,7 +2,7 @@ import { ClientSideConnection, ndJsonStream, RequestError } from "@agentclientpr
 import type { Client, SessionNotification } from "@agentclientprotocol/sdk";
 import spawn from "cross-spawn";
 import { spawnSync, type ChildProcess } from "node:child_process";
-import { EventEmitter, on } from "node:events";
+import { EventEmitter, on, once } from "node:events";
 import { Readable, Writable } from "node:stream";
 import {
   AgentConnection,
@@ -39,6 +39,18 @@ export class AcpConnection implements AgentConnection {
       cwd: options.cwd,
       stdio: ["pipe", "pipe", "pipe"],
     });
+    this.process.on("error", (error) => {
+      this.sdkConn = null;
+      this.emitEvent("stderr", error.message);
+      this.emitEvent("disconnect", { error: error.message });
+    });
+    try {
+      await once(this.process, "spawn");
+    } catch (error) {
+      throw new AgentSpawnError(
+        `Failed to start agent process: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
 
     if (!this.process.stdin || !this.process.stdout) {
       throw new AgentSpawnError("Failed to open stdin/stdout for agent process");
@@ -169,7 +181,11 @@ export class AcpConnection implements AgentConnection {
 
   async authenticate(methodId: string, authMethod: any): Promise<void> {
     if (!this.sdkConn) throw new TransportError("Not connected");
-    await this.sdkConn.authenticate({ methodId, authMethod });
+    await this.sdkConn.authenticate({
+      methodId,
+      authMethod,
+      ...(methodId === "gateway" ? { _meta: authMethod?._meta } : {}),
+    });
   }
 
   async createSession(cwd: string, mcpServers: McpServerConfig[] = []): Promise<SessionRecord> {

@@ -6,6 +6,11 @@ import type {
   DriverRuntimeHandle,
   DriverStreamEventListener,
 } from './contract';
+import {
+  evidenceOf,
+  isDriverTransportError,
+  type DriverExecutionEvidence,
+} from './driver-transport-error';
 
 export interface ExternalDriverTransport {
   invoke(input: DriverPrompt): Promise<DriverRunResult>;
@@ -47,12 +52,39 @@ export class ExternalDriverRuntime implements DriverRuntimeHandle {
   }
 
   async sendPrompt(input: DriverPrompt): Promise<DriverRunResult> {
-    const effectiveInput =
-      !this.capabilities.supports_session_load && input.session_id
-        ? withoutSessionId(input)
-        : input;
-    const result = await this.invokeTransport(effectiveInput);
+    if (input.session_id && !this.capabilities.supports_session_load) {
+      throw new Error(
+        `DRIVER_SESSION_LOAD_UNSUPPORTED: ${this.driver_id} cannot load ${input.session_id}; refusing a fresh session`,
+      );
+    }
+    const result = await this.invokeTransport(input);
     assertDriverRunResult(result);
+    if (
+      result.status === 'succeeded' &&
+      result.response?.trim() === 'No response requested.' &&
+      result.tool_events.length === 0 &&
+      result.artifacts.length === 0
+    ) {
+      return {
+        ...result,
+        status: 'failed',
+        error: {
+          code: 'DRIVER_NO_PROGRESS',
+          message:
+            'Driver returned a no-response marker without executing the task; refusing to report completion',
+          retryable: false,
+        },
+      };
+    }
+    if (
+      input.session_id &&
+      result.status === 'succeeded' &&
+      result.session_id !== input.session_id
+    ) {
+      throw new Error(
+        `DRIVER_SESSION_MISMATCH: requested ${input.session_id}, received ${result.session_id}`,
+      );
+    }
     this.latestTranscriptRef = result.transcript_ref;
     return result;
   }
@@ -90,12 +122,6 @@ export class ExternalDriverRuntime implements DriverRuntimeHandle {
   subscribeToEvents(listener: DriverStreamEventListener): () => void {
     return this.transport.subscribeToEvents?.(listener) ?? (() => undefined);
   }
-}
-
-function withoutSessionId(input: DriverPrompt): DriverPrompt {
-  const copy = { ...input };
-  delete copy.session_id;
-  return copy;
 }
 
 export function assertDriverRunResult(
@@ -146,6 +172,10 @@ function buildTransportFailureResult(input: {
   const created_at = nowTimestamp();
   const message = errorMessage(input.error);
   const schema_version = input.input.schema_version || SCHEMA_VERSION;
+  // A1 证据模型（issue #149）：typed 传输错误携带阶段证据，据此给出区分「明确
+  // 未执行」与「结果未知」的错误码；未类型化错误保留历史形状，ADP 映射层会保守
+  // 当作执行状态不明处理。
+  const failure = transportFailureShape(input.error);
   const transcript_ref: ArtifactRef = {
     artifact_id: createId('artifact'),
     type: 'transcript',
@@ -170,16 +200,30 @@ function buildTransportFailureResult(input: {
     diagnostics: {
       driver_id: input.driver_id,
       duration_ms: 0,
-      notes: [`transport_error=${message}`],
+      notes: [`transport_error=${message}`, `execution_evidence=${failure.evidence}`],
     },
     error: {
-      code: 'EXTERNAL_DRIVER_TRANSPORT_ERROR',
+      code: failure.code,
       message,
-      retryable: true,
+      retryable: failure.retryable,
     },
     created_at,
     schema_version,
   };
+}
+
+function transportFailureShape(error: unknown): {
+  code: string;
+  retryable: boolean;
+  evidence: DriverExecutionEvidence;
+} {
+  const evidence = evidenceOf(error);
+  if (!isDriverTransportError(error)) {
+    return { code: 'EXTERNAL_DRIVER_TRANSPORT_ERROR', retryable: true, evidence };
+  }
+  return evidence === 'not_executed'
+    ? { code: 'DRIVER_START_FAILED', retryable: true, evidence }
+    : { code: 'DRIVER_OUTCOME_UNKNOWN', retryable: false, evidence };
 }
 
 function errorMessage(error: unknown): string {

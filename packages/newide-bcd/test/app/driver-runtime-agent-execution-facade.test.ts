@@ -13,6 +13,7 @@ import type { BMemoryMaintenancePort } from '../../src/app/b-memory-maintenance-
 import { SCHEMA_VERSION, nowTimestamp, type ArtifactRef } from '../../src/core';
 import {
   MockDriver,
+  createAdpRetryPolicy,
   type DriverCapabilities,
   type DriverPrompt,
   type DriverRunResult,
@@ -22,11 +23,13 @@ import {
 import {
   InMemoryBufferRepository,
   InMemoryRepository,
+  buildDriverUsageFeedbackRecords,
+  type AgentContextCleaner,
   type CallJournalEvent,
   type CallJournalPort,
   type ToolCallingClient,
 } from '../../src/memory';
-import type { ExperienceRecord, SkillRecord } from '../../src/memory/schemas';
+import type { AgentContextSnapshot, ExperienceRecord, SkillRecord } from '../../src/memory/schemas';
 import {
   MailboxDeliveryWorker,
   PersistentMailboxService,
@@ -43,6 +46,62 @@ import {
 import { InMemoryParticipantSessionRegistry } from '../../src/coordination';
 
 describe('DriverRuntimeAgentExecutionFacade', () => {
+  it('persists a Council native session before its first Driver turn finishes', async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-inflight-session-'));
+    const driver = new CapturingDriver('succeeded');
+    driver.capabilities.supports_session_load = true;
+    let listener: DriverStreamEventListener | undefined;
+    let finish!: (result: DriverRunResult) => void;
+    vi.spyOn(driver, 'subscribeToEvents').mockImplementation((callback) => {
+      listener = callback;
+      return () => {
+        listener = undefined;
+      };
+    });
+    vi.spyOn(driver, 'sendPrompt').mockImplementation((input) => {
+      listener?.({
+        schema_version: 'driver-event.v1',
+        event_type: 'driver.turn_started',
+        task_id: input.task_id,
+        run_id: input.run_id,
+        session_id: 'native_inflight',
+      });
+      return new Promise((resolve) => {
+        finish = resolve;
+      });
+    });
+    const sessions = new InMemoryParticipantSessionRegistry();
+    const store = new SqliteCoordinationStore(':memory:');
+    const facade = new DriverRuntimeAgentExecutionFacade({
+      driver,
+      repository: new InMemoryRepository(),
+      bufferRepository: new InMemoryBufferRepository(),
+      llm: invokeDriverLlm(),
+      mailbox: {
+        service: new PersistentMailboxService(store),
+        allowedRoleIds: ['reviewer'],
+        sessionRegistry: sessions,
+      },
+    });
+    const controller = new AbortController();
+    const { session_id: _unused, ...input } = request('task_inflight', 'reviewer', workspace);
+    const pending = facade
+      .runAgent({ ...input, context_policy: 'council_reviewer' }, { signal: controller.signal })
+      .catch((error) => error);
+    try {
+      await vi.waitFor(() =>
+        expect(sessions.get(input.task_id, workspace, 'reviewer')).toBe('native_inflight'),
+      );
+      controller.abort(new Error('interrupt before result'));
+      await pending;
+      expect(sessions.get(input.task_id, workspace, 'reviewer')).toBe('native_inflight');
+    } finally {
+      finish?.(driverResult(driver, 'cancelled', 'native_inflight'));
+      store.close();
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
+  });
+
   it('cancels a pending Session initialization and releases its provisioning slot', async () => {
     const driver = new CapturingDriver('succeeded');
     let finish!: (result: DriverRunResult) => void;
@@ -129,6 +188,70 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     expect(events).toContainEqual(
       expect.objectContaining({ run_id: 'run_parent', role_id: 'primary' }),
     );
+  });
+
+  it('resolves every driver lookup by the task run id, not the council phase run id', async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-routing-runid-'));
+    try {
+      const repository = new InMemoryRepository();
+      await repository.initializeAgent({ role_id: 'proposer_a', name: 'Proposer A' });
+      const driver = new CapturingDriver('succeeded');
+      const resolveDriver = vi.fn(() => driver);
+      const facade = new DriverRuntimeAgentExecutionFacade({
+        driver,
+        resolveDriver,
+        repository,
+        bufferRepository: new InMemoryBufferRepository(),
+        llm: invokeDriverLlm(),
+      });
+      const { session_id: _unused, ...input } = request('task_phase', 'proposer_a', workspace);
+
+      const result = await facade.runAgent({
+        ...input,
+        run_id: 'run_task_phase_council_p1',
+        activity_run_id: 'run_task',
+        context_policy: 'council_proposer',
+      });
+
+      expect(result.status).toBe('completed');
+      expect(driver.prompts.length).toBeGreaterThan(0);
+      // 相位执行身份查不到该 Run 冻结的 routing 快照，会静默回落到当前全局配置——所以
+      // 会话归属、留档 source_driver、invoke_driver、结果归属这几处都必须用任务 run id。
+      expect(resolveDriver.mock.calls.length).toBeGreaterThan(0);
+      expect(resolveDriver.mock.calls.map((call) => call[1])).toEqual(
+        resolveDriver.mock.calls.map(() => 'run_task'),
+      );
+    } finally {
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  it('hands the task run id to Session provisioning', async () => {
+    const driver = new CapturingDriver('succeeded');
+    const original = driver.sendPrompt.bind(driver);
+    vi.spyOn(driver, 'sendPrompt').mockImplementation(async (input) => ({
+      ...(await original(input)),
+      session_id: 'session_provisioned',
+      response: 'SESSION_READY',
+    }));
+    const resolveDriver = vi.fn(() => driver);
+    const facade = new DriverRuntimeAgentExecutionFacade({
+      driver,
+      resolveDriver,
+      repository: new InMemoryRepository(),
+      bufferRepository: new InMemoryBufferRepository(),
+      llm: invokeDriverLlm(),
+    });
+
+    await facade.provisionParticipantSession({
+      task_id: 'task_provision',
+      run_id: 'run_task_phase_council_p1',
+      activity_run_id: 'run_task',
+      role_id: 'proposer_a',
+      workspace_path: os.tmpdir(),
+    });
+
+    expect(resolveDriver.mock.calls.map((call) => call[1])).toEqual(['run_task']);
   });
   it('lets one real B Agent tool turn send and another role reply through Mailbox', async () => {
     const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-mailbox-agent-'));
@@ -440,6 +563,9 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
           schema_version: SCHEMA_VERSION,
         };
       },
+      async recordDriverUsageFeedback() {
+        return [];
+      },
     };
     const { facade } = createFacade(
       new CapturingDriver('succeeded'),
@@ -465,6 +591,132 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     });
   });
 
+  /**
+   * Driver 自报了引用，但本进程没有 outbox：这是配置错误，不是「这次没有反馈」。
+   * 任务照旧完成（下游的事不该把任务判失败），但现场必须留一条能看见的原因——
+   * 否则这条数据是被悄悄丢掉的，事后无从追查。
+   */
+  it('没有 outbox 时丢下的 Driver feedback 会在 diagnostics 里留痕', async () => {
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-feedback-missing-'));
+    const taskId = 'task_feedback_missing';
+    // 驱动侧报告文件是 DriverReturn 的一手来源：用它把「引用了哪条经验」喂进链路
+    await fs.writeFile(
+      path.join(workspace, `${taskId}_report.txt`),
+      JSON.stringify({
+        summary: 'Applied a remembered rule while implementing the change.',
+        artifacts: [],
+        decisions: [],
+        blockers: [],
+        referenced_experiences: [
+          {
+            // 形状上是经验 id（uuid）但本 role 名下没有：这类引用照记，缺的是 outbox 而不是它
+            experience_id: '8d0e6a4c-3f21-4b7a-9c58-1e2f3a4b5c6d',
+            applied: true,
+            effectiveness: 'fully_effective',
+            note: 'saved a round of rework',
+          },
+        ],
+        assumptions: [],
+      }),
+      'utf8',
+    );
+
+    try {
+      // 不注入 memoryMaintenance：本进程根本没有反馈 outbox
+      const { facade } = createFacade(new CapturingDriver('succeeded'));
+      const result = await facade.runAgent(request(taskId, 'role_primary', workspace));
+
+      expect(result.status).toBe('completed');
+      // 一条都没写进去 + 明确的原因：0 不是「本次没有引用」的 0，而是「报了却没落盘」
+      expect(result.diagnostics.driver_feedback_recorded).toBe(0);
+      expect(String(result.diagnostics.driver_feedback_error)).toContain('not configured');
+      expect(result.diagnostics.driver_feedback_ids).toBeUndefined();
+    } finally {
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * Driver 分不清「发给它的经验 id」与「上下文占位条目的编号」，会把后者当引用报回来。
+   * 那类条目命名不了任何一条经验，等多久都不会出现——不进 outbox，但必须计数：
+   * 悄悄少掉一条引用和「本次没有反馈」在诊断里长得一模一样。
+   */
+  it('引用若不是经验 id（上下文占位编号），不进 outbox 但要计数', async () => {
+    const placeholder = 'context-experience-1';
+    const real = '4c7b9d21-8e35-4f6a-b0c2-7a3d5e8f9b10';
+    const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-feedback-placeholder-'));
+    const taskId = 'task_feedback_placeholder';
+    await fs.writeFile(
+      path.join(workspace, `${taskId}_report.txt`),
+      JSON.stringify({
+        summary: 'Used the experience context it was given.',
+        artifacts: [],
+        decisions: [],
+        blockers: [],
+        referenced_experiences: [
+          {
+            experience_id: placeholder,
+            applied: true,
+            effectiveness: 'fully_effective',
+            note: 'misread',
+          },
+          {
+            experience_id: real,
+            applied: true,
+            effectiveness: 'partially_effective',
+            note: 'real',
+          },
+        ],
+        assumptions: [],
+      }),
+      'utf8',
+    );
+
+    try {
+      const sentReferences: string[][] = [];
+      const memoryMaintenance: BMemoryMaintenancePort = {
+        async scheduleBuffer(input) {
+          return {
+            maintenance_ref: 'b_maintenance_placeholder',
+            kind: 'experience_extraction',
+            status: 'scheduled',
+            ...input,
+            experiences: [],
+            skills: [],
+            warnings: [],
+            created_at: '2026-07-21T00:00:00.000Z',
+            completed_at: '2026-07-21T00:00:01.000Z',
+            schema_version: SCHEMA_VERSION,
+          };
+        },
+        async recordDriverUsageFeedback(input) {
+          sentReferences.push(input.references.map((reference) => reference.experience_id));
+          return buildDriverUsageFeedbackRecords({
+            role_id: input.role_id,
+            task_id: input.task_id,
+            references: input.references,
+          });
+        },
+      };
+      const { facade } = createFacade(
+        new CapturingDriver('succeeded'),
+        new InMemoryBufferRepository(),
+        invokeDriverLlm(),
+        new InMemoryRepository(),
+        memoryMaintenance,
+      );
+      const result = await facade.runAgent(request(taskId, 'role_primary', workspace));
+
+      expect(result.status).toBe('completed');
+      // 占位编号压根没进 outbox，真引用照进
+      expect(sentReferences).toEqual([[real]]);
+      expect(result.diagnostics.driver_feedback_recorded).toBe(1);
+      expect(result.diagnostics.driver_feedback_ignored).toBe(1);
+    } finally {
+      await fs.rm(workspace, { recursive: true, force: true });
+    }
+  });
+
   it('journals memory_query with request identity and forwards workspace to maintenance', async () => {
     const events: CallJournalEvent[] = [];
     const callJournal: CallJournalPort = { record: (event) => void events.push(event) };
@@ -484,6 +736,9 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
           completed_at: '2026-07-21T00:00:01.000Z',
           schema_version: SCHEMA_VERSION,
         };
+      },
+      async recordDriverUsageFeedback() {
+        return [];
       },
     };
     // 第一轮：query_memory；第二轮：invoke_driver；第三轮：完成
@@ -544,7 +799,14 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     }
   });
 
-  it('applies memory_ablation B0/B1/B2 to retrieval and maintenance scheduling', async () => {
+  /**
+   * 消融标签只影响**检索**（include_skills / include_recent_experience），不影响生产执行
+   * 路径的处理边界：B0–B4 都要照常把这条 Buffer 登记成交付项交给下游。
+   *
+   * 曾经 `schedule_extraction` 为假（B0/B4）就整个跳过调度——那等于让一个请求字段把生产
+   * 路径的输出掐掉，Buffer 永远留在 pending、下游根本不知道有这条输入。
+   */
+  it('applies memory_ablation B0/B1/B2 to retrieval only — the maintenance boundary is label-independent', async () => {
     const roleId = 'implementer';
     const repository = new InMemoryRepository();
     await repository.initializeAgent({ role_id: roleId, name: roleId });
@@ -565,13 +827,13 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
       }),
     );
 
-    const b0Requests: unknown[] = [];
-    const b0Maintenance: BMemoryMaintenancePort = {
+    const scheduled: Parameters<BMemoryMaintenancePort['scheduleBuffer']>[0][] = [];
+    const maintenance: BMemoryMaintenancePort = {
       async scheduleBuffer(input) {
-        b0Requests.push(input);
+        scheduled.push(input);
         return {
-          maintenance_ref: 'should_not_run',
-          kind: 'experience_extraction',
+          maintenance_ref: 'context_delivery_maint',
+          kind: 'context_delivery',
           status: 'scheduled',
           task_id: input.task_id,
           run_id: input.run_id,
@@ -586,75 +848,48 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
         };
       },
     };
-    const b0 = await new DriverRuntimeAgentExecutionFacade({
-      driver: new CapturingDriver('succeeded'),
-      repository,
-      bufferRepository: new InMemoryBufferRepository(),
-      llm: invokeDriverLlm(),
-      memoryMaintenance: b0Maintenance,
-    }).runAgent({ ...request('task_b0', roleId), memory_ablation: 'B0' });
-    expect(b0.diagnostics.retrieval).toEqual({ experiences: 0, skills: 0 });
-    expect(b0Requests).toHaveLength(0);
-    expect(b0.diagnostics.memory_maintenance).toBeUndefined();
+    const runWithAblation = (taskId: string, ablation: 'B0' | 'B1' | 'B2' | 'B3' | 'B4') =>
+      new DriverRuntimeAgentExecutionFacade({
+        driver: new CapturingDriver('succeeded'),
+        repository,
+        bufferRepository: new InMemoryBufferRepository(),
+        llm: invokeDriverLlm(),
+        memoryMaintenance: maintenance,
+      }).runAgent({ ...request(taskId, roleId), memory_ablation: ablation });
 
-    const b1Requests: Parameters<BMemoryMaintenancePort['scheduleBuffer']>[0][] = [];
-    const b1 = await new DriverRuntimeAgentExecutionFacade({
-      driver: new CapturingDriver('succeeded'),
-      repository,
-      bufferRepository: new InMemoryBufferRepository(),
-      llm: invokeDriverLlm(),
-      memoryMaintenance: {
-        async scheduleBuffer(input) {
-          b1Requests.push(input);
-          return {
-            maintenance_ref: 'b1_maint',
-            kind: 'experience_extraction',
-            status: 'scheduled',
-            task_id: input.task_id,
-            run_id: input.run_id,
-            role_id: input.role_id,
-            buffer_seq: input.buffer_seq,
-            experiences: [],
-            skills: [],
-            warnings: [],
-            created_at: '2026-07-21T00:00:00.000Z',
-            completed_at: '2026-07-21T00:00:01.000Z',
-            schema_version: SCHEMA_VERSION,
-          };
-        },
-      },
-    }).runAgent({ ...request('task_b1', roleId), memory_ablation: 'B1' });
+    const b0 = await runWithAblation('task_b0', 'B0');
+    expect(b0.diagnostics.retrieval).toEqual({ experiences: 0, skills: 0 });
+
+    const b1 = await runWithAblation('task_b1', 'B1');
     expect(b1.diagnostics.retrieval).toMatchObject({ skills: 0 });
     expect((b1.diagnostics.retrieval as { experiences: number }).experiences).toBeGreaterThan(0);
-    expect(b1Requests[0]?.memory_ablation).toBe('B1');
 
-    const b2 = await new DriverRuntimeAgentExecutionFacade({
-      driver: new CapturingDriver('succeeded'),
-      repository,
-      bufferRepository: new InMemoryBufferRepository(),
-      llm: invokeDriverLlm(),
-      memoryMaintenance: {
-        async scheduleBuffer(input) {
-          return {
-            maintenance_ref: 'b2_maint',
-            kind: 'experience_extraction',
-            status: 'scheduled',
-            task_id: input.task_id,
-            run_id: input.run_id,
-            role_id: input.role_id,
-            buffer_seq: input.buffer_seq,
-            experiences: [],
-            skills: [],
-            warnings: [],
-            created_at: '2026-07-21T00:00:00.000Z',
-            completed_at: '2026-07-21T00:00:01.000Z',
-            schema_version: SCHEMA_VERSION,
-          };
-        },
-      },
-    }).runAgent({ ...request('task_b2', roleId), memory_ablation: 'B2' });
+    const b2 = await runWithAblation('task_b2', 'B2');
     expect((b2.diagnostics.retrieval as { skills: number }).skills).toBeGreaterThan(0);
     expect((b2.diagnostics.retrieval as { experiences: number }).experiences).toBeGreaterThan(0);
+
+    // B0/B4 曾是最容易被「标签改边界」掐掉的两臂，这里连同 B3 一起钉死：每臂都调度了一次，
+    // 都带了对应标签，返回的都只是交付项。
+    await runWithAblation('task_b3', 'B3');
+    const b4 = await runWithAblation('task_b4', 'B4');
+    expect(b4.diagnostics.retrieval).toMatchObject({ skills: 1, experiences: 1 });
+
+    expect(scheduled.map((input) => input.memory_ablation)).toEqual(['B0', 'B1', 'B2', 'B3', 'B4']);
+    expect(scheduled.map((input) => input.task_id)).toEqual([
+      'task_b0',
+      'task_b1',
+      'task_b2',
+      'task_b3',
+      'task_b4',
+    ]);
+    for (const evidence of [
+      b0.diagnostics.memory_maintenance,
+      b1.diagnostics.memory_maintenance,
+      b2.diagnostics.memory_maintenance,
+      b4.diagnostics.memory_maintenance,
+    ]) {
+      expect(evidence).toMatchObject({ kind: 'context_delivery', status: 'scheduled' });
+    }
   });
 
   it('preserves a completed Agent execution when B maintenance scheduling fails', async () => {
@@ -676,13 +911,48 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     expect(result.status).toBe('completed');
     expect(result.diagnostics.memory_maintenance).toMatchObject({
       maintenance_ref: expect.stringMatching(/^b_maintenance_/),
-      kind: 'experience_extraction',
+      // 生产路径（无消融标签）失败的是「交付」，不是「本进程提取」——报成
+      // experience_extraction 就等于在说任务流程在提取，那是这条边界要拆掉的说法
+      kind: 'context_delivery',
       status: 'failed',
       task_id: 'task_maintenance_failure',
       run_id: 'run_task_maintenance_failure',
       role_id: 'proposer_a',
       buffer_seq: 1,
       error: 'maintenance evidence store unavailable',
+      warnings: ['Memory maintenance could not be scheduled; Agent execution was preserved.'],
+    });
+
+    // 报「哪条路径」看运行时而**不看请求**：给生产 runner 打上消融标签，走的仍然是交付，
+    // 失败的说法也仍然是交付——标签改不动路径，这条边界不能被一个请求字段捅穿。
+    const labelled = await facade.runAgent({
+      ...request('task_maintenance_labelled', 'proposer_a'),
+      memory_ablation: 'B2',
+    });
+    expect(labelled.diagnostics.memory_maintenance).toMatchObject({
+      kind: 'context_delivery',
+      status: 'failed',
+    });
+
+    // 打开进程内模拟的 runner 也一样：在线任务路径只登记交付，这条入口失败的就是交付。
+    // 加工路径（processBuffer）根本不在任务流程里，它的失败不该在这里出现。
+    const emulated = await createFacade(
+      new CapturingDriver('succeeded'),
+      new InMemoryBufferRepository(),
+      invokeDriverLlm(),
+      new InMemoryRepository(),
+      {
+        async scheduleBuffer() {
+          throw new Error('maintenance evidence store unavailable');
+        },
+      },
+    ).facade.runAgent({
+      ...request('task_maintenance_emulated', 'proposer_a'),
+      memory_ablation: 'B2',
+    });
+    expect(emulated.diagnostics.memory_maintenance).toMatchObject({
+      kind: 'context_delivery',
+      status: 'failed',
     });
   });
 
@@ -788,6 +1058,7 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
     });
 
     expect(events).toEqual([
+      expect.objectContaining({ event_type: 'driver.prompt_dispatching', role_id: 'reviewer' }),
       expect.objectContaining({ event_type: 'agent_message_chunk', role_id: 'reviewer' }),
     ]);
   });
@@ -977,6 +1248,10 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
         description: eligibleExperience.description,
         content: eligibleExperience.content,
       });
+      // 只有正文的占位条目（LLM 通过 invoke_driver 的 context 传进来的）编号刻意避开经验
+      // id 的形状：它们没有落库身份，长得像经验 id 只会让 Driver 拿它们当引用报回来
+      expect(prompt.skills[1]!.id).toBe('context-skill-2');
+      expect(prompt.experiences[1]!.id).toBe('context-experience-2');
 
       expect(result.diagnostics).toMatchObject({ retrieval: { experiences: 1, skills: 1 } });
       const persisted = JSON.parse(
@@ -1002,6 +1277,82 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
         experiences: [storedEligibleExperience],
       });
       expect(persisted.driver_invocation_context).toEqual(prompt);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('pairs the cleaned Agent context with the same memory_buffer_ref the evidence reports', async () => {
+    const roleId = 'context_pairing_role';
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'newide-context-evidence-'));
+    const repository = new InMemoryRepository();
+    await repository.initializeAgent({ role_id: roleId, name: roleId });
+    const buffer = new InMemoryBufferRepository();
+    const cleaner: AgentContextCleaner = {
+      async clean(input) {
+        return {
+          snapshot_id: randomUUID(),
+          source_task_id: input.source_task_id,
+          agent_id: input.agent_id,
+          thinking_trace: 'Considered a second code path, rejected it.',
+          planning_trace: 'Step 1: extend the existing serializer.',
+          driver_calls: input.driver_returns.map((call) => ({
+            call_id: call.call_id,
+            driver_id: call.driver_id,
+            driver_return_ref: 'placeholder.json',
+          })),
+          cleaned_at: nowTimestamp(),
+          original_token_count: 200,
+          cleaned_token_count: 60,
+          compression_ratio: 0.3,
+        } satisfies AgentContextSnapshot;
+      },
+    };
+    const facade = new DriverRuntimeAgentExecutionFacade({
+      driver: new CapturingDriver('succeeded'),
+      repository,
+      bufferRepository: buffer,
+      llm: invokeDriverLlm(),
+      contextCleaner: cleaner,
+      evidenceStore: new FileAgentExecutionEvidenceStore({ root }),
+    });
+
+    try {
+      const result = await facade.runAgent(request('task_context_pairing', roleId));
+
+      // 证据里的引用和真正落盘的那条 Buffer 说的是同一件事
+      const pending = await buffer.getPendingBuffer(roleId, 1);
+      expect(pending?.snapshot.context_snapshot_ref).toBe('1');
+      expect(pending?.agentContext?.source_task_id).toBe('task_context_pairing');
+      expect(pending?.agentContext?.driver_calls.map((call) => call.driver_return_ref)).toEqual([
+        'report_1.json',
+      ]);
+      expect(result.memory_buffer_ref).toBe(`${roleId}:1`);
+      expect(result.diagnostics).not.toHaveProperty('memory_context_warnings');
+
+      const persisted = JSON.parse(
+        await fs.readFile(path.join(root, `${result.context_pack_ref}.json`), 'utf-8'),
+      ) as { memory_buffer_ref: string; context_snapshot_paired: boolean };
+      expect(persisted.memory_buffer_ref).toBe(result.memory_buffer_ref);
+      expect(persisted.context_snapshot_paired).toBe(true);
+
+      // 降级路径：同一个 facade 换个没有清理器的实例，任务照样完成，但证据不再声称成对
+      const degraded = new DriverRuntimeAgentExecutionFacade({
+        driver: new CapturingDriver('succeeded'),
+        repository,
+        bufferRepository: new InMemoryBufferRepository(),
+        llm: invokeDriverLlm(),
+        evidenceStore: new FileAgentExecutionEvidenceStore({ root }),
+      });
+      const degradedResult = await degraded.runAgent(request('task_context_degraded', roleId));
+      const degradedEvidence = JSON.parse(
+        await fs.readFile(path.join(root, `${degradedResult.context_pack_ref}.json`), 'utf-8'),
+      ) as { context_snapshot_paired: boolean; context_snapshot_warnings?: string[] };
+      expect(degradedEvidence.context_snapshot_paired).toBe(false);
+      expect(String(degradedEvidence.context_snapshot_warnings?.join(' '))).toContain(
+        'AgentContextCleaner',
+      );
+      expect(degradedResult.diagnostics.context_snapshot_paired).toBe(false);
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
@@ -1131,6 +1482,102 @@ describe('DriverRuntimeAgentExecutionFacade', () => {
 
     expect(driver.prompts).toHaveLength(1);
     expect(result).toMatchObject({ status: 'failed', diagnostics: { driver_attempts: 1 } });
+  });
+
+  it('ADP 装配:驱动调用经 endpoint 落账,回执经宿主内回调交还 Agent', async () => {
+    const driver = new CapturingDriver('succeeded');
+    const store = new SqliteCoordinationStore(':memory:');
+    seedTaskRun(store, 'task_adp_facade', 'run_task_adp_facade');
+    const receipts: string[] = [];
+    const facade = new DriverRuntimeAgentExecutionFacade({
+      driver,
+      repository: new InMemoryRepository(),
+      bufferRepository: new InMemoryBufferRepository(),
+      llm: invokeDriverLlm(),
+      adp: {
+        store,
+        side_effect: 'workspace_write',
+        onReceipt: (delivery) => receipts.push(delivery.receipt.status),
+      },
+    });
+
+    const result = await facade.runAgent(request('task_adp_facade', 'proposer_a'));
+
+    expect(result.status).toBe('completed');
+    expect(receipts).toEqual(['succeeded']);
+    const journal = store.listJournal('task_adp_facade', 'run_task_adp_facade');
+    expect(journal.find((row) => row.event === 'host.intent')).toMatchObject({
+      kind: 'call',
+      causation_id: null,
+    });
+    expect(
+      journal.some(
+        (row) =>
+          row.frame !== null && 'command' in row.frame && row.frame.command === 'driver.invoke',
+      ),
+    ).toBe(true);
+    expect(
+      journal.some(
+        (row) =>
+          row.frame !== null &&
+          'result' in row.frame &&
+          row.frame.result === 'driver.invocation_result',
+      ),
+    ).toBe(true);
+    store.close();
+  });
+
+  it('ADP 装配:transport 失败收束为 unknown,不自动重跑(retryable 启发式失效)', async () => {
+    const driver = new RetryableOnceDriver(); // EXTERNAL_DRIVER_TRANSPORT_ERROR + retryable:true
+    const store = new SqliteCoordinationStore(':memory:');
+    seedTaskRun(store, 'task_adp_unknown', 'run_task_adp_unknown');
+    const receipts: string[] = [];
+    const facade = new DriverRuntimeAgentExecutionFacade({
+      driver,
+      repository: new InMemoryRepository(),
+      bufferRepository: new InMemoryBufferRepository(),
+      llm: invokeDriverLlm(),
+      adp: {
+        store,
+        side_effect: 'workspace_write',
+        // 即使部署开启 workspace_write 自动重跑,unknown 也永不重跑。
+        retryPolicy: createAdpRetryPolicy({ workspace_write: true }),
+        onReceipt: (delivery) => receipts.push(delivery.receipt.status),
+      },
+    });
+
+    const result = await facade.runAgent(request('task_adp_unknown', 'proposer_a'));
+
+    expect(driver.prompts).toHaveLength(1);
+    expect(receipts).toEqual(['unknown']);
+    expect(result.diagnostics).toMatchObject({ driver_attempts: 1 });
+    store.close();
+  });
+
+  it('ADP 装配:确定失败按部署级 auto_retry[side_effect] 重执行', async () => {
+    const driver = new RetryableOnceDriver('BUSINESS_BOOM');
+    const store = new SqliteCoordinationStore(':memory:');
+    seedTaskRun(store, 'task_adp_retry', 'run_task_adp_retry');
+    const receipts: string[] = [];
+    const facade = new DriverRuntimeAgentExecutionFacade({
+      driver,
+      repository: new InMemoryRepository(),
+      bufferRepository: new InMemoryBufferRepository(),
+      llm: invokeDriverLlm(),
+      adp: {
+        store,
+        side_effect: 'workspace_write',
+        retryPolicy: createAdpRetryPolicy({ workspace_write: true }),
+        onReceipt: (delivery) => receipts.push(delivery.receipt.status),
+      },
+    });
+
+    const result = await facade.runAgent(request('task_adp_retry', 'proposer_a'));
+
+    expect(driver.prompts).toHaveLength(2);
+    expect(receipts).toEqual(['succeeded']);
+    expect(result.diagnostics).toMatchObject({ driver_attempts: 2 });
+    store.close();
   });
 
   it('keeps role memory isolated while reusing each role runtime', async () => {
@@ -1490,6 +1937,59 @@ describe('mergeArtifacts path normalization', () => {
     expect(merged[0]?.artifact_id).toBe('artifact_workspace_full');
   });
 });
+
+function seedTaskRun(store: SqliteCoordinationStore, task_id: string, run_id: string): void {
+  const at = '2026-09-25T09:00:00.000Z';
+  store.commitState({
+    task: {
+      task_id,
+      status: 'created',
+      risk_level: 'medium',
+      spec: 'ADP facade test',
+      completion_criteria: ['done'],
+      affected_paths: [],
+      workspace_path: '/workspace',
+      warnings: [],
+      revision: 1,
+      created_at: at,
+      updated_at: at,
+      schema_version: 'v0',
+    },
+    run: {
+      run_id,
+      task_id,
+      status: 'created',
+      mode: 'single_agent',
+      workspace_path: '/workspace',
+      revision: 1,
+      created_at: at,
+      updated_at: at,
+      schema_version: 'v0',
+    },
+    runtime_state: {
+      task_id,
+      current_run_id: run_id,
+      resume_cursor: 'execute_agent',
+      waiting_on: [],
+      artifact_refs: [],
+      diagnostics: {},
+      updated_at: at,
+      schema_version: 'v0',
+    },
+    events: [
+      {
+        event_id: `event-${run_id}`,
+        event_type: 'task.created',
+        subject_id: task_id,
+        task_id,
+        run_id,
+        payload: {},
+        created_at: at,
+        schema_version: 'v0',
+      },
+    ],
+  });
+}
 
 function createFacade(
   driver: DriverRuntimeHandle,
@@ -1867,7 +2367,9 @@ function request(taskId: string, roleId: string, workspacePath?: string) {
 }
 
 function parseDriverContext(prompt: string): unknown {
-  return JSON.parse(prompt.split('\n\n---\n', 1)[0]!);
+  const context = prompt.split('\n').find((line) => line.startsWith('{"experiences":'));
+  if (!context) throw new Error('Missing structured Driver context');
+  return JSON.parse(context);
 }
 
 class CapturingDriver implements DriverRuntimeHandle {

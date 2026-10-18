@@ -174,6 +174,7 @@ function buildService(input: {
     new FileRunTelemetryJsonlSink(input.runsRoot),
     undefined,
     undefined,
+    undefined,
     input.reader,
   );
 }

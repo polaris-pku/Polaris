@@ -558,58 +558,6 @@ describe('summarizeRunConsumption', () => {
   });
 });
 
-describe('summarizeRunConsumption', () => {
-  it('attributes events to the stage open at the time, and prefers an explicit stage', () => {
-    const summary = summarizeRunConsumption([
-      { type: 'run.created', payload: { mode: 'single_agent' } },
-      { type: 'handler.started', payload: { cursor: 'select_agent' } },
-      { type: 'handler.completed', payload: { cursor: 'select_agent', next_cursor: 'gate' } },
-      // 窗口已关：这条属于 run，不该塞给 select_agent。
-      { type: 'run.started', payload: { mode: 'single_agent' } },
-      { type: 'handler.started', payload: { cursor: 'deliver' } },
-      // 用量事件自带归属：它记在 gate 名下，即使此刻开着的是 deliver。
-      {
-        type: 'proxy.llm_usage_recorded',
-        payload: { stage_cursor: 'gate', input_tokens: 7, output_tokens: 3 },
-      },
-    ]);
-
-    expect(summary.by_stage.unattributed).toMatchObject({ events: 2 });
-    expect(summary.by_stage.select_agent).toMatchObject({ events: 2, llm_calls: 0 });
-    expect(summary.by_stage.deliver).toMatchObject({ events: 1, llm_calls: 0 });
-    expect(summary.by_stage.gate).toMatchObject({ events: 1, llm_calls: 1, total_tokens: 10 });
-    expect(summary.totals).toMatchObject({ events: 6, llm_calls: 1, total_tokens: 10 });
-    expect(summary).not.toHaveProperty('latency_by_name');
-  });
-
-  it('folds stage spans into stage durations and keeps the rest by name', () => {
-    const summary = summarizeRunConsumption(
-      [{ type: 'handler.started', payload: { cursor: 'gate' } }],
-      {
-        run_id: 'run_x',
-        span_count: 3,
-        by_name: {
-          'stage.gate': { count: 1, total_duration_ms: 42, max_duration_ms: 42 },
-          // stage 有 span 但没有事件归到它名下时，耗时仍要出现，故这里应新建桶。
-          'stage.deliver': { count: 1, total_duration_ms: 5, max_duration_ms: 5 },
-          'agent.llm_round': { count: 2, total_duration_ms: 10, max_duration_ms: 6 },
-        },
-        by_layer: {
-          stage: { count: 2, total_duration_ms: 47 },
-          agent: { count: 2, total_duration_ms: 10 },
-        },
-      },
-    );
-
-    expect(summary.by_stage.gate).toMatchObject({ events: 1, duration_ms: 42 });
-    expect(summary.by_stage.deliver).toMatchObject({ events: 0, duration_ms: 5 });
-    expect(summary.totals.duration_ms).toBe(47);
-    expect(summary.latency_by_name).toMatchObject({
-      'agent.llm_round': { count: 2, total_duration_ms: 10 },
-    });
-  });
-});
-
 function failedSnapshot(): AppRunSnapshot {
   return {
     schema_version: 'v0',

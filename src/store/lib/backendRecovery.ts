@@ -24,6 +24,8 @@ export function recoverBackendTasks(
 
   for (const snapshot of snapshots) {
     const taskId = snapshot.task.task_id;
+    const previous = liveTasks[taskId];
+    if (previous && snapshot.revision <= previous.snapshot.revision) continue;
     const run = snapshot.current_run ?? snapshot.run_history[0];
     if (!known.has(taskId)) {
       known.add(taskId);
@@ -45,6 +47,15 @@ export function recoverBackendTasks(
             files: [],
             agentIds: [],
           });
+      } else if (!projects.some((project) => project.id === projectId)) {
+        projects.push({
+          id: projectId,
+          name: '待确认归属的历史任务',
+          lastOpened: snapshot.task.updated_at.slice(0, 10),
+          tags: [],
+          files: [],
+          agentIds: [],
+        });
       }
       tasks.push({
         ...createRequirementTask(
@@ -66,17 +77,31 @@ export function recoverBackendTasks(
         ].filter((id): id is string => !!id),
       });
     }
-    if (run && !liveRuns[run.run_id]) {
+    const index = tasks.findIndex((task) => task.contractTaskId === taskId);
+    if (index >= 0)
+      tasks[index] = {
+        ...tasks[index],
+        contractTaskStatus: snapshot.task.status,
+        contractWaitingReason: snapshot.waiting_reason ?? snapshot.error?.message,
+        ...(run ? { contractRunId: run.run_id, mode: run.mode } : {}),
+      };
+    if (run) {
       liveRuns[run.run_id] = {
+        ...liveRuns[run.run_id],
         runId: run.run_id,
         taskId,
-        status: run.status === 'interrupted' ? 'failed' : run.status,
-        timeline: [],
-        snapshot: null,
+        status: run.status,
+        timeline: liveRuns[run.run_id]?.timeline ?? [],
+        snapshot: liveRuns[run.run_id]?.snapshot ?? null,
         error: run.error?.message ?? null,
       };
     }
-    liveTasks[taskId] ??= { snapshot, events: [], status: 'subscribing' };
+    liveTasks[taskId] = {
+      ...previous,
+      snapshot,
+      events: previous?.events ?? [],
+      status: 'subscribing',
+    };
   }
   return { projects, tasks, liveRuns, liveTasks };
 }

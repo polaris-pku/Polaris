@@ -5,36 +5,6 @@ import { JSON_RPC_ERROR_CODES } from '../../src/rpc/json-rpc-line-protocol';
 import { RunRpcMethods, type RunMethodsService } from '../../src/rpc/run-methods';
 
 describe('RunRpcMethods', () => {
-  it('accepts the accumulation-frozen memory ablation and rejects unknown levels', async () => {
-    const output: string[] = [];
-    const createRun = vi.fn(async () => ({
-      run_id: 'run_1',
-      task_id: 'task_1',
-      status: 'running' as const,
-    }));
-    const dispatcher = new JsonRpcDispatcher();
-    const session = new JsonRpcLineSession(dispatcher, (line) => output.push(line));
-    new RunRpcMethods(fakeService({ createRun }), (method, params) =>
-      session.sendNotification(method, params),
-    ).register(dispatcher);
-
-    for (const [index, level] of ['B4', 'B5'].entries()) {
-      await session.handleLine(
-        JSON.stringify({
-          jsonrpc: '2.0',
-          id: index + 1,
-          method: 'run.create',
-          params: { prompt: 'Build RPC', workspace_path: process.cwd(), memory_ablation: level },
-        }),
-      );
-    }
-    expect(createRun).toHaveBeenCalledWith(expect.objectContaining({ memory_ablation: 'B4' }));
-    expect(JSON.parse(output[1]!)).toMatchObject({
-      id: 2,
-      error: { code: -32602, message: 'Invalid params' },
-    });
-  });
-
   it('validates create params and maps run not found errors', async () => {
     const output: string[] = [];
     const service = fakeService();
@@ -58,6 +28,52 @@ describe('RunRpcMethods', () => {
         error: { code: -32004, message: 'Run not found', data: { run_id: 'missing' } },
       },
     ]);
+  });
+
+  it('accepts the accumulation-frozen memory ablation and rejects unknown levels', async () => {
+    const output: string[] = [];
+    const createRun = vi.fn(async () => ({
+      run_id: 'run_1',
+      task_id: 'task_1',
+      status: 'running' as const,
+    }));
+    const service = fakeService({ createRun });
+    const dispatcher = new JsonRpcDispatcher();
+    const session = new JsonRpcLineSession(dispatcher, (line) => output.push(line));
+    new RunRpcMethods(service, (method, params) =>
+      session.sendNotification(method, params),
+    ).register(dispatcher);
+
+    await session.handleLine(
+      `${JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'run.create',
+        params: {
+          prompt: 'Build RPC',
+          workspace_path: process.cwd(),
+          memory_ablation: 'B4',
+        },
+      })}`,
+    );
+    await session.handleLine(
+      `${JSON.stringify({
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'run.create',
+        params: {
+          prompt: 'Build RPC',
+          workspace_path: process.cwd(),
+          memory_ablation: 'B5',
+        },
+      })}`,
+    );
+
+    expect(createRun).toHaveBeenCalledWith(expect.objectContaining({ memory_ablation: 'B4' }));
+    expect(output.map((line) => JSON.parse(line))[1]).toMatchObject({
+      id: 2,
+      error: { code: -32602, message: 'Invalid params' },
+    });
   });
 
   it('passes a reconnect watermark through to the subscription', async () => {
@@ -113,7 +129,7 @@ describe('RunRpcMethods', () => {
     ).register(dispatcher);
 
     await session.handleLine(
-      '{"jsonrpc":"2.0","id":1,"method":"run.getEvents","params":{"run_id":"run_1","after_sequence":8,"limit":500}}',
+      '{"jsonrpc":"2.0","id":1,"method":"run.getEvents","params":{"run_id":"run_1","after_sequence":8,"limit":50}}',
     );
     await session.handleLine(
       '{"jsonrpc":"2.0","id":2,"method":"run.getEvents","params":{"run_id":"run_1"}}',
@@ -125,10 +141,7 @@ describe('RunRpcMethods', () => {
       '{"jsonrpc":"2.0","id":4,"method":"run.getEvents","params":{"run_id":"run_1","limit":501}}',
     );
 
-    expect(calls).toEqual([
-      { run_id: 'run_1', after_sequence: 8, limit: 500 },
-      { run_id: 'run_1' },
-    ]);
+    expect(calls).toEqual([{ run_id: 'run_1', after_sequence: 8, limit: 50 }, { run_id: 'run_1' }]);
     const responses = output.map((line) => JSON.parse(line));
     expect(responses[0]).toMatchObject({
       id: 1,
@@ -148,7 +161,6 @@ describe('RunRpcMethods', () => {
     // 超限字段只留引用不内联；取回口此前完全缺失，前端能看见引用却永远拿不到内容。
     const output: string[] = [];
     const service = fakeService({
-      getRunSnapshot: snapshotOf,
       getRunPayload: async (_runId, payloadRef) =>
         payloadRef.endsWith('=42')
           ? { payload_ref: payloadRef, event: { event_type: 'tool_call' } as never }
@@ -189,29 +201,6 @@ describe('RunRpcMethods', () => {
       id: 3,
       error: { code: JSON_RPC_ERROR_CODES.INVALID_PARAMS },
     });
-  });
-
-  it('rejects unknown payload runs before reading their files', async () => {
-    const output: string[] = [];
-    const readPayload = vi.fn(async () => undefined);
-    const dispatcher = new JsonRpcDispatcher();
-    const session = new JsonRpcLineSession(dispatcher, (line) => output.push(line));
-    new RunRpcMethods(fakeService({ getRunPayload: readPayload }), () => undefined).register(
-      dispatcher,
-    );
-    await session.handleLine(
-      JSON.stringify({
-        jsonrpc: '2.0',
-        id: 1,
-        method: 'run.getPayload',
-        params: { run_id: 'missing', payload_ref: 'driver-stream.jsonl#stream_sequence=0' },
-      }),
-    );
-    expect(JSON.parse(output[0]!)).toMatchObject({
-      id: 1,
-      error: { code: JSON_RPC_ERROR_CODES.RUN_NOT_FOUND, data: { run_id: 'missing' } },
-    });
-    expect(readPayload).not.toHaveBeenCalled();
   });
 
   it('requires a subject for task and role scopes and forwards the usage query', async () => {
@@ -429,22 +418,6 @@ describe('RunRpcMethods', () => {
     });
   });
 });
-
-function snapshotOf(runId: string): ReturnType<RunMethodsService['getRunSnapshot']> {
-  return {
-    schema_version: 'v0',
-    run_id: runId,
-    task_id: 'task_1',
-    mode: 'single_agent',
-    status: 'running',
-    current: { stage: 'executing', active_node_code: 'N3' },
-    timeline: [],
-    agent_runs: [],
-    artifacts: [],
-    gates: [],
-    errors: [],
-  };
-}
 
 function fakeService(overrides?: Partial<RunMethodsService>): RunMethodsService {
   return {

@@ -1,7 +1,7 @@
 import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { once } from 'node:events';
 import { createInterface } from 'node:readline';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -40,13 +40,14 @@ describe('Task-first JSON-RPC child process acceptance', () => {
       const primaryAgentId = firstTerminal.task.owner_agent_id;
       expect(primaryAgentId).toMatch(/^role_/);
       if (!primaryAgentId) throw new Error('Completed Task has no selected primary Agent');
-      const firstExperiences = await waitForExperiences(
+      const firstDelivery = await waitForContextDelivery(
         client,
         primaryAgentId,
         created.task.task_id,
       );
-      expect(firstExperiences).toMatchObject({
-        experiences: [expect.objectContaining({ source_task_id: created.task.task_id })],
+      expect(firstDelivery.deliveries[0]).toMatchObject({
+        task_id: created.task.task_id,
+        memory_buffer_ref: expect.stringMatching(/^role_[a-z_]+:\d+$/),
       });
       await client.call('task.subscribe', { task_id: created.task.task_id });
 
@@ -100,8 +101,7 @@ describe('Task-first JSON-RPC child process acceptance', () => {
         candidates: expect.any(Array),
       });
       expect(
-        liveCouncilEvents.find((event) => event.type === 'market.auction.completed')
-          ?.payload,
+        liveCouncilEvents.find((event) => event.type === 'market.auction.completed')?.payload,
       ).toMatchObject({
         selection_scope: 'primary',
         winner_role_id: expect.stringMatching(/^role_/),
@@ -109,16 +109,13 @@ describe('Task-first JSON-RPC child process acceptance', () => {
         bids: expect.any(Array),
       });
       expect(
-        liveCouncilEvents.find((event) => event.type === 'council.proposal.completed')
-          ?.payload,
+        liveCouncilEvents.find((event) => event.type === 'council.proposal.completed')?.payload,
       ).toMatchObject({ proposal: { summary: expect.any(String) } });
       expect(
-        liveCouncilEvents.find((event) => event.type === 'council.review.completed')
-          ?.payload,
+        liveCouncilEvents.find((event) => event.type === 'council.review.completed')?.payload,
       ).toMatchObject({ reviews: expect.any(Array) });
       expect(
-        liveCouncilEvents.find((event) => event.type === 'council.synthesis.completed')
-          ?.payload,
+        liveCouncilEvents.find((event) => event.type === 'council.synthesis.completed')?.payload,
       ).toMatchObject({ synthesis: { summary: expect.any(String) } });
 
       const runSnapshot = await client.call<RunSnapshot>('run.getSnapshot', {
@@ -165,31 +162,30 @@ describe('Task-first JSON-RPC child process acceptance', () => {
       expect(maintenance.maintenance.map((item) => item.role_id)).toEqual(
         expect.arrayContaining(['role_ts_engineer', 'role_fullstack_engineer']),
       );
+      // 生产路径交给下游的是**上下文交付项**，本进程不加工记忆
       expect(maintenance.maintenance).toEqual(
         expect.arrayContaining([
-          expect.objectContaining({ status: 'completed', evidence_uri: expect.stringMatching(/^file:/) }),
+          expect.objectContaining({
+            kind: 'context_delivery',
+            status: 'scheduled',
+            context_delivery: expect.objectContaining({
+              memory_buffer_ref: expect.stringMatching(/^role_[a-z_]+:\d+$/),
+            }),
+          }),
         ]),
       );
+      // 人工晋升入口仍在，但主链没有隐式副作用：没有经验可晋升，也就没有技能
       await expect(
         client.call('memory.promoteSkills', {
           role_id: primaryAgentId,
           requested_by: 'acceptance',
         }),
       ).resolves.toMatchObject({
-        maintenance: {
-          status: 'completed',
-          skills: expect.arrayContaining([
-            expect.objectContaining({ review_status: 'pending' }),
-          ]),
-        },
+        maintenance: { status: 'completed', skills: [] },
       });
       await expect(
         client.call('memory.listSkills', { role_id: primaryAgentId }),
-      ).resolves.toMatchObject({
-        skills: expect.arrayContaining([
-          expect.objectContaining({ review_status: 'pending' }),
-        ]),
-      });
+      ).resolves.toMatchObject({ skills: [] });
 
       const replayCursor = liveCouncilEvents.find((event) => event.type === 'run.created');
       expect(replayCursor).toBeDefined();
@@ -326,6 +322,217 @@ describe('Task-first JSON-RPC child process acceptance', () => {
     }
   }, 20_000);
 
+  it('keeps the interrupted Run driver mapping when config changes before resume', async () => {
+    const runnerDir = mkdtempSync(path.join(os.tmpdir(), 'newide-driver-resume-runner-'));
+    const homeDir = mkdtempSync(path.join(os.tmpdir(), 'newide-driver-resume-home-'));
+    const workspace = mkdtempSync(path.join(os.tmpdir(), 'newide-driver-resume-workspace-'));
+    const holdPath = path.join(runnerDir, 'hold-first-invocation');
+    const enteredPath = path.join(runnerDir, 'first-invocation-entered');
+    const runIds = new Set<string>();
+    const marketDirectories = new Set<string>();
+    initGitWorkspace(workspace);
+    writeInterruptibleFakeDriver(runnerDir);
+    writeDriverConfig(homeDir, 'claude');
+    writeFileSync(holdPath, 'hold');
+    const firstClient = new RpcChildClient(
+      spawnBackend(runnerDir, {
+        HOME: homeDir,
+        NEWIDE_EPHEMERAL_ACP_SESSIONS: '0',
+      }),
+    );
+    let resumedClient: RpcChildClient | undefined;
+
+    try {
+      const created = await firstClient.call<TaskSnapshot>('task.create', {
+        spec: 'Preserve the driver mapping across checkpoint resume',
+        completion_criteria: ['The task completes after an explicit resume'],
+        workspace_path: workspace,
+        session_id: 'session_driver_resume',
+      });
+      collectEvidence(created, runIds, marketDirectories);
+      await waitForFile(enteredPath);
+
+      await firstClient.kill();
+      rmSync(holdPath, { force: true });
+      writeDriverConfig(homeDir, 'codex');
+
+      resumedClient = new RpcChildClient(
+        spawnBackend(runnerDir, {
+          HOME: homeDir,
+          NEWIDE_EPHEMERAL_ACP_SESSIONS: '0',
+        }),
+      );
+      await expect(resumedClient.call('system.ping')).resolves.toMatchObject({ status: 'ok' });
+      const blocked = await resumedClient.call<TaskSnapshot>('task.get', {
+        task_id: created.task.task_id,
+      });
+      expect(blocked.task.status).toBe('blocked');
+      collectEvidence(blocked, runIds, marketDirectories);
+
+      const resumed = await resumedClient.call<TaskSnapshot>('task.resume', {
+        task_id: created.task.task_id,
+      });
+      collectEvidence(resumed, runIds, marketDirectories);
+      const terminal = await waitForTerminalTask(resumedClient, created.task.task_id);
+      collectEvidence(terminal, runIds, marketDirectories);
+      expect(terminal.task.status).toBe('completed');
+
+      const driverIds = readFileSync(path.join(runnerDir, 'drivers.log'), 'utf8')
+        .trim()
+        .split('\n')
+        .filter(Boolean);
+      expect(driverIds.length).toBeGreaterThanOrEqual(2);
+      expect(new Set(driverIds)).toEqual(new Set(['claude']));
+
+      const resumedRunId = terminal.run_history[0]?.run_id;
+      if (!resumedRunId) throw new Error('resumed run id was not persisted');
+      const request = JSON.parse(
+        readFileSync(path.join('.newide', 'runs', resumedRunId, 'request.json'), 'utf8'),
+      ) as { driver_config?: { default_driver?: string } };
+      expect(request.driver_config?.default_driver).toBe('claude');
+    } finally {
+      await firstClient.close();
+      await resumedClient?.close();
+      rmSync(runnerDir, { recursive: true, force: true });
+      rmSync(homeDir, { recursive: true, force: true });
+      rmSync(workspace, { recursive: true, force: true });
+      for (const runId of runIds) {
+        rmSync(path.join('.newide', 'runs', runId), { recursive: true, force: true });
+      }
+      for (const directory of marketDirectories) {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    }
+  }, 20_000);
+
+  it('interrupts an active Driver turn, restarts the backend, and resumes the same Task', async () => {
+    const runnerDir = mkdtempSync(path.join(os.tmpdir(), 'newide-task-interrupt-runner-'));
+    const workspace = mkdtempSync(path.join(os.tmpdir(), 'newide-task-interrupt-workspace-'));
+    const holdPath = path.join(runnerDir, 'hold-first-invocation');
+    const enteredPath = path.join(runnerDir, 'first-invocation-entered');
+    const runIds = new Set<string>();
+    const marketDirectories = new Set<string>();
+    initGitWorkspace(workspace);
+    writeInterruptibleFakeDriver(runnerDir);
+    writeFileSync(holdPath, 'hold');
+    const firstClient = new RpcChildClient(
+      spawnBackend(runnerDir, { NEWIDE_EPHEMERAL_ACP_SESSIONS: '0' }),
+    );
+    let resumedClient: RpcChildClient | undefined;
+
+    try {
+      const created = await firstClient.call<TaskSnapshot>('task.create', {
+        spec: 'Interrupt this active task and resume it after backend restart',
+        completion_criteria: ['The Task completes after task.interrupt and task.resume'],
+        workspace_path: workspace,
+      });
+      collectEvidence(created, runIds, marketDirectories);
+      await waitForFile(enteredPath);
+
+      const interrupted = await firstClient.call<TaskSnapshot>('task.interrupt', {
+        task_id: created.task.task_id,
+      });
+      collectEvidence(interrupted, runIds, marketDirectories);
+      expect(interrupted.task.status).toBe('blocked');
+      expect(interrupted.run_history[0]).toMatchObject({ status: 'interrupted' });
+
+      await firstClient.close();
+      rmSync(holdPath, { force: true });
+      resumedClient = new RpcChildClient(
+        spawnBackend(runnerDir, { NEWIDE_EPHEMERAL_ACP_SESSIONS: '0' }),
+      );
+      await expect(resumedClient.call('system.ping')).resolves.toMatchObject({ status: 'ok' });
+      const afterRestart = await resumedClient.call<TaskSnapshot>('task.get', {
+        task_id: created.task.task_id,
+      });
+      expect(afterRestart.task.status).toBe('blocked');
+      collectEvidence(afterRestart, runIds, marketDirectories);
+
+      const resumed = await resumedClient.call<TaskSnapshot>('task.resume', {
+        task_id: created.task.task_id,
+      });
+      collectEvidence(resumed, runIds, marketDirectories);
+      const terminal = await waitForTerminalTask(resumedClient, created.task.task_id);
+      collectEvidence(terminal, runIds, marketDirectories);
+      expect(terminal.task.status).toBe('completed');
+      expect(terminal.run_history[0]).toMatchObject({ status: 'completed' });
+      expect(terminal.run_history[1]).toMatchObject({ status: 'interrupted' });
+      expect(terminal.run_history[0]?.run_id).not.toBe(terminal.run_history[1]?.run_id);
+    } finally {
+      await firstClient.close();
+      await resumedClient?.close();
+      rmSync(runnerDir, { recursive: true, force: true });
+      rmSync(workspace, { recursive: true, force: true });
+      for (const runId of runIds) {
+        rmSync(path.join('.newide', 'runs', runId), { recursive: true, force: true });
+      }
+      for (const directory of marketDirectories) {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    }
+  }, 20_000);
+
+  it('interrupts a Council Task and resumes it through the Council stages', async () => {
+    const runnerDir = mkdtempSync(path.join(os.tmpdir(), 'newide-council-interrupt-runner-'));
+    const workspace = mkdtempSync(path.join(os.tmpdir(), 'newide-council-interrupt-workspace-'));
+    const holdPath = path.join(runnerDir, 'hold-first-invocation');
+    const enteredPath = path.join(runnerDir, 'first-invocation-entered');
+    const runIds = new Set<string>();
+    const marketDirectories = new Set<string>();
+    initGitWorkspace(workspace);
+    writeInterruptibleFakeDriver(runnerDir);
+    writeFileSync(holdPath, 'hold');
+    const firstClient = new RpcChildClient(
+      spawnBackend(runnerDir, { NEWIDE_EPHEMERAL_ACP_SESSIONS: '0' }),
+    );
+    let resumedClient: RpcChildClient | undefined;
+
+    try {
+      const created = await firstClient.call<TaskSnapshot>('task.create', {
+        spec: 'Create a small snake game and validate it with Council',
+        completion_criteria: ['Council completes and delivers a final artifact'],
+        workspace_path: workspace,
+        mode: 'council',
+      });
+      collectEvidence(created, runIds, marketDirectories);
+      await waitForFile(enteredPath);
+
+      const interrupted = await firstClient.call<TaskSnapshot>('task.interrupt', {
+        task_id: created.task.task_id,
+      });
+      expect(interrupted.task.status).toBe('blocked');
+      collectEvidence(interrupted, runIds, marketDirectories);
+
+      await firstClient.close();
+      rmSync(holdPath, { force: true });
+      resumedClient = new RpcChildClient(
+        spawnBackend(runnerDir, { NEWIDE_EPHEMERAL_ACP_SESSIONS: '0' }),
+      );
+      await expect(resumedClient.call('system.ping')).resolves.toMatchObject({ status: 'ok' });
+      await expect(
+        resumedClient.call<TaskSnapshot>('task.resume', { task_id: created.task.task_id }),
+      ).resolves.toMatchObject({ task: { status: 'running' } });
+      const terminal = await waitForTerminalTask(resumedClient, created.task.task_id);
+      collectEvidence(terminal, runIds, marketDirectories);
+      expect(terminal.task.status).toBe('completed');
+      expect(terminal.council).toMatchObject({ status: 'completed' });
+      expect(terminal.run_history[0]).toMatchObject({ status: 'completed' });
+      expect(terminal.run_history[1]).toMatchObject({ status: 'interrupted' });
+    } finally {
+      await firstClient.close();
+      await resumedClient?.close();
+      rmSync(runnerDir, { recursive: true, force: true });
+      rmSync(workspace, { recursive: true, force: true });
+      for (const runId of runIds) {
+        rmSync(path.join('.newide', 'runs', runId), { recursive: true, force: true });
+        rmSync(path.join('.newide', 'council', runId), { recursive: true, force: true });
+      }
+      for (const directory of marketDirectories) {
+        rmSync(directory, { recursive: true, force: true });
+      }
+    }
+  }, 30_000);
+
   it('replays a scoped pending Mailbox delivery across restarts', async () => {
     const runnerDir = mkdtempSync(path.join(os.tmpdir(), 'newide-mailbox-rpc-runner-'));
     writeFakeDriver(runnerDir);
@@ -349,9 +556,7 @@ describe('Task-first JSON-RPC child process acceptance', () => {
         idempotency_key: 'rpc_send_1',
       });
       expect(sent.message.thread_id).toBe('thread_mailbox_e2e');
-      expect(sent.deliveries).toMatchObject([
-        { status: 'pending', retry_count: 0 },
-      ]);
+      expect(sent.deliveries).toMatchObject([{ status: 'pending', retry_count: 0 }]);
       const deliveryId = sent.deliveries[0]?.delivery_id;
       expect(deliveryId).toBeTruthy();
 
@@ -466,7 +671,10 @@ class RpcChildClient {
   }
 }
 
-function spawnBackend(runnerDir: string): ChildProcessWithoutNullStreams {
+function spawnBackend(
+  runnerDir: string,
+  environment: Record<string, string> = {},
+): ChildProcessWithoutNullStreams {
   return spawn(
     process.execPath,
     ['--import', 'tsx', path.join(process.cwd(), 'test/fixtures/task-rpc-server.ts')],
@@ -477,6 +685,7 @@ function spawnBackend(runnerDir: string): ChildProcessWithoutNullStreams {
         ACP_DRIVER_RUNNER_DIR: runnerDir,
         NEWIDE_COORDINATION_DB: path.join(runnerDir, 'coordination.sqlite'),
         NEWIDE_B_APP_STATE_ROOT: path.join(runnerDir, 'b-state'),
+        ...environment,
       },
       stdio: ['pipe', 'pipe', 'pipe'],
     },
@@ -493,42 +702,48 @@ async function waitForTerminalTask(client: RpcChildClient, taskId: string): Prom
   throw new Error(`Task ${taskId} did not reach terminal state`);
 }
 
-async function waitForExperiences(
+/**
+ * 等一次任务的上下文交付项出现。
+ *
+ * 生产路径不在本进程提取经验（那是外部 Memory Maintenance 系统的事），所以要等
+ * 的是「任务产出的上下文已经登记给下游」，而不是「经验已经写出来」。
+ */
+async function waitForContextDelivery(
   client: RpcChildClient,
   roleId: string,
-  sourceTaskId: string,
-): Promise<{ experiences: Array<{ source_task_id: string }> }> {
+  taskId: string,
+): Promise<{ deliveries: Array<{ task_id: string; memory_buffer_ref: string }> }> {
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
-    const result = await client.call<{ experiences: Array<{ source_task_id: string }> }>(
-      'memory.listExperiences',
-      { role_id: roleId },
-    );
-    if (result.experiences.some((experience) => experience.source_task_id === sourceTaskId)) {
+    const result = await client.call<{
+      deliveries: Array<{ task_id: string; memory_buffer_ref: string }>;
+    }>('memory.listContextDeliveries', { role_id: roleId, task_id: taskId });
+    if (result.deliveries.length > 0) {
       return result;
     }
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
-  throw new Error(`Timed out waiting for B Experience from ${sourceTaskId}`);
+  throw new Error(`Timed out waiting for a B context delivery from ${taskId}`);
 }
 
+/** 等每个角色都至少留下一条上下文交付证据（生产路径的 maintenance 就是它） */
 async function waitForMaintenance(
   client: RpcChildClient,
   roleIds: readonly string[],
 ): Promise<{
-  maintenance: Array<{ role_id: string; status: string; evidence_uri?: string }>;
+  maintenance: Array<{ role_id: string; kind: string; status: string }>;
 }> {
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
     const result = await client.call<{
-      maintenance: Array<{ role_id: string; status: string; evidence_uri?: string }>;
+      maintenance: Array<{ role_id: string; kind: string; status: string }>;
     }>('memory.listMaintenance', {});
-    const completedRoles = new Set(
+    const deliveredRoles = new Set(
       result.maintenance
-        .filter((item) => item.status === 'completed')
+        .filter((item) => item.kind === 'context_delivery' && item.status === 'scheduled')
         .map((item) => item.role_id),
     );
-    if (roleIds.every((roleId) => completedRoles.has(roleId))) return result;
+    if (roleIds.every((roleId) => deliveredRoles.has(roleId))) return result;
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new Error(`Timed out waiting for B maintenance for ${roleIds.join(', ')}`);
@@ -590,16 +805,24 @@ function writeInterruptibleFakeDriver(runnerDir: string): void {
     path.join(runnerDir, 'fake.mjs'),
     `import { appendFileSync, existsSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { join } from 'node:path';
 let body='';
 process.stdin.on('data', chunk => body += chunk);
 process.stdin.on('end', () => {
   const input = JSON.parse(body);
   appendFileSync(new URL('./sessions.log', import.meta.url), String(input.session_id || '') + '\\n');
+  appendFileSync(new URL('./drivers.log', import.meta.url), String(process.env.ACP_AGENT_ID || '') + '\\n');
+  const councilRole = String(input.workspace_path || '').replaceAll('\\\\', '/').includes('.newide/council');
+  const reviewPrompt = input.prompt.includes('Review the isolated proposal inputs');
   const complete = () => {
     const created_at = new Date().toISOString();
     const suffix = createHash('sha256').update(JSON.stringify([input.task_id, input.prompt, input.session_id])).digest('hex').slice(0, 16);
-    const artifact = { artifact_id: 'artifact_' + suffix, type: 'driver_result', uri: 'artifact://fake/resumed', producer_id: 'fake-acp', task_id: input.task_id, created_at, schema_version: input.schema_version };
-    process.stdout.write(JSON.stringify({ driver_run_result_id: 'driver_' + suffix, session_id: input.session_id, status: 'succeeded', response: 'Resumed fake ACP completed.', artifacts: [artifact], transcript_ref: { ...artifact, artifact_id: 'transcript_' + suffix, type: 'transcript' }, tool_events: [], diagnostics: { driver_id: 'fake-acp', duration_ms: 1, notes: [] }, created_at, schema_version: input.schema_version }));
+    const artifact = { artifact_id: 'artifact_' + suffix, type: councilRole ? 'diff' : 'driver_result', uri: 'artifact://fake/resumed', producer_id: 'fake-acp', task_id: input.task_id, ...(councilRole ? { content: { kind: 'text', content_ref: 'data:text/plain,COUNCIL_FINAL%0A', target_path: 'council-output.txt', media_type: 'text/plain' } } : {}), created_at, schema_version: input.schema_version };
+    if (reviewPrompt && input.workspace_path) {
+      writeFileSync(join(input.workspace_path, 'reviews.json'), JSON.stringify({ reviews: [...new Set(input.prompt.match(/proposal_[a-z0-9-]+/g) || [])].map(id => ({ proposal_id: id, verdict: 'approve', reason: 'Reviewed staged evidence.', unmet_criteria: [], evidence_refs: [] })) }));
+    }
+    const response = reviewPrompt ? 'Review written to reviews.json.' : 'Resumed fake ACP completed.';
+    process.stdout.write(JSON.stringify({ driver_run_result_id: 'driver_' + suffix, session_id: input.session_id || 'session_ephemeral', status: 'succeeded', response, artifacts: [artifact, ...(reviewPrompt ? [{ artifact_id: 'reviews_' + suffix, type: 'file', uri: 'artifact://fake/reviews', producer_id: 'fake-acp', task_id: input.task_id, content: { kind: 'text', content_ref: 'data:text/plain,%7B%22reviews%22%3A%5B%5D%7D', target_path: 'reviews.json' }, created_at, schema_version: input.schema_version }] : [])], transcript_ref: { ...artifact, artifact_id: 'transcript_' + suffix, type: 'transcript' }, tool_events: [], diagnostics: { driver_id: 'fake-acp', duration_ms: 1, notes: [] }, created_at, schema_version: input.schema_version }));
   };
   const hold = new URL('./hold-first-invocation', import.meta.url);
   if (!existsSync(hold)) return complete();
@@ -615,4 +838,22 @@ process.stdout.on('error', () => process.exit(0));
 `,
   );
   writeFakeAcpRunnerBuild(runnerDir, { importFromRunnerRoot: 'fake.mjs' });
+}
+
+function writeDriverConfig(homeDir: string, defaultDriver: 'claude' | 'codex'): void {
+  const agentDir = path.join(homeDir, '.agent');
+  mkdirSync(agentDir, { recursive: true });
+  writeFileSync(
+    path.join(agentDir, 'drivers.yaml'),
+    [
+      'version: 1',
+      `default_driver: ${defaultDriver}`,
+      'drivers:',
+      '  claude:',
+      '    agent: claude',
+      '  codex:',
+      '    agent: codex',
+      '',
+    ].join('\n'),
+  );
 }

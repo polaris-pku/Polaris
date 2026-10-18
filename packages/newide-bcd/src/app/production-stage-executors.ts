@@ -21,6 +21,7 @@ import {
   evaluateCompletionCriteria,
   type CompletionCriteriaEvaluation,
 } from '../coordinator/completion-criteria-evaluator';
+import { PLAN_SELF_CHECK_REQUIREMENT, PLAN_STEP_LIST_REQUIREMENT } from '../coordinator/plan-check';
 import {
   isMaterializableFileArtifact,
   readArtifactBytes,
@@ -39,6 +40,7 @@ import {
   type EvidencePack,
 } from '../council';
 import {
+  councilArtifactStageRelativePath,
   councilRunWorkspaceRoot,
   prepareCouncilWorkspace,
   stageCouncilArtifacts,
@@ -227,18 +229,15 @@ export function createProductionStageExecutors(
       const strategyName = councilStrategyName(dependencies.councilProvider);
       const planFirst = context.mode === 'council' && strategyName === 'plan_first';
       const executionWorkspace =
-        context.delivery_workspace_path &&
-        context.workspace_path !== context.delivery_workspace_path
-          ? context.workspace_path
-          : context.mode === 'council'
-            ? path.join(
-                councilRunWorkspaceRoot(
-                  dependencies.councilRoot,
-                  context.restarted_from_run_id ?? context.run_id,
-                ),
-                'primary',
-              )
-            : context.workspace_path;
+        context.mode === 'council'
+          ? path.join(
+              councilRunWorkspaceRoot(
+                dependencies.councilRoot,
+                await stateStore.workspaceRunId(context.run_id, context.restarted_from_run_id),
+              ),
+              'primary',
+            )
+          : context.workspace_path;
       if (context.mode === 'council') {
         if (!context.restarted_from_run_id) {
           await prepareCouncilWorkspace(context.workspace_path, executionWorkspace);
@@ -266,6 +265,11 @@ export function createProductionStageExecutors(
             schema_version: SCHEMA_VERSION,
             ...(context.memory_ablation ? { memory_ablation: context.memory_ablation } : {}),
             ...(sessionId ? { session_id: sessionId } : {}),
+            ...(sessionId &&
+            context.restarted_from_run_id &&
+            context.native_task_prompt_dispatched !== false
+              ? { resume_session: true }
+              : {}),
             ...(context.cursor_input.mailbox_delivery_id
               ? { mailbox_delivery_id: context.cursor_input.mailbox_delivery_id }
               : {}),
@@ -541,13 +545,19 @@ export function createProductionStageExecutors(
             gate_results: [],
             evidence_pack: evidencePack,
             question: context.task_request.spec,
-            workspace_path: context.delivery_workspace_path ?? context.workspace_path,
+            workspace_path: context.workspace_path,
             proposal_agent_id: primary.agent_id ?? primary.role_id,
             ...(context.memory_ablation ? { memory_ablation: context.memory_ablation } : {}),
           },
           {
+            recovery_key: await stateStore.workspaceRunId(
+              context.run_id,
+              context.restarted_from_run_id,
+            ),
             ...(context.signal ? { signal: context.signal } : {}),
             ...(context.on_driver_event ? { onDriverEvent: context.on_driver_event } : {}),
+            ...(context.on_sap_dispatch ? { onSapDispatch: context.on_sap_dispatch } : {}),
+            ...(context.on_sap_result ? { onSapResult: context.on_sap_result } : {}),
             onCouncilLifecycleEvent: (event) =>
               emit(
                 context,
@@ -698,7 +708,7 @@ export function createProductionStageExecutors(
         run_id: context.run_id,
         task_id: context.task_id,
         phase: context.mode === 'council' ? 'post_council' : 'pre_selection',
-        workspace_path: context.delivery_workspace_path ?? context.workspace_path,
+        workspace_path: context.workspace_path,
         completion_criteria: context.task_request.completion_criteria,
         artifact_refs: selection.selected_artifacts.map((artifact) => artifact.artifact_id),
       });
@@ -724,7 +734,7 @@ export function createProductionStageExecutors(
         manifest_path: pathFromFileRef(selection.manifest_ref),
         delivery_receipt_path: buildRunOutputPaths(context.run_id, dependencies.runsRoot)
           .delivery_receipt_path,
-        user_workspace_path: context.delivery_workspace_path ?? context.workspace_path,
+        user_workspace_path: context.workspace_path,
         ...(context.mode === 'council'
           ? {
               council_workspace_path: councilRunWorkspaceRoot(
@@ -864,8 +874,7 @@ export function createProductionStageExecutors(
         files: delivery.files,
         quality: gateState.completion_evaluation.outcome,
       });
-      const firstFile =
-        delivery.files[0]?.file_path ?? context.delivery_workspace_path ?? context.workspace_path;
+      const firstFile = delivery.files[0]?.file_path ?? context.workspace_path;
       return {
         final_output: {
           artifact_ref: selection.manifest_ref,
@@ -920,10 +929,21 @@ async function executeFinalCouncilPlan(input: {
   const workspace = path.join(
     councilRunWorkspaceRoot(
       input.dependencies.councilRoot,
-      input.context.restarted_from_run_id ?? input.context.run_id,
+      await new ProductionStageStateStore(input.dependencies.runsRoot).workspaceRunId(
+        input.context.run_id,
+        input.context.restarted_from_run_id,
+      ),
     ),
     'primary',
   );
+  // staged 落点在这里算一次，指令直接点名它；拼法来自 councilArtifactStageRelativePath，
+  // 与落盘同源（见该函数注释：不给文件名就等于把「按 Plan 执行」交给模型的自觉）。
+  const stagedPlanPaths = input.finalPlans
+    .filter((artifact) => isMaterializableFileArtifact(artifact))
+    .flatMap((artifact) => {
+      const relativePath = councilArtifactStageRelativePath(artifact);
+      return relativePath ? [relativePath] : [];
+    });
   await stageCouncilArtifacts(workspace, input.finalPlans);
   const workspaceBefore = await snapshotWorkspaceFiles(workspace);
   let phaseId = input.phaseId;
@@ -947,20 +967,25 @@ async function executeFinalCouncilPlan(input: {
     });
   };
   const implementationInstruction = [
-    'Implement the approved final Council Plan staged under inputs/.',
+    stagedPlanPaths.length > 0
+      ? `Implement the approved final Council Plan staged under inputs/: ${stagedPlanPaths.join(', ')}.`
+      : 'Implement the approved final Council Plan staged under inputs/.',
+    'Read the Plan file at that path in full before editing any product file.',
     'Use the Plan as execution guidance, modify the product files needed by the original Task, and verify the result.',
     'Use paths relative to the current workspace for every product file; never construct an absolute path.',
     'Do not stop after rewriting or summarizing the Plan; produce the concrete implementation artifacts.',
+    ...PLAN_SELF_CHECK_REQUIREMENT,
     `Original Task: ${input.context.task_request.spec}`,
   ].join('\n');
-  const runImplementation = async (attempt: 1 | 2) => {
+  const runImplementation = async (
+    attempt: 1 | 2,
+    steer?: string,
+    recovery?: 'same_session_continuation',
+  ) => {
     const retryInstruction =
-      attempt === 1
+      attempt === 1 || !steer
         ? implementationInstruction
-        : [
-            implementationInstruction,
-            'RETRY: Resume this same Plan execution after a recoverable runtime interruption. Inspect the existing workspace, preserve completed work, and finish the remaining implementation.',
-          ].join('\n\n');
+        : [implementationInstruction, steer].join('\n\n');
     emit(input.context, 'agent.execution_requested', input.context.run_id, {
       phase: 'council_plan_execution',
       phase_id: phaseId,
@@ -969,7 +994,9 @@ async function executeFinalCouncilPlan(input: {
       session_id: input.primary.session_id,
       workspace_path: workspace,
       final_plan_artifact_refs: input.finalPlans.map((artifact) => artifact.artifact_id),
-      ...(attempt === 2 ? { recovery: 'single_agent_continuation' } : {}),
+      // 原因如实透出：与 council.phase.started 的 recovery 必须一致，
+      // 否则同一件事在两个事件里给出两个说法。
+      ...(attempt === 2 && recovery ? { recovery } : {}),
     });
     return input.dependencies.agentExecutionFacade.runAgent(
       {
@@ -978,6 +1005,10 @@ async function executeFinalCouncilPlan(input: {
         role_id: input.primary.role_id,
         instruction: retryInstruction,
         driver_instruction: retryInstruction,
+        ...(input.context.restarted_from_run_id &&
+        input.context.native_task_prompt_dispatched !== false
+          ? { resume_session: true }
+          : {}),
         workspace_path: workspace,
         session_id: input.primary.session_id,
         input_artifact_refs: input.finalPlans.map((artifact) => artifact.artifact_id),
@@ -995,6 +1026,8 @@ async function executeFinalCouncilPlan(input: {
   };
   let result = await runImplementation(1);
   let implementationArtifacts = implementationArtifactsFrom(result);
+  // 唯一的打回原因是运行时中断/可重试驱动失败。Plan 自检报告不参与判定，
+  // 因此它不会触发重试、也不会改变 run 结果（见 plan-check.ts）。
   if (shouldResumeFinalCouncilPlan(result, implementationArtifacts)) {
     recordFailure(result, 1, true);
     phaseId = createId('council_phase');
@@ -1008,7 +1041,11 @@ async function executeFinalCouncilPlan(input: {
       recovery: 'same_session_continuation',
       input_artifact_refs: input.finalPlans.map((artifact) => artifact.artifact_id),
     });
-    result = await runImplementation(2);
+    result = await runImplementation(
+      2,
+      PLAN_EXECUTION_INTERRUPTION_STEER,
+      'same_session_continuation',
+    );
     if (result.status === 'completed') {
       result = {
         ...result,
@@ -1061,8 +1098,16 @@ async function executeFinalCouncilPlan(input: {
     implementation_artifact_refs: implementationArtifacts.map((artifact) => artifact.artifact_id),
     response: result.response,
   });
-  return { result, artifact_refs: implementationArtifacts, failed_attempts: failedAttempts };
+  return {
+    result,
+    artifact_refs: implementationArtifacts,
+    failed_attempts: failedAttempts,
+  };
 }
+
+/** 运行时中断的打回指令；同一次实现最多重试一次。 */
+const PLAN_EXECUTION_INTERRUPTION_STEER =
+  'RETRY: Resume this same Plan execution after a recoverable runtime interruption. Inspect the existing workspace, preserve completed work, and finish the remaining implementation.';
 
 function implementationArtifactsFrom(result: AgentExecutionResult): ArtifactRef[] {
   return result.artifact_refs.filter(
@@ -1184,6 +1229,7 @@ function agentExecutionInstruction(
       'Use your Persona, Skills, and Memory, but do not modify product files or implement the solution yet.',
       'Write the complete Plan to the relative path council-plan.md in the current workspace; never construct an absolute path.',
       'Include affected files, ordered steps, risks, and verification.',
+      ...PLAN_STEP_LIST_REQUIREMENT,
       `Original Task: ${context.task_request.spec}`,
     ].join('\n');
   }
@@ -1310,19 +1356,50 @@ function emitCouncilFailure<TCursor extends TaskResumeCursor>(
 class ProductionStageStateStore {
   constructor(private readonly runsRoot: string) {}
 
+  async workspaceRunId(runId: string, inheritedFromRunId?: string): Promise<string> {
+    const lineage = await this.lineage(runId, inheritedFromRunId);
+    return lineage[lineage.length - 1]!;
+  }
+
+  private async lineage(runId: string, parent?: string): Promise<string[]> {
+    const lineage = [runId];
+    parent = await this.readRecoveryParent(runId, parent);
+    while (parent) {
+      if (!/^[A-Za-z0-9_-]+$/.test(parent) || lineage.includes(parent)) {
+        throw new Error('Invalid Run recovery lineage');
+      }
+      lineage.push(parent);
+      parent = await this.readRecoveryParent(parent);
+    }
+    return lineage;
+  }
+
+  private async readRecoveryParent(runId: string, fallback?: string): Promise<string | undefined> {
+    if (!/^[A-Za-z0-9_-]+$/.test(runId)) throw new Error('Invalid Run recovery lineage');
+    try {
+      const request = JSON.parse(
+        await fs.readFile(path.join(this.runsRoot, runId, 'request.json'), 'utf8'),
+      );
+      return 'recovery_parent_run_id' in request
+        ? (request.recovery_parent_run_id ?? undefined)
+        : (request.restarted_from_run_id ?? fallback);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      return fallback;
+    }
+  }
+
   /**
    * 读取 stage 中间产物。resume 会新建 run_id，已完成 stage 的产物落在被中断 run 的
-   * 目录下，所以允许沿 restarted_from_run_id 回溯一层，否则续跑的 deliver 会因为
+   * 目录下，所以沿持久化恢复链回溯，否则连续中断后的 deliver 会因为
    * "no production stage state" 直接失败。
    *
    * 只回溯读、不回溯写：update 始终写当前 run 的文件，保持每个 run 的证据自洽。
    */
   async require(runId: string, inheritedFromRunId?: string): Promise<ProductionStageState> {
-    const state = await this.read(runId);
-    if (state) return state;
-    if (inheritedFromRunId) {
-      const inherited = await this.read(inheritedFromRunId);
-      if (inherited) return inherited;
+    for (const id of await this.lineage(runId, inheritedFromRunId)) {
+      const state = await this.read(id);
+      if (state) return state;
     }
     throw new Error(`Run ${runId} has no production stage state`);
   }
@@ -1334,7 +1411,11 @@ class ProductionStageStateStore {
     inheritedFromRunId?: string,
   ): Promise<void> {
     // 续跑 run 的首次写入必须以被中断 run 的状态为底，否则会把前序 stage 的产物写没。
-    const inherited = inheritedFromRunId ? await this.read(inheritedFromRunId) : undefined;
+    let inherited: ProductionStageState | undefined;
+    for (const id of (await this.lineage(runId, inheritedFromRunId)).slice(1)) {
+      inherited = await this.read(id);
+      if (inherited) break;
+    }
     const current =
       (await this.read(runId)) ??
       ({

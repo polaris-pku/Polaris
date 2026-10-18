@@ -154,10 +154,12 @@ export async function promoteExperienceToSkill(
     updated_at: now,
   };
 
-  await repository.saveSkill(input.role_id, skill);
-  await repository.updateExperience(input.role_id, { ...experience, promoted_to: skill.id });
+  // 幂等键 (role_id, promoted_from)：saveSkill 成功而 updateExperience 失败后重试时，
+  // 这里认得出「这条经验已经有技能了」，返回既有那条而不是再造一个副本。
+  const { skill: stored } = await repository.saveSkillIfAbsent(input.role_id, skill);
+  await repository.updateExperience(input.role_id, { ...experience, promoted_to: stored.id });
 
-  return (await requireStoredSkill(repository, input.role_id, skill.id)) ?? skill;
+  return (await requireStoredSkill(repository, input.role_id, stored.id)) ?? stored;
 }
 
 /**
@@ -282,8 +284,7 @@ async function recomputeAvgConfidence(
   const experiences = await repository.listExperiences(role_id);
   const average =
     experiences.length > 0
-      ? experiences.reduce((sum, experience) => sum + experience.confidence, 0) /
-        experiences.length
+      ? experiences.reduce((sum, experience) => sum + experience.confidence, 0) / experiences.length
       : 0;
   await repository.updateMetrics(role_id, (metrics) => ({
     ...metrics,

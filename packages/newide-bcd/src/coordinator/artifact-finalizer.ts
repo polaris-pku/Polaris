@@ -20,6 +20,12 @@ import {
 import { buildCouncilProposalFromDriverResult } from '../council/proposal-adapter';
 import type { AutonomousCouncilHandler } from './handlers/autonomous-council-handler';
 import type { DriverStreamEventListener } from '../driver/contract';
+import type {
+  SapExecuteDispatch,
+  SapExecutionAdmission,
+  SapResultFrame,
+  SapResultDisposition,
+} from '../coordination/sap-task-bridge';
 
 export type SelectionMode = 'single_agent' | 'council';
 
@@ -67,9 +73,17 @@ export interface ArtifactSelectionInput {
 }
 
 export interface ArtifactSelectionExecutionOptions {
+  recovery_key?: string;
   signal?: AbortSignal;
   onDriverEvent?: DriverStreamEventListener;
   onCouncilLifecycleEvent?: (event: CouncilLifecycleEvent) => void | Promise<void>;
+  onSapDispatch?: (dispatch: SapExecuteDispatch) => void | Promise<void>;
+  onSapResult?: (input: {
+    admission: SapExecutionAdmission;
+    frame: SapResultFrame;
+    phase: 'proposal' | 'review' | 'synthesis';
+    participant_id: string;
+  }) => SapResultDisposition | Promise<SapResultDisposition>;
 }
 
 export interface ArtifactSelectorOptions {
@@ -153,28 +167,31 @@ export class ArtifactSelector {
     if (input.proposal_agent_id) proposal.agent_id = input.proposal_agent_id;
 
     const councilRequest = {
-        run_id: input.run_id,
-        task_id: input.task_id,
-        trigger: 'user_choice' as const,
-        decision_mode: 'advisory' as const,
-        question: input.question ?? 'Select the best driver output artifact for v0 integration.',
-        ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
-        ...(input.memory_ablation ? { memory_ablation: input.memory_ablation } : {}),
-        ...(input.proposal_agent_id ? { primary_agent_id: input.proposal_agent_id } : {}),
-        candidate_artifacts: [...input.driver_result.artifacts],
-        proposals: [proposal],
-        evidence_pack: input.evidence_pack,
-        schema_version: SCHEMA_VERSION,
-      };
+      run_id: input.run_id,
+      task_id: input.task_id,
+      trigger: 'user_choice' as const,
+      decision_mode: 'advisory' as const,
+      question: input.question ?? 'Select the best driver output artifact for v0 integration.',
+      ...(input.workspace_path ? { workspace_path: input.workspace_path } : {}),
+      ...(input.memory_ablation ? { memory_ablation: input.memory_ablation } : {}),
+      ...(input.proposal_agent_id ? { primary_agent_id: input.proposal_agent_id } : {}),
+      candidate_artifacts: [...input.driver_result.artifacts],
+      proposals: [proposal],
+      evidence_pack: input.evidence_pack,
+      schema_version: SCHEMA_VERSION,
+    };
     const councilOptions = execution
-        ? {
-            ...(execution.signal ? { signal: execution.signal } : {}),
-            ...(execution.onDriverEvent ? { onDriverEvent: execution.onDriverEvent } : {}),
-            ...(execution.onCouncilLifecycleEvent
-              ? { onLifecycleEvent: execution.onCouncilLifecycleEvent }
-              : {}),
-          }
-        : undefined;
+      ? {
+          ...(execution.recovery_key ? { recovery_key: execution.recovery_key } : {}),
+          ...(execution.signal ? { signal: execution.signal } : {}),
+          ...(execution.onDriverEvent ? { onDriverEvent: execution.onDriverEvent } : {}),
+          ...(execution.onCouncilLifecycleEvent
+            ? { onLifecycleEvent: execution.onCouncilLifecycleEvent }
+            : {}),
+          ...(execution.onSapDispatch ? { onSapDispatch: execution.onSapDispatch } : {}),
+          ...(execution.onSapResult ? { onSapResult: execution.onSapResult } : {}),
+        }
+      : undefined;
     const autonomousExecution = this.options.councilHandler
       ? await this.options.councilHandler.execute(councilRequest, councilOptions)
       : undefined;

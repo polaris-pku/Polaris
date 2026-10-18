@@ -80,10 +80,7 @@ export function parseTaskCursorInput(value: unknown): TaskCursorInput {
         value.execution_evidence_ref,
         'execution_evidence_ref',
       );
-      const mailboxDeliveryId = optionalString(
-        value.mailbox_delivery_id,
-        'mailbox_delivery_id',
-      );
+      const mailboxDeliveryId = optionalString(value.mailbox_delivery_id, 'mailbox_delivery_id');
       return {
         cursor: value.cursor,
         winner_agent_id: requireString(value.winner_agent_id, 'winner_agent_id'),
@@ -254,6 +251,7 @@ export interface PersistedCheckpointMessage {
 export interface PersistedCheckpointParticipantSession {
   role_id: string;
   session_id: string;
+  workspace_path?: string;
 }
 
 export interface PersistedCheckpointMailboxState {

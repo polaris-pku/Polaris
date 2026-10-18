@@ -8,6 +8,8 @@ export function terminalRunStatus(type: string): Exclude<RunStatus, 'running'> |
       return 'failed';
     case 'run.cancelled':
       return 'cancelled';
+    case 'run.interrupted':
+      return 'interrupted';
     default:
       return undefined;
   }

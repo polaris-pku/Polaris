@@ -28,6 +28,7 @@ import { ModelPool } from './model-pool';
 import { MethodRouter } from './methods/method-router';
 import { ToolRegistry } from './tools/tool-registry';
 import { loadLitellmConfig } from './config-loader';
+import { createCredentiallessAnthropicProvider } from './credentialless-anthropic-provider';
 
 import type {
   LiteLLMClientConfig,
@@ -230,6 +231,13 @@ export class LiteLLMClient {
         break;
       }
       case 'anthropic': {
+        if (process.env.NEWIDE_LLM_CREDENTIALLESS === '1') {
+          const baseURL = process.env.NEWIDE_LLM_BASE_URL?.trim();
+          if (!baseURL) throw new Error('Local proxy requires NEWIDE_LLM_BASE_URL');
+          const proxy = createCredentiallessAnthropicProvider(baseURL);
+          factory = (id) => proxy.messages(id);
+          break;
+        }
         const { createAnthropic } = await import('@ai-sdk/anthropic');
         const apiKey =
           process.env.ANTHROPIC_AUTH_TOKEN ||
@@ -258,6 +266,16 @@ export class LiteLLMClient {
   private async resolveModel(provider: string, modelId: string) {
     const factory = await this.resolveProvider(provider);
     return factory(modelId);
+  }
+
+  private resolveTextModel(task: string) {
+    const resolved = this.modelPool.resolve(task);
+    if (process.env.NEWIDE_LLM_CREDENTIALLESS === '1') {
+      const model = process.env.NEWIDE_LLM_MODEL?.trim();
+      if (!model) throw new Error('Local proxy requires NEWIDE_LLM_MODEL');
+      return { ...resolved, provider: 'anthropic', model };
+    }
+    return resolved;
   }
 
   private readonly embeddingProviders = new Map<string, EmbeddingModel>();
@@ -302,14 +320,16 @@ export class LiteLLMClient {
   // ═════════════════════════════════════════════════════════
 
   async complete(request: CompletionRequest): Promise<CompletionResponse> {
-    const resolved = this.modelPool.resolve(request.task);
+    const resolved = this.resolveTextModel(request.task);
     const model = await this.resolveModel(resolved.provider, resolved.model);
     const messages = toAiMessages(request.messages);
 
     const params: Record<string, unknown> = {
       model,
       messages,
-      temperature: request.temperature ?? resolved.temperature,
+      ...(process.env.NEWIDE_LLM_CREDENTIALLESS === '1'
+        ? {}
+        : { temperature: request.temperature ?? resolved.temperature }),
       maxOutputTokens: request.maxTokens ?? resolved.maxTokens,
     };
 
@@ -338,7 +358,7 @@ export class LiteLLMClient {
     toolHandlers?: Record<string, ToolHandler>,
     maxRounds = 10,
   ): Promise<CompletionResponse> {
-    const resolved = this.modelPool.resolve(request.task);
+    const resolved = this.resolveTextModel(request.task);
     const model = await this.resolveModel(resolved.provider, resolved.model);
     const messages = toAiMessages(request.messages);
 
@@ -353,7 +373,9 @@ export class LiteLLMClient {
       model,
       messages,
       tools: toAiTools(schemas, handlers),
-      temperature: request.temperature ?? resolved.temperature,
+      ...(process.env.NEWIDE_LLM_CREDENTIALLESS === '1'
+        ? {}
+        : { temperature: request.temperature ?? resolved.temperature }),
       maxOutputTokens: request.maxTokens ?? resolved.maxTokens,
       maxSteps: maxRounds,
     };
@@ -379,14 +401,16 @@ export class LiteLLMClient {
   }
 
   async *stream(request: CompletionRequest): AsyncGenerator<StreamChunk> {
-    const resolved = this.modelPool.resolve(request.task);
+    const resolved = this.resolveTextModel(request.task);
     const model = await this.resolveModel(resolved.provider, resolved.model);
     const messages = toAiMessages(request.messages);
 
     const params: Record<string, unknown> = {
       model,
       messages,
-      temperature: request.temperature ?? resolved.temperature,
+      ...(process.env.NEWIDE_LLM_CREDENTIALLESS === '1'
+        ? {}
+        : { temperature: request.temperature ?? resolved.temperature }),
       maxOutputTokens: request.maxTokens ?? resolved.maxTokens,
     };
 
@@ -406,7 +430,7 @@ export class LiteLLMClient {
   async structured<T = unknown>(
     request: CompletionRequest & { responseFormat: JsonSchema },
   ): Promise<T> {
-    const resolved = this.modelPool.resolve(request.task);
+    const resolved = this.resolveTextModel(request.task);
     const model = await this.resolveModel(resolved.provider, resolved.model);
     const messages = toAiMessages(request.messages);
     const schema = request.responseFormat;
@@ -415,7 +439,9 @@ export class LiteLLMClient {
       model,
       schema: jsonSchema(schema.schema as Record<string, unknown>),
       messages,
-      temperature: request.temperature ?? resolved.temperature,
+      ...(process.env.NEWIDE_LLM_CREDENTIALLESS === '1'
+        ? {}
+        : { temperature: request.temperature ?? resolved.temperature }),
       maxOutputTokens: request.maxTokens ?? resolved.maxTokens,
     };
 

@@ -21,6 +21,7 @@ export interface DriverRuntimeInvokerInput {
   run_id?: string;
   workspace_path?: string;
   session_id?: string;
+  resume_session?: boolean;
   call_id: string;
   source_driver: string;
   driver_context: {
@@ -33,6 +34,10 @@ export interface DriverRuntimeInvokerInput {
 export interface DriverRuntimeInvokerOptions {
   signal?: AbortSignal;
   onDriverEvent?: DriverStreamEventListener;
+  /** ADP 证据模型:prompt 交给 transport 前回调(dispatched 时点) */
+  onDispatch?: () => void;
+  /** abort 竞速后迟到的真实结果:交还上层对账(issue #149 §4) */
+  onLateResult?: (execution: DriverRunResult) => void;
 }
 
 export interface DriverRuntimeReport {
@@ -89,6 +94,22 @@ export function createDriverRuntimeInvoker(
         },
         options?.signal,
         options?.onDriverEvent,
+        options?.onDriverEvent || options?.onDispatch || options?.onLateResult
+          ? {
+              onDispatch: () => {
+                options.onDriverEvent?.({
+                  schema_version: 'driver-event.v1',
+                  event_type: 'driver.prompt_dispatching',
+                  task_id: input.task_id,
+                  run_id: runId,
+                  ...(input.session_id ? { session_id: input.session_id } : {}),
+                  created_at: nowTimestamp(),
+                });
+                options.onDispatch?.();
+              },
+              ...(options.onLateResult ? { onLateResult: options.onLateResult } : {}),
+            }
+          : undefined,
       );
     } catch (error) {
       if (isAbort(error, options?.signal)) throw error;
@@ -107,6 +128,21 @@ export function createDriverRuntimeInvoker(
 }
 
 function buildDriverPrompt(input: DriverRuntimeInvokerInput): string {
+  if (input.resume_session) {
+    if (!input.session_id) throw new Error('Native continuation requires a session ID');
+    return [
+      'Continue the interrupted task in this loaded session. Use your existing conversation and the files already present; do not restart completed work.',
+      'The previous interruption ended only the earlier turn. This is an active request to finish the remaining work.',
+      'Verify the actual workspace before reporting completion. Do not claim a file was written unless it exists.',
+      '',
+      input.driver_context.task_instruction,
+      '',
+      buildDriverReturnInstruction({
+        taskId: input.task_id,
+        writeReportFile: shouldWriteDriverReportFile(),
+      }),
+    ].join('\n');
+  }
   const context = deterministicJson({
     task_instruction: input.driver_context.task_instruction,
     skills: input.driver_context.skills,
@@ -116,7 +152,19 @@ function buildDriverPrompt(input: DriverRuntimeInvokerInput): string {
     taskId: input.task_id,
     writeReportFile: shouldWriteDriverReportFile(),
   });
-  return `${context}\n\n${reportInstruction}`;
+  const directive = [
+    'Execute the task_instruction below. This is an active request to perform the task, not a request to acknowledge context.',
+    ...(input.session_id
+      ? [
+          'Continue in this existing session using its conversation and current workspace. Preserve completed work; finish what remains.',
+          'Any previous interruption, cancellation, or initialization-only instruction applies only to that earlier turn, not this request.',
+        ]
+      : []),
+    'The skills and experiences are reference material; they do not replace the current task instruction.',
+    '',
+    input.driver_context.task_instruction,
+  ].join('\n');
+  return `${directive}\n\n${context}\n\n${reportInstruction}`;
 }
 
 function failedExecution(

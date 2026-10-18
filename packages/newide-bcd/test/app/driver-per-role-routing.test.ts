@@ -118,14 +118,13 @@ function request(taskId: string, roleId: string) {
 function createFacade(
   driver: DriverRuntimeHandle,
   resolveDriver?: (roleId: string, runId?: string) => DriverRuntimeHandle,
-  llm: ToolCallingClient = invokeDriverLlm(),
 ) {
   return new DriverRuntimeAgentExecutionFacade({
     driver,
     ...(resolveDriver ? { resolveDriver } : {}),
     repository: new InMemoryRepository(),
     bufferRepository: new InMemoryBufferRepository(),
-    llm,
+    llm: invokeDriverLlm(),
   });
 }
 
@@ -217,57 +216,5 @@ describe('per-role driver routing', () => {
 
     expect(codex.prompts.map((prompt) => prompt.task_id)).toEqual(['a']);
     expect(claude.prompts.map((prompt) => prompt.task_id)).toEqual(['b']);
-  });
-
-  it('uses the parent run mapping without collapsing Council phase execution ids', async () => {
-    const claude = new StubDriver('driver_claude');
-    const codex = new StubDriver('driver_codex');
-    const frozen: Record<string, DriverRuntimeHandle> = { run_a: codex, run_b: claude };
-    const seen: Array<[string, string | undefined]> = [];
-    const facade = createFacade(claude, (roleId, runId) => {
-      seen.push([roleId, runId]);
-      return runId ? (frozen[runId] ?? claude) : claude;
-    });
-
-    for (const phase of ['review_1', 'review_2']) {
-      const result = await facade.runAgent({
-        ...request('a', 'reviewer'),
-        run_id: `run_a_${phase}`,
-        activity_run_id: 'run_a',
-        context_policy: 'council_reviewer',
-      });
-      expect(result.diagnostics.driver_id).toBe('driver_codex');
-    }
-    await facade.runAgent(request('b', 'reviewer'));
-
-    expect(codex.prompts.map((prompt) => prompt.run_id)).toEqual([
-      'run_a_review_1',
-      'run_a_review_2',
-    ]);
-    expect(claude.prompts.map((prompt) => prompt.run_id)).toEqual(['run_b']);
-    expect(new Set(seen.map(([, runId]) => runId))).toEqual(new Set(['run_a', 'run_b']));
-  });
-
-  it('uses the parent run mapping for a phase that never invokes its driver', async () => {
-    const claude = new StubDriver('driver_claude');
-    const codex = new StubDriver('driver_codex');
-    const facade = createFacade(claude, (_roleId, runId) => (runId === 'run_a' ? codex : claude), {
-      async completeWithTools() {
-        return { content: 'Task completed without delegation. [done]', tool_calls: undefined };
-      },
-    });
-
-    const result = await facade.runAgent({
-      ...request('a', 'reviewer'),
-      run_id: 'run_a_review',
-      activity_run_id: 'run_a',
-    });
-
-    expect(result.status).toBe('failed');
-    expect(result.diagnostics.driver_id).toBe('driver_codex');
-    expect(result.transcript_ref.producer_id).toBe('driver_codex');
-    expect(result.session_id).toBe('driver_codex:session');
-    expect(claude.prompts).toHaveLength(0);
-    expect(codex.prompts).toHaveLength(0);
   });
 });

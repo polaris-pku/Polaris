@@ -9,7 +9,7 @@ import type {
 } from '@/types';
 import type { EventChannelStatus } from '@/api/events';
 import type { Event as ContractEvent, FilePermissionOutcome } from '@/api/types';
-import type { RunEvent, RunSnapshot } from '@/api/types/rpc';
+import type { RunEvent, RunSnapshot, RunStatus } from '@/api/types/rpc';
 import type { TaskSnapshot } from '@/api/types/task';
 import type { AgentFileWriteResult } from '@/lib/agentFs';
 import type { DockChannel } from '@/lib/glossary';
@@ -26,13 +26,14 @@ export type LiveTaskState = {
   cursor?: string;
   status: 'subscribing' | 'live' | 'error';
   error?: string;
+  pendingAction?: 'interrupt' | 'resume';
 };
 
 export type LiveRunState = {
   runId: string;
   taskId: string;
   /** 后端权威状态。running → 终态由 run.completed / run.failed / run.cancelled 事件带出 */
-  status: 'running' | 'completed' | 'failed' | 'cancelled';
+  status: RunStatus;
   /** 后端数组顺序；同序号事件保留，按 event_id 去重。 */
   timeline: RunEvent[];
   /** 定期刷新的权威快照（含实时 activity / usage / current.cursor）。 */
@@ -156,12 +157,8 @@ export type TaskSlice = {
     mode?: 'single_agent' | 'council',
   ) => Promise<{ ok: true } | { ok: false; error: string }>;
   /** 每条后端事件都重投影一次泳道图（幂等）——「泳道图实时跟着后端走」的落点 */
-  applyLiveProgress: (
-    runId: string,
-    events: RunEvent[],
-    runStatus: 'running' | 'completed' | 'failed' | 'cancelled',
-  ) => void;
-  /** 后端进程没了：把所有还挂着 running 的 run 如实标成失败（否则界面永远转圈） */
+  applyLiveProgress: (runId: string, events: RunEvent[], runStatus: RunStatus) => void;
+  /** 连接中断时标记观测待同步，不改写持久任务状态。 */
   failLiveRuns: (reason: string) => void;
   /** 真实 run 终态：用后端快照把该任务切换成「后端事实回放」（泳道图/日志/交付全部换成真数据） */
   attachLiveRun: (runId: string, snapshot: RunSnapshot) => void;
@@ -173,6 +170,8 @@ export type TaskSlice = {
    * 调用方必须把 error 显示出来，不能吞掉。
    */
   retrySubmit: (taskId: string) => Promise<{ ok: true } | { ok: false; error: string }>;
+  interruptTask: (taskId: string) => Promise<{ ok: true } | { ok: false; error: string }>;
+  resumeTask: (taskId: string) => Promise<{ ok: true } | { ok: false; error: string }>;
   startTask: () => void;
   selectTask: (taskId: string) => void;
   deleteTask: (taskId: string) => void;

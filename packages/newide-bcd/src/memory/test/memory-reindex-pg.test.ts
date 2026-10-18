@@ -63,6 +63,7 @@ describe('PgMemoryRepository reindex path on embedded PGlite', () => {
 
   afterAll(async () => {
     if (pool) {
+      await pool.query('DROP TABLE IF EXISTS memory_persona_versions');
       await pool.query('DROP TABLE IF EXISTS memory_experiences');
       await pool.query('DROP TABLE IF EXISTS memory_skills');
       await pool.query('DROP TABLE IF EXISTS memory_agents');
@@ -108,9 +109,7 @@ describe('PgMemoryRepository reindex path on embedded PGlite', () => {
     expect(experiences[0]!.description_embedding).toHaveLength(8);
 
     // 重建后向量检索按新维度可用（query 用与技能描述相同的 8 维向量 → 相似度 1）
-    const queryEmbedding = await new HashEmbeddingProvider(8).embed(
-      skills[0]!.description,
-    );
+    const queryEmbedding = await new HashEmbeddingProvider(8).embed(skills[0]!.description);
     const hits = await newRepo.searchSkills(roleId, {
       query_embedding: queryEmbedding,
       top_k: 5,

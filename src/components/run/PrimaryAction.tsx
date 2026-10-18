@@ -1,12 +1,6 @@
-/**
- * 主行动 —— **一个按钮，而且只在 idle 与 failed / unsent 时存在。**
- *
- * 【R4 · 收不到就别画按钮】running 期间这一行**根本不渲染**：后端全自动，且它**没有人类回写通道**
- * （`can_create_merge_authorization` 恒 false，也没有 `gate.respond` RPC）。
- * 一个 live run 上的「介入」按钮只会改本地状态，永远送不到 agent 那里 ——
- * 让用户以为自己影响了 agent，比一个死按钮更糟。所以 `介入` / `Next Step` / `Auto Run` 全部删除。
- */
-import { Play, RotateCcw, Workflow, Loader2 } from 'lucide-react';
+/** 开始、从头重试与可恢复停止/继续；不提供只有本地效果的人工裁决按钮。 */
+import { useState } from 'react';
+import { Play, RotateCcw, Workflow, Loader2, Pause } from 'lucide-react';
 import { Button } from '@/components/ui/Button';
 import type { RunState } from '@/lib/runState';
 
@@ -17,6 +11,10 @@ export function PrimaryAction({
   onStart,
   onUseRecommended,
   onRetry,
+  onInterrupt,
+  onResume,
+  pendingAction,
+  connected = true,
 }: {
   state: RunState;
   retrying: boolean;
@@ -25,7 +23,65 @@ export function PrimaryAction({
   onStart: () => void;
   onUseRecommended: () => void;
   onRetry: () => void;
+  onInterrupt?: () => void;
+  onResume?: () => void;
+  pendingAction?: 'interrupt' | 'resume';
+  connected?: boolean;
 }) {
+  const [confirmResume, setConfirmResume] = useState(false);
+  if (onInterrupt || onResume || pendingAction) {
+    return (
+      <div className="flex flex-col gap-2 border-t border-edge px-5 py-3">
+        {confirmResume && onResume && (
+          <p className="text-body text-human">
+            继续会从检查点恢复，可能回写工作区文件。请先保护中断后自行修改的内容。
+          </p>
+        )}
+        <div className="flex items-center gap-2">
+          <Button
+            size="sm"
+            disabled={!connected || !!pendingAction}
+            onClick={() => {
+              if (onInterrupt) onInterrupt();
+              else if (!confirmResume) setConfirmResume(true);
+              else {
+                setConfirmResume(false);
+                onResume?.();
+              }
+            }}
+          >
+            {pendingAction ? (
+              <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+            ) : onInterrupt ? (
+              <Pause className="h-4 w-4" aria-hidden />
+            ) : (
+              <Play className="h-4 w-4" aria-hidden />
+            )}
+            {pendingAction === 'interrupt'
+              ? '正在停止并保存'
+              : pendingAction === 'resume'
+                ? '正在恢复'
+                : onInterrupt
+                  ? '停止并保存'
+                  : confirmResume
+                    ? '确认继续任务'
+                    : '继续任务'}
+          </Button>
+          {confirmResume && !pendingAction && (
+            <Button size="sm" variant="ghost" onClick={() => setConfirmResume(false)}>
+              取消
+            </Button>
+          )}
+        </div>
+        {!connected && <p className="text-body text-fg-muted">后端连接中断，等待同步后再操作。</p>}
+        {error && (
+          <p role="alert" className="whitespace-pre-line text-body text-danger">
+            {error}
+          </p>
+        )}
+      </div>
+    );
+  }
   if (state !== 'idle' && state !== 'failed' && state !== 'unsent') return null;
 
   return (

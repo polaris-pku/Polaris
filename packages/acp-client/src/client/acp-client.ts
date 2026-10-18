@@ -29,6 +29,7 @@ export interface AcpClientOptions {
   verbose?: boolean;
   experimentalCapabilities?: Record<string, any>;
   extensionMethods?: ExtensionMethod[];
+  gateway?: { baseUrl: string; headers: Record<string, string> };
 }
 
 export class AcpClient extends EventEmitter {
@@ -41,6 +42,7 @@ export class AcpClient extends EventEmitter {
   private verbose: boolean;
   private experimentalCapabilities?: Record<string, any>;
   private extensionMethods: ExtensionMethod[];
+  private gateway?: { baseUrl: string; headers: Record<string, string> };
   private extensionMcpServer: ExtensionMcpServer | null = null;
 
   private initialized = false;
@@ -62,6 +64,7 @@ export class AcpClient extends EventEmitter {
     this.verbose = options.verbose ?? false;
     this.experimentalCapabilities = options.experimentalCapabilities;
     this.extensionMethods = options.extensionMethods ?? [];
+    this.gateway = options.gateway;
 
     // Connect the router to the connection
     this.connection.setMethodRouter(this.methodRouter);
@@ -168,6 +171,7 @@ export class AcpClient extends EventEmitter {
     const clientCapabilities: ClientCapabilities = {
       fs: { readTextFile: true, writeTextFile: true, listDirectory: true },
       terminal: true,
+      ...(this.gateway ? { auth: { _meta: { gateway: true } } } : {}),
       experimental: {
         ...this.experimentalCapabilities,
         ...customCapabilities?.experimental,
@@ -231,6 +235,19 @@ export class AcpClient extends EventEmitter {
     this.ensureInitialized();
     const agentId = this.adapter.agentId;
     this.emit("pre:authenticate", { point: "pre:authenticate", agentId });
+
+    if (this.gateway) {
+      if (!this.authMethods.some((method) => method.id === "gateway")) {
+        throw new SessionError(`Agent ${agentId} did not advertise gateway auth`);
+      }
+      await this.connection.authenticate("gateway", {
+        _meta: { gateway: { baseUrl: this.gateway.baseUrl, headers: this.gateway.headers } },
+      });
+      this.authenticated = true;
+      this.setState("authenticated");
+      this.emit("post:authenticate", { point: "post:authenticate", agentId });
+      return;
+    }
 
     const strategy = this.adapter.resolveAuthStrategy();
     if (this.verbose) console.log(`[Auth] Using strategy: ${strategy}`);

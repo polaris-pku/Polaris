@@ -65,6 +65,9 @@ function fixture() {
   const initial = snapshot();
   const api = {
     getConfig: vi.fn(async () => initial),
+    refresh: vi
+      .fn<(params?: { force?: boolean }) => Promise<DriverRoutingSnapshot>>()
+      .mockResolvedValue(snapshot('b')),
     updateRouting: vi
       .fn<(input: UpdateDriverRoutingInput) => Promise<DriverRoutingSnapshot>>()
       .mockResolvedValue(snapshot('b')),
@@ -76,6 +79,44 @@ function fixture() {
 }
 
 describe('driver routing editor', () => {
+  it('uses a single explicit probe refresh and replaces all returned state', async () => {
+    const { api, editor } = fixture();
+    await editor.getState().load();
+    expect(api.refresh).not.toHaveBeenCalled();
+    editor.getState().changeRole('engineer', 'codex');
+    const fresh = snapshot();
+    fresh.drivers.push({
+      driver_id: 'discovered:copilot-123',
+      agent: 'copilot',
+      display_name: 'GitHub Copilot CLI',
+      selectable: true,
+      status: 'degraded',
+    });
+    api.refresh.mockResolvedValue(fresh);
+    await Promise.all([editor.getState().refresh(), editor.getState().refresh()]);
+    expect(api.refresh).toHaveBeenCalledTimes(1);
+    expect(api.refresh).toHaveBeenCalledWith({ force: true });
+    expect(editor.getState().snapshot).toEqual(fresh);
+    expect(editor.getState().draft).toEqual(routingDraft(fresh));
+  });
+
+  it.each([-32027, -32028, -32029, -32030, -32601])(
+    'preserves the previous snapshot and draft when probe refresh fails with %s',
+    async (code) => {
+      const { api, initial, editor } = fixture();
+      await editor.getState().load();
+      editor.getState().changeRole('engineer', 'codex');
+      api.refresh.mockRejectedValue(new BackendError('refresh failed', 'driver.refresh', code));
+      await editor.getState().refresh();
+      expect(editor.getState().snapshot).toEqual(initial);
+      expect(editor.getState().draft?.roles.engineer).toBe('codex');
+      expect(editor.getState().issue).toEqual(
+        routingIssue(new BackendError('refresh failed', 'driver.refresh', code)),
+      );
+      expect(editor.getState().notice).toBeNull();
+      expect(editor.getState().busy).toBe(false);
+    },
+  );
   it('saves a complete role map, including orphan roles, when only the default is edited', async () => {
     const { api, initial, editor } = fixture();
     await editor.getState().load();

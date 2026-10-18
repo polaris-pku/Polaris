@@ -17,7 +17,7 @@ afterEach(() => {
 });
 
 describe('SqliteCoordinationStore', () => {
-  it('creates the coordination, protocol delivery and token usage ledger schema in WAL mode', () => {
+  it('creates the v6 coordination and protocol delivery schema in WAL mode', () => {
     const { databasePath, store } = createStore();
     store.close();
 

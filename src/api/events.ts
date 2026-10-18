@@ -47,6 +47,7 @@ interface RunCursor {
 const cursors = new Map<string, RunCursor>();
 let detachTransport: (() => void) | undefined;
 let lastBackendState: BackendState | null = null;
+let connectionGeneration = 0;
 
 function toChannelStatus(status: BackendStatus): EventChannelStatus {
   if (status.state === 'ready') return 'connected';
@@ -73,6 +74,14 @@ function deliver(event: RunEvent): void {
   runHandlers.forEach((handler) => handler(event));
   const legacy = toLegacyEvent(event);
   legacyHandlers.forEach((handler) => handler(legacy));
+}
+
+export function deliverTaskRunEvent(event: RunEvent): void {
+  deliver(event);
+}
+
+export function getConnectionGeneration(): number {
+  return connectionGeneration;
 }
 
 function reportSyncError(runId: string, error: string | null): void {
@@ -113,7 +122,11 @@ async function syncRun(runId: string, reason: RunResyncReason): Promise<void> {
   cursor.receivedDuringSync = [];
   clearTimeout(cursor.timer);
   const transport = getTransport();
-  const active = () => cursors.get(runId) === cursor && subscribedRunIds.has(runId);
+  const generation = connectionGeneration;
+  const active = () =>
+    generation === connectionGeneration &&
+    cursors.get(runId) === cursor &&
+    subscribedRunIds.has(runId);
   const after = reason === 'reconnect' ? 0 : (cursor.recoveryFrom ?? cursor.applied);
   cursor.recoveryFrom = undefined;
   if (reason === 'reconnect') cursor.applied = 0;
@@ -132,6 +145,7 @@ async function syncRun(runId: string, reason: RunResyncReason): Promise<void> {
         result.events.forEach(deliver);
         if (!result.has_more) cursor.applied = Math.max(cursor.applied, result.latest_sequence);
       } catch (error) {
+        if (!active()) return;
         warning =
           error instanceof BackendError && error.code === -32601
             ? '后端版本不支持增量事件，已改用完整快照；请更新后端。'
@@ -167,9 +181,11 @@ async function syncRun(runId: string, reason: RunResyncReason): Promise<void> {
     if (cursor.needsSubscription && snapshot.status === 'running') {
       try {
         await transport.call('run.subscribe', { run_id: runId, after_sequence: watermark });
+        if (!active()) return;
       } catch (error) {
         if (error instanceof BackendError && error.code === -32602) {
           await transport.call('run.subscribe', { run_id: runId });
+          if (!active()) return;
           warning = '后端版本不支持订阅水位，已改用全量重放；请更新后端。';
         } else {
           throw error;
@@ -185,8 +201,8 @@ async function syncRun(runId: string, reason: RunResyncReason): Promise<void> {
       reportSyncError(runId, `运行状态同步失败：${errorText(error)}`);
     }
   } finally {
-    cursor.syncing = false;
     if (active()) {
+      cursor.syncing = false;
       const pending = cursor.pendingReason;
       cursor.pendingReason = undefined;
       if (pending) void syncRun(runId, pending);
@@ -220,7 +236,14 @@ function receiveStatus(status: BackendStatus): void {
   lastBackendState = status.state;
   statusHandlers.forEach((handler) => handler(toChannelStatus(status)));
   if (status.state !== 'ready') {
-    for (const cursor of cursors.values()) clearTimeout(cursor.timer);
+    connectionGeneration += 1;
+    for (const cursor of cursors.values()) {
+      clearTimeout(cursor.timer);
+      cursor.syncing = false;
+      cursor.pendingReason = undefined;
+      cursor.receivedDuringSync = [];
+      cursor.needsSubscription = true;
+    }
     return;
   }
   if (previous !== null && previous !== 'ready') {
@@ -290,10 +313,14 @@ export function onEventChannelStatus(handler: (status: EventChannelStatus) => vo
 export function onBackendStatus(handler: (status: BackendStatus) => void): () => void {
   const transport = getTransport();
   let active = true;
+  let received = false;
   void transport.getStatus().then((status) => {
-    if (active) handler(status);
+    if (active && !received) handler(status);
   });
-  const detach = transport.onStatus(handler);
+  const detach = transport.onStatus((status) => {
+    received = true;
+    handler(status);
+  });
   return () => {
     active = false;
     detach();
@@ -365,4 +392,5 @@ export function resetEventChannel(): void {
   subscribedRunIds.clear();
   cursors.clear();
   lastBackendState = null;
+  connectionGeneration += 1;
 }

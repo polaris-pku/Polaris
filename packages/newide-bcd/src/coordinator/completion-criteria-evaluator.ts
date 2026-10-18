@@ -1,10 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { GateResult } from '../gate';
-import type {
-  CompletionCriterionResult,
-  RunOutcome,
-  RunOutcomeStatus,
-} from './run-outcome';
+import type { CompletionCriterionResult, RunOutcome, RunOutcomeStatus } from './run-outcome';
 
 export interface CompletionArtifactManifest {
   artifact_refs: string[];
@@ -31,6 +27,9 @@ export interface CompletionCriteriaEvaluation {
  * A materialized final artifact completes the current product flow. When a real
  * Gate is configured, criterion-scoped evidence may additionally attest it as
  * verified without changing whether the Task completed.
+ *
+ * 这里刻意不看执行者的 Plan 自检报告：那条路径已按实测结论下线（见 plan-check.ts）。
+ * 「计划遵循情况」是给人读的证据，不是 outcome 的输入。
  */
 export function evaluateCompletionCriteria(
   input: CompletionCriteriaEvaluationInput,
@@ -70,8 +69,7 @@ function evaluateCriterion(
 ): CompletionCriterionResult {
   const criterionId = completionCriterionId(description, index);
   const matching = gateResults.filter(
-    (result) =>
-      result.subject_type === 'completion_criterion' && result.subject_id === criterionId,
+    (result) => result.subject_type === 'completion_criterion' && result.subject_id === criterionId,
   );
   const failed = matching.some((result) => result.decision === 'deny');
   const verified = matching.some(
@@ -97,9 +95,7 @@ function determineOutcomeStatus(
   if (!input.execution_succeeded) return 'failed';
   if (input.gate_results.some((result) => result.decision === 'deny')) return 'failed';
   if (
-    input.gate_results.some(
-      (result) => result.decision === 'ask' || result.decision === 'defer',
-    )
+    input.gate_results.some((result) => result.decision === 'ask' || result.decision === 'defer')
   ) {
     return 'blocked';
   }
@@ -110,13 +106,9 @@ function determineOutcomeStatus(
     return 'failed';
   }
   const hasOutput =
-    input.artifact_manifest.changed_files.length > 0 ||
-    input.artifact_manifest.response_available;
+    input.artifact_manifest.changed_files.length > 0 || input.artifact_manifest.response_available;
   if (!hasOutput) return 'failed';
-  if (
-    criteria.length > 0 &&
-    criteria.every((criterion) => criterion.status === 'satisfied')
-  ) {
+  if (criteria.length > 0 && criteria.every((criterion) => criterion.status === 'satisfied')) {
     return 'verified';
   }
   return 'completed';

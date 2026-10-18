@@ -40,6 +40,7 @@ export interface ClientCapabilities {
     listDirectory?: boolean;
   };
   terminal?: boolean;
+  auth?: { _meta?: { gateway?: boolean } };
   /** Custom or experimental client-provided capabilities */
   experimental?: Record<string, any>;
   [key: string]: any;

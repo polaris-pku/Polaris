@@ -12,8 +12,13 @@
  * 两套编号不通用 —— 跨流对齐只能按 `event_id`，`sequence` 只在同一条实时流内部使用。
  * 一个 task 还可能跑过多个 run，各自的 sequence 都从 1 起，所以游标必须按 run_id 分开记。
  */
-import { onTransportReconnect, RUN_OBSERVATION_INTERVAL_MS } from './events';
-import { getTransport } from './transport';
+import {
+  deliverTaskRunEvent,
+  getConnectionGeneration,
+  onBackendStatus,
+  RUN_OBSERVATION_INTERVAL_MS,
+} from './events';
+import { BackendError, getTransport } from './transport';
 import type { RunEvent } from './types/rpc';
 import type { TaskCreateParams, TaskSnapshot } from './types/task';
 
@@ -22,6 +27,7 @@ export const taskApi = {
   get: (taskId: string) => getTransport().call('task.get', { task_id: taskId }),
   list: () => getTransport().call('task.list', {}),
   cancel: (taskId: string) => getTransport().call('task.cancel', { task_id: taskId }),
+  interrupt: (taskId: string) => getTransport().call('task.interrupt', { task_id: taskId }),
   resume: (taskId: string) => getTransport().call('task.resume', { task_id: taskId }),
   startCouncil: (taskId: string) => getTransport().call('task.startCouncil', { task_id: taskId }),
   unsubscribe: (taskId: string) => getTransport().call('task.unsubscribe', { task_id: taskId }),
@@ -38,12 +44,32 @@ interface TaskWatcher {
 }
 
 const taskWatchers = new Map<string, TaskWatcher>();
+const starts = new Map<string, Promise<void>>();
 
-export async function watchTask(
+export function watchTask(
   taskId: string,
   handlers: TaskStreamHandlers,
   afterEventId?: string,
 ): Promise<() => Promise<void>> {
+  const previous = starts.get(taskId) ?? Promise.resolve();
+  const next = previous.then(() => startWatchingTask(taskId, handlers, afterEventId));
+  const settled = next.then(
+    () => undefined,
+    () => undefined,
+  );
+  starts.set(taskId, settled);
+  void settled.then(() => {
+    if (starts.get(taskId) === settled) starts.delete(taskId);
+  });
+  return next;
+}
+
+async function startWatchingTask(
+  taskId: string,
+  handlers: TaskStreamHandlers,
+  afterEventId?: string,
+): Promise<() => Promise<void>> {
+  await taskWatchers.get(taskId)?.dispose();
   const transport = getTransport();
   const buffered: RunEvent[] = [];
   const seen = new Set<string>();
@@ -56,6 +82,7 @@ export async function watchTask(
   let refreshAgain = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let latestSnapshot: TaskSnapshot | undefined;
+  let online = true;
 
   const reportError = (error: unknown) => {
     if (disposed) return;
@@ -75,6 +102,7 @@ export async function watchTask(
     clearTimeout(timer);
     if (
       disposed ||
+      !online ||
       !latestSnapshot ||
       ['completed', 'failed', 'cancelled'].includes(latestSnapshot.task.status)
     )
@@ -84,36 +112,41 @@ export async function watchTask(
     }, RUN_OBSERVATION_INTERVAL_MS);
   };
   const refresh = async () => {
-    if (disposed) return;
+    if (disposed || !online) return;
     if (refreshing) {
       refreshAgain = true;
       return;
     }
     refreshing = true;
+    const generation = getConnectionGeneration();
     clearTimeout(timer);
     try {
-      acceptSnapshot(await taskApi.get(taskId));
+      const snapshot = await taskApi.get(taskId);
+      if (generation === getConnectionGeneration()) acceptSnapshot(snapshot);
     } catch (error) {
-      reportError(error);
+      if (generation === getConnectionGeneration()) reportError(error);
     } finally {
-      refreshing = false;
-      if (refreshAgain && !disposed) {
-        refreshAgain = false;
-        void refresh();
-      } else scheduleRefresh();
+      if (generation === getConnectionGeneration()) {
+        refreshing = false;
+        if (refreshAgain && !disposed) {
+          refreshAgain = false;
+          void refresh();
+        } else scheduleRefresh();
+      }
     }
   };
 
   const apply = (event: RunEvent) => {
     if (seen.has(event.event_id)) return;
     seen.add(event.event_id);
+    deliverTaskRunEvent(event);
     handlers.onEvent(event);
   };
 
   /**
    * 收一条实时事件：断号探测 + 投递。
    *
-   * 断号**不拦截投递** —— 重同步是「补」不是「等」，拦下来等一次 RPC 回来只会让界面卡一拍。
+   * 触发断号的事件立即投递；重同步期间新来的事件缓存到权威快照与重放之后。
    * 已经投递过的重复事件也要推进游标（同一条后端事件会同时从 `task.event` 与 `run.event`
    * 到达），否则被去重掉的那几条会被误判成断号。
    */
@@ -125,19 +158,30 @@ export async function watchTask(
     apply(event);
     if (
       !known &&
-      (/^task\./.test(event.type) || /^run\.(started|completed|failed|cancelled)$/.test(event.type))
+      (/^task\./.test(event.type) ||
+        /^run\.(started|completed|failed|cancelled|interrupted)$/.test(event.type))
     )
       void refresh();
   };
 
   const subscribe = async (after?: string) => {
-    const subscribed = await transport.call('task.subscribe', {
-      task_id: taskId,
-      ...(after ? { after_event_id: after } : {}),
-    });
+    const generation = getConnectionGeneration();
+    const request = (cursor?: string) =>
+      transport.call('task.subscribe', {
+        task_id: taskId,
+        ...(cursor ? { after_event_id: cursor } : {}),
+      });
+    let subscribed;
+    try {
+      subscribed = await request(after);
+    } catch (error) {
+      if (disposed || generation !== getConnectionGeneration()) return;
+      if (!(error instanceof BackendError) || error.code !== -32009 || !after) throw error;
+      subscribed = await request();
+    }
+    if (disposed || generation !== getConnectionGeneration()) return;
     acceptSnapshot(subscribed.snapshot);
     for (const event of subscribed.replay_events) apply(event);
-    return subscribed;
   };
 
   /**
@@ -147,9 +191,18 @@ export async function watchTask(
    * 在途标记保证一串乱序事件只换来一次重拉。失败保留最后一次事实并通知观测错误。
    */
   const resync = async () => {
-    if (resyncing || disposed) return;
+    if (resyncing || disposed || !online) return;
     resyncing = true;
-    await subscribe().catch(reportError);
+    live = false;
+    const generation = getConnectionGeneration();
+    try {
+      await subscribe();
+    } catch (error) {
+      if (generation === getConnectionGeneration()) reportError(error);
+    }
+    if (generation !== getConnectionGeneration()) return;
+    for (const event of buffered.splice(0)) ingest(event);
+    live = true;
     resyncing = false;
     scheduleRefresh();
   };
@@ -162,7 +215,6 @@ export async function watchTask(
 
   try {
     await subscribe(afterEventId);
-    buffered.sort((left, right) => left.sequence - right.sequence);
     for (const event of buffered) ingest(event);
     buffered.length = 0;
     live = true;
@@ -176,31 +228,38 @@ export async function watchTask(
 
   // 重连后旧的 task.subscribe 注册在上一个 BCD 进程里，已经作废 —— 不重订阅的话，
   // 这个任务从此再也收不到任何事件（界面表现为永远卡在某一步）。
-  const stopReconnectWatch = onTransportReconnect(() => {
-    void resync();
+  const stopStatusWatch = onBackendStatus((status) => {
+    const wasOnline = online;
+    online = status.state === 'ready';
+    if (!online) {
+      clearTimeout(timer);
+      resyncing = false;
+      refreshing = false;
+      applied.clear();
+      buffered.length = 0;
+    } else if (!wasOnline) void resync();
   });
-
-  const previous = taskWatchers.get(taskId);
   const dispose = async () => {
     if (taskWatchers.get(taskId)?.dispose !== dispose) return;
     taskWatchers.delete(taskId);
     disposed = true;
     clearTimeout(timer);
-    stopReconnectWatch();
+    stopStatusWatch();
     detach();
     await taskApi
       .unsubscribe(taskId)
       .catch((error) => console.warn(`[task observation] ${taskId}: unsubscribe failed`, error));
   };
-  if (previous) await previous.dispose();
   taskWatchers.set(taskId, { dispose });
   return dispose;
 }
 
 export async function unwatchTask(taskId: string): Promise<void> {
+  await starts.get(taskId);
   await taskWatchers.get(taskId)?.dispose();
 }
 
 export async function unwatchAllTasks(): Promise<void> {
+  await Promise.all(starts.values());
   await Promise.all([...taskWatchers.values()].map((watcher) => watcher.dispose()));
 }

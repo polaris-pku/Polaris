@@ -15,6 +15,13 @@ function driverLabel(driver: DriverRoutingDriver): string {
   return `${name}（${driver.agent} · ${availability}）`;
 }
 
+const DRIVER_REASON: Record<string, string> = {
+  DRIVER_RUNTIME_NOT_CONFIGURED: '配置里有此档案，但当前进程没有对应运行时。',
+  DRIVER_RUNTIME_REGISTRATION_FAILED: '运行时装配失败，请查看下方诊断。',
+  DRIVER_DISCOVERY_STALE: '本轮探测没有再发现它；不代表未安装。',
+  DRIVER_CONNECTION_TYPE_UNSUPPORTED: '当前执行链不支持此连接类型。',
+};
+
 export function DriverRoutingPanel({
   available,
   workspace,
@@ -43,11 +50,13 @@ export function DriverRoutingPanel({
           {value}（配置中未找到）
         </option>
       )}
-      {snapshot?.drivers.map((driver) => (
-        <option key={driver.driver_id} value={driver.driver_id} disabled={!driver.selectable}>
-          {driverLabel(driver)}
-        </option>
-      ))}
+      {snapshot?.drivers
+        .filter((driver) => driver.selectable || driver.driver_id === value)
+        .map((driver) => (
+          <option key={driver.driver_id} value={driver.driver_id} disabled={!driver.selectable}>
+            {driverLabel(driver)}
+          </option>
+        ))}
     </>
   );
   const selectClass =
@@ -67,10 +76,10 @@ export function DriverRoutingPanel({
           variant="ghost"
           size="icon"
           className="ml-auto"
-          disabled={!available || state.busy}
-          onClick={() => void state.load()}
-          aria-label="重新读取驱动配置"
-          title="重新读取驱动配置"
+          disabled={!available || state.busy || conflict}
+          onClick={() => void state.refresh()}
+          aria-label="刷新本机驱动"
+          title="重新探测本机驱动；将采用返回配置并替换未保存的编辑"
         >
           <RefreshCw className="h-4 w-4" aria-hidden />
         </Button>
@@ -78,6 +87,14 @@ export function DriverRoutingPanel({
       <p className="mt-2 text-body text-fg-secondary">
         按角色选择执行驱动。保存不重启后端，只影响新创建的运行。
       </p>
+      <p className="mt-1 text-body text-fg-muted">
+        刷新会重新探测本机驱动，可能需要数秒，并替换未保存的编辑；首屏不会重复探测。
+      </p>
+      {snapshot && state.busy && (
+        <p className="mt-2 flex items-center gap-2 text-body text-fg-muted" role="status">
+          <Loader2 className="h-4 w-4 animate-spin" aria-hidden /> 正在同步驱动配置，请稍候
+        </p>
+      )}
       <p className="mt-1 break-all font-mono text-code text-fg-muted">
         当前后端工作区：{workspace || '后端项目'}
       </p>
@@ -179,6 +196,13 @@ export function DriverRoutingPanel({
               <div key={driver.driver_id} className="mt-2">
                 <p className="font-mono text-code text-fg-secondary">{driverLabel(driver)}</p>
                 {driver.description && <p>{driver.description}</p>}
+                {!driver.selectable && (
+                  <p>
+                    {DRIVER_REASON[driver.reason_code ?? ''] ??
+                      driver.reason_code ??
+                      '后端将此驱动标记为不可选择。'}
+                  </p>
+                )}
                 {driver.limitations?.map((limitation, index) => (
                   <p key={index}>{limitation}</p>
                 ))}

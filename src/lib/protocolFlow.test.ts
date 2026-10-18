@@ -22,6 +22,11 @@ const statusOf = (nodes: ReturnType<typeof projectProtocolFlow>, code: string) =
   nodes.find((n) => n.code === code)?.status;
 
 describe('protocolFlow · 事件驱动的 N0–N18 投影', () => {
+  it('shows interruption as blocked rather than successful delivery', () => {
+    expect(statusOf(projectProtocolFlow([event('run.interrupted')], 'interrupted'), 'N18')).toBe(
+      'blocked',
+    );
+  });
   it('同序号时按数组中最后出现的事件推进节点', () => {
     const first = { ...event('task.created'), sequence: 1 };
     const second = { ...event('run.created'), sequence: 1 };

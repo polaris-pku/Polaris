@@ -13,6 +13,16 @@ import { missionLineOf, phaseSegments, producedFiles } from '@/lib/missionLine';
 
 const NOW = new Date('2026-01-01T00:01:12.000Z').getTime();
 
+it('shows recoverable interruption without a failure label or an infinite timer', () => {
+  const input = {
+    task: task({ contractRunId: 'run-1', contractTaskStatus: 'blocked' }),
+    live: live({ status: 'interrupted' }),
+    now: NOW,
+  };
+  expect(missionLineOf(input)).toEqual(missionLineOf({ ...input, now: NOW + 60_000 }));
+  expect(missionLineOf(input).headline).toBe('已中断 · 可尝试继续');
+});
+
 let seq = 0;
 function evt(type: string, payload: Record<string, unknown> = {}, at = '00:00:00'): RunEvent {
   seq += 1;

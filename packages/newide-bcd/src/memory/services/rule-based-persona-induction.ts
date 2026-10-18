@@ -25,10 +25,7 @@ export interface PersonaInductionInput {
 }
 
 /** 取标签集合中最高频的若干标签 */
-function topTags(
-  records: Array<{ tags: string[] }>,
-  limit: number,
-): string[] {
+function topTags(records: Array<{ tags: string[] }>, limit: number): string[] {
   const counts = new Map<string, number>();
   for (const record of records) {
     for (const tag of record.tags) {
@@ -41,8 +38,17 @@ function topTags(
     .map(([tag]) => tag);
 }
 
-/** 生成技能覆盖概述：优先高频 tags，否则给出技能描述要点 */
-function buildSkillsOverview(skills: SkillRecord[]): string {
+/**
+ * 生成技能覆盖概述：优先高频 tags，否则给出技能描述要点。
+ *
+ * 参数故意收成结构类型（只要 `description` / `tags`）而不是 `SkillRecord[]`：Phase 4 的
+ * `DefaultPersonaEvolutionStrategy` 只能读到**输入快照**里的技能条目（字段是裁过的），
+ * 让它复用的正是这段文案逻辑。两份「技能覆盖该怎么写」的定义一旦分叉，同一批技能在
+ * 两条 Persona 路径下会给出两种概述——那正是要避免的。
+ */
+export function buildSkillsOverview(
+  skills: Array<{ description: string; tags: string[] }>,
+): string {
   if (skills.length === 0) {
     return 'Retrieve with query_memory.';
   }
@@ -54,8 +60,13 @@ function buildSkillsOverview(skills: SkillRecord[]): string {
     .join('; ')}.`;
 }
 
-/** 生成经验覆盖概述：统计正/负经验与置信度范围，附带高频标签 */
-function buildExperienceCoverage(experiences: ExperienceRecord[]): string {
+/**
+ * 生成经验覆盖概述：统计正/负经验与置信度范围，附带高频标签。
+ * 参数同样收成结构类型，理由见 `buildSkillsOverview`。
+ */
+export function buildExperienceCoverage(
+  experiences: Array<{ type: 'positive' | 'negative'; confidence: number; tags: string[] }>,
+): string {
   if (experiences.length === 0) {
     return 'Retrieve with query_memory.';
   }

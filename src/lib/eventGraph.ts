@@ -12,11 +12,11 @@
  * Agent 执行是一个跨度（requested→completed）；其间的 driver 生命周期归入同一步，
  * 不因工具调用完成就提前结束父级 Agent 步骤。
  */
-import type { RunEvent } from '@/api/types/rpc';
+import type { RunEvent, RunStatus } from '@/api/types/rpc';
 import type { PhaseKey } from '@/data/workflow';
 import type { Lane, NodeDirection, NodeTier, WorkflowNodeData, WorkflowNodeStatus } from '@/types';
 
-export type LiveRunStatus = 'running' | 'completed' | 'failed' | 'cancelled';
+export type LiveRunStatus = RunStatus;
 
 /** 一个步骤背后的原始事件（Inspector 里逐条可查，一条不丢） */
 export type EventGroup = {
@@ -24,6 +24,8 @@ export type EventGroup = {
   events: RunEvent[];
   /** 跨度步骤：开始事件已到、结束事件未到 → agent 此刻正在做这件事 */
   open: boolean;
+  spanStartedAt?: string;
+  spanEndedAt?: string;
 };
 
 // ── 语义步骤定义 ──
@@ -122,6 +124,27 @@ export const STEPS: Record<StepKey, StepDef> = {
 function stepOf(event: RunEvent): StepKey | undefined {
   const messageType = String((event.payload as { message_type?: unknown }).message_type ?? '');
   switch (event.type) {
+    case 'handler.started':
+    case 'handler.completed':
+    case 'handler.failed':
+      switch (event.payload.cursor) {
+        case 'select_agent':
+          return 'prepare';
+        case 'council':
+          return 'council';
+        case 'gate':
+          return 'review';
+        case 'deliver':
+          return 'deliver';
+        default:
+          return undefined;
+      }
+    case 'market.auction.started':
+    case 'market.auction.completed':
+    case 'market.selected':
+      return 'prepare';
+    case 'completion.evaluated':
+      return 'deliver';
     case 'task.created':
     case 'run.created':
     case 'run.started':
@@ -171,6 +194,7 @@ function stepOf(event: RunEvent): StepKey | undefined {
     case 'artifact.delivered':
     case 'run.failed':
     case 'run.cancelled':
+    case 'run.interrupted':
       return 'deliver';
 
     case 'proxy.llm_usage_recorded':
@@ -186,7 +210,6 @@ function stepOf(event: RunEvent): StepKey | undefined {
 }
 
 /** 跨度：开始事件到了、结束事件还没到 = 这一步正在进行中 */
-const SPAN_STARTS = new Set(['agent.execution_requested', 'council.started']);
 const SPAN_ENDS = new Set([
   'agent.execution_completed',
   'agent.execution_failed',
@@ -246,7 +269,7 @@ function pick(events: RunEvent[], type: string, key: string): string {
 }
 
 /** 该步骤的「关键事实」一行 —— 人扫一眼就知道这步发生了什么。 */
-function summaryOf(step: StepKey, events: RunEvent[]): string {
+function summaryOf(step: StepKey, events: RunEvent[], status: WorkflowNodeStatus): string {
   switch (step) {
     case 'intake': {
       const spec = pick(events, 'task.created', 'spec');
@@ -261,8 +284,11 @@ function summaryOf(step: StepKey, events: RunEvent[]): string {
         .join(' · ');
     }
     case 'execute': {
-      const status = events.find((e) => e.type.startsWith('agent.execution_c'))?.payload;
-      return status ? text(asRecord(status).status) : '执行中';
+      if (status === 'active') return '执行中';
+      const result = executionResult(events);
+      if (status === 'done') return '执行完成';
+      if (result === 'blocked') return '执行未成功';
+      return '运行已结束 · 未收到执行结果';
     }
     case 'produce': {
       const artifacts = events.filter((e) => e.type === 'artifact.registered');
@@ -352,6 +378,7 @@ export function groupEvents(events: RunEvent[]): EventGroup[] {
 
   const groups: EventGroup[] = [];
   const byKey = new Map<string, EventGroup>();
+  const spanOwners = new Map<string, 'agent' | 'driver' | 'council' | 'handler'>();
 
   for (const event of events) {
     const step = stepOf(event);
@@ -368,8 +395,47 @@ export function groupEvents(events: RunEvent[]): EventGroup[] {
     }
     group.events.push(event);
 
-    if (SPAN_STARTS.has(event.type)) group.open = true;
-    if (SPAN_ENDS.has(event.type)) group.open = false;
+    const start = (owner: 'agent' | 'driver' | 'council' | 'handler') => {
+      if (!group.open) group.spanStartedAt = event.created_at;
+      group.open = true;
+      group.spanEndedAt = undefined;
+      spanOwners.set(key, owner);
+    };
+    const end = () => {
+      group.open = false;
+      group.spanEndedAt = event.created_at;
+      spanOwners.delete(key);
+    };
+    if (event.type === 'agent.execution_requested') start('agent');
+    else if (event.type === 'council.started') start('council');
+    else if (SPAN_ENDS.has(event.type)) end();
+    else if (event.type === 'handler.started' && !group.open) start('handler');
+    else if (
+      ['handler.completed', 'handler.failed'].includes(event.type) &&
+      spanOwners.get(key) === 'handler'
+    )
+      end();
+    else if (step === 'execute') {
+      if (
+        [
+          'driver.session_initializing',
+          'driver.prompt_dispatching',
+          'driver.turn_started',
+        ].includes(event.type) &&
+        spanOwners.get(key) !== 'agent'
+      ) {
+        if (!group.open) start('driver');
+      } else if (
+        [
+          'driver.turn_completed',
+          'driver.turn_failed',
+          'driver.disconnected',
+          'driver.disconnect',
+        ].includes(event.type) &&
+        spanOwners.get(key) === 'driver'
+      )
+        end();
+    }
   }
 
   return groups;
@@ -385,19 +451,34 @@ function roleKeyOf(group: EventGroup): string {
   return group.nodeId.slice('step-'.length).split('|')[1] ?? '';
 }
 
+function executionResult(events: RunEvent[]): 'done' | 'blocked' | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    const payload = asRecord(event.payload);
+    if (event.type === 'agent.execution_completed') {
+      return ['succeeded', 'completed'].includes(text(payload.status)) ? 'done' : 'blocked';
+    }
+    if (event.type === 'agent.execution_failed' || event.type === 'driver.turn_failed')
+      return 'blocked';
+    if (event.type === 'driver.turn_completed') {
+      return payload.stop_reason === 'cancelled' ? 'blocked' : 'done';
+    }
+    if (
+      event.type === 'agent.execution_requested' ||
+      event.type === 'driver.prompt_dispatching' ||
+      event.type === 'driver.turn_started' ||
+      event.type === 'driver.session_initializing'
+    )
+      return undefined;
+  }
+  return undefined;
+}
+
 function statusOf(group: EventGroup, runStatus: LiveRunStatus): WorkflowNodeStatus {
   if (group.open) return runStatus === 'running' ? 'active' : 'blocked';
-  const executionResult = [...group.events]
-    .reverse()
-    .find(
-      (event) =>
-        event.type === 'agent.execution_completed' || event.type === 'agent.execution_failed',
-    );
-  if (
-    executionResult?.type === 'agent.execution_completed' &&
-    asRecord(executionResult.payload).status === 'succeeded'
-  )
-    return 'done';
+  if (stepKeyOf(group) === 'deliver' && runStatus === 'running') return 'pending';
+  if (group.events.some((event) => event.type === 'run.interrupted')) return 'blocked';
+  if (stepKeyOf(group) === 'execute') return executionResult(group.events) ?? 'blocked';
   if (group.events.some((e) => e.type.endsWith('.failed'))) return 'blocked';
   // 后端失败不总用 `.failed` 事件表达：agent 失败发的是 `agent.execution_completed` +
   // payload.status='failed'。只看类型后缀会把失败的步骤画成「完成」。
@@ -407,10 +488,8 @@ function statusOf(group: EventGroup, runStatus: LiveRunStatus): WorkflowNodeStat
 
 /** 跨度耗时：requested → completed 的真实间隔。 */
 function durationOf(group: EventGroup): number | undefined {
-  const start = group.events.find((e) => SPAN_STARTS.has(e.type));
-  const end = group.events.find((e) => SPAN_ENDS.has(e.type));
-  if (!start || !end) return undefined;
-  return new Date(end.created_at).getTime() - new Date(start.created_at).getTime();
+  if (!group.spanStartedAt || !group.spanEndedAt) return undefined;
+  return new Date(group.spanEndedAt).getTime() - new Date(group.spanStartedAt).getTime();
 }
 
 /**
@@ -431,7 +510,6 @@ export function buildEventGraph(
     const def = STEPS[step];
     const status = statusOf(group, runStatus);
     const durationMs = durationOf(group);
-    const first = group.events[0];
 
     return {
       id: group.nodeId,
@@ -449,10 +527,10 @@ export function buildEventGraph(
       owner: ownerOf(step, role, group.events),
       status,
       taskStatus: null,
-      ...(group.open ? { spanStartedAt: first.created_at } : {}),
+      ...(status === 'active' ? { spanStartedAt: group.spanStartedAt } : {}),
       ...(durationMs !== undefined ? { statusNote: fmtDuration(durationMs) } : {}),
       frozen: 'frozen' as const,
-      summary: summaryOf(step, group.events),
+      summary: summaryOf(step, group.events, status),
       // 后端事件没有「输入/输出/风险/下一步」这些模板字段 —— 不虚构，留空
       input: [],
       output: [],

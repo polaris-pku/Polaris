@@ -52,6 +52,21 @@ function live(patch: Partial<LiveRunState> = {}): LiveRunState {
 }
 
 describe('runStateOf —— 全应用唯一的状态判定', () => {
+  it('keeps recoverable interruption distinct from other blocked Tasks and failures', () => {
+    const accepted = task({ contractRunId: 'run-1', contractTaskStatus: 'blocked' });
+    expect(runStateOf(accepted, live({ status: 'interrupted' }))).toBe('interrupted');
+    expect(runStateOf(accepted, live({ status: 'running' }))).toBe('blocked');
+    expect(
+      runStateOf({ ...accepted, contractTaskStatus: 'completed' }, live({ status: 'interrupted' })),
+    ).toBe('interrupted');
+  });
+  it('Task completion cannot announce delivery while the current Run is still reviewing', () => {
+    const accepted = task({ contractRunId: 'run-1', contractTaskStatus: 'completed' });
+    expect(runStateOf(accepted, live({ status: 'running' }))).toBe('running');
+    expect(runStateOf(accepted, live({ status: 'completed' }))).toBe('completed');
+    expect(runStateOf(accepted, live({ status: 'failed' }))).toBe('failed');
+    expect(runStateOf(accepted, live({ status: 'cancelled' }))).toBe('cancelled');
+  });
   it('Task waiting or blocked takes precedence over a completed execution leg', () => {
     const completed = live({ status: 'completed' });
     expect(
@@ -152,6 +167,7 @@ describe('词表', () => {
     'completed',
     'failed',
     'cancelled',
+    'interrupted',
     'unsent',
   ];
 

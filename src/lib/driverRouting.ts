@@ -67,6 +67,20 @@ export function routingIssue(error: unknown): RoutingIssue {
     : '';
   const code = error instanceof BackendError ? error.code : undefined;
   switch (code) {
+    case -32027:
+      return {
+        kind: 'unsupported',
+        message: 'ACP 探针模块不可用，请重新构建或更新 ACP runner；这不表示未安装 agent。',
+      };
+    case -32028:
+      return { kind: 'other', message: '驱动探测失败，请重试；保留上一次的驱动列表。' };
+    case -32029:
+      return {
+        kind: 'write',
+        message: '自动发现配置写入失败，本次发现结果不会在重启后保留。请检查项目 .agent 目录权限。',
+      };
+    case -32030:
+      return { kind: 'busy', message: '其他实例正在更新自动发现配置，请稍后重新刷新。' };
     case -32021:
       return {
         kind: 'conflict',
@@ -117,6 +131,7 @@ interface RoutingEditorState {
   busy: boolean;
   notice: string | null;
   load(): Promise<void>;
+  refresh(): Promise<void>;
   changeDefault(driver: string): void;
   changeRole(role: string, driver: string): void;
   save(): Promise<void>;
@@ -126,7 +141,12 @@ interface RoutingEditorState {
   cancel(): void;
 }
 
-export function createDriverRoutingEditor(api = driverApi) {
+export function createDriverRoutingEditor(
+  api: Pick<
+    typeof driverApi,
+    'getConfig' | 'refresh' | 'updateRouting' | 'resetRouting'
+  > = driverApi,
+) {
   let epoch = 0;
   const install = (snapshot: DriverRoutingSnapshot, notice: string | null = null) =>
     store.setState({
@@ -216,6 +236,19 @@ export function createDriverRoutingEditor(api = driverApi) {
               pending: null,
             });
         } else install(latest);
+      } catch (error) {
+        if (ticket === epoch) set({ issue: routingIssue(error) });
+      } finally {
+        if (ticket === epoch) set({ busy: false });
+      }
+    },
+    async refresh() {
+      if (get().busy || get().conflict) return;
+      const ticket = ++epoch;
+      set({ busy: true, issue: null, notice: null, pending: null });
+      try {
+        const latest = await api.refresh({ force: true });
+        if (ticket === epoch) install(latest, '已同步本机可用的驱动；仅影响新创建的运行。');
       } catch (error) {
         if (ticket === epoch) set({ issue: routingIssue(error) });
       } finally {

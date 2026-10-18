@@ -90,8 +90,8 @@ export class SqliteCoordinationStore
 {
   private readonly database: DatabaseSync;
   private readonly protocolDelivery: SqliteProtocolDelivery;
-  private protocolTransactionActive = false;
   private readonly tokenUsageLedger: SqliteTokenUsageLedger;
+  private protocolTransactionActive = false;
 
   constructor(databasePath: string) {
     if (databasePath !== ':memory:') mkdirSync(path.dirname(databasePath), { recursive: true });
@@ -127,9 +127,21 @@ export class SqliteCoordinationStore
           ensureOpen();
           return this.writeCoordinationState(input);
         },
+        getOutbox: (id) => {
+          ensureOpen();
+          return this.protocolDelivery.getOutbox(id);
+        },
+        getInbox: (key) => {
+          ensureOpen();
+          return this.protocolDelivery.getInbox(key);
+        },
         enqueueOutbox: (input) => {
           ensureOpen();
           return this.protocolDelivery.enqueueOutbox(input);
+        },
+        activateOutbox: (id, expectedRevision, at) => {
+          ensureOpen();
+          return this.protocolDelivery.activateOutbox(id, expectedRevision, at);
         },
         receiveInbox: (input) => {
           ensureOpen();
@@ -138,6 +150,30 @@ export class SqliteCoordinationStore
         completeInbox: (input) => {
           ensureOpen();
           return this.protocolDelivery.completeInbox(input);
+        },
+        claimOutbox: (id, owner, now, leaseExpiresAt, expectedRevision) => {
+          ensureOpen();
+          return this.protocolDelivery.claimOutbox(
+            id,
+            owner,
+            now,
+            leaseExpiresAt,
+            expectedRevision,
+          );
+        },
+        markOutboxSent: (id, owner, expectedRevision, at) => {
+          ensureOpen();
+          return this.protocolDelivery.markOutboxSent(id, owner, expectedRevision, at);
+        },
+        claimInbox: (key, owner, now, leaseExpiresAt, expectedRevision) => {
+          ensureOpen();
+          return this.protocolDelivery.claimInbox(
+            key,
+            owner,
+            now,
+            leaseExpiresAt,
+            expectedRevision,
+          );
         },
         appendCall: (input) => {
           ensureOpen();
@@ -704,6 +740,20 @@ export class SqliteCoordinationStore
 
   close(): void {
     this.database.close();
+  }
+
+  listParticipantSessionsForTask(taskId: string): ParticipantSessionBinding[] {
+    return this.database
+      .prepare(
+        'SELECT task_id, workspace_path, role_id, session_id FROM participant_sessions WHERE task_id = ? ORDER BY workspace_path, role_id',
+      )
+      .all(taskId)
+      .map((row) => ({
+        task_id: readString(row, 'task_id'),
+        workspace_path: readString(row, 'workspace_path'),
+        role_id: readString(row, 'role_id'),
+        session_id: readString(row, 'session_id'),
+      }));
   }
 
   private configure(): void {

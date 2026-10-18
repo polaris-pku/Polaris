@@ -31,7 +31,7 @@ process.env.CLAUDE_CLI_COMMAND = nodeBin;
 process.env.CLAUDE_CLI_ARGS = `${acpAgentEntry} acp`;
 process.env.CLAUDE_CODE_EXECUTABLE = claudeBinary;
 
-runBackendRpcMain(process.env).catch((error: unknown) => {
+runBackendRpcMain(process.env, { projectRoot: workspace }).catch((error: unknown) => {
   const message = error instanceof Error ? error.stack || error.message : String(error);
   process.stderr.write(`${message}\n`);
   process.exitCode = 1;

@@ -34,6 +34,8 @@ export interface AgentExecutionRequest {
   driver_instruction?: string;
   workspace_path?: string;
   session_id?: string;
+  /** Resume an interrupted native turn; do not resend the initial memory/context package. */
+  resume_session?: boolean;
   /** Pending Mailbox Delivery injected into this role's task-scoped turn. */
   mailbox_delivery_id?: string;
   input_artifact_refs: ArtifactId[];
@@ -41,9 +43,10 @@ export interface AgentExecutionRequest {
   /**
    * 这次执行在**面板/观测**那一侧属于哪个 run。
    *
-   * 显式提供观测身份，允许调用方把阶段执行归到同一个面板 run。
-   * 不改变 `run_id` 的生成规则；缺省时观测与执行身份相同。
-   * 阶段执行也按此所属 Run 解析冻结的驱动路由，而不以阶段 ID 读取当前配置。
+   * 与 `run_id` 分开是因为它们在 council 下真的不同：每个席位每一相位都拿
+   * `${run_id}_${phaseId}`（`createId('council_phase')`）当执行身份——相位之间必须隔离，
+   * 否则信箱幂等键、driver 会话记账会互相撞车——而面板看的是**任务那个 run**。
+   * 在飞状态（`activity`）按这个字段归集；缺它就退回 `run_id`（单 agent 路径两者相同）。
    */
   activity_run_id?: RunId;
   /** RFC §1.2 memory ablation; applied by production Agent execution facade. */

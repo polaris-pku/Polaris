@@ -35,8 +35,11 @@ export function ProtocolFlowFold({
       title="协议流程"
       status={current?.status === 'blocked' ? 'danger' : 'idle'}
       tier="machine"
-      fact={current ? `${current.code} · ${current.labelCn}` : undefined}
-      meta={`${String(lit)}/19`}
+      fact={
+        current
+          ? `${current.code} · ${current.labelCn} · 已观测 ${String(lit)} 个节点`
+          : '尚无协议事件'
+      }
       evidence={{ count: eventCount, onOpen: onOpenEvidence }}
     >
       <ul className="flex flex-col">
@@ -58,14 +61,12 @@ export function ProtocolFlowFold({
             >
               {node.labelCn}
             </span>
-            <span className="shrink-0 text-meta text-fg-faint">
-              {node.time ?? (node.reachable ? '' : '无事件')}
-            </span>
+            <span className="shrink-0 text-meta text-fg-faint">{node.time ?? '未观测'}</span>
           </li>
         ))}
       </ul>
       <p className="mt-1 text-body text-fg-muted">
-        由后端事件流实时点亮。灰暗的节点在今天的后端上没有对应事件，不会点亮。
+        这是协议事件覆盖记录，不是完成进度。未观测的节点不代表仍在执行，也不要求全部点亮。
       </p>
     </Fold>
   );

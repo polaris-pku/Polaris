@@ -46,6 +46,9 @@ import {
   snapshotWorkspaceFiles,
   type WorkspaceFileSnapshot,
 } from '../../coordinator/workspace-change-detector';
+import { PLAN_STEP_LIST_REQUIREMENT } from '../../coordinator/plan-check';
+import { CouncilRecovery } from '../council-recovery';
+import type { SapTaskBridge } from '../../coordination/sap-task-bridge';
 
 export type CouncilRoleFailureCode =
   | 'COUNCIL_PROPOSAL_FAILED'
@@ -120,6 +123,7 @@ export class CouncilRoleExecutionError extends Error {
 
 export interface SynthesisAgentCouncilProviderOptions {
   agentExecutionFacade: AgentExecutionFacade;
+  sapBridge?: SapTaskBridge;
   participantResolver?: CouncilParticipantResolver;
   councilRoot?: string;
   /** Steer only after a started Driver turn stops emitting all stream events. */
@@ -131,6 +135,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
   private readonly participantResolver: CouncilParticipantResolver | undefined;
   private readonly councilRoot: string;
   private readonly roleInactivityTimeoutMs: number | undefined;
+  private readonly sapBridge: SapTaskBridge | undefined;
 
   constructor(options: SynthesisAgentCouncilProviderOptions) {
     this.agentExecutionFacade = options.agentExecutionFacade;
@@ -140,6 +145,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       options.roleInactivityTimeoutMs,
       'roleInactivityTimeoutMs',
     );
+    this.sapBridge = options.sapBridge;
   }
 
   async runCouncilRound(
@@ -147,8 +153,29 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     options?: CouncilExecutionOptions,
   ): Promise<CouncilRunResult> {
     const executionRunId = input.run_id ?? createId('run');
-    const councilRunId = createId('council_run');
-    const participants = await this.resolveParticipants(input, executionRunId, options);
+    const councilDir = councilRunWorkspaceRoot(
+      this.councilRoot,
+      options?.recovery_key ?? executionRunId,
+    );
+    const recoveryFile = path.join(councilDir, 'recovery.json');
+    let recovery = options?.recovery_key
+      ? CouncilRecovery.read(recoveryFile, input.task_id)
+      : undefined;
+    const councilRunId = recovery?.state.council_run_id ?? createId('council_run');
+    const participants =
+      recovery?.state.participants ??
+      (await this.resolveParticipants(input, executionRunId, options));
+    if (options?.recovery_key && !recovery) {
+      recovery = CouncilRecovery.create(recoveryFile, {
+        task_id: input.task_id,
+        council_run_id: councilRunId,
+        participants,
+        initial_proposals: input.proposals,
+        proposals: {},
+        roles: {},
+      });
+    }
+    if (recovery) input = { ...input, proposals: recovery.state.initial_proposals };
     await emitLifecycle(options, {
       type: 'council.participants.selected',
       payload: {
@@ -164,7 +191,6 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       .sort((left, right) => left.seat_index - right.seat_index);
     const reviewerParticipant = requireSeat(participants, 'reviewer');
     const synthesizerParticipant = requireSeat(participants, 'synthesizer');
-    const councilDir = councilRunWorkspaceRoot(this.councilRoot, executionRunId);
     const generatedResults: AgentExecutionResult[] = [];
     const diagnosticRefs: string[] = [];
     const generatedProposals: Proposal[] = [];
@@ -200,6 +226,8 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
           diagnosticRefs,
           2,
           () => prepareCouncilWorkspace(input.workspace_path, workspace),
+          undefined,
+          recovery,
         );
         return execution ? { execution, participant } : undefined;
       }),
@@ -210,7 +238,13 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       const result = execution?.result;
       if (!result) continue;
       generatedResults.push(result);
-      const proposal = buildProposal(input, participant, result);
+      const proposal =
+        recovery?.state.proposals[participant.participant_id] ??
+        buildProposal(input, participant, result);
+      if (recovery) {
+        recovery.state.proposals[participant.participant_id] = proposal;
+        recovery.save();
+      }
       generatedProposals.push(proposal);
       await emitLifecycle(
         options,
@@ -238,10 +272,11 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
       diagnosticRefs,
       REVIEW_ATTEMPTS,
       async () => {
-        await prepareCouncilWorkspace(
-          options?.artifact_mode === 'plan' ? undefined : input.workspace_path,
-          reviewerWorkspace,
-        );
+        // A plan reviewer needs the same repository baseline as the authors in
+        // order to validate file paths, APIs, and tests instead of reviewing
+        // prose in isolation. The snapshot is a separate Council worktree/copy,
+        // so reviewer tools cannot mutate the user's source workspace.
+        await prepareCouncilWorkspace(input.workspace_path, reviewerWorkspace);
         await stageCouncilArtifacts(reviewerWorkspace, candidateArtifacts);
         await writeProposalManifest(reviewerWorkspace, proposals, candidateArtifacts);
       },
@@ -263,6 +298,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
           );
         }
       },
+      recovery,
     );
     const reviewer = reviewerExecution?.result;
     if (reviewer) generatedResults.push(reviewer);
@@ -322,6 +358,8 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
           'utf-8',
         );
       },
+      undefined,
+      recovery,
     );
     const synthesizer = synthesisExecution?.result;
     const synthesisPhaseId = synthesisExecution?.phase_id;
@@ -388,10 +426,61 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     maxAttempts: number,
     prepare?: () => Promise<void>,
     validate?: (result: AgentExecutionResult) => Promise<void>,
+    recovery?: CouncilRecovery,
   ): Promise<CouncilRoleExecution | undefined> {
-    let sessionId: string | undefined;
+    const recoveryId = `${participant.participant_id}:${phase}`;
+    const saved = recovery?.state.roles[recoveryId];
+    if (saved?.prepared) await fs.access(workspacePath);
+    if (saved?.execution) {
+      await validate?.(saved.execution.result);
+      return saved.execution;
+    }
+    if (saved?.prepared && saved.driver_dispatched !== false && !saved.session_id) {
+      throw new Error(
+        'Interrupted Council role has no durable native session ID; refusing a fresh session',
+      );
+    }
+    let sessionId: string | undefined = saved?.session_id;
+    let recoveryError: unknown;
     let recoveryReason: string | undefined;
-    let workspaceBefore: WorkspaceFileSnapshot | undefined;
+    let workspaceBefore: WorkspaceFileSnapshot | undefined = saved
+      ? new Map(saved.workspace_before)
+      : undefined;
+    const originalOptions = options;
+    if (recovery) {
+      options = {
+        ...options,
+        onDriverEvent: (event) => {
+          try {
+            if (event.event_type === 'driver.prompt_dispatching') {
+              const role = recovery.state.roles[recoveryId];
+              if (role) {
+                role.driver_dispatched = true;
+                recovery.save();
+              }
+            }
+            if (event.event_type === 'driver.turn_started' && event.session_id) {
+              const role = recovery.state.roles[recoveryId];
+              if (role) {
+                if (role.session_id && role.session_id !== event.session_id) {
+                  throw new Error('Council Driver returned a different session while resuming');
+                }
+                role.session_id = event.session_id;
+                role.driver_dispatched = true;
+                sessionId = event.session_id;
+                recovery.save();
+              }
+            }
+          } catch (error) {
+            recoveryError = error;
+            // This callback is invoked synchronously before transport launch.
+            // A failed durable dispatch record must prevent that launch.
+            if (event.event_type === 'driver.prompt_dispatching') throw error;
+          }
+          originalOptions?.onDriverEvent?.(event);
+        },
+      };
+    }
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       options?.signal?.throwIfAborted();
       const phaseId = createId('council_phase');
@@ -414,9 +503,17 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
         },
       });
       try {
-        if (attempt === 1) {
+        if (attempt === 1 && !saved?.prepared) {
           await prepare?.();
           workspaceBefore = await snapshotWorkspaceFiles(workspacePath);
+          if (recovery) {
+            recovery.state.roles[recoveryId] = {
+              prepared: true,
+              driver_dispatched: false,
+              workspace_before: [...workspaceBefore],
+            };
+            recovery.save();
+          }
         }
         const execution = await this.runRoleWithInactivitySteering(
           input,
@@ -433,14 +530,24 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
           phaseId,
           this.roleInactivityTimeoutMs,
           sessionId,
-          attempt > 1 ? workspaceBefore : undefined,
+          attempt > 1 || saved ? workspaceBefore : undefined,
+          attempt,
         );
+        if (recoveryError) throw recoveryError;
         await validate?.(execution.result);
+        if (recovery) {
+          recovery.state.roles[recoveryId]!.execution = {
+            result: execution.result,
+            phase_id: phaseId,
+          };
+          recovery.save();
+        }
         for (const warning of (execution.result.diagnostics.council_warnings as string[]) ?? []) {
           diagnosticRefs.push(`${participant.participant_id}:${warning}`);
         }
         return { result: execution.result, phase_id: phaseId };
       } catch (error) {
+        if (recoveryError) throw recoveryError;
         if (options?.signal?.aborted) throw error;
         const retry = attempt < maxAttempts && isRecoverableRoleFailure(error);
         const failure = await this.toRoleFailure(
@@ -481,6 +588,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     inactivityTimeoutMs: number | undefined,
     sessionId?: string,
     workspaceBefore?: WorkspaceFileSnapshot,
+    attempt = 1,
   ): Promise<{ result: AgentExecutionResult }> {
     const driverRunId = `${executionRunId}_${phaseId}`;
     if (!inactivityTimeoutMs) {
@@ -504,6 +612,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
           phaseId,
           sessionId,
           workspaceBefore,
+          attempt,
         ),
       };
     }
@@ -536,6 +645,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
         phaseId,
         sessionId,
         workspaceBefore,
+        attempt,
       );
       return { result };
     } catch (error) {
@@ -595,15 +705,46 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
     phaseId?: string,
     sessionId?: string,
     workspaceBefore?: WorkspaceFileSnapshot,
+    attempt = 1,
   ): Promise<AgentExecutionResult> {
     await fs.mkdir(workspacePath, { recursive: true });
+    const sapDispatch = this.sapBridge?.createExecute({
+      task_id: input.task_id,
+      run_id: input.run_id ?? executionRunId,
+      role_id: participant.agent_id,
+      instruction,
+      council_seat: participant.seat,
+      ...(input.deadline_at ? { deadline_at: input.deadline_at } : {}),
+      exchange_id: councilSapExchangeId(
+        input.run_id ?? executionRunId,
+        phase,
+        participant.participant_id,
+        attempt,
+      ),
+    });
+    let sapAdmission;
+    if (sapDispatch && this.sapBridge) {
+      if (options?.onSapDispatch) {
+        await options.onSapDispatch(sapDispatch);
+      } else {
+        this.sapBridge.persistExecute(sapDispatch);
+      }
+      sapAdmission = this.sapBridge.beginExecute(sapDispatch);
+      if (!sapAdmission.should_execute) {
+        throw new Error(
+          `Council SAP execute ${sapDispatch.frame.exchange_id} is already active or complete`,
+        );
+      }
+    }
     let result: AgentExecutionResult;
     try {
       result = await this.agentExecutionFacade.runAgent(
         {
           task_id: input.task_id,
           run_id: executionRunId,
-          // 观测身份锚到面板 run，执行身份仍沿用现有规则。
+          // 面板看的是**任务那个 run**，而 `executionRunId` 在 council 下是
+          // `${run_id}_${phaseId}`（相位隔离要它）。在飞状态按前者归集，否则议会阶段——
+          // 一次 run 里最长的一段——在快照上整段看不见。
           activity_run_id: input.run_id ?? executionRunId,
           role_id: participant.agent_id,
           participant_id: participant.participant_id,
@@ -616,6 +757,7 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
           context_policy: `council_${participant.seat}`,
           schema_version: SCHEMA_VERSION,
           ...(sessionId ? { session_id: sessionId } : {}),
+          ...(sessionId ? { resume_session: true } : {}),
           ...(input.memory_ablation ? { memory_ablation: input.memory_ablation } : {}),
         },
         options?.signal || options?.onDriverEvent
@@ -626,7 +768,21 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
           : undefined,
       );
     } catch (error) {
-      if (options?.signal?.aborted) throw error;
+      if (options?.signal?.aborted) {
+        if (sapDispatch && this.sapBridge) {
+          this.sapBridge.enqueueCancel(
+            sapDispatch,
+            this.sapBridge.createCancel({ execute: sapDispatch.frame }),
+          );
+        }
+        throw error;
+      }
+      if (sapDispatch && this.sapBridge && sapAdmission) {
+        this.sapBridge.enqueueCancel(
+          sapDispatch,
+          this.sapBridge.createCancel({ execute: sapDispatch.frame }),
+        );
+      }
       const failure = new CouncilRoleExecutionError(
         phase,
         participant,
@@ -640,6 +796,53 @@ export class SynthesisAgentCouncilProvider implements CouncilProvider {
         },
       );
       throw failure;
+    }
+    if (sapDispatch && sapAdmission && this.sapBridge && result.status === 'interrupted') {
+      this.sapBridge.enqueueCancel(
+        sapDispatch,
+        this.sapBridge.createCancel({ execute: sapDispatch.frame }),
+      );
+    }
+    if (sapDispatch && sapAdmission && this.sapBridge && result.status !== 'interrupted') {
+      const sapResult = this.sapBridge.createResult({
+        execute: sapDispatch.frame,
+        status: result.status,
+        summary: `Council ${phase} role ended with status ${result.status}.`,
+        ...(result.status === 'failed'
+          ? {
+              error: {
+                code: 'council_role_failed',
+                message: `Council ${phase} role failed.`,
+                retryable: true,
+              },
+            }
+          : {}),
+        exchange_id: `sap_result_${sapDispatch.frame.exchange_id}`,
+      });
+      const disposition = options?.onSapResult
+        ? await options.onSapResult({
+            admission: sapAdmission,
+            frame: sapResult,
+            phase,
+            participant_id: participant.participant_id,
+          })
+        : this.sapBridge.acceptResult(sapAdmission, sapResult);
+      if (disposition !== 'accepted') {
+        throw new CouncilRoleExecutionError(
+          phase,
+          participant,
+          'failed',
+          result.agent_run_id,
+          result.driver_run_result_id,
+          {
+            council_run_id: councilRunId,
+            ...(phaseId ? { phase_id: phaseId } : {}),
+            reason: `SAP result was ${disposition}; Council cannot use it for a decision.`,
+            retryable: true,
+            session_id: result.session_id,
+          },
+        );
+      }
     }
     options?.signal?.throwIfAborted();
     if (workspaceBefore && result.status === 'completed') {
@@ -990,17 +1193,33 @@ function createInactivitySignal(
     }, inactivityTimeoutMs);
     timer.unref?.();
   };
+  const disarm = (): void => {
+    if (timer) clearTimeout(timer);
+    timer = undefined;
+    started = false;
+  };
   return {
     signal: controller.signal,
     observe: (event) => {
+      // 终态按生产端实发的名字对齐（跨仓库契约）：contract-runner 只发
+      // driver.turn_completed / driver.turn_failed。取消路径实发
+      // driver.turn_cancel_requested（进入收尾静默，解除监听）与
+      // driver.turn_cancel_failed（取消失败、turn 继续跑，恢复监听）。
+      // `driver.turn_cancelled` 从未有生产者，此前监听它是名字漂移，保留为别名。
+      if (['driver.turn_completed', 'driver.turn_failed'].includes(event.event_type)) {
+        disarm();
+        return;
+      }
       if (
-        ['driver.turn_completed', 'driver.turn_failed', 'driver.turn_cancelled'].includes(
-          event.event_type,
-        )
+        event.event_type === 'driver.turn_cancel_requested' ||
+        event.event_type === 'driver.turn_cancelled'
       ) {
-        if (timer) clearTimeout(timer);
-        timer = undefined;
-        started = false;
+        disarm();
+        return;
+      }
+      if (event.event_type === 'driver.turn_cancel_failed') {
+        started = true;
+        arm();
         return;
       }
       if (!started) {
@@ -1375,6 +1594,7 @@ function buildProposalInstruction(
     'Do not modify product files or implement the solution.',
     'Write the complete Plan to the relative path council-plan.md in the current role workspace; never construct an absolute path.',
     'Include affected files, ordered steps, risks, and verification.',
+    ...PLAN_STEP_LIST_REQUIREMENT,
   ].join(' ');
 }
 
@@ -1387,9 +1607,10 @@ function buildReviewerInstruction(
     return [
       `Review the staged Council Plan inputs for: ${question}.`,
       `Proposal ids: ${proposals.map((proposal) => proposal.proposal_id).join(', ')}.`,
-      'Read proposals.json for proposal summaries and the exact mapping from proposal_id to staged input files. Read only those files inside this workspace; do not inspect parent directories, run state, market ledgers, other sessions or driver streams.',
+      'This workspace contains an isolated snapshot of the task repository plus the staged proposal inputs. Inspect the repository files needed to verify each Plan against the actual codebase.',
+      'Read proposals.json for proposal summaries and the exact mapping from proposal_id to staged input files. Stay inside this workspace; do not inspect parent directories, run state, market ledgers, other sessions or driver streams.',
       'Compare scope, implementation feasibility, unnecessary changes, risks, and verification coverage.',
-      'Do not modify product files.',
+      'Treat repository files as read-only: do not modify product files. Only reviews.json is an allowed review deliverable.',
       `Write exactly one review per proposal to the relative path ${REVIEW_FILE} at the root of the current role workspace; never construct an absolute path. The file must contain {"reviews":[{"proposal_id":"...","verdict":"approve|reject|needs_revision","reason":"...","unmet_criteria":[],"evidence_refs":[]}]}. That file is the review deliverable — a summary in the Driver report is not a substitute for it.`,
       'Then return the normal structured Driver report.',
     ].join(' ');
@@ -1417,6 +1638,7 @@ function buildSynthesisInstruction(
       'Use the relative path final-plan.md in the current role workspace; never construct an absolute path.',
       'Do not implement the Plan or modify product files.',
       'The final Plan must identify affected files, ordered steps, risks, and verification.',
+      ...PLAN_STEP_LIST_REQUIREMENT,
     ].join(' ');
   }
   return [
@@ -1448,4 +1670,13 @@ function buildFinalizationInstruction(
     ...(requiredArtifact ? [`Ensure ${requiredArtifact} exists before returning.`] : []),
     'Return the required structured Driver report in this turn.',
   ].join(' ');
+}
+
+function councilSapExchangeId(
+  runId: string,
+  phase: CouncilPhase,
+  participantId: string,
+  attempt: number,
+): string {
+  return `sap_council:${runId}:${phase}:${participantId}:attempt:${String(attempt)}`;
 }

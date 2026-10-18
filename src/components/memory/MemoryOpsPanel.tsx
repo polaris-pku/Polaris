@@ -115,6 +115,28 @@ function splitTags(raw: string): string[] {
     .filter((tag) => tag.length > 0);
 }
 
+function DeliveryState({ delivery }: { delivery: NonNullable<RpcBufferState['delivery']> }) {
+  return (
+    <div className="rounded-panel border border-edge bg-surface-void px-3 py-2">
+      <KeyValue k="记忆交付" v={delivery.available ? '可用' : '未配置交付存储'} />
+      {delivery.available && (
+        <>
+          <KeyValue k="上下文待处理" v={String(delivery.context.pending)} mono />
+          <KeyValue k="反馈待处理" v={String(delivery.feedback.pending)} mono />
+          <KeyValue k="交付死信" v={String(delivery.dead_letters.length)} mono />
+          <KeyValue k="已交付但未归档" v={String(delivery.archive_backlog.length)} mono />
+          {delivery.archive_backlog.map((entry) => (
+            <p key={entry.delivery_id} className="break-all text-body text-human">
+              Buffer {entry.buffer_seq}{' '}
+              已处理，源报告仍待归档；这是跨存储归档缺口，可按序号重试归档。
+            </p>
+          ))}
+        </>
+      )}
+    </div>
+  );
+}
+
 export function MemoryOpsPanel({ roleId, capabilities, onError, onChanged }: MemoryPanelProps) {
   const fail = useCallback(
     (reason: unknown) => {
@@ -854,6 +876,8 @@ export function MemoryOpsPanel({ roleId, capabilities, onError, onChanged }: Mem
                 />
               </div>
 
+              {bufferState.delivery && <DeliveryState delivery={bufferState.delivery} />}
+
               {/* 死信先讲：它是这块面板存在的理由 */}
               <div>
                 <div className="mb-2 flex items-center gap-2">
@@ -1202,9 +1226,15 @@ function PendingBufferDetail({ seq, buffer }: { seq: number; buffer: RpcPendingB
           )}
         </Fold>
         <Fold id={`buffer-${String(seq)}-context`} title="上下文快照">
-          {!agentContext ? (
+          {buffer.agentContextStatus === 'unreadable' ? (
+            <p className="whitespace-pre-wrap break-all text-body text-danger" role="alert">
+              上下文快照读取失败：{buffer.agentContextError ?? '后端未提供读取失败的原因。'}
+            </p>
+          ) : !agentContext ? (
             <p className="text-body text-fg-muted">
-              这条报告没有配对的上下文快照，提取只会用到上面的执行报告。
+              {buffer.agentContextStatus === 'absent'
+                ? '这条报告没有配对的上下文快照。'
+                : '后端未返回配对的上下文快照；旧版后端未提供读取状态。'}
             </p>
           ) : (
             <div>

@@ -16,6 +16,7 @@
  * 为一个从不执行的 import 去做原生模块的跨平台编译不值得（见 scripts/stub-node-pty.cjs）。
  *
  * 用法：node scripts/build-backend.mjs [--target-os=win32] [--target-cpu=x64]
+ *       node scripts/build-backend.mjs --bundles-only [--out-dir=<directory>]
  */
 import { build } from 'esbuild';
 import { execFileSync } from 'node:child_process';
@@ -32,12 +33,18 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const out = path.join(root, 'backend');
-
 const arg = (name, fallback) => {
   const hit = process.argv.find((a) => a.startsWith(`--${name}=`));
   return hit ? hit.split('=')[1] : fallback;
 };
+const out = path.resolve(root, arg('out-dir', 'backend'));
+const bundlesOnly = process.argv.includes('--bundles-only');
+if (out === root || out === path.parse(out).root) {
+  throw new Error('后端输出目录不能是仓库根目录或文件系统根目录');
+}
+if (!bundlesOnly && out !== path.join(root, 'backend')) {
+  throw new Error('--out-dir 仅支持 --bundles-only；完整构建使用固定的 backend/ 目录');
+}
 const targetOs = arg('target-os', process.platform);
 const targetCpu = arg('target-cpu', process.arch);
 
@@ -48,7 +55,7 @@ const acpPkg = JSON.parse(
 const agentVersion = acpPkg.dependencies['@agentclientprotocol/claude-agent-acp'];
 
 console.log(`[backend] 目标平台 ${targetOs}-${targetCpu}`);
-rmSync(out, { recursive: true, force: true });
+if (!bundlesOnly) rmSync(out, { recursive: true, force: true });
 mkdirSync(out, { recursive: true });
 
 // PGlite 相关包与版本以 BCD 的 package.json 为准，避免打包产物与源码依赖漂移。
@@ -106,6 +113,11 @@ await build({
   entryPoints: [path.join(root, 'packages/acp-client/src/driver/contract-runner.ts')],
   outfile: acpRunnerEntry,
 });
+await build({
+  ...common,
+  entryPoints: [path.join(root, 'packages/acp-client/src/driver-adapter/probe.ts')],
+  outfile: path.join(acpRunnerDir, 'dist', 'src', 'driver-adapter', 'probe.js'),
+});
 writeFileSync(
   path.join(acpRunnerDir, 'package.json'),
   JSON.stringify(
@@ -128,6 +140,10 @@ writeFileSync(
   path.join(out, 'package.json'),
   JSON.stringify({ name: 'polaris-backend', private: true, version: '0.1.0' }, null, 2),
 );
+if (bundlesOnly) {
+  console.log('[backend] bundles 已更新；保留既有 Node、agent 和 PGlite 运行时 →', out);
+  process.exit(0);
+}
 
 // ── 2. Node 运行时 ──
 // agent 的 JS 外壳（claude-agent-acp）要用 node 跑；Claude Code 本体是原生二进制，不需要 node。

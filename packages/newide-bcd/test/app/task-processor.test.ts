@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { SCHEMA_VERSION, type Event, type TaskCreateRequest } from '../../src/core';
-import { TaskProcessor } from '../../src/coordination';
+import { SapTaskBridge, TaskProcessor } from '../../src/coordination';
 import { PersistentMailboxService } from '../../src/mailbox';
 import { SqliteCoordinationStore, type TaskCursorInput } from '../../src/persistence';
 import { projectPersistedRunSnapshot } from '../../src/app/task-run-snapshot-projector';
@@ -18,6 +18,71 @@ afterEach(() => {
 });
 
 describe('TaskProcessor', () => {
+  it('distinguishes initialization-only sessions from dispatched task turns across resume', () => {
+    const { processor, store } = createProcessor();
+    processor.beginRun({
+      task_id: 'task_processor',
+      run_id: 'run_processor',
+      task_request: taskRequest,
+      workspace_path: '/workspace',
+      mode: 'single_agent',
+    });
+    processor.recordRunEvent(
+      'run_processor',
+      event('market_native', 'market.selected', { winner_agent_id: 'role_ts_engineer' }),
+    );
+    processor.recordRunEvent(
+      'run_processor',
+      event('native_init', 'driver.session_initializing', { role_id: 'role_ts_engineer' }),
+    );
+    processor.recordRunEvent(
+      'run_processor',
+      event('native_ready', 'driver.turn_started', {
+        role_id: 'role_ts_engineer',
+        session_id: 'native_initialization',
+      }),
+    );
+    // Dispatch by another role cannot prove the primary received its task.
+    processor.recordRunEvent(
+      'run_processor',
+      event('other_dispatch', 'driver.prompt_dispatching', { role_id: 'reviewer' }),
+    );
+    expect(processor.getRunExecutionState('run_processor').native_task_prompt_dispatched).toBe(
+      false,
+    );
+    processor.interruptRun('run_processor', {
+      source: 'user',
+      reason: 'pause before primary task prompt',
+    });
+    const checkpoint = store.getLatestCheckpoint('task_processor')!;
+    processor.beginRun({
+      task_id: 'task_processor',
+      run_id: 'run_native_resumed',
+      task_request: taskRequest,
+      workspace_path: '/workspace',
+      mode: 'single_agent',
+      session_id: 'native_initialization',
+      restarted_from_run_id: 'run_processor',
+      resume_checkpoint_id: checkpoint.checkpoint_id,
+      requested_resume_cursor: checkpoint.resume_cursor,
+      cursor_input: checkpoint.cursor_input!,
+      run_intent: { type: 'checkpoint_resume', strategy: 'from_checkpoint' },
+    });
+    expect(processor.getRunExecutionState('run_native_resumed').native_task_prompt_dispatched).toBe(
+      false,
+    );
+    processor.recordRunEvent('run_native_resumed', {
+      ...event('native_task_dispatch', 'driver.prompt_dispatching', {
+        role_id: 'role_ts_engineer',
+      }),
+      run_id: 'run_native_resumed',
+    });
+    expect(processor.getRunExecutionState('run_native_resumed').native_task_prompt_dispatched).toBe(
+      true,
+    );
+    store.close();
+  });
+
   it('begins a run and advances only through finite resume cursors', () => {
     const { processor, store } = createProcessor();
     const started = processor.beginRun({
@@ -291,6 +356,128 @@ describe('TaskProcessor', () => {
     store.close();
   });
 
+  it('commits each Council SAP seat dispatch with the active Task stage', () => {
+    const { store } = createProcessor();
+    const clock = deterministicClock();
+    const sapBridge = new SapTaskBridge({ store, now: clock.now });
+    const processor = new TaskProcessor(store, { ...clock, sapBridge });
+    processor.beginRun({
+      task_id: 'task_council_sap_tx',
+      run_id: 'run_council_sap_tx',
+      task_request: taskRequest,
+      workspace_path: '/workspace',
+      mode: 'council',
+      cursor_input: selectInput,
+    });
+    processor.startStage({
+      run_id: 'run_council_sap_tx',
+      expected_cursor: 'select_agent',
+      invocation_id: 'invocation_select_for_council',
+    });
+    processor.advanceStage({
+      run_id: 'run_council_sap_tx',
+      expected_cursor: 'select_agent',
+      invocation_id: 'invocation_select_for_council',
+      evidence_ref: evidenceRef('select_for_council'),
+      next_input: { cursor: 'execute_agent', winner_agent_id: 'agent_a' },
+    });
+    processor.startStage({
+      run_id: 'run_council_sap_tx',
+      expected_cursor: 'execute_agent',
+      invocation_id: 'invocation_execute_for_council',
+    });
+    processor.advanceStage({
+      run_id: 'run_council_sap_tx',
+      expected_cursor: 'execute_agent',
+      invocation_id: 'invocation_execute_for_council',
+      evidence_ref: evidenceRef('execute_for_council'),
+      next_input: {
+        cursor: 'council',
+        trigger: 'explicit_mode',
+        primary_evidence_ref: 'memory://primary',
+        candidate_manifest_ref: 'memory://candidate',
+      },
+    });
+    processor.startStage({
+      run_id: 'run_council_sap_tx',
+      expected_cursor: 'council',
+      invocation_id: 'invocation_council',
+    });
+    const dispatch = sapBridge.createExecute({
+      task_id: 'task_council_sap_tx',
+      run_id: 'run_council_sap_tx',
+      role_id: 'role_reviewer',
+      council_seat: 'reviewer',
+      instruction: 'Review the Council proposal.',
+      exchange_id: 'sap_council_seat_tx',
+    });
+
+    processor.recordCouncilSapDispatch('run_council_sap_tx', dispatch);
+    processor.recordCouncilSapDispatch('run_council_sap_tx', dispatch);
+
+    const aggregate = store.getTaskAggregate('task_council_sap_tx');
+    expect(aggregate).toMatchObject({
+      runtime_state: {
+        diagnostics: {
+          active_stage: {
+            cursor: 'council',
+            council_sap_exchange_ids: ['sap_council_seat_tx'],
+          },
+        },
+      },
+    });
+    expect(store.getTaskAggregate('task_council_sap_tx')?.events).toContainEqual(
+      expect.objectContaining({
+        event_type: 'council.sap.dispatched',
+        subject_id: 'sap_council_seat_tx',
+      }),
+    );
+    expect(store.getOutbox('outbox_sap_council_seat_tx')).toMatchObject({
+      status: 'pending',
+      exchange_id: 'sap_council_seat_tx',
+    });
+    const admission = sapBridge.beginExecute(dispatch);
+    const result = sapBridge.createResult({
+      execute: dispatch.frame,
+      status: 'completed',
+      summary: 'Reviewer completed.',
+      exchange_id: 'sap_result_sap_council_seat_tx',
+    });
+    expect(
+      processor.recordCouncilSapResult(
+        'run_council_sap_tx',
+        admission,
+        result,
+        'review',
+        'participant_reviewer',
+      ),
+    ).toBe('accepted');
+    expect(store.getTaskAggregate('task_council_sap_tx')).toMatchObject({
+      runtime_state: {
+        diagnostics: {
+          active_stage: {
+            council_sap_result_exchange_ids: ['sap_result_sap_council_seat_tx'],
+          },
+        },
+      },
+    });
+    expect(store.getOutbox('outbox_sap_result_sap_council_seat_tx')).toMatchObject({
+      status: 'sent',
+    });
+    expect(store.getTaskAggregate('task_council_sap_tx')?.events).toContainEqual(
+      expect.objectContaining({
+        event_type: 'council.sap.result.received',
+        subject_id: 'sap_result_sap_council_seat_tx',
+      }),
+    );
+    expect(store.listJournal('task_council_sap_tx', 'run_council_sap_tx')).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: 'sap_council_seat_tx', event: 'outbox.enqueued' }),
+      ]),
+    );
+    store.close();
+  });
+
   it('continues one waiting Task exactly once with the persisted Mailbox reply', async () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'newide-task-mailbox-'));
     temporaryDirectories.push(directory);
@@ -378,11 +565,30 @@ describe('TaskProcessor', () => {
       idempotency_key: 'run_mailbox_sender:reply:1',
     });
     const replyDeliveryId = replied.reply.deliveries[0]!.delivery_id;
+    expect(() =>
+      processor.beginRun({
+        task_id: 'task_mailbox_continue',
+        run_id: 'run_wrong_delivery_target',
+        task_request: taskRequest,
+        workspace_path: '/workspace/.newide/council/primary',
+        mode: 'single_agent',
+        restarted_from_run_id: 'run_mailbox_sender',
+        run_intent: {
+          type: 'mailbox_continuation',
+          source_delivery_id: sourceDeliveryId,
+        },
+        cursor_input: {
+          cursor: 'execute_agent',
+          winner_agent_id: 'agent_a',
+          mailbox_delivery_id: replyDeliveryId,
+        },
+      }),
+    ).toThrow(/definition cannot change/i);
     processor.beginRun({
       task_id: 'task_mailbox_continue',
       run_id: 'run_mailbox_continuation',
       task_request: taskRequest,
-      workspace_path: '/workspace/.newide/council/primary',
+      workspace_path: '/workspace',
       mode: 'single_agent',
       memory_ablation: 'B0',
       session_id: 'session_sender',
@@ -401,22 +607,21 @@ describe('TaskProcessor', () => {
     expect(processor.getRunExecutionState('run_mailbox_continuation')).toMatchObject({
       task_id: 'task_mailbox_continue',
       memory_ablation: 'B0',
-      workspace_path: '/workspace/.newide/council/primary',
+      workspace_path: '/workspace',
       resume_cursor: 'execute_agent',
-      delivery_workspace_path: '/workspace',
       cursor_input: {
         winner_agent_id: 'agent_a',
         mailbox_delivery_id: replyDeliveryId,
       },
     });
     const persisted = store.getTaskAggregate('task_mailbox_continue');
+    expect(persisted?.task.workspace_path).toBe('/workspace');
+    expect(persisted?.runs.find((run) => run.run_id === 'run_mailbox_continuation')).toMatchObject({
+      workspace_path: '/workspace',
+    });
     expect(processor.getTaskSnapshot('task_mailbox_continue').task.workspace_path).toBe(
       '/workspace',
     );
-    expect(persisted?.task.workspace_path).toBe('/workspace');
-    expect(persisted?.runs.find((run) => run.run_id === 'run_mailbox_continuation')).toMatchObject({
-      workspace_path: '/workspace/.newide/council/primary',
-    });
     expect(() =>
       processor.beginRun({
         task_id: 'task_mailbox_continue',
