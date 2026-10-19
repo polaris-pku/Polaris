@@ -56,8 +56,10 @@ export function StepFold({
         ) : (
           node.status === 'active' && <KeyValue k="用时" v="进行中" />
         )}
-        {/* summary 是 eventGraph 从 payload 里挑出来的那一行关键事实（已经是人话） */}
-        {node.summary && <KeyValue k="关键事实" v={node.summary} />}
+        {/* summary 是 eventGraph 从 payload 里挑出来的那一行关键事实（已经是人话）。
+            显式开 wrap：右栏再窄也保证整句可读 —— 它是这一格唯一"必须看完"的事实，
+            截断成 `…` 等于把它的人话属性抹掉。其它 KV 仍走单行 truncate。 */}
+        {node.summary && <KeyValue k="关键事实" v={node.summary} wrap />}
       </KeyValueList>
     </Fold>
   );
