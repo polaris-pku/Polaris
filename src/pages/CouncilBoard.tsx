@@ -4,6 +4,7 @@ import {
   ArrowLeft,
   Award,
   BadgeCheck,
+  ChevronDown,
   FileCode2,
   FileText,
   Gavel,
@@ -125,8 +126,8 @@ export function CouncilBoard() {
   return (
     <div className="flex h-full flex-col overflow-hidden">
       {/* 抬头：状态 + 决议标识（机器 ID 收进 IdChip）+ 当前谁在做什么 */}
-      <header className="border-b border-edge px-6 py-4">
-        <div className="flex flex-wrap items-center gap-2">
+      <header className="relative border-b border-edge px-6 py-4">
+        <div className="flex flex-wrap items-center gap-2 pr-44">
           <Scale className="h-5 w-5 text-command-soft" />
           <h1 className="text-title text-fg-primary">合议</h1>
           <Badge variant={statusBadge.variant}>{statusBadge.label}</Badge>
@@ -142,11 +143,47 @@ export function CouncilBoard() {
             <span className="font-mono text-code text-danger">{model.failedCode}</span>
           )}
         </div>
+
+        {/* 右上角动作区 —— 始终可见，与状态无关；返回任务常驻，再开一轮在非运行态出现 */}
+        <div className="absolute right-4 top-4 flex items-center gap-2">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => {
+              setPage('tasks');
+            }}
+          >
+            <ArrowLeft className="h-4 w-4" /> 返回任务
+          </Button>
+          {model.status !== 'running' && (
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={!backendTaskId || reopening}
+              onClick={() => void reopen()}
+            >
+              <RotateCw className="h-4 w-4" />
+              {reopening ? '正在请求…' : '再开一轮合议'}
+            </Button>
+          )}
+        </div>
+
         <p className="mt-1 max-w-3xl text-body text-fg-secondary">
-          提案者各给出一份候选实现，评审员逐案评审，综合员产出最终候选 ——
-          裁决由后端自主完成，这里呈现全过程。
+          {model.status === 'running'
+            ? '提案者起草 → 评审员审议 → 综合员裁决'
+            : model.status === 'completed'
+              ? '合议已结束，裁决由后端自主完成'
+              : '合议未成功，裁决由后端自主完成'}
         </p>
         <PhaseLine model={model} />
+
+        {/* 后端拒绝时把原话摆出来，不改写、不吞掉 —— 紧跟动作按钮下方 */}
+        {reopenError && (
+          <div className="absolute right-4 top-14 z-10 flex max-w-xs items-start gap-2 rounded-panel border border-human/30 bg-human/10 px-3 py-2 shadow-modal">
+            <AlertTriangle className="mt-1 h-4 w-4 shrink-0 text-human-soft" />
+            <p className="whitespace-pre-line text-body text-fg-secondary">{reopenError}</p>
+          </div>
+        )}
       </header>
 
       {/* 致命错误摆在最上面：出现它这一轮合议就中止了，不能藏在右栏里 */}
@@ -194,7 +231,10 @@ export function CouncilBoard() {
           <PanelTitle icon={Scale}>提案 · {model.proposals.length}</PanelTitle>
           <div className="min-h-0 flex-1 overflow-y-auto p-4">
             <RoleFailureList failures={model.roleFailures} />
-            <div className="grid grid-cols-1 content-start gap-4 xl:grid-cols-2">
+            {/* 用 flex-wrap 代替 CSS grid —— 同一行的卡片不再被强制等高对齐，
+                每张提案按自身内容长度自由伸缩，关闭后头部紧凑、展开后正文按需占高。
+                两列布局靠 w-[calc(50%-0.5rem)] 撑开（gap=1rem 减半后取整）。 */}
+            <div className="flex flex-wrap items-start gap-4">
               {model.proposals.length === 0 && (
                 <p className="text-body text-fg-muted">
                   提案者还在起草 —— 提案完成后会出现在这里。
@@ -205,6 +245,7 @@ export function CouncilBoard() {
                   key={proposal.proposalId}
                   proposal={proposal}
                   onOpenArtifact={openArtifact}
+                  className="w-full xl:w-[calc(50%-0.5rem)]"
                 />
               ))}
             </div>
@@ -358,51 +399,12 @@ export function CouncilBoard() {
               )}
             </div>
 
-            {/*
-              唯一的动作。它能存在，是因为 `task.startCouncil` 是一条真实 RPC ——
-              而「采纳 / 驳回」至今没有回写通道，所以那两个按钮仍然不存在。
-            */}
-            <div className="space-y-2 border-t border-edge p-4">
-              {model.status === 'running' ? (
-                <p className="text-body text-fg-muted">合议进行中，结束后可以再开一轮。</p>
-              ) : (
-                <>
-                  <Button
-                    variant="secondary"
-                    className="w-full"
-                    disabled={!backendTaskId || reopening}
-                    onClick={() => void reopen()}
-                  >
-                    <RotateCw className="h-4 w-4" />
-                    {reopening ? '正在请求…' : '再开一轮合议'}
-                  </Button>
-                  <p className="text-body text-fg-muted">
-                    {backendTaskId
-                      ? '后端会用同一份需求重新发起合议：这次 run 已结束就新起一次 run，还在执行中则把它转入合议。'
-                      : '这个任务还没有被后端受理，暂时开不了新一轮。'}
-                  </p>
-                </>
-              )}
-              {/* 后端拒绝时把原话摆出来，不改写、不吞掉 */}
-              {reopenError && (
-                <div className="flex items-start gap-2 rounded-panel border border-human/30 bg-human/5 px-3 py-2">
-                  <AlertTriangle className="mt-1 h-4 w-4 shrink-0 text-human-soft" />
-                  <p className="whitespace-pre-line text-body text-fg-secondary">{reopenError}</p>
-                </div>
-              )}
+            {/* 简短说明 —— 真正的动作按钮已搬到抬头右上角，这里只留一句解释 */}
+            <div className="border-t border-edge p-4">
               <p className="text-body text-fg-muted">
                 裁决由后端 agent 自主完成，Polaris 没有把人工裁决送回后端的通道 ——
-                所以这里不会有「采纳 / 驳回」按钮。
+                再开一轮可随时在右上发起。
               </p>
-              <Button
-                variant="secondary"
-                className="w-full"
-                onClick={() => {
-                  setPage('tasks');
-                }}
-              >
-                <ArrowLeft className="h-4 w-4" /> 返回任务
-              </Button>
             </div>
           </div>
         </SidePanel>
@@ -606,7 +608,6 @@ function PhaseLine({ model }: { model: CouncilBoardModel }) {
           <Badge variant={model.status === 'running' ? 'command' : 'default'}>
             {labelOf(PHASE_LABEL, model.phase)}
           </Badge>
-          <span className="font-mono text-code text-fg-faint">{model.phase}</span>
         </>
       ) : (
         <span className="text-body text-fg-muted">后端还没报阶段。</span>
@@ -713,63 +714,67 @@ function AuctionFold({
       title={title}
       status={auction.status === 'running' ? 'running' : 'idle'}
       fact={fact}
-      meta={`${auction.candidates.length}/${auction.bids.length}`}
+      meta={`${auction.candidates.length}候选 · ${auction.bids.length}报价`}
       defaultOpen={defaultOpen}
+      tier="machine"
     >
-      <div className="flex flex-wrap items-center gap-2">
-        {auction.selectionScope && (
-          <span className="text-body text-fg-muted">
-            范围 {labelOf(SCOPE_LABEL, auction.selectionScope)}{' '}
-            <span className="font-mono text-code text-fg-faint">{auction.selectionScope}</span>
-          </span>
-        )}
-        {auction.selectionMode && (
-          <span className="text-body text-fg-muted">
-            方式 {labelOf(AUCTION_MODE_LABEL, auction.selectionMode)}{' '}
-            <span className="font-mono text-code text-fg-faint">{auction.selectionMode}</span>
-          </span>
-        )}
+      {/* D1：人读信息 —— 席位、需求、候选、报价；协议原文全部拿掉 */}
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-body text-fg-muted">
         {auction.seatIndex !== null && (
-          <span className="text-body text-fg-muted">
+          <span>
             席位序号 <span className="tabular font-mono text-code">{auction.seatIndex}</span>
           </span>
         )}
+        <span>
+          {labelOf(SCOPE_LABEL, auction.selectionScope || '')} ·{' '}
+          {labelOf(AUCTION_MODE_LABEL, auction.selectionMode || '')}
+        </span>
+        {auction.probabilitySampled && auction.tau !== null && (
+          <span>
+            温度 <span className="tabular font-mono text-code">{score2(auction.tau)}</span>
+          </span>
+        )}
+        {auction.probabilitySampled && auction.winnerProbability !== null && (
+          <span>
+            中选概率{' '}
+            <span className="tabular font-mono text-code">{pctOf(auction.winnerProbability)}</span>
+          </span>
+        )}
       </div>
-
       {auction.requirementProfile && (
         <div className="mt-2">
-          <div className="text-body text-fg-muted">需求画像</div>
-          <TagRow tags={auction.requirementProfile.personaKeywords} />
-          <TagRow tags={auction.requirementProfile.preferredSkillTags} />
-          <TagRow tags={auction.requirementProfile.preferredExperienceTags} />
+          <div className="mb-1 text-body text-fg-muted">需求画像</div>
+          <TagRow
+            tags={Array.from(
+              new Set([
+                ...auction.requirementProfile.personaKeywords,
+                ...auction.requirementProfile.preferredSkillTags,
+                ...auction.requirementProfile.preferredExperienceTags,
+              ]),
+            )}
+          />
         </div>
       )}
-
       <div className="mt-2">
-        <div className="text-body text-fg-muted">
-          候选人 · <span className="tabular">{auction.candidates.length}</span>
-        </div>
+        <div className="mb-1 text-body text-fg-muted">候选人 · {auction.candidates.length}</div>
         {auction.candidates.length === 0 ? (
-          <p className="text-body text-fg-faint">这一场没有候选人明细（只收到了结果那半边）。</p>
+          <p className="text-body text-fg-faint">没有候选人明细。</p>
         ) : (
-          <ul className="mt-1 space-y-1">
+          <ul className="space-y-2">
             {auction.candidates.map((candidate) => (
               <CandidateItem key={candidate.roleId} candidate={candidate} />
             ))}
           </ul>
         )}
       </div>
-
       <div className="mt-2">
-        <div className="text-body text-fg-muted">
-          报价 · <span className="tabular">{auction.bids.length}</span>
-        </div>
+        <div className="mb-1 text-body text-fg-muted">报价 · {auction.bids.length}</div>
         {auction.bids.length === 0 ? (
           <p className="text-body text-fg-faint">
             {auction.status === 'running' ? '还在收报价。' : '后端没有给出报价明细。'}
           </p>
         ) : (
-          <ul className="mt-1 space-y-1">
+          <ul className="space-y-2">
             {auction.bids.map((bid, i) => (
               <BidItem
                 key={bid.bidId || bid.roleId}
@@ -781,27 +786,38 @@ function AuctionFold({
           </ul>
         )}
       </div>
-
-      {/* 抽签参数只有真跑了 seeded-softmax 才有意义 */}
-      {(auction.policyVersion || auction.seed || auction.probabilitySampled) && (
-        <dl className="mt-2 space-y-1 border-t border-edge pt-2">
-          {auction.policyVersion && <FactRow k="打分策略" v={auction.policyVersion} />}
-          {auction.seed && <FactRow k="随机种子" v={auction.seed} />}
-          {auction.probabilitySampled && auction.tau !== null && (
-            <FactRow k="抽样温度" v={score2(auction.tau)} />
+      {/* D2：协议原文、凭证 ID —— 开发者才关心的信息 */}{' '}
+      <div className="mt-2 border-t border-edge pt-2">
+        <div className="text-meta text-fg-faint">协议信息</div>
+        <dl className="mt-1 space-y-1">
+          {auction.selectionScope && (
+            <FactRow
+              k="范围"
+              v={labelOf(SCOPE_LABEL, auction.selectionScope)}
+              raw={auction.selectionScope}
+            />
           )}
-          {auction.probabilitySampled && auction.winnerProbability !== null && (
-            <FactRow k="中选概率" v={pctOf(auction.winnerProbability)} />
+          {auction.selectionMode && (
+            <FactRow
+              k="方式"
+              v={labelOf(AUCTION_MODE_LABEL, auction.selectionMode)}
+              raw={auction.selectionMode}
+            />
+          )}
+          {auction.policyVersion && (
+            <FactRow k="打分策略" v={auction.policyVersion} raw={auction.policyVersion} />
+          )}
+          {auction.seed && <FactRow k="随机种子" v={auction.seed} raw={auction.seed} />}
+          {auction.tau !== null && !auction.probabilitySampled && (
+            <FactRow k="温度 τ" v={score2(auction.tau)} />
           )}
         </dl>
-      )}
-
-      <div className="mt-2 flex flex-wrap items-center gap-2 border-t border-edge pt-2">
-        {auction.winnerBidId && <IdChip value={auction.winnerBidId} label="中选报价" />}
-        {auction.ledgerRef && <IdChip value={auction.ledgerRef} label="账本" />}
-        {auction.auditRef && <IdChip value={auction.auditRef} label="审计" />}
+        <div className="mt-2 flex flex-wrap items-center gap-2">
+          {auction.winnerBidId && <IdChip value={auction.winnerBidId} label="中选报价" />}
+          {auction.ledgerRef && <IdChip value={auction.ledgerRef} label="账本" />}
+          {auction.auditRef && <IdChip value={auction.auditRef} label="审计" />}
+        </div>
       </div>
-
       {auction.taskDescription && (
         <p className="mt-2 border-t border-edge pt-2 text-body text-fg-muted">
           竞标议题：{auction.taskDescription}
@@ -814,67 +830,94 @@ function AuctionFold({
 function CandidateItem({ candidate }: { candidate: CouncilAuctionCandidate }) {
   const m = candidate.metrics;
   return (
-    <li className="rounded-panel border border-edge bg-surface-panel p-2">
+    <li className="rounded-panel border border-edge bg-surface-panel p-3">
+      {/* 主行：角色名 + 画像标签 */}
       <div className="flex flex-wrap items-baseline gap-2">
-        <span className="text-body text-fg-primary">{roleName(candidate.roleId)}</span>
+        <span className="text-body font-semibold text-fg-primary">
+          {roleName(candidate.roleId)}
+        </span>
         <span className="font-mono text-code text-fg-faint">{candidate.roleId}</span>
         {candidate.personaRef && <IdChip value={candidate.personaRef} label="画像" />}
       </div>
+
+      {/* 量化指标行 */}
       {m && (
-        <div className="mt-1 flex flex-wrap gap-x-3 text-body text-fg-muted">
+        <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-body text-fg-muted">
           <span>
-            任务 <span className="tabular">{intOf(m.totalTasks)}</span>
+            任务 <span className="tabular font-mono text-code">{intOf(m.totalTasks)}</span>
           </span>
           <span>
-            完成 <span className="tabular">{intOf(m.tasksCompleted)}</span>
+            完成 <span className="tabular font-mono text-code">{intOf(m.tasksCompleted)}</span>
           </span>
           <span>
-            成功 <span className="tabular">{intOf(m.tasksSucceeded)}</span>
+            成功{' '}
+            <span className="tabular font-mono text-code text-ok">{intOf(m.tasksSucceeded)}</span>
           </span>
           <span>
-            技能 <span className="tabular">{intOf(m.skillCount)}</span>
+            技能 <span className="tabular font-mono text-code">{intOf(m.skillCount)}</span>
           </span>
           <span>
-            经验 <span className="tabular">{intOf(m.experienceCount)}</span>
+            经验 <span className="tabular font-mono text-code">{intOf(m.experienceCount)}</span>
           </span>
           <span>
-            平均置信 <span className="tabular">{pctOf(m.avgConfidence)}</span>
+            置信 <span className="tabular font-mono text-code">{pctOf(m.avgConfidence)}</span>
           </span>
         </div>
       )}
       {candidate.load && (
         <div className="mt-1 flex flex-wrap gap-x-3 text-body text-fg-muted">
           <span>
-            在跑 <span className="tabular">{intOf(candidate.load.activeTaskCount)}</span>
+            在跑{' '}
+            <span className="tabular font-mono text-code">
+              {intOf(candidate.load.activeTaskCount)}
+            </span>
           </span>
           <span>
-            距上次 <span className="tabular">{intOf(candidate.load.daysSinceLastTask)}</span> 天
+            距上次{' '}
+            <span className="tabular font-mono text-code">
+              {intOf(candidate.load.daysSinceLastTask)}
+            </span>{' '}
+            天
           </span>
         </div>
       )}
+
+      {/* 人格标签 */}
       <TagRow tags={candidate.personaKeywords} />
-      <TagRow tags={candidate.skills.map((skill) => skill.name)} />
+
+      {/* 技能 */}
+      {candidate.skills.length > 0 && (
+        <div className="mt-2">
+          <div className="mb-1 text-meta text-fg-faint">技能</div>
+          <TagRow tags={candidate.skills.map((skill) => skill.name)} />
+        </div>
+      )}
+
+      {/* 经验 */}
       {candidate.experiences.length > 0 && (
-        <ul className="mt-1 space-y-0.5">
-          {candidate.experiences.map((experience) => (
-            <li
-              key={experience.name}
-              className="flex items-baseline gap-2 text-body text-fg-secondary"
-            >
-              <span
-                aria-hidden
-                className={cn(
-                  'h-1.5 w-1.5 shrink-0 rounded-full',
-                  experience.type === 'positive' ? 'bg-ok' : 'bg-danger',
-                )}
-              />
-              <span className="min-w-0 flex-1 truncate">{experience.name}</span>
-              <span className="tabular shrink-0 font-mono text-code text-fg-faint">
-                {pctOf(experience.confidence)}
-              </span>
-            </li>
-          ))}
-        </ul>
+        <div className="mt-2">
+          <div className="mb-1 text-meta text-fg-faint">经验</div>
+          <ul className="space-y-1">
+            {candidate.experiences.map((experience) => (
+              <li
+                key={experience.name}
+                className="flex items-baseline gap-2 text-body text-fg-secondary"
+              >
+                <span
+                  aria-hidden
+                  className={cn(
+                    'mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full',
+                    experience.type === 'positive' ? 'bg-ok' : 'bg-danger',
+                  )}
+                />
+                <span className="min-w-0 flex-1 truncate">{experience.name}</span>
+                <span className="tabular shrink-0 font-mono text-code text-fg-faint">
+                  {pctOf(experience.confidence)}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
       )}
     </li>
   );
@@ -892,35 +935,45 @@ function BidItem({
   return (
     <li
       className={cn(
-        'rounded-panel border bg-surface-panel p-2',
-        bid.winner ? 'border-ok/60' : 'border-edge',
+        'rounded-panel border bg-surface-panel p-3',
+        bid.winner ? 'border-ok/50 bg-ok/5' : 'border-edge',
       )}
     >
-      <div className="flex items-baseline gap-2">
+      {/* 主行：排名 · 角色名 · 得分 · 徽章 */}
+      <div className="flex items-center gap-2">
         <span className="tabular shrink-0 text-meta text-fg-faint">{rank}</span>
-        <span className="min-w-0 flex-1 truncate text-body text-fg-primary">
+        <span className="min-w-0 flex-1 truncate text-body font-semibold text-fg-primary">
           {roleName(bid.roleId)}
         </span>
         {bid.winner && <Badge variant="ok">中选</Badge>}
-        <span className="tabular shrink-0 font-mono text-code text-fg-primary">
+        <span
+          className={cn(
+            'tabular shrink-0 font-mono text-title',
+            bid.winner ? 'text-ok' : 'text-fg-primary',
+          )}
+        >
           {score2(bid.finalScore)}
         </span>
       </div>
+
+      {/* 次行：概率 · 预估时间 */}
       <div className="mt-1 flex flex-wrap gap-x-3 text-body text-fg-muted">
-        {/* 抽中概率只在真跑了 seeded-softmax 时存在；固定指派 / 按名册顺序时没有抽签，
-            把一个概率摆出来就是编造。 */}
-        {sampled && (
+        {sampled && bid.probability !== null && (
           <span>
-            抽中概率 <span className="tabular">{pctOf(bid.probability)}</span>
+            抽中 <span className="tabular font-mono text-code">{pctOf(bid.probability)}</span>
           </span>
         )}
         {bid.estimatedTimeSeconds !== null && (
           <span>
-            预估 <span className="tabular">{bid.estimatedTimeSeconds}</span> 秒
+            预估 <span className="tabular font-mono text-code">{bid.estimatedTimeSeconds}</span> 秒
           </span>
         )}
       </div>
+
+      {/* 打分明细 */}
       {bid.score && <ScoreBreakdown score={bid.score} />}
+
+      {/* 策略摘要 */}
       {bid.strategySummary && (
         <p className="mt-1 text-body text-fg-secondary">{bid.strategySummary}</p>
       )}
@@ -928,50 +981,81 @@ function BidItem({
   );
 }
 
-/** 打分明细。后端分组是 relevance / quality 两大块 + 三个独立项，这里按同样的分组摊开。 */
+/** 打分明细。三层：核心得分 → 相关性/质量子分 → 辅助参数。 */
 function ScoreBreakdown({ score }: { score: CouncilBidScore }) {
   return (
-    <div className="mt-1 space-y-0.5 border-t border-edge pt-1">
-      <div className="flex flex-wrap gap-x-3 text-body text-fg-muted">
-        <span className="text-fg-secondary">
-          相关 <span className="tabular">{score2(score.relevance)}</span>
+    <div className="mt-2 border-t border-edge pt-2">
+      {/* 第一层：核心得分 */}
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-body">
+        <span className="text-fg-muted">综合</span>
+        <span className="tabular font-mono text-title font-semibold text-fg-primary">
+          {score2(score.finalScore)}
         </span>
-        <span>
-          画像 <span className="tabular">{score2(score.personaMatch)}</span>
+        <span className="text-fg-muted">
+          相关 <span className="tabular font-mono text-code">{score2(score.relevance)}</span>
         </span>
-        <span>
-          技能 <span className="tabular">{score2(score.skillMatch)}</span>
-        </span>
-        <span>
-          经验 <span className="tabular">{score2(score.experienceMatch)}</span>
-        </span>
-      </div>
-      <div className="flex flex-wrap gap-x-3 text-body text-fg-muted">
-        <span className="text-fg-secondary">
-          质量 <span className="tabular">{score2(score.quality)}</span>
-        </span>
-        <span>
-          成功率 <span className="tabular">{score2(score.successRate)}</span>
-        </span>
-        <span>
-          置信 <span className="tabular">{score2(score.avgConfidence)}</span>
-        </span>
-        <span>
-          经验密度 <span className="tabular">{score2(score.experienceDensity)}</span>
-        </span>
-        <span>
-          技能密度 <span className="tabular">{score2(score.skillDensity)}</span>
+        <span className="text-fg-muted">
+          质量 <span className="tabular font-mono text-code">{score2(score.quality)}</span>
         </span>
       </div>
-      <div className="flex flex-wrap gap-x-3 text-body text-fg-muted">
+      {/* 第二层：相关性子分 */}
+      <div className="mt-1 flex flex-wrap gap-x-3 text-body text-fg-muted">
         <span>
-          容量 <span className="tabular">{score2(score.capacity)}</span>
+          画像{' '}
+          <span className="tabular font-mono text-code text-fg-secondary">
+            {score2(score.personaMatch)}
+          </span>
         </span>
         <span>
-          新鲜度 <span className="tabular">{score2(score.freshness)}</span>
+          技能{' '}
+          <span className="tabular font-mono text-code text-fg-secondary">
+            {score2(score.skillMatch)}
+          </span>
         </span>
         <span>
-          加成 <span className="tabular">{score2(score.bonus)}</span>
+          经验{' '}
+          <span className="tabular font-mono text-code text-fg-secondary">
+            {score2(score.experienceMatch)}
+          </span>
+        </span>
+      </div>
+      {/* 第三层：质量子分 */}
+      <div className="mt-0.5 flex flex-wrap gap-x-3 text-body text-fg-muted">
+        <span>
+          成功率{' '}
+          <span className="tabular font-mono text-code text-fg-secondary">
+            {score2(score.successRate)}
+          </span>
+        </span>
+        <span>
+          置信{' '}
+          <span className="tabular font-mono text-code text-fg-secondary">
+            {score2(score.avgConfidence)}
+          </span>
+        </span>
+        <span>
+          经验密度{' '}
+          <span className="tabular font-mono text-code text-fg-secondary">
+            {score2(score.experienceDensity)}
+          </span>
+        </span>
+        <span>
+          技能密度{' '}
+          <span className="tabular font-mono text-code text-fg-secondary">
+            {score2(score.skillDensity)}
+          </span>
+        </span>
+      </div>
+      {/* 第四层：辅助参数 */}
+      <div className="mt-0.5 flex flex-wrap gap-x-3 text-meta text-fg-faint">
+        <span>
+          容量 <span className="tabular font-mono text-code">{score2(score.capacity)}</span>
+        </span>
+        <span>
+          新鲜度 <span className="tabular font-mono text-code">{score2(score.freshness)}</span>
+        </span>
+        <span>
+          加成 <span className="tabular font-mono text-code">{score2(score.bonus)}</span>
         </span>
       </div>
     </div>
@@ -1021,6 +1105,7 @@ function RosterFold({
       title="席位名册"
       fact={participants.length > 0 ? `${participants.length} 席` : '还没定'}
       defaultOpen
+      tier="machine"
     >
       {selectionMode && (
         <p className="text-body text-fg-muted">
@@ -1084,31 +1169,35 @@ function RosterFold({
 function SubjectFold({ model }: { model: CouncilBoardModel }) {
   const firstLine = model.subject.split('\n')[0] || '后端没给议题正文';
   return (
-    <Fold id="council-subject" title="议题" fact={firstLine} defaultOpen>
+    <Fold id="council-subject" title="议题" fact={firstLine} defaultOpen tier="machine">
       {model.subject ? (
-        <div className="max-h-32 overflow-y-auto whitespace-pre-line rounded-panel border border-edge bg-surface-panel p-2 text-body text-fg-secondary">
+        <div className="max-h-32 overflow-y-auto whitespace-pre-line rounded-panel border border-edge bg-surface-raised p-2 text-body text-fg-secondary">
           {model.subject}
         </div>
       ) : (
         <p className="text-body text-fg-muted">这一轮没有回显议题正文。</p>
       )}
+      {/* 合议配置 —— 人读层 */}
       <dl className="mt-2 space-y-1">
-        {model.strategy && (
-          <FactRow k="合议策略" v={labelOf(STRATEGY_LABEL, model.strategy)} raw={model.strategy} />
-        )}
+        {model.strategy && <FactRow k="合议策略" v={labelOf(STRATEGY_LABEL, model.strategy)} />}
         {model.artifactMode && (
-          <FactRow
-            k="产出形态"
-            v={labelOf(ARTIFACT_MODE_LABEL, model.artifactMode)}
-            raw={model.artifactMode}
-          />
+          <FactRow k="产出形态" v={labelOf(ARTIFACT_MODE_LABEL, model.artifactMode)} />
         )}
-        {model.trigger && (
-          <FactRow k="触发方式" v={labelOf(TRIGGER_LABEL, model.trigger)} raw={model.trigger} />
-        )}
+        {model.trigger && <FactRow k="触发方式" v={labelOf(TRIGGER_LABEL, model.trigger)} />}
       </dl>
+      {/* 协议原文 —— 开发者层 */}
+      <div className="mt-2 border-t border-edge pt-2">
+        <div className="text-meta text-fg-faint">协议信息</div>
+        <dl className="mt-1 space-y-1">
+          {model.strategy && <FactRow k="策略" v={model.strategy} raw={model.strategy} />}
+          {model.artifactMode && (
+            <FactRow k="形态" v={model.artifactMode} raw={model.artifactMode} />
+          )}
+          {model.trigger && <FactRow k="触发" v={model.trigger} raw={model.trigger} />}
+        </dl>
+      </div>
       {model.councilRunId && (
-        <div className="mt-2">
+        <div className="mt-2 border-t border-edge pt-2">
           <IdChip value={model.councilRunId} label="合议 ID" />
         </div>
       )}
@@ -1118,7 +1207,7 @@ function SubjectFold({ model }: { model: CouncilBoardModel }) {
 
 function FeedFold({ feed }: { feed: { time: string; type: string; roleId: string }[] }) {
   return (
-    <Fold id="council-feed-list" title="事件序" fact={`${feed.length} 条`} defaultOpen>
+    <Fold id="council-feed-list" title="事件序" fact={`${feed.length} 条`} tier="machine">
       {feed.length === 0 ? (
         <p className="text-body text-fg-muted">还没有合议事件。</p>
       ) : (
@@ -1196,121 +1285,229 @@ function RoleFailureList({ failures }: { failures: CouncilRoleFailure[] }) {
 function ProposalCard({
   proposal,
   onOpenArtifact,
+  className,
 }: {
   proposal: CouncilProposalCard;
   onOpenArtifact: (artifactId: string) => void;
+  className?: string;
 }) {
+  // 组件本地状态：默认展开，便于第一眼读到正文。
+  // 评审 / 风险 / 证据 / 产物数依然常显（进 header），折叠后也能看见这卡「值不值得点开」。
+  const [expanded, setExpanded] = useState(true);
+
+  const signals: { count: number; tone: 'command' | 'danger' | 'muted'; label: string }[] = [
+    { count: proposal.reviews.length, tone: 'muted', label: '评审' },
+    { count: proposal.knownRisks.length, tone: 'danger', label: '风险' },
+    { count: proposal.completionEvidence.length, tone: 'command', label: '证据' },
+    { count: proposal.artifactRefs.length, tone: 'command', label: '产物' },
+  ];
+  const signalChips = signals.filter((s) => s.count > 0);
+
   return (
     <div
       className={cn(
-        'flex flex-col rounded-panel border bg-surface-panel p-4',
-        proposal.selected ? 'border-ok/60 ring-1 ring-ok/40' : 'border-edge',
+        'group relative flex flex-col rounded-panel border bg-surface-panel transition-colors',
+        proposal.selected
+          ? 'border-command/60 bg-command/5 ring-1 ring-command/30'
+          : 'border-edge hover:border-edge-strong',
+        className,
       )}
     >
-      <div className="flex items-start justify-between gap-2">
-        <span className="text-title text-fg-primary">{roleName(proposal.roleId)}</span>
-        {proposal.selected && <Badge variant="ok">已选中</Badge>}
-      </div>
-      {proposal.seat && (
-        <div className="mt-0.5 flex flex-wrap items-baseline gap-2">
-          <span className="text-body text-fg-muted">{labelOf(SEAT_LABEL, proposal.seat)}</span>
-          <span className="font-mono text-code text-fg-faint">{proposal.seat}</span>
+      {/* 头：可折叠 —— 整行是可点击按钮；徽标/计数也常驻，折叠后也可见 */}
+      <button
+        type="button"
+        onClick={() => setExpanded((current) => !current)}
+        aria-expanded={expanded}
+        aria-controls={`proposal-body-${proposal.proposalId}`}
+        className="flex w-full items-start justify-between gap-3 rounded-t-panel p-4 text-left transition-colors hover:bg-surface-raised/60"
+      >
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <ChevronDown
+              className={cn(
+                'h-3.5 w-3.5 shrink-0 text-fg-muted transition-transform duration-200',
+                expanded ? 'rotate-0' : '-rotate-90',
+              )}
+            />
+            <Scale className="h-3.5 w-3.5 shrink-0 text-command" />
+            <span className="truncate text-title text-fg-primary">{roleName(proposal.roleId)}</span>
+            {proposal.selected && <Badge variant="command">已选中</Badge>}
+          </div>
+          {/* 计数 / 关键信号：折叠时仍能扫一眼这卡是不是值得展开 */}
+          {signalChips.length > 0 && (
+            <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-meta text-fg-faint">
+              {signalChips.map((signal) => {
+                const toneClass =
+                  signal.tone === 'danger'
+                    ? 'border-danger/30 bg-danger/10 text-danger-soft'
+                    : signal.tone === 'command'
+                      ? 'border-command/20 bg-command/10 text-command-soft'
+                      : 'border-edge bg-surface-raised text-fg-muted';
+                return (
+                  <span
+                    key={signal.label}
+                    className={cn(
+                      'rounded-chip border px-1.5 py-0.5 font-mono text-code',
+                      toneClass,
+                    )}
+                  >
+                    {signal.label}·{signal.count}
+                  </span>
+                );
+              })}
+            </div>
+          )}
+          {proposal.seat && (
+            <div className="mt-1 flex items-center gap-1.5 text-meta text-fg-muted">
+              <span>{labelOf(SEAT_LABEL, proposal.seat)}</span>
+              <span className="font-mono text-fg-faint">·</span>
+              <span className="font-mono text-fg-faint">{proposal.seat}</span>
+            </div>
+          )}
         </div>
-      )}
-      <div className="mt-1 flex flex-wrap items-center gap-2">
-        <IdChip value={proposal.proposalId} label="提案 ID" />
-        {proposal.participantId && <IdChip value={proposal.participantId} label="席位 ID" />}
-      </div>
+      </button>
 
-      {proposal.summary ? (
-        <p className="mt-2 text-body text-fg-secondary">{proposal.summary}</p>
-      ) : (
-        <p className="mt-2 text-body text-fg-muted">提案正文随终态快照到达。</p>
-      )}
+      {/* 折叠后正文区整体隐藏 —— 状态用组件本地 state，不用 <details>（与现有的协议信息 details 不冲突） */}
+      {expanded && (
+        <div
+          id={`proposal-body-${proposal.proposalId}`}
+          className="border-t border-edge px-4 pb-4 pt-3"
+        >
+          {/* 正文摘要 */}
+          {proposal.summary ? (
+            <p className="text-body text-fg-secondary">{proposal.summary}</p>
+          ) : (
+            <p className="text-body text-fg-muted">提案正文随终态快照到达。</p>
+          )}
 
-      {proposal.reviews.length > 0 && (
-        <div className="mt-3 space-y-1.5">
-          <div className="text-body text-fg-muted">评审</div>
-          {proposal.reviews.map((review) => {
-            const badge = badgeOf(REVIEW_BADGE, review.verdict);
-            return (
-              <div key={review.reviewId} className="rounded-panel border border-edge p-2">
-                <div className="flex flex-wrap items-center gap-2">
-                  {badge ? (
-                    <Badge variant={badge.variant}>{badge.label}</Badge>
-                  ) : (
-                    <Badge>评审中</Badge>
-                  )}
-                  {review.verdict && (
-                    <span className="font-mono text-code text-fg-faint">{review.verdict}</span>
-                  )}
-                  {review.reviewerId && (
-                    <span className="text-body text-fg-muted">{roleName(review.reviewerId)}</span>
-                  )}
-                </div>
-                {review.reason && (
-                  <p className="mt-1 text-body text-fg-secondary">{review.reason}</p>
-                )}
+          {/* 评审 —— 提案的关键裁决 */}
+          {proposal.reviews.length > 0 && (
+            <div className="mt-4 border-t border-edge pt-3">
+              <div className="mb-2 flex items-center gap-1.5 text-meta text-fg-muted">
+                <MessagesSquare className="h-3 w-3" /> 评审 · {proposal.reviews.length}
               </div>
-            );
-          })}
+              <ul className="space-y-2">
+                {proposal.reviews.map((review) => {
+                  const badge = badgeOf(REVIEW_BADGE, review.verdict);
+                  return (
+                    <li
+                      key={review.reviewId}
+                      className="rounded-chip border border-edge bg-surface-raised px-3 py-2"
+                    >
+                      <div className="flex flex-wrap items-center gap-2">
+                        {badge ? (
+                          <Badge variant={badge.variant}>{badge.label}</Badge>
+                        ) : (
+                          <Badge>评审中</Badge>
+                        )}
+                        {review.reviewerId && (
+                          <span className="text-body text-fg-secondary">
+                            {roleName(review.reviewerId)}
+                          </span>
+                        )}
+                      </div>
+                      {review.reason && (
+                        <p className="mt-1 text-body text-fg-secondary">{review.reason}</p>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            </div>
+          )}
+
+          {/* 关键信号：风险用红色，完成证据用紫色高亮 */}
+          {proposal.knownRisks.length > 0 && (
+            <div className="mt-3">
+              <div className="mb-1 flex items-center gap-1.5 text-meta text-danger-soft">
+                <AlertTriangle className="h-3 w-3" /> 已知风险 · {proposal.knownRisks.length}
+              </div>
+              <ul className="space-y-1 text-body text-fg-secondary">
+                {proposal.knownRisks.map((risk) => (
+                  <li key={risk} className="flex items-baseline gap-1.5">
+                    <span aria-hidden className="mt-1.5 h-1 w-1 shrink-0 rounded-full bg-danger" />
+                    <span>{risk}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {proposal.completionEvidence.length > 0 && (
+            <div className="mt-3">
+              <div className="mb-1 flex items-center gap-1.5 text-meta text-command-soft">
+                <Sparkles className="h-3 w-3" /> 完成证据 · {proposal.completionEvidence.length}
+              </div>
+              <ul className="space-y-1 text-body text-fg-secondary">
+                {proposal.completionEvidence.map((item) => (
+                  <li key={item} className="flex items-baseline gap-1.5">
+                    <span aria-hidden className="mt-1.5 h-1 w-1 shrink-0 rounded-full bg-command" />
+                    <span>{item}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {/* 前置假设 */}
+          {proposal.assumptions.length > 0 && (
+            <div className="mt-3">
+              <div className="mb-1 text-meta text-fg-faint">
+                前置假设 · {proposal.assumptions.length}
+              </div>
+              <ul className="space-y-1 text-body text-fg-muted">
+                {proposal.assumptions.map((item) => (
+                  <li key={item} className="flex items-baseline gap-1.5">
+                    <span
+                      aria-hidden
+                      className="mt-1.5 h-1 w-1 shrink-0 rounded-full bg-fg-faint"
+                    />
+                    <span>{item}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {/* 影响文件 */}
+          {proposal.affectedPaths.length > 0 && (
+            <div className="mt-3">
+              <div className="mb-1 flex items-center gap-1.5 text-meta text-fg-muted">
+                <FileCode2 className="h-3 w-3" /> 影响文件 · {proposal.affectedPaths.length}
+              </div>
+              <div className="flex flex-wrap gap-1">
+                {proposal.affectedPaths.map((path) => (
+                  <span
+                    key={path}
+                    className="rounded-chip border border-edge bg-surface-raised px-2 py-0.5 font-mono text-code text-fg-secondary"
+                  >
+                    {path}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* 产物 —— 最重要的一行，用紫色顶边高亮 */}
+          {proposal.artifactRefs.length > 0 && (
+            <div className="mt-4 -mx-4 -mb-4 border-t border-command/20 bg-command/5 px-4 py-3">
+              <ArtifactRefs refs={proposal.artifactRefs} label="产物" onOpen={onOpenArtifact} />
+            </div>
+          )}
+
+          {/* 协议信息 —— 折叠区 */}
+          <details className="mt-3 text-meta text-fg-faint">
+            <summary className="cursor-pointer transition-colors hover:text-fg-muted">
+              协议信息
+            </summary>
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <IdChip value={proposal.proposalId} label="提案 ID" />
+              {proposal.participantId && <IdChip value={proposal.participantId} label="席位 ID" />}
+              <span className="font-mono text-fg-faint">{proposal.roleId}</span>
+            </div>
+          </details>
         </div>
       )}
-
-      {proposal.assumptions.length > 0 && (
-        <div className="mt-3">
-          <div className="mb-1 text-body text-fg-muted">前置假设</div>
-          <ul className="space-y-0.5 text-body text-fg-secondary">
-            {proposal.assumptions.map((item) => (
-              <li key={item}>· {item}</li>
-            ))}
-          </ul>
-        </div>
-      )}
-
-      {proposal.knownRisks.length > 0 && (
-        <div className="mt-3">
-          <div className="mb-1 flex items-center gap-1 text-body text-danger">
-            <AlertTriangle className="h-3 w-3" /> 已知风险
-          </div>
-          <ul className="space-y-0.5 text-body text-fg-secondary">
-            {proposal.knownRisks.map((risk) => (
-              <li key={risk}>· {risk}</li>
-            ))}
-          </ul>
-        </div>
-      )}
-
-      {proposal.completionEvidence.length > 0 && (
-        <div className="mt-3">
-          <div className="mb-1 text-body text-fg-muted">完成证据</div>
-          <ul className="space-y-0.5 text-body text-fg-secondary">
-            {proposal.completionEvidence.map((item) => (
-              <li key={item}>· {item}</li>
-            ))}
-          </ul>
-        </div>
-      )}
-
-      {proposal.affectedPaths.length > 0 && (
-        <div className="mt-3">
-          <div className="mb-1 flex items-center gap-1 text-body text-fg-muted">
-            <FileCode2 className="h-3 w-3" /> 影响文件
-          </div>
-          <div className="flex flex-wrap gap-1">
-            {proposal.affectedPaths.map((path) => (
-              <span
-                key={path}
-                className="rounded-chip bg-surface-raised px-1.5 font-mono text-code text-fg-secondary"
-              >
-                {path}
-              </span>
-            ))}
-          </div>
-        </div>
-      )}
-
-      <ArtifactRefs refs={proposal.artifactRefs} label="产物" onOpen={onOpenArtifact} />
     </div>
   );
 }
