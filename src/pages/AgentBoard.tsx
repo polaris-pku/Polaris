@@ -735,10 +735,11 @@ function OverviewTab({
         </div>
 
         {/*
-          第二档：横向数据点。设计成 `<dl>` 是因为每个点本质是"k → v"的定义关系，
-          但 `dl` 不允许把 `<div>` 作为直接子节点 —— 每个 DataPoint 必须直接产出
-          `<dt> + <dd>`，所以这里用 Fragment 包一对兄弟。
-          单点内用了 flex 让 k / v 基线对齐；4 个点之间用外层 `gap-x-4 gap-y-1` 留节奏。
+          第二档：横向数据点。设计成 `<dl>` 是因为每个点本质是"k → v"的定义关系。
+          HTML5 允许 `<div>` 把 `<dt> + <dd>` 组成 dl 的子组 —— DataPoint 返回 `<div>` 包一对 dt/dd，
+          外层 `dl` 的 `flex flex-wrap` 把每组当成一个 flex item：窄窗下整组换行，不会把 dt / dd
+          拆到两行。
+          组内用 inline 排版让 k / v 同行基线对齐；4 个组之间靠外层 `gap-x-4 gap-y-1` 留节奏。
         */}
         <dl className="mt-3 flex flex-wrap items-baseline gap-x-4 gap-y-1">
           <DataPoint k="竞标" v={`${numText(raw.tasks_bid)} 参 / ${numText(raw.tasks_won)} 中`} />
@@ -822,11 +823,11 @@ function OverviewTab({
                     return (
                       <div
                         key={field.key}
-                        className="rounded-panel border border-edge bg-surface-void px-3 py-2"
+                        className="min-w-0 rounded-panel border border-edge bg-surface-void px-3 py-2"
                       >
                         <div className="text-meta text-fg-muted">{field.label}</div>
                         {value ? (
-                          <p className="mt-0.5 whitespace-pre-wrap text-body text-fg-secondary">
+                          <p className="mt-0.5 whitespace-pre-wrap break-words text-body text-fg-secondary">
                             {value}
                           </p>
                         ) : (
@@ -1096,14 +1097,16 @@ function MetricCard({
 /**
  * 横向数据点：k / v 同行，v 用 mono 数字 + 紧凑间距 —— 它是参考型数据，不该跟正文一个字号。
  *
- * 渲染成 `<dt> + <dd>` 直接节点对（外层 `dl` 要求这两个元素不能被任何包装元素包起来），
- * 用 inline 排版维持 k / v 同行基线对齐。
+ * 容器走 `<div>` 而非 Fragment：HTML5 允许 `<div>` 把一对 `<dt> + <dd>` 作为一个
+ * dl 子组，外层 `dl` 的 `flex flex-wrap` 会把整组当成一个 flex item —— 在窄窗下
+ * 整组换行，而不是 dt / dd 各自被 flex 当成兄弟项、互相断到两行。
+ * 组内再用 inline 排版让 k / v 同行基线对齐。
  */
 function DataPoint({ k, v }: { k: string; v: string }) {
   return (
-    <>
+    <div>
       <dt className="inline text-meta text-fg-muted">{k}</dt>
       <dd className="ml-1.5 inline tabular text-code text-fg-secondary">{v}</dd>
-    </>
+    </div>
   );
 }
