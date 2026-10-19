@@ -135,7 +135,7 @@ function BlockView({ block }: { block: DocBlock }) {
      *   ### 子节标题   → BlockView   `text-title` (15px) `fg-secondary` 与父节同字号但降一档色阶 ——「下面要讲一节」而非「继续讲正文」
      *   p / ul / ol   → BlockView   `text-body`  (13px) `fg-secondary`  正文基线
      *   quote         → BlockView   `text-body`  (13px) `fg-secondary` + 左缘 `border-l-human` —— 用边色区分层级而非字色
-     *   pre           → BlockView   `text-code`  (12px) `fg-muted`      代码块本身已是独立视觉块，字色降一档免得它抢走正文
+     *   pre           → BlockView   `text-code`  (12px) `fg-secondary`  字号本身已小一档 + `bg-surface-void` + `border-edge` 三个维度和正文分离，字色保持 secondary 才能在黑底上达到 4.5:1 可读对比度
      *
      * 旧版 h3 用的是 `text-body text-fg-primary` —— 子节标题和正文同字号、还比正文亮，整页扫读时它**冒不出来**。
      * 一个「快速开始 / 已知限制 / 常见问题」开头的几行小节在视觉上形同段落，TOC 之外读者压根找不到结构。
@@ -188,13 +188,13 @@ function BlockView({ block }: { block: DocBlock }) {
       );
 
     /*
-     * 代码块：`bg-surface-void` + `border-edge` 已是一个独立视觉块。字色降到 `fg-muted` 让它**退后一步**，
-     * 避免长 .py 例子把读者眼睛吸走 —— 它是参考，不是主讲。上下边距 `mt-3 / first:mt-0` 区分「它是另一类内容」，
-     * 不是「又一段正文」。
+     * 代码块：用字号（12px vs 正文 13px）+ `bg-surface-void` + `border-edge` 三个维度
+     * 与正文分离，字色保持 `fg-secondary`（不在黑底上再降一档，否则会跌破 4.5:1 可读对比度）。
+     * 上下边距 `mt-3 / first:mt-0` 区分「它是另一类内容」，不是「又一段正文」。
      */
     case 'pre':
       return (
-        <pre className="mt-3 overflow-x-auto rounded-chip border border-edge bg-surface-void px-2 py-1 text-code text-fg-muted first:mt-0">
+        <pre className="mt-3 overflow-x-auto rounded-chip border border-edge bg-surface-void px-2 py-1 text-code text-fg-secondary first:mt-0">
           {block.text}
         </pre>
       );
