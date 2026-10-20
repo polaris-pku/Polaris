@@ -96,7 +96,9 @@ async function resolveProviderModel(
     case 'openai': {
       const { createOpenAI } = await import('@ai-sdk/openai');
       const apiKey = explicit?.apiKey ?? process.env.OPENAI_API_KEY;
-      const baseURL = explicit?.baseUrl ?? process.env.OPENAI_BASE_URL;
+      const baseURL = explicit?.baseUrl
+        ? normalizeProviderBaseUrl(explicit.baseUrl)
+        : process.env.OPENAI_BASE_URL;
       // 显式按当前 env 创建 provider：模块级默认 `openai` 实例在模块加载时
       // 读取 OPENAI_BASE_URL，若当时未设置会被钉死在 api.openai.com。
       return createOpenAI({
@@ -117,11 +119,8 @@ async function resolveProviderModel(
         explicit?.apiKey ??
         process.env.ANTHROPIC_AUTH_TOKEN ??
         process.env.ANTHROPIC_API_KEY;
-      const baseURL =
-        explicit?.baseUrl ??
-        (process.env.ANTHROPIC_BASE_URL
-          ? normalizeAnthropicBaseUrl(process.env.ANTHROPIC_BASE_URL)
-          : undefined);
+      const baseUrl = explicit?.baseUrl ?? process.env.ANTHROPIC_BASE_URL;
+      const baseURL = baseUrl ? normalizeProviderBaseUrl(baseUrl) : undefined;
       return createAnthropic({
         ...(apiKey ? { apiKey } : {}),
         ...(baseURL ? { baseURL } : {}),
@@ -136,12 +135,10 @@ async function resolveProviderModel(
 }
 
 /**
- * AI SDK's Anthropic provider appends `/messages` to baseURL; unlike ACP's
- * adapter, it expects the version prefix to already be present. MiniMax's
- * compatible endpoint is commonly configured as `/anthropic`, so normalize it
- * to `/anthropic/v1` before constructing the model.
+ * The SDKs append `/messages` or `/chat/completions`, so preserve provider
+ * prefixes such as `/anthropic` and include the version exactly once.
  */
-function normalizeAnthropicBaseUrl(value: string): string {
+function normalizeProviderBaseUrl(value: string): string {
   const normalized = value.trim().replace(/\/+$/, '');
   return /\/v1$/i.test(normalized) ? normalized : `${normalized}/v1`;
 }
@@ -204,15 +201,13 @@ export interface LiteLLMToolCallingClientOptions {
    */
   model?: string;
   /**
-   * API Key 覆盖（默认从环境变量读取
-   * DEEPSEEK_API_KEY / LLM_PROVIDER=deepseek 或 OPENAI_API_KEY）。
-   * 传此值会覆盖 process.env.OPENAI_API_KEY。
+   * API key override. Only the legacy path without `protocol` updates
+   * process.env.OPENAI_API_KEY; explicit protocols pass credentials per request.
    */
   apiKey?: string;
   /**
-   * Base URL 覆盖（如 'https://api.deepseek.com'）。
-   * 传此值会覆盖 process.env.OPENAI_BASE_URL。
-   * LiteLLM 通过 @ai-sdk/openai 调用，SDK 会读 OPENAI_BASE_URL env。
+   * Provider root or versioned base URL, with provider-specific prefixes preserved.
+   * Only the legacy path without `protocol` updates process.env.OPENAI_BASE_URL.
    */
   baseUrl?: string;
   /**
@@ -249,7 +244,7 @@ export class LiteLLMToolCallingClient implements ToolCallingClient {
         process.env.OPENAI_API_KEY = options.apiKey;
       }
       if (options.baseUrl) {
-        process.env.OPENAI_BASE_URL = options.baseUrl.replace(/\/+$/, '') + '/v1';
+        process.env.OPENAI_BASE_URL = normalizeProviderBaseUrl(options.baseUrl);
       }
     }
 
