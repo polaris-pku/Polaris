@@ -15,6 +15,7 @@
   "task.get",
   "task.list",
   "task.cancel",
+  "task.delete",
   "task.interrupt",
   "task.resume",
   "task.startCouncil",

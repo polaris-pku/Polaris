@@ -7,7 +7,7 @@ const methods = require('./backend-rpc-methods.json');
 const expectedGroups = {
   system: 6,
   driver: 6,
-  task: 9,
+  task: 10,
   run: 10,
   memory: 43,
   mailbox: 4,
@@ -15,12 +15,12 @@ const expectedGroups = {
 };
 
 test('RPC method manifest exposes the complete contract surface', () => {
-  assert.equal(methods.length, 79);
-  assert.equal(new Set(methods).size, 79);
+  assert.equal(methods.length, 80);
+  assert.equal(new Set(methods).size, 80);
   for (const method of ['driver.getConfig', 'driver.updateRouting', 'driver.resetRouting']) {
     assert.ok(methods.includes(method));
   }
-  for (const method of ['driver.refresh', 'driver.list', 'driver.probe', 'task.interrupt']) {
+  for (const method of ['driver.refresh', 'driver.list', 'driver.probe', 'task.interrupt', 'task.delete']) {
     assert.ok(methods.includes(method));
   }
   for (const method of ['run.getUsage', 'run.getEvents', 'run.getPayload']) {
