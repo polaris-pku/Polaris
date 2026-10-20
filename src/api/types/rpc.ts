@@ -371,6 +371,7 @@ export interface RpcMethodMap {
   'task.get': { params: { task_id: string }; result: TaskSnapshot };
   'task.list': { params: Record<string, never>; result: { tasks: TaskSnapshot[] } };
   'task.cancel': { params: { task_id: string }; result: TaskSnapshot };
+  'task.delete': { params: { task_id: string }; result: { deleted: true } };
   'task.interrupt': { params: { task_id: string }; result: TaskSnapshot };
   'task.resume': { params: { task_id: string }; result: TaskSnapshot };
   'task.startCouncil': { params: { task_id: string }; result: TaskSnapshot };

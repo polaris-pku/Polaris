@@ -27,6 +27,7 @@ export const taskApi = {
   get: (taskId: string) => getTransport().call('task.get', { task_id: taskId }),
   list: () => getTransport().call('task.list', {}),
   cancel: (taskId: string) => getTransport().call('task.cancel', { task_id: taskId }),
+  delete: (taskId: string) => getTransport().call('task.delete', { task_id: taskId }),
   interrupt: (taskId: string) => getTransport().call('task.interrupt', { task_id: taskId }),
   resume: (taskId: string) => getTransport().call('task.resume', { task_id: taskId }),
   startCouncil: (taskId: string) => getTransport().call('task.startCouncil', { task_id: taskId }),

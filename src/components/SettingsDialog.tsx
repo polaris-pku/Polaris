@@ -246,7 +246,7 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
             </div>
 
             <p className="mt-2 text-body text-fg-secondary">
-              Coding agent（Claude Code）已随应用一起安装，你不需要另外安装任何东西。 它只会说
+              Coding agent 使用你本机自己的 Claude Code 配置，Polaris 不替它选模型。 它只会说
               Anthropic 的 Messages API —— 但任何提供
               <span className="text-brand-silver"> Anthropic 兼容端点 </span>
               的服务都能接（DeepSeek 官方就有一个）。
@@ -397,7 +397,7 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
               </div>
             </div>
             <p className="mt-1 text-body text-fg-muted">
-              B Agent、Memory 维护与 Coding agent 使用同一服务商；模型名按服务商实际支持填写。
+              B Agent、Memory 维护使用同一服务商；模型名按服务商实际支持填写。
             </p>
 
             <div className="mt-4 border-t border-edge pt-4">
