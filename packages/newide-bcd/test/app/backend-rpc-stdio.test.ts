@@ -105,6 +105,7 @@ describe('resolveProductionLlmRuntime', () => {
       baseUrl: 'https://api.minimax.io',
       apiKey: 'acp-token',
       model: 'MiniMax-M3',
+      protocol: 'anthropic',
     });
   });
 
@@ -126,6 +127,7 @@ describe('resolveProductionLlmRuntime', () => {
       baseUrl: 'https://local.example',
       apiKey: 'local-token',
       model: 'local-model',
+      protocol: 'anthropic',
     });
   });
 
@@ -147,6 +149,7 @@ describe('resolveProductionLlmRuntime', () => {
       baseUrl: 'https://api.minimax.io',
       apiKey: 'acp-token',
       model: 'MiniMax-M3',
+      protocol: 'anthropic',
     });
   });
 });
