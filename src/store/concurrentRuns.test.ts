@@ -44,6 +44,8 @@ function installFakeBackend(
     snapshots?: Record<string, RunSnapshot>;
     taskSnapshots?: Record<string, TaskSnapshot>;
     workspace?: string;
+    /** 挂起 task.delete 的响应，用例靠它在 await 期间制造并发写入。 */
+    deleteGate?: { promise: Promise<void> };
   } = {},
 ) {
   const eventCbs = new Set<BackendEventCb>();
@@ -51,6 +53,7 @@ function installFakeBackend(
   const rpc: Array<{ method: string; params: unknown }> = [];
   const historicalRuns = new Set<string>();
   let created = 0;
+  const deleteGate = options.deleteGate;
   const readyStatus = { ...READY_STATUS, workspace: options.workspace ?? READY_STATUS.workspace };
 
   const backend = {
@@ -128,6 +131,9 @@ function installFakeBackend(
         };
       }
       if (method === 'task.delete') {
+        // 可挂起：让用例能在 await 期间插入并发操作，复现「删除返回后覆盖新状态」的回归。
+        const gate = deleteGate;
+        if (gate) await gate.promise;
         return { ok: true as const, result: { deleted: true } };
       }
       if (method === 'run.getSnapshot') {
@@ -704,5 +710,47 @@ describe('并发跑两个需求', () => {
     await vi.waitFor(() =>
       expect(fake.calls('run.unsubscribe').map((c) => c.params)).toEqual([{ run_id: 'run-1' }]),
     );
+  });
+
+  it('删除等待期间新建的任务不会被旧 state 覆盖掉', async () => {
+    // 回归：deleteTask 曾在 await task.delete **之前**捕获 state，await 返回后拿这份旧快照
+    // 去 set —— 于是等待期间建好的第二个任务会凭空消失（后端已有 btask-2，本地 tasks 却变 []）。
+    let release!: () => void;
+    const gate = { promise: new Promise<void>((resolve) => (release = resolve)) };
+    const fake = installFakeBackend({ deleteGate: gate });
+
+    const { resetTransport } = await import('@/api/transport');
+    resetTransport();
+    const { resetEventChannel } = await import('@/api/events');
+    resetEventChannel();
+    const { useDemoStore } = await import('@/store/useDemoStore');
+
+    useDemoStore.getState().resetDemo();
+    useDemoStore.getState().createProject('P1', '并发用例');
+
+    await useDemoStore.getState().createTask('实现贪吃蛇', undefined, ['游戏可运行']);
+    await vi.waitFor(() => expect(useDemoStore.getState().tasks[0].contractRunId).toBe('run-1'));
+    fake.emit(evt('run-1', 'task.created', { spec: '实现贪吃蛇' }));
+
+    const doomedId = useDemoStore.getState().tasks[0].id;
+
+    // 发出删除但不 await —— 卡在 RPC 上
+    const deleting = useDemoStore.getState().deleteTask(doomedId);
+    await vi.waitFor(() => expect(fake.calls('task.delete')).toHaveLength(1));
+
+    // 删除还在飞：用户新建了第二个任务
+    await useDemoStore.getState().createTask('实现俄罗斯方块', undefined, ['游戏可运行']);
+    await vi.waitFor(() => expect(useDemoStore.getState().tasks).toHaveLength(2));
+    expect(fake.calls('task.create')).toHaveLength(2);
+
+    release();
+    const result = await deleting;
+    expect(result.ok).toBe(true);
+
+    // 只有被删的那个消失，同期新建的必须还在
+    const remaining = useDemoStore.getState().tasks;
+    expect(remaining.map((t) => t.id)).toEqual([expect.not.stringMatching(doomedId)]);
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0].contractRunId).toBe('run-2');
   });
 });

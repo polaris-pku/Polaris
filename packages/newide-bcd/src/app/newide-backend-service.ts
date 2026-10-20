@@ -851,9 +851,28 @@ export class NewideBackendService {
       ]),
     ];
 
+    // 先确认 coordination 库里到底有没有这条聚合，再决定要不要动磁盘。
+    //
+    // getTask / collectTaskSnapshots 能从 request.json 恢复**只存在于历史目录**的任务，
+    // 而生产装配始终挂着 TaskProcessor。对这类任务，磁盘目录删掉之后再去
+    // processor.deleteTask，它会因找不到聚合抛 TaskProcessorTaskNotFoundError ——
+    // 那个异常也不会被映射成前端认识的 -32006，于是变成「文件已删、RPC 报错、本地任务
+    // 还在」的半成功状态。两条路径都清干净才算删成功，所以先判存在性。
+    const inCoordinationStore = this.taskProcessor
+      ? this.taskProcessor
+          .listTaskSnapshots()
+          .some((snapshot) => snapshot.task.task_id === taskId)
+      : false;
+
+    if (!inCoordinationStore && runIds.length === 0) {
+      // 既无聚合也无历史目录：这个 task_id 本来就不存在，按幂等成功收尾。
+      this.taskListeners.delete(taskId);
+      return { deleted: true };
+    }
+
     this.taskListeners.delete(taskId);
     await Promise.all(runIds.map((runId) => this.requestStore.removeRun(runId)));
-    this.taskProcessor?.deleteTask(taskId);
+    if (inCoordinationStore) this.taskProcessor?.deleteTask(taskId);
     return { deleted: true };
   }
 

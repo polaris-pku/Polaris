@@ -150,6 +150,92 @@ describe('NewideBackendService Task-first view', () => {
     }
   });
 
+  it('deletes a history-only task cleanly under the production TaskProcessor wiring', async () => {
+    // 回归：生产装配**始终**挂着 TaskProcessor。历史任务（能从 request.json 恢复，但不在
+    // coordination 库里）原先会先删掉磁盘目录、再无条件调 processor.deleteTask，后者因找不到
+    // 聚合抛 TaskProcessorTaskNotFoundError —— 异常不会映射成前端认识的 -32006，于是留下
+    // 「文件已删、RPC 报错、本地任务还在」的半成功状态。
+    const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'task-service-delete-histonly-'));
+    const stateRoot = await mkdtemp(path.join(os.tmpdir(), 'task-service-histonly-store-'));
+    const requestStore = new FileRunRequestStore(runsRoot);
+    await requestStore.save({
+      run_id: 'run_hist',
+      task_id: 'task_hist',
+      prompt: 'History only',
+      workspace_path: process.cwd(),
+      mode: 'single_agent',
+      task_request: { spec: 'History only', completion_criteria: ['Gone stays gone'] },
+    });
+    await writeFile(
+      path.join(runsRoot, 'run_hist', 'frontend-snapshot.json'),
+      JSON.stringify({
+        schema_version: 'v0',
+        run_id: 'run_hist',
+        task_id: 'task_hist',
+        mode: 'single_agent',
+        status: 'completed',
+        current: { stage: 'delivery', active_node_code: 'N18' },
+        run: {
+          run_id: 'run_hist',
+          task_id: 'task_hist',
+          status: 'completed',
+          mode: 'single_agent',
+          event_ids: [],
+          started_at: '2026-07-19T01:00:00.000Z',
+          completed_at: '2026-07-19T01:01:00.000Z',
+        },
+        timeline: [],
+        agent_runs: [],
+        artifacts: [],
+        gates: [],
+        errors: [],
+      }),
+      'utf-8',
+    );
+
+    // 空的持久库 + TaskProcessor：这正是生产装配，也是这个 bug 的触发条件。
+    const store = new SqliteCoordinationStore(path.join(stateRoot, 'coordination.db'));
+    const taskProcessor = new TaskProcessor(store, { runsRoot });
+    expect(taskProcessor.listTaskSnapshots()).toEqual([]);
+
+    const service = new NewideBackendService(
+      {
+        run: async () => {
+          throw new Error('the deleted task must not be started again');
+        },
+      },
+      new InMemoryRunRegistry(),
+      {
+        initialize: async () => undefined,
+        append: async () => undefined,
+        flush: async () => undefined,
+      },
+      { finalize: async () => undefined },
+      requestStore,
+      taskProcessor,
+    );
+
+    try {
+      // 只存在于历史目录：getTask 能读出来，但 coordination 库里没有它。
+      await expect(service.getTask('task_hist')).resolves.toMatchObject({
+        task: { task_id: 'task_hist' },
+      });
+
+      // 半成功是这个用例的全部意义：必须 resolve，不能抛。
+      await expect(service.deleteTask('task_hist')).resolves.toEqual({ deleted: true });
+
+      // 两处都得真的清掉：磁盘目录没了，列表里也不再出现。
+      await expect(requestStore.listHistory()).resolves.toEqual([]);
+      await expect(service.listTasks()).resolves.toEqual({ tasks: [] });
+      await expect(service.getTask('task_hist')).rejects.toBeInstanceOf(TaskNotFoundError);
+    } finally {
+      // SQLite 句柄不关，Windows 上删不掉 db 文件。
+      store.close();
+      await rm(runsRoot, { recursive: true, force: true });
+      await rm(stateRoot, { recursive: true, force: true });
+    }
+  });
+
   it('refuses to delete a task whose run is still running', async () => {
     const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'task-service-delete-running-'));
     const requestStore = new FileRunRequestStore(runsRoot);

@@ -324,26 +324,24 @@ function readAuthEnv() {
   if (!providerComplete(p) && !hasLocalCredentials()) return { set: {}, unset: [] };
 
   const model = p.model || 'claude-opus-5';
-  const llmBaseUrl = p.baseUrl
-    ? `${p.baseUrl.replace(/\/+$/, '')}${p.baseUrl.replace(/\/+$/, '').endsWith('/v1') ? '' : '/v1'}`
-    : '';
-  // BCD 的 LiteLLMToolCallingClient 走 @ai-sdk/openai 兼容通道，base URL 不带 /v1
-  const openAiBaseUrl = p.baseUrl
-    ? p.baseUrl.trim().replace(/\/+$/, '').replace(/\/(?:anthropic|v1)$/i, '')
-    : '';
+  // 内部 LLM 用自己的一组 NEWIDE_AGENT_LLM_* 变量，不借用 driver 的 ANTHROPIC_* / OPENAI_*。
+  //
+  // 协议必须**显式**传给 BCD（NEWIDE_LLM_PROVIDER）：UI 里的「自定义」端点是 Anthropic 兼容
+  // 接口，只保证 /v1/messages，不保证有 /v1/chat/completions。靠 base URL 里有没有
+  // deepseek/anthropic 字样去猜协议，会把这类端点错判成 OpenAI；显式声明则无歧义。
+  const internal = {
+    NEWIDE_LLM_PROVIDER: 'anthropic',
+    NEWIDE_LLM_MODEL: model,
+    NEWIDE_LLM_API_KEY: p.key,
+    NEWIDE_AGENT_LLM_MODEL: model,
+    ...(p.baseUrl ? { NEWIDE_AGENT_LLM_BASE_URL: p.baseUrl.trim() } : {}),
+  };
 
   return {
-    set: {
-      // 只服务 Polaris 内部调用，不会进入 driver
-      NEWIDE_LLM_PROVIDER: 'anthropic',
-      NEWIDE_LLM_MODEL: model,
-      NEWIDE_LLM_API_KEY: p.key,
-      ...(llmBaseUrl ? { NEWIDE_LLM_BASE_URL: llmBaseUrl } : {}),
-      NEWIDE_AGENT_LLM_MODEL: model,
-      OPENAI_API_KEY: p.key,
-      ...(openAiBaseUrl ? { OPENAI_BASE_URL: openAiBaseUrl } : {}),
-    },
-    // 不覆盖、不删除任何 ANTHROPIC_*：它们属于 driver 自己的环境
+    // 只服务 Polaris 内部调用（规划 / 记忆 / 合议），不会进入 driver。
+    set: internal,
+    // 不覆盖、不删除任何 ANTHROPIC_*：它们属于 driver 自己的环境，由用户本机的
+    // Claude Code 配置决定，内部模型配置不该改写它。
     unset: [],
   };
 }

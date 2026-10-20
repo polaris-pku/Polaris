@@ -91,7 +91,9 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
     description?: string;
     confirmLabel?: string;
     danger?: boolean;
-    onConfirm: () => void;
+    // 删除会打后端 RPC，可能因为「运行中」「后端过旧」等原因失败 —— 结果必须回传给弹窗，
+    // 否则用户只看到弹窗关掉、任务还在，却收不到任何原因。
+    onConfirm: () => Promise<{ ok: true } | { ok: false; error: string }>;
   } | null>(null);
 
   /**
