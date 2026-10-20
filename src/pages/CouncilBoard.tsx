@@ -833,9 +833,7 @@ function CandidateItem({ candidate }: { candidate: CouncilAuctionCandidate }) {
     <li className="rounded-panel border border-edge bg-surface-panel p-3">
       {/* 主行：角色名 + 画像标签 */}
       <div className="flex flex-wrap items-baseline gap-2">
-        <span className="text-body font-semibold text-fg-primary">
-          {roleName(candidate.roleId)}
-        </span>
+        <span className="text-body font-bold text-fg-primary">{roleName(candidate.roleId)}</span>
         <span className="font-mono text-code text-fg-faint">{candidate.roleId}</span>
         {candidate.personaRef && <IdChip value={candidate.personaRef} label="画像" />}
       </div>
@@ -942,7 +940,7 @@ function BidItem({
       {/* 主行：排名 · 角色名 · 得分 · 徽章 */}
       <div className="flex items-center gap-2">
         <span className="tabular shrink-0 text-meta text-fg-faint">{rank}</span>
-        <span className="min-w-0 flex-1 truncate text-body font-semibold text-fg-primary">
+        <span className="min-w-0 flex-1 truncate text-body font-bold text-fg-primary">
           {roleName(bid.roleId)}
         </span>
         {bid.winner && <Badge variant="ok">中选</Badge>}
@@ -988,7 +986,7 @@ function ScoreBreakdown({ score }: { score: CouncilBidScore }) {
       {/* 第一层：核心得分 */}
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-body">
         <span className="text-fg-muted">综合</span>
-        <span className="tabular font-mono text-title font-semibold text-fg-primary">
+        <span className="tabular font-mono text-title font-bold text-fg-primary">
           {score2(score.finalScore)}
         </span>
         <span className="text-fg-muted">
@@ -1319,7 +1317,7 @@ function ProposalCard({
         onClick={() => setExpanded((current) => !current)}
         aria-expanded={expanded}
         aria-controls={`proposal-body-${proposal.proposalId}`}
-        className="flex w-full items-start justify-between gap-3 rounded-t-panel p-4 text-left transition-colors hover:bg-surface-raised/60"
+        className="flex w-full items-start justify-between gap-3 rounded-panel p-4 text-left transition-colors hover:bg-surface-raised/60"
       >
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
