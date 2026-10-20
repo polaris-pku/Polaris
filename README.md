@@ -55,7 +55,7 @@ flowchart TB
 从 [Releases](https://github.com/polaris-pku/Polaris/releases) 下载已发布的平台安装包。
 安装包包含后端与 Claude Code，无需另外安装 Node.js 或开发工具。没有对应平台安装包时，可从源码启动。
 
-1. **配置模型**：打开「设置 → 模型与认证」，选择服务商并填写 API Key；自定义服务还需填写端点和模型，然后「保存并重启后端」。
+1. **配置模型**：打开「设置 → 模型与认证」，选择服务商并填写 API Key；自定义服务还需填写端点和模型，然后「保存并重启后端」。该配置服务 Polaris 内部模型（规划、记忆、合议），Coding agent 使用本机自己的 Claude Code 配置。
 2. **选择项目**：在首页新建项目，或通过「打开项目 → 从文件夹打开」选择已有目录。
 3. **提交需求**：点击「新建需求」，填写需求与验收标准，选择「单 Agent」或「多 Agent 合议」。
 4. **查看交付**：在运行页查看进度与用量，在项目文件树查看产物；运行 Python 脚本前，先在「运行时」中选择或安装解释器。
@@ -85,7 +85,7 @@ Linux / WSL 需要可用的图形环境及 Electron 系统依赖。启动后按�
 
 BCD 与 A 按各自上游 `main` 同步，本次同步基线为：
 
-- BCD：[`polaris-pku/newide-scaffold@861b185d`](https://github.com/polaris-pku/newide-scaffold/commit/861b185d8c6e9c16a0248084810b4839bd42cbbc)。
+- BCD：[`polaris-pku/newide-scaffold@7938780d`](https://github.com/polaris-pku/newide-scaffold/commit/7938780d)。
 - A：[`polaris-pku/acp-client-prototype@e8a58ed3`](https://github.com/polaris-pku/acp-client-prototype/commit/e8a58ed3b5835d06d050a26a7f213687f776fafe)。
 
 保留桌面宿主所需的项目根注入、包内 Node 启动与打包适配。原生会话恢复失败会显式报错，不以新建会话冒充恢复；真实模型的单 Agent / 合议恢复及目标平台安装包仍需实机验收。
