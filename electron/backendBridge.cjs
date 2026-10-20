@@ -324,26 +324,28 @@ function readAuthEnv() {
   if (!providerComplete(p) && !hasLocalCredentials()) return { set: {}, unset: [] };
 
   const model = p.model || 'claude-opus-5';
-  const llmBaseUrl = p.baseUrl
-    ? `${p.baseUrl.replace(/\/+$/, '')}${p.baseUrl.replace(/\/+$/, '').endsWith('/v1') ? '' : '/v1'}`
-    : '';
-  // BCD 的 LiteLLMToolCallingClient 走 @ai-sdk/openai 兼容通道，base URL 不带 /v1
-  const openAiBaseUrl = p.baseUrl
-    ? p.baseUrl.trim().replace(/\/+$/, '').replace(/\/(?:anthropic|v1)$/i, '')
+  // 保留 baseUrl 的完整路径（含 /anthropic），因为 BCD 的 preferAnthropicCompat()
+  // 通过检查 ANTHROPIC_BASE_URL 是否含 "deepseek|anthropic" 来决定走哪个 AI SDK client。
+  // 去掉尾部 /v1（LiteLLMToolCallingClient 不需要）：
+  //   https://api.minimax.io/anthropic   → https://api.minimax.io/anthropic
+  //   https://api.deepseek.com/anthropic  → https://api.deepseek.com/anthropic
+  const anthropicBaseUrl = p.baseUrl
+    ? p.baseUrl.trim().replace(/\/+$/, '').replace(/\/v1$/i, '')
     : '';
 
   return {
     set: {
-      // 只服务 Polaris 内部调用，不会进入 driver
-      NEWIDE_LLM_PROVIDER: 'anthropic',
-      NEWIDE_LLM_MODEL: model,
-      NEWIDE_LLM_API_KEY: p.key,
-      ...(llmBaseUrl ? { NEWIDE_LLM_BASE_URL: llmBaseUrl } : {}),
-      NEWIDE_AGENT_LLM_MODEL: model,
-      OPENAI_API_KEY: p.key,
-      ...(openAiBaseUrl ? { OPENAI_BASE_URL: openAiBaseUrl } : {}),
+      // 只服务 Polaris 内部调用，不会进入 driver。
+      // ANTHROPIC_BASE_URL 含 /anthropic 段 → BCD preferAnthropicCompat() → anthropic.messages
+      ...(anthropicBaseUrl ? { ANTHROPIC_BASE_URL: anthropicBaseUrl } : {}),
+      ANTHROPIC_AUTH_TOKEN: p.key,
+      ANTHROPIC_MODEL: model,
+      ANTHROPIC_DEFAULT_OPUS_MODEL: model,
+      ANTHROPIC_DEFAULT_SONNET_MODEL: model,
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: p.fastModel || model,
+      CLAUDE_CODE_SUBAGENT_MODEL: p.fastModel || model,
     },
-    // 不覆盖、不删除任何 ANTHROPIC_*：它们属于 driver 自己的环境
+    // 不覆盖、不删除 driver 已有的 ANTHROPIC_*：它们属于 driver 自己
     unset: [],
   };
 }

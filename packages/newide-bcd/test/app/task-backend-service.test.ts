@@ -175,6 +175,77 @@ describe('NewideBackendService Task-first view', () => {
     }
   });
 
+  /**
+   * 真实生产装配下 TaskProcessor 一定存在，而历史任务（只从 request.json 恢复、coordination
+   * 库里没有 aggregate）会让 processor.deleteTask 抛 TaskProcessorTaskNotFoundError。
+   * 若不吞掉就是「磁盘目录已删、RPC 却失败、本地任务还留着」的半成功状态。
+   */
+  it('deletes a history-only task even when the production TaskProcessor is wired', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'task-service-delete-history-'));
+    const runsRoot = path.join(root, 'runs');
+    const requestStore = new FileRunRequestStore(runsRoot);
+    await requestStore.save({
+      run_id: 'run_legacy',
+      task_id: 'task_legacy',
+      prompt: 'Legacy run',
+      workspace_path: process.cwd(),
+      mode: 'single_agent',
+      task_request: { spec: 'Legacy run', completion_criteria: ['Gone stays gone'] },
+    });
+    await writeFile(
+      path.join(runsRoot, 'run_legacy', 'frontend-snapshot.json'),
+      JSON.stringify({
+        schema_version: 'v0',
+        run_id: 'run_legacy',
+        task_id: 'task_legacy',
+        mode: 'single_agent',
+        status: 'failed',
+        current: { stage: 'delivery', active_node_code: 'N18' },
+        run: {
+          run_id: 'run_legacy',
+          task_id: 'task_legacy',
+          status: 'failed',
+          mode: 'single_agent',
+          event_ids: [],
+          started_at: '2026-07-19T01:00:00.000Z',
+          completed_at: '2026-07-19T01:01:00.000Z',
+        },
+        timeline: [],
+        agent_runs: [],
+        artifacts: [],
+        gates: [],
+        errors: [{ code: 'AGENT_FAILED', message: 'boom' }],
+      }),
+      'utf-8',
+    );
+    // 生产装配：持久 TaskProcessor 存在，但 coordination 库（:memory:）里没有 task_legacy 的 aggregate。
+    const processor = new TaskProcessor(new SqliteCoordinationStore(':memory:'));
+    const service = serviceWith(
+      requestStore,
+      new InMemoryRunRegistry(),
+      async () => {
+        throw new Error('the deleted task must not be started again');
+      },
+      processor,
+    );
+
+    try {
+      // 历史目录里读得到它
+      await expect(service.getTask('task_legacy')).resolves.toMatchObject({
+        task: { task_id: 'task_legacy', status: 'failed' },
+      });
+
+      // 删除必须成功返回，而不是抛 TaskProcessorTaskNotFoundError
+      await expect(service.deleteTask('task_legacy')).resolves.toEqual({ deleted: true });
+
+      await expect(requestStore.listHistory()).resolves.toEqual([]);
+      await expect(service.listTasks()).resolves.toEqual({ tasks: [] });
+      await expect(service.getTask('task_legacy')).rejects.toBeInstanceOf(TaskNotFoundError);
+    } finally {
+      try { await rm(root, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+  });
+
   it('cancels the current run through the Task boundary', async () => {
     const runsRoot = await mkdtemp(path.join(os.tmpdir(), 'task-service-cancel-'));
     const requestStore = new FileRunRequestStore(runsRoot);
@@ -494,6 +565,7 @@ function serviceWith(
   requestStore: FileRunRequestStore,
   registry: InMemoryRunRegistry,
   run: (request: CoordinatorRunRequest) => Promise<IntegrationV0Result>,
+  taskProcessor?: TaskProcessor,
 ): NewideBackendService {
   return new NewideBackendService(
     { run },
@@ -505,5 +577,6 @@ function serviceWith(
     },
     { finalize: async () => undefined },
     requestStore,
+    taskProcessor,
   );
 }

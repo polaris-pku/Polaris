@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { AlertTriangle } from 'lucide-react';
 import { Dialog } from '@/components/ui/Dialog';
 import { Button } from '@/components/ui/Button';
@@ -9,7 +10,11 @@ type Props = {
   description?: string;
   confirmLabel?: string;
   danger?: boolean;
-  onConfirm: () => void;
+  /** 确认动作。返回 Promise 时弹窗会进入 pending 状态：等待期间禁用按钮防重复提交，
+   * 结果为 `{ ok: false }` 时**保持打开**并展示 error，由调用方决定后续。
+   * void 返回值（同步动作）走旧行为：立刻关闭弹窗。
+   */
+  onConfirm: () => void | Promise<{ ok: true } | { ok: false; error: string }>;
   onClose: () => void;
 };
 
@@ -23,8 +28,31 @@ export function ConfirmDialog({
   onConfirm,
   onClose,
 }: Props) {
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleConfirm = async () => {
+    if (pending) return;
+    setPending(true);
+    setError(null);
+    try {
+      const result = await onConfirm();
+      // 同步 void（返回 undefined）：旧行为，立刻关闭；只有 Promise 且返回 { ok: false }
+      // 时保持打开并展示 error —— 这正是破坏性操作（删除）需要的行为。
+      if (result && typeof result === 'object' && 'ok' in result && !result.ok) {
+        setError(result.error);
+        return;
+      }
+      onClose();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setPending(false);
+    }
+  };
+
   return (
-    <Dialog open={open} onClose={onClose} className="max-w-md">
+    <Dialog open={open} onClose={pending ? () => undefined : onClose} className="max-w-md">
       <div className="p-6">
         <div className="flex items-center gap-2">
           <div
@@ -38,18 +66,21 @@ export function ConfirmDialog({
           <h2 className="text-title text-fg-primary">{title}</h2>
         </div>
         {description && <p className="mt-3 text-body text-fg-secondary">{description}</p>}
+        {error && (
+          <p role="alert" className="mt-3 text-body text-danger">
+            {error}
+          </p>
+        )}
         <div className="mt-6 flex justify-end gap-2">
-          <Button variant="ghost" onClick={onClose}>
+          <Button variant="ghost" onClick={onClose} disabled={pending}>
             取消
           </Button>
           <Button
             variant={danger ? 'danger' : 'primary'}
-            onClick={() => {
-              onConfirm();
-              onClose();
-            }}
+            disabled={pending}
+            onClick={handleConfirm}
           >
-            {confirmLabel}
+            {pending ? '处理中…' : confirmLabel}
           </Button>
         </div>
       </div>

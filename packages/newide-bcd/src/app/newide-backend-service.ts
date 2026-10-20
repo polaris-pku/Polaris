@@ -853,7 +853,16 @@ export class NewideBackendService {
 
     this.taskListeners.delete(taskId);
     await Promise.all(runIds.map((runId) => this.requestStore.removeRun(runId)));
-    this.taskProcessor?.deleteTask(taskId);
+
+    // 历史任务可能只存在于 `.newide/runs/<run_id>/request.json` 的恢复路径里，coordination
+    // 库中根本没有对应 aggregate。此时 TaskProcessor.deleteTask 会抛 TaskProcessorTaskNotFoundError，
+    // 若不吞掉就会变成「磁盘目录已删、但 RPC 报错、本地任务还留着」的半成功状态。
+    // 上面的 run 目录清理已经让它不再出现在 collectTaskSnapshots 里，所以缺失聚合即幂等成功。
+    try {
+      this.taskProcessor?.deleteTask(taskId);
+    } catch (error) {
+      if (!(error instanceof TaskProcessorTaskNotFoundError)) throw error;
+    }
     return { deleted: true };
   }
 

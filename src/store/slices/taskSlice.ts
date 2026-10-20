@@ -490,8 +490,9 @@ export const createTaskSlice: SliceCreator<TaskSlice & TaskCouncilSlice> = (set,
   },
 
   deleteTask: async (taskId) => {
-    const state = get();
-    const target = state.tasks.find((t) => t.id === taskId);
+    // 先抓快照（用于 RPC 调用），再在成功后取最新状态来算 diff
+    const captured = get();
+    const target = captured.tasks.find((t) => t.id === taskId);
     if (!target) return { ok: false, error: '任务不存在。' };
 
     // 有 contractTaskId 时先尝试调用后端 task.delete
@@ -519,18 +520,19 @@ export const createTaskSlice: SliceCreator<TaskSlice & TaskCouncilSlice> = (set,
       void unwatchTask(target.contractTaskId);
     }
 
-    // 先回写当前活动任务的实时状态，避免误删非活动任务时丢活动任务进度
-    const synced = state.activeTaskId
-      ? syncTasks(state.tasks, state.activeTaskId, extractTaskFields(state))
-      : state.tasks;
+    // ⚠ 必须在 RPC 成功后重新 get()：如果等待期间新建了任务，旧的 captured.tasks
+    // 里没有它，直接 set(remaining) 会把它从列表里抹掉。
+    const latest = get();
+    const synced = latest.activeTaskId
+      ? syncTasks(latest.tasks, latest.activeTaskId, extractTaskFields(latest))
+      : latest.tasks;
     const remaining = synced.filter((t) => t.id !== taskId);
 
-    // 任务没了，它那次 run 的订阅与实时状态也要一并撤掉
     const dropped = target.contractRunId;
-    const liveRuns = dropRun(state.liveRuns, dropped);
+    const liveRuns = dropRun(latest.liveRuns, dropped);
     if (dropped) void unwatchRun(dropped);
 
-    if (taskId === state.activeTaskId) {
+    if (taskId === latest.activeTaskId) {
       // 删掉的是当前任务：切到同项目下另一个任务，或空态。
       get().stopAutoRun();
       const { activeTaskId, taskState } = pickProjectTask(remaining, target.projectId);
@@ -538,9 +540,9 @@ export const createTaskSlice: SliceCreator<TaskSlice & TaskCouncilSlice> = (set,
         tasks: remaining,
         liveTasks: target.contractTaskId
           ? Object.fromEntries(
-              Object.entries(state.liveTasks).filter(([id]) => id !== target.contractTaskId),
+              Object.entries(latest.liveTasks).filter(([id]) => id !== target.contractTaskId),
             )
-          : state.liveTasks,
+          : latest.liveTasks,
         liveRuns,
         activeTaskId,
         currentPage: 'tasks',
@@ -552,9 +554,9 @@ export const createTaskSlice: SliceCreator<TaskSlice & TaskCouncilSlice> = (set,
         tasks: remaining,
         liveTasks: target.contractTaskId
           ? Object.fromEntries(
-              Object.entries(state.liveTasks).filter(([id]) => id !== target.contractTaskId),
+              Object.entries(latest.liveTasks).filter(([id]) => id !== target.contractTaskId),
             )
-          : state.liveTasks,
+          : latest.liveTasks,
         liveRuns,
       });
     }
