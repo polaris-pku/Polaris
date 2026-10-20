@@ -489,39 +489,72 @@ export const createTaskSlice: SliceCreator<TaskSlice & TaskCouncilSlice> = (set,
     });
   },
 
-  deleteTask: (taskId) => {
+  deleteTask: async (taskId) => {
     const state = get();
     const target = state.tasks.find((t) => t.id === taskId);
-    if (!target) return;
+    if (!target) return { ok: false, error: '任务不存在。' };
+
+    // 有 contractTaskId 时先尝试调用后端 task.delete
     if (target.contractTaskId) {
+      try {
+        await taskApi.delete(target.contractTaskId);
+      } catch (error: unknown) {
+        // -32007：任务还在跑 → 提示用户先停止
+        if (error instanceof Error && 'code' in error && (error as { code: number }).code === -32007) {
+          return { ok: false, error: '运行中的任务不能删除，请先停止。' };
+        }
+        // -32006：后端已经没有这条任务 → 按成功处理，本地照常清掉
+        if (error instanceof Error && 'code' in error && (error as { code: number }).code === -32006) {
+          // fall through to local cleanup
+        }
+        // -32601：旧后端没有这个方法
+        else if (error instanceof Error && 'code' in error && (error as { code: number }).code === -32601) {
+          return { ok: false, error: '后端缺少 task.delete，请重新构建后端。' };
+        }
+        // 其他错误按原样透出
+        else {
+          return { ok: false, error: error instanceof Error ? error.message : String(error) };
+        }
+      }
       void unwatchTask(target.contractTaskId);
-      void taskApi.cancel(target.contractTaskId).catch((error: unknown) => {
-        console.warn('[api] task.cancel 失败：', error);
-      });
     }
+
+    // ── await 之后必须重读 state ──
+    // 上面那次 RPC 是网络往返，期间用户可能新建了任务、切换了活动任务、事件也推了新状态。
+    // 继续用请求发出前捕获的 state 去 set，会把这些并发变更整份覆盖掉 —— 表现为
+    // 「删除一个任务，另一个刚建的任务凭空消失」。
+    const fresh = get();
+    const latestTask = fresh.tasks.find((t) => t.id === taskId);
+    if (!latestTask) {
+      // 等待期间任务已经被别处删掉了：后端也删成功，本地目标已消失，按幂等成功收尾。
+      if (fresh.activeTaskId === taskId) get().stopAutoRun();
+      return { ok: true };
+    }
+
     // 先回写当前活动任务的实时状态，避免误删非活动任务时丢活动任务进度
-    const synced = state.activeTaskId
-      ? syncTasks(state.tasks, state.activeTaskId, extractTaskFields(state))
-      : state.tasks;
+    const synced = fresh.activeTaskId
+      ? syncTasks(fresh.tasks, fresh.activeTaskId, extractTaskFields(fresh))
+      : fresh.tasks;
     const remaining = synced.filter((t) => t.id !== taskId);
 
-    // 任务没了，它那次 run 的订阅与实时状态也要一并撤掉 —— 否则后端订阅和 liveRuns 条目
-    // 会随着建了又删的任务一直堆积。（run 本身仍在后端跑；这里只是不再关注它。）
-    const dropped = target.contractRunId;
-    const liveRuns = dropRun(state.liveRuns, dropped);
+    // 任务没了，它那次 run 的订阅与实时状态也要一并撤掉
+    const dropped = latestTask.contractRunId;
+    const liveRuns = dropRun(fresh.liveRuns, dropped);
     if (dropped) void unwatchRun(dropped);
 
-    if (taskId === state.activeTaskId) {
+    const remainingLiveTasks = latestTask.contractTaskId
+      ? Object.fromEntries(
+          Object.entries(fresh.liveTasks).filter(([id]) => id !== latestTask.contractTaskId),
+        )
+      : fresh.liveTasks;
+
+    if (taskId === fresh.activeTaskId) {
       // 删掉的是当前任务：切到同项目下另一个任务，或空态。
       get().stopAutoRun();
-      const { activeTaskId, taskState } = pickProjectTask(remaining, target.projectId);
+      const { activeTaskId, taskState } = pickProjectTask(remaining, latestTask.projectId);
       set({
         tasks: remaining,
-        liveTasks: target.contractTaskId
-          ? Object.fromEntries(
-              Object.entries(state.liveTasks).filter(([id]) => id !== target.contractTaskId),
-            )
-          : state.liveTasks,
+        liveTasks: remainingLiveTasks,
         liveRuns,
         activeTaskId,
         currentPage: 'tasks',
@@ -531,13 +564,10 @@ export const createTaskSlice: SliceCreator<TaskSlice & TaskCouncilSlice> = (set,
     } else {
       set({
         tasks: remaining,
-        liveTasks: target.contractTaskId
-          ? Object.fromEntries(
-              Object.entries(state.liveTasks).filter(([id]) => id !== target.contractTaskId),
-            )
-          : state.liveTasks,
+        liveTasks: remainingLiveTasks,
         liveRuns,
       });
     }
+    return { ok: true };
   },
 });

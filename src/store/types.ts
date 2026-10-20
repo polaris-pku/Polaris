@@ -174,7 +174,7 @@ export type TaskSlice = {
   resumeTask: (taskId: string) => Promise<{ ok: true } | { ok: false; error: string }>;
   startTask: () => void;
   selectTask: (taskId: string) => void;
-  deleteTask: (taskId: string) => void;
+  deleteTask: (taskId: string) => Promise<{ ok: true } | { ok: false; error: string }>;
 };
 
 /**

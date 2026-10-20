@@ -153,13 +153,23 @@ test('serializes restarts, preserves API authentication and reports B Memory set
   await new Promise(setImmediate);
   assert.equal(processes.length, 1);
   const env = processes[0].spawnOptions.env;
-  assert.equal(env.ANTHROPIC_API_KEY, 'test-key');
+  assert.equal(env.ANTHROPIC_API_KEY, undefined);
   assert.equal(env.NEWIDE_LLM_API_KEY, 'test-key');
   assert.equal(env.NEWIDE_LLM_PROVIDER, 'anthropic');
   assert.equal(env.NEWIDE_LLM_CREDENTIALLESS, undefined);
   assert.equal(env.POLARIS_MODEL_PROXY_BASE_URL, undefined);
   assert.equal(env.NEWIDE_EPHEMERAL_ACP_SESSIONS, '0');
-  assert.ok(env.CLAUDE_CONFIG_DIR.endsWith('backend-state/rpc-v1/claude-config'));
+  assert.equal(env.CLAUDE_CONFIG_DIR, undefined);
+  assert.equal(env.NEWIDE_AGENT_LLM_MODEL, 'claude-opus-5');
+  // 内部 LLM 走独立通道，且协议显式声明为 anthropic。
+  // 绝不写 OPENAI_*：那会把 Anthropic 端点的凭据写进 OpenAI 的槽位，
+  // 让 LiteLLMToolCallingClient 选错协议（自定义 Anthropic 端点被错发到 /chat/completions）。
+  assert.equal(env.OPENAI_API_KEY, undefined);
+  assert.equal(env.OPENAI_BASE_URL, undefined);
+  // 超时默认值
+  assert.equal(env.NEWIDE_COUNCIL_ROLE_INACTIVITY_TIMEOUT_MS, '600000');
+  assert.equal(env.ACP_DRIVER_INACTIVITY_TIMEOUT_MS, '300000');
+  assert.equal(env.NEWIDE_GATE_TIMEOUT_MS, '600000');
   const publicSettings = await handlers.get('backend:getSettings')();
   assert.equal(publicSettings.provider, 'anthropic');
   assert.equal(publicSettings.configured.anthropic.hasKey, true);
@@ -222,12 +232,16 @@ test('serializes restarts, preserves API authentication and reports B Memory set
   assert.equal(processes.length, 2);
   const customEnv = processes[1].spawnOptions.env;
   assert.equal(customEnv.ANTHROPIC_API_KEY, undefined);
-  assert.equal(customEnv.ANTHROPIC_AUTH_TOKEN, 'custom-test-key');
-  assert.equal(customEnv.ANTHROPIC_BASE_URL, 'https://models.example.test/anthropic');
-  assert.equal(customEnv.ANTHROPIC_MODEL, 'custom-model');
-  assert.equal(customEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL, 'custom-fast-model');
-  assert.equal(customEnv.NEWIDE_LLM_API_KEY, 'custom-test-key');
-  assert.equal(customEnv.NEWIDE_LLM_BASE_URL, 'https://models.example.test/anthropic/v1');
+  assert.equal(customEnv.ANTHROPIC_AUTH_TOKEN, undefined);
+  assert.equal(customEnv.ANTHROPIC_BASE_URL, undefined);
+  assert.equal(customEnv.ANTHROPIC_MODEL, undefined);
+  assert.equal(customEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL, undefined);
+  assert.equal(customEnv.NEWIDE_AGENT_LLM_MODEL, 'custom-model');
+  // 自定义（Anthropic 兼容端点）必须保持 anthropic 协议，且不碰任何 OPENAI_* / ANTHROPIC_*。
+  assert.equal(customEnv.NEWIDE_LLM_PROVIDER, 'anthropic');
+  assert.equal(customEnv.NEWIDE_AGENT_LLM_BASE_URL, 'https://models.example.test/anthropic');
+  assert.equal(customEnv.OPENAI_API_KEY, undefined);
+  assert.equal(customEnv.OPENAI_BASE_URL, undefined);
   const customSettings = await handlers.get('backend:getSettings')();
   assert.equal(customSettings.provider, 'custom');
   assert.equal(customSettings.configured.custom.hasKey, true);

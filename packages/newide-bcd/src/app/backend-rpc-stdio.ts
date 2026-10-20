@@ -823,8 +823,15 @@ const MODEL_OVERRIDE_ENV = [
 export interface ProductionLlmRuntime {
   readonly model: string;
   readonly apiKey: string;
-  /** OpenAI-compatible base URL without the trailing `/v1`. */
+  /** Provider base URL; the client adds the SDK's version prefix if needed. */
   readonly baseUrl: string;
+  /**
+   * Which wire protocol the endpoint speaks: `anthropic` (Messages API) or
+   * `openai` (chat/completions). Never inferred from the URL — a custom
+   * Anthropic-compatible endpoint only guarantees `/v1/messages`, so guessing
+   * by hostname silently routes it to `/v1/chat/completions` and fails.
+   */
+  readonly protocol: 'anthropic' | 'openai';
 }
 
 /**
@@ -832,24 +839,48 @@ export interface ProductionLlmRuntime {
  * MiniMax credentials for B's text/tool calls so one Council does not silently
  * split between MiniMax for Driver work and a stale DeepSeek configuration for
  * planning or maintenance.
+ *
+ * Polarity matters here: the host passes its own selection explicitly via
+ * `NEWIDE_AGENT_LLM_*` / `NEWIDE_LLM_PROVIDER`, and only falls back to the
+ * driver's own `ANTHROPIC_*` when the host has not configured an internal model.
  */
 export function resolveProductionLlmRuntime(
   env: NodeJS.ProcessEnv,
   driverEnv: NodeJS.ProcessEnv,
 ): ProductionLlmRuntime | undefined {
   const model = firstNonBlank(env.NEWIDE_AGENT_LLM_MODEL, driverEnv.ANTHROPIC_MODEL);
-  const apiKey = firstNonBlank(
-    env.OPENAI_API_KEY,
-    driverEnv.ANTHROPIC_AUTH_TOKEN,
-    driverEnv.ANTHROPIC_API_KEY,
-  );
-  const baseUrl = firstNonBlank(
-    toOpenAiCompatibleBaseUrl(env.OPENAI_BASE_URL),
-    toOpenAiCompatibleBaseUrl(driverEnv.ANTHROPIC_BASE_URL),
-  );
 
+  // Host has set up the dedicated internal-model channel: use it exclusively.
+  // Any of NEWIDE_LLM_API_KEY / NEWIDE_AGENT_LLM_BASE_URL signals intent to isolate
+  // from the driver's ANTHROPIC_ variables and the host's OPENAI_ variables.
+  const hasDedicatedKey = Boolean(env.NEWIDE_LLM_API_KEY?.trim());
+  const hasDedicatedBaseUrl = Boolean(env.NEWIDE_AGENT_LLM_BASE_URL?.trim());
+
+  if (hasDedicatedKey || hasDedicatedBaseUrl) {
+    const protocol = readLlmProtocol(env.NEWIDE_LLM_PROVIDER);
+    const apiKey = firstNonBlank(env.NEWIDE_LLM_API_KEY, env.ANTHROPIC_AUTH_TOKEN, env.ANTHROPIC_API_KEY);
+    const baseUrl = firstNonBlank(
+      env.NEWIDE_AGENT_LLM_BASE_URL,
+      env.NEWIDE_LLM_BASE_URL,
+      protocol === 'openai' ? 'https://api.openai.com/v1' : 'https://api.anthropic.com/v1',
+    );
+    if (!model || !apiKey || !baseUrl) return undefined;
+    return { model, apiKey, baseUrl, protocol };
+  }
+
+  // Preserve legacy OpenAI settings or the driver's Anthropic endpoint, including
+  // provider-specific prefixes such as /anthropic. Versioning belongs to the SDK client.
+  const apiKey = firstNonBlank(env.OPENAI_API_KEY, driverEnv.ANTHROPIC_AUTH_TOKEN, driverEnv.ANTHROPIC_API_KEY);
+  const baseUrl = firstNonBlank(env.OPENAI_BASE_URL, driverEnv.ANTHROPIC_BASE_URL);
+  const protocol = readLlmProtocol(
+    firstNonBlank(env.NEWIDE_LLM_PROVIDER, env.OPENAI_BASE_URL?.trim() ? 'openai' : undefined),
+  );
   if (!model || !apiKey || !baseUrl) return undefined;
-  return { model, apiKey, baseUrl };
+  return { model, apiKey, baseUrl, protocol };
+}
+
+function readLlmProtocol(value: string | undefined): 'anthropic' | 'openai' {
+  return value?.trim().toLowerCase() === 'openai' ? 'openai' : 'anthropic';
 }
 
 function createProductionToolCallingClient(
@@ -861,6 +892,7 @@ function createProductionToolCallingClient(
       model: runtime.model,
       apiKey: runtime.apiKey,
       baseUrl: runtime.baseUrl,
+      protocol: runtime.protocol,
     });
   }
   return new LiteLLMToolCallingClient({
@@ -870,12 +902,6 @@ function createProductionToolCallingClient(
 
 function firstNonBlank(...values: Array<string | undefined>): string | undefined {
   return values.find((value): value is string => Boolean(value?.trim()))?.trim();
-}
-
-function toOpenAiCompatibleBaseUrl(value: string | undefined): string | undefined {
-  const normalized = value?.trim().replace(/\/+$/, '');
-  if (!normalized) return undefined;
-  return normalized.replace(/\/(?:anthropic|v1)$/i, '');
 }
 
 function readDriverTimeout(value: string | undefined): number {

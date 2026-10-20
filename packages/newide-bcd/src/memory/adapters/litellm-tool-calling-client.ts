@@ -87,15 +87,23 @@ function loadLocalEnv(): void {
 // Provider 解析（与 LiteLLMClient 内部逻辑一致）
 // ──────────────────────────────────────────────
 
-async function resolveProviderModel(provider: string, modelId: string): Promise<LanguageModel> {
+async function resolveProviderModel(
+  provider: string,
+  modelId: string,
+  explicit?: { apiKey?: string; baseUrl?: string },
+): Promise<LanguageModel> {
   switch (provider) {
     case 'openai': {
       const { createOpenAI } = await import('@ai-sdk/openai');
+      const apiKey = explicit?.apiKey ?? process.env.OPENAI_API_KEY;
+      const baseURL = explicit?.baseUrl
+        ? normalizeProviderBaseUrl(explicit.baseUrl)
+        : process.env.OPENAI_BASE_URL;
       // 显式按当前 env 创建 provider：模块级默认 `openai` 实例在模块加载时
       // 读取 OPENAI_BASE_URL，若当时未设置会被钉死在 api.openai.com。
       return createOpenAI({
-        ...(process.env.OPENAI_API_KEY ? { apiKey: process.env.OPENAI_API_KEY } : {}),
-        ...(process.env.OPENAI_BASE_URL ? { baseURL: process.env.OPENAI_BASE_URL } : {}),
+        ...(apiKey ? { apiKey } : {}),
+        ...(baseURL ? { baseURL } : {}),
       }).chat(modelId) as LanguageModel;
     }
     case 'anthropic': {
@@ -105,15 +113,17 @@ async function resolveProviderModel(provider: string, modelId: string): Promise<
         return createCredentiallessAnthropicProvider(baseURL).messages(modelId);
       }
       const { createAnthropic } = await import('@ai-sdk/anthropic');
+      // 显式凭据优先，且**不再**回落到 DEEPSEEK_API_KEY：那是 OpenAI 协议的 key，
+      // 喂给 Anthropic Messages 端点只会得到 401，把它藏起来反而更难排查。
       const apiKey =
-        process.env.ANTHROPIC_AUTH_TOKEN ||
-        process.env.ANTHROPIC_API_KEY ||
-        process.env.DEEPSEEK_API_KEY;
+        explicit?.apiKey ??
+        process.env.ANTHROPIC_AUTH_TOKEN ??
+        process.env.ANTHROPIC_API_KEY;
+      const baseUrl = explicit?.baseUrl ?? process.env.ANTHROPIC_BASE_URL;
+      const baseURL = baseUrl ? normalizeProviderBaseUrl(baseUrl) : undefined;
       return createAnthropic({
         ...(apiKey ? { apiKey } : {}),
-        ...(process.env.ANTHROPIC_BASE_URL
-          ? { baseURL: normalizeAnthropicBaseUrl(process.env.ANTHROPIC_BASE_URL) }
-          : {}),
+        ...(baseURL ? { baseURL } : {}),
       })(modelId) as LanguageModel;
     }
     default:
@@ -125,12 +135,10 @@ async function resolveProviderModel(provider: string, modelId: string): Promise<
 }
 
 /**
- * AI SDK's Anthropic provider appends `/messages` to baseURL; unlike ACP's
- * adapter, it expects the version prefix to already be present. MiniMax's
- * compatible endpoint is commonly configured as `/anthropic`, so normalize it
- * to `/anthropic/v1` before constructing the model.
+ * The SDKs append `/messages` or `/chat/completions`, so preserve provider
+ * prefixes such as `/anthropic` and include the version exactly once.
  */
-function normalizeAnthropicBaseUrl(value: string): string {
+function normalizeProviderBaseUrl(value: string): string {
   const normalized = value.trim().replace(/\/+$/, '');
   return /\/v1$/i.test(normalized) ? normalized : `${normalized}/v1`;
 }
@@ -193,33 +201,51 @@ export interface LiteLLMToolCallingClientOptions {
    */
   model?: string;
   /**
-   * API Key 覆盖（默认从环境变量读取
-   * DEEPSEEK_API_KEY / LLM_PROVIDER=deepseek 或 OPENAI_API_KEY）。
-   * 传此值会覆盖 process.env.OPENAI_API_KEY。
+   * API key override. Only the legacy path without `protocol` updates
+   * process.env.OPENAI_API_KEY; explicit protocols pass credentials per request.
    */
   apiKey?: string;
   /**
-   * Base URL 覆盖（如 'https://api.deepseek.com'）。
-   * 传此值会覆盖 process.env.OPENAI_BASE_URL。
-   * LiteLLM 通过 @ai-sdk/openai 调用，SDK 会读 OPENAI_BASE_URL env。
+   * Provider root or versioned base URL, with provider-specific prefixes preserved.
+   * Only the legacy path without `protocol` updates process.env.OPENAI_BASE_URL.
    */
   baseUrl?: string;
+  /**
+   * 显式协议：`anthropic` 走 Messages API，`openai` 走 chat/completions。
+   *
+   * 传入时它**完全**决定 provider 与凭据落点 —— 不再从 base URL 字样猜协议，也不再
+   * 借用 `OPENAI_API_KEY` / `OPENAI_BASE_URL` / `ANTHROPIC_*` 这些进程级变量。
+   * 不传时保持旧行为（读环境变量 + `preferAnthropicCompat` 猜测），供未显式配置的
+   * 既有调用方（driver 兜底路径）继续工作。
+   */
+  protocol?: 'anthropic' | 'openai';
 }
 
 export class LiteLLMToolCallingClient implements ToolCallingClient {
   private readonly client: LiteLLMClient;
   private readonly taskName: string;
   private readonly modelOverride: string | undefined;
+  /** 显式协议；未设时回退到「读环境变量 + 猜」。 */
+  private readonly explicitProtocol: 'anthropic' | 'openai' | undefined;
+  private readonly explicitApiKey: string | undefined;
+  private readonly explicitBaseUrl: string | undefined;
 
   constructor(options: LiteLLMToolCallingClientOptions = {}) {
     this.taskName = options.taskName ?? DEFAULT_TASK_NAME;
+    this.explicitProtocol = options.protocol;
+    this.explicitApiKey = options.apiKey;
+    this.explicitBaseUrl = options.baseUrl;
 
-    // 构造参数覆盖环境变量
-    if (options.apiKey) {
-      process.env.OPENAI_API_KEY = options.apiKey;
-    }
-    if (options.baseUrl) {
-      process.env.OPENAI_BASE_URL = options.baseUrl.replace(/\/+$/, '') + '/v1';
+    // 显式 protocol 时**不写** OPENAI_API_KEY / OPENAI_BASE_URL：那会把一份 Anthropic 端点
+    // 的凭据写进 OpenAI 的环境槽位，既污染同进程内其它调用方，也会让 provider 解析误判。
+    // 凭据改为随请求走（见 resolveProviderModel），只有走旧的环境变量路径才需要写回。
+    if (!this.explicitProtocol) {
+      if (options.apiKey) {
+        process.env.OPENAI_API_KEY = options.apiKey;
+      }
+      if (options.baseUrl) {
+        process.env.OPENAI_BASE_URL = normalizeProviderBaseUrl(options.baseUrl);
+      }
     }
 
     // 加载环境变量（支持 DEEPSEEK_API_KEY → OPENAI_API_KEY 映射）
@@ -262,6 +288,10 @@ export class LiteLLMToolCallingClient implements ToolCallingClient {
       if (!proxyModel) throw new Error('Local proxy requires NEWIDE_LLM_MODEL');
       providerName = 'anthropic';
       modelId = proxyModel;
+    } else if (this.explicitProtocol) {
+      // 显式协议：调用方已经声明了端点讲哪种协议，这里不再猜、不再回落环境变量。
+      providerName = this.explicitProtocol;
+      modelId = this.modelOverride ?? resolved.model;
     } else if (this.modelOverride) {
       providerName = preferAnthropicCompat() ? 'anthropic' : 'openai';
       modelId = this.modelOverride;
@@ -275,7 +305,16 @@ export class LiteLLMToolCallingClient implements ToolCallingClient {
     const { temperature, maxTokens } = resolved;
 
     // 2. 解析 provider 得到 AI SDK model 实例
-    const model = await resolveProviderModel(providerName, modelId);
+    const model = await resolveProviderModel(
+      providerName,
+      modelId,
+      this.explicitProtocol
+        ? {
+            ...(this.explicitApiKey ? { apiKey: this.explicitApiKey } : {}),
+            ...(this.explicitBaseUrl ? { baseUrl: this.explicitBaseUrl } : {}),
+          }
+        : undefined,
+    );
 
     // 3. 转换消息：AI SDK v7 要求 system 消息通过 system 参数传入
     const systemParts: string[] = [];

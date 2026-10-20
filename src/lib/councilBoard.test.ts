@@ -376,8 +376,8 @@ const auctionStarted = () =>
     task_description: '写一个能跑的贪吃蛇网页',
     requirement_profile: {
       persona_keywords: ['贪吃蛇', '网页'],
-      preferred_skill_tags: ['贪吃蛇', '网页'],
-      preferred_experience_tags: ['贪吃蛇', '网页'],
+      preferred_skill_tags: ['canvas', 'html5', 'game-dev'],
+      preferred_experience_tags: [],
     },
     candidates: [
       {

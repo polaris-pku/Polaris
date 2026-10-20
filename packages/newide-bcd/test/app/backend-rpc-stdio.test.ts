@@ -28,6 +28,7 @@ import {
   InMemoryBufferRepository,
   InMemoryMemoryDeliveryRepository,
   InMemoryRepository,
+  LiteLLMToolCallingClient,
   type LlmClient,
   type ToolCallingClient,
 } from '../../src/memory';
@@ -91,7 +92,7 @@ describe('Council auction configuration', () => {
 });
 
 describe('resolveProductionLlmRuntime', () => {
-  it('reuses ACP MiniMax settings through the OpenAI-compatible endpoint', () => {
+  it('preserves the ACP MiniMax Anthropic endpoint', () => {
     expect(
       resolveProductionLlmRuntime(
         {},
@@ -102,9 +103,10 @@ describe('resolveProductionLlmRuntime', () => {
         },
       ),
     ).toEqual({
-      baseUrl: 'https://api.minimax.io',
+      baseUrl: 'https://api.minimax.io/anthropic',
       apiKey: 'acp-token',
       model: 'MiniMax-M3',
+      protocol: 'anthropic',
     });
   });
 
@@ -123,9 +125,10 @@ describe('resolveProductionLlmRuntime', () => {
         },
       ),
     ).toEqual({
-      baseUrl: 'https://local.example',
+      baseUrl: 'https://local.example/v1',
       apiKey: 'local-token',
       model: 'local-model',
+      protocol: 'openai',
     });
   });
 
@@ -144,10 +147,172 @@ describe('resolveProductionLlmRuntime', () => {
         },
       ),
     ).toEqual({
-      baseUrl: 'https://api.minimax.io',
+      baseUrl: 'https://api.minimax.io/anthropic',
       apiKey: 'acp-token',
       model: 'MiniMax-M3',
+      protocol: 'anthropic',
     });
+  });
+});
+
+describe('production LLM request routing', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it.each<{
+    name: string;
+    channel: 'host' | 'driver' | 'openai';
+    protocol: 'anthropic' | 'openai';
+    baseUrl?: string;
+    expectedUrl: string;
+  }>([
+    {
+      name: 'custom Anthropic root',
+      channel: 'host',
+      protocol: 'anthropic',
+      baseUrl: 'https://models.example.test',
+      expectedUrl: 'https://models.example.test/v1/messages',
+    },
+    {
+      name: 'DeepSeek Anthropic prefix',
+      channel: 'host',
+      protocol: 'anthropic',
+      baseUrl: 'https://api.deepseek.com/anthropic',
+      expectedUrl: 'https://api.deepseek.com/anthropic/v1/messages',
+    },
+    {
+      name: 'already versioned Anthropic endpoint',
+      channel: 'host',
+      protocol: 'anthropic',
+      baseUrl: 'https://models.example.test/anthropic/v1/',
+      expectedUrl: 'https://models.example.test/anthropic/v1/messages',
+    },
+    {
+      name: 'official Anthropic endpoint',
+      channel: 'host',
+      protocol: 'anthropic',
+      expectedUrl: 'https://api.anthropic.com/v1/messages',
+    },
+    {
+      name: 'explicit OpenAI endpoint',
+      channel: 'host',
+      protocol: 'openai',
+      baseUrl: 'https://models.example.test/v1',
+      expectedUrl: 'https://models.example.test/v1/chat/completions',
+    },
+    {
+      name: 'official OpenAI endpoint',
+      channel: 'host',
+      protocol: 'openai',
+      expectedUrl: 'https://api.openai.com/v1/chat/completions',
+    },
+    {
+      name: 'driver MiniMax endpoint',
+      channel: 'driver',
+      protocol: 'anthropic',
+      baseUrl: 'https://api.minimax.io/anthropic',
+      expectedUrl: 'https://api.minimax.io/anthropic/v1/messages',
+    },
+    {
+      name: 'legacy OpenAI endpoint',
+      channel: 'openai',
+      protocol: 'openai',
+      baseUrl: 'https://local.example/v1',
+      expectedUrl: 'https://local.example/v1/chat/completions',
+    },
+  ])('routes $name with isolated credentials', async ({ channel, protocol, baseUrl, expectedUrl }) => {
+    vi.stubEnv('NEWIDE_LLM_CREDENTIALLESS', undefined);
+    vi.stubEnv('OPENAI_API_KEY', 'ambient-openai-key');
+    vi.stubEnv('OPENAI_BASE_URL', 'https://ambient-openai.example/v1');
+    vi.stubEnv('ANTHROPIC_AUTH_TOKEN', 'ambient-anthropic-token');
+    vi.stubEnv('ANTHROPIC_BASE_URL', 'https://ambient-anthropic.example/anthropic');
+
+    const model = 'configured-model';
+    const apiKey = 'configured-key';
+    const env: NodeJS.ProcessEnv =
+      channel === 'host'
+        ? {
+            NEWIDE_LLM_PROVIDER: protocol,
+            NEWIDE_LLM_API_KEY: apiKey,
+            NEWIDE_AGENT_LLM_MODEL: model,
+            NEWIDE_AGENT_LLM_BASE_URL: baseUrl,
+          }
+        : channel === 'openai'
+          ? {
+              OPENAI_API_KEY: apiKey,
+              OPENAI_BASE_URL: baseUrl,
+              NEWIDE_AGENT_LLM_MODEL: model,
+            }
+          : {};
+    const driverEnv: NodeJS.ProcessEnv =
+      channel === 'driver'
+        ? {
+            ANTHROPIC_AUTH_TOKEN: apiKey,
+            ANTHROPIC_BASE_URL: baseUrl,
+            ANTHROPIC_MODEL: model,
+          }
+        : {
+            ANTHROPIC_AUTH_TOKEN: 'stale-driver-token',
+            ANTHROPIC_BASE_URL: 'https://stale-driver.example/anthropic',
+            ANTHROPIC_MODEL: 'stale-driver-model',
+          };
+    const runtime = resolveProductionLlmRuntime(env, driverEnv);
+    expect(runtime).toBeDefined();
+    if (!runtime) throw new Error('Configured model runtime is missing');
+
+    const response =
+      protocol === 'anthropic'
+        ? {
+            id: 'msg_test',
+            type: 'message',
+            role: 'assistant',
+            model,
+            content: [{ type: 'text', text: 'ok' }],
+            stop_reason: 'end_turn',
+            stop_sequence: null,
+            usage: { input_tokens: 1, output_tokens: 1 },
+          }
+        : {
+            id: 'chatcmpl-test',
+            object: 'chat.completion',
+            created: 1,
+            model,
+            choices: [
+              { index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' },
+            ],
+            usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+          };
+    const fetchMock = vi.fn<typeof fetch>().mockImplementation(async () =>
+      new Response(JSON.stringify(response), {
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new LiteLLMToolCallingClient({ ...runtime, loadEnv: false });
+
+    await expect(
+      client.completeWithTools({
+        messages: [{ role: 'user', content: 'probe' }],
+        tools: [],
+      }),
+    ).resolves.toMatchObject({ content: 'ok' });
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [input, init] = fetchMock.mock.calls[0];
+    const request = new Request(input, init);
+    expect(request.url).toBe(expectedUrl);
+    expect(request.method).toBe('POST');
+    expect(await request.json()).toMatchObject({ model });
+    expect(request.headers.get('x-api-key')).toBe(protocol === 'anthropic' ? apiKey : null);
+    expect(request.headers.get('authorization')).toBe(
+      protocol === 'openai' ? `Bearer ${apiKey}` : null,
+    );
+    expect(process.env.OPENAI_API_KEY).toBe('ambient-openai-key');
+    expect(process.env.OPENAI_BASE_URL).toBe('https://ambient-openai.example/v1');
+    expect(process.env.ANTHROPIC_AUTH_TOKEN).toBe('ambient-anthropic-token');
+    expect(process.env.ANTHROPIC_BASE_URL).toBe('https://ambient-anthropic.example/anthropic');
   });
 });
 
