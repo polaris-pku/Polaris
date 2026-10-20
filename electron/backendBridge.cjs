@@ -324,21 +324,25 @@ function readAuthEnv() {
   if (!providerComplete(p) && !hasLocalCredentials()) return { set: {}, unset: [] };
 
   const model = p.model || 'claude-opus-5';
-  // 保留 baseUrl 的完整路径（含 /anthropic），因为 BCD 的 preferAnthropicCompat()
-  // 通过检查 ANTHROPIC_BASE_URL 是否含 "deepseek|anthropic" 来决定走哪个 AI SDK client。
-  // 去掉尾部 /v1（LiteLLMToolCallingClient 不需要）：
-  //   https://api.minimax.io/anthropic   → https://api.minimax.io/anthropic
-  //   https://api.deepseek.com/anthropic  → https://api.deepseek.com/anthropic
-  const anthropicBaseUrl = p.baseUrl
+  // 只有官方 'anthropic' provider 才注入 ANTHROPIC_BASE_URL（BCD 会识别它走 anthropic.messages）。
+  // 'custom' 端点是用户自配的第三方 OpenAI 兼容服务，走 OpenAI 接口；不应强制改成 Anthropic。
+  const isAnthropicProvider = p.def.id === 'anthropic';
+  const anthropicBaseUrl = isAnthropicProvider && p.baseUrl
     ? p.baseUrl.trim().replace(/\/+$/, '').replace(/\/v1$/i, '')
     : '';
+
+  // ANTHROPIC_AUTH_TOKEN：只有 custom provider 才注入（用户明确配置了 key），
+  // 'anthropic' 官方和 'deepseek' 保持不注入，让 BCD 的 resolveProductionLlmRuntime
+  // fallback 到 driver 的 token。
+  const shouldInjectAuthToken = p.def.id === 'custom' && Boolean(p.key);
 
   return {
     set: {
       // 只服务 Polaris 内部调用，不会进入 driver。
-      // ANTHROPIC_BASE_URL 含 /anthropic 段 → BCD preferAnthropicCompat() → anthropic.messages
+      // NEWIDE_LLM_API_KEY 是 BCD resolveProductionLlmRuntime 的专用通道信号。
+      ...(shouldInjectAuthToken ? { NEWIDE_LLM_API_KEY: p.key } : {}),
       ...(anthropicBaseUrl ? { ANTHROPIC_BASE_URL: anthropicBaseUrl } : {}),
-      ANTHROPIC_AUTH_TOKEN: p.key,
+      ...(shouldInjectAuthToken ? { ANTHROPIC_AUTH_TOKEN: p.key } : {}),
       ANTHROPIC_MODEL: model,
       ANTHROPIC_DEFAULT_OPUS_MODEL: model,
       ANTHROPIC_DEFAULT_SONNET_MODEL: model,

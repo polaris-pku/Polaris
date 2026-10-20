@@ -154,15 +154,25 @@ test('serializes restarts, preserves API authentication and reports B Memory set
   assert.equal(processes.length, 1);
   const env = processes[0].spawnOptions.env;
   assert.equal(env.ANTHROPIC_API_KEY, undefined);
-  assert.equal(env.NEWIDE_LLM_API_KEY, 'test-key');
-  assert.equal(env.NEWIDE_LLM_PROVIDER, 'anthropic');
+  // 官方 Anthropic provider：不注入 ANTHROPIC_AUTH_TOKEN，让 BCD 的 resolveProductionLlmRuntime
+  // fallback 到 driver 的 token — 官方 provider 本就不该覆盖 driver 配置。
+  assert.equal(env.ANTHROPIC_AUTH_TOKEN, undefined);
+  assert.equal(env.ANTHROPIC_MODEL, 'claude-opus-5');
+  assert.equal(env.ANTHROPIC_DEFAULT_OPUS_MODEL, 'claude-opus-5');
+  assert.equal(env.ANTHROPIC_DEFAULT_SONNET_MODEL, 'claude-opus-5');
+  // fastModel 来自 provider 的 defaultFastModel（'claude-haiku-4-5'）
+  assert.equal(env.ANTHROPIC_DEFAULT_HAIKU_MODEL, 'claude-haiku-4-5');
+  assert.equal(env.CLAUDE_CODE_SUBAGENT_MODEL, 'claude-haiku-4-5');
+  // 不再走 OPENAI_* 通道 —— 所有 provider（anthropic/deepseek/custom）都用 Anthropic 协议
+  assert.equal(env.OPENAI_API_KEY, undefined);
+  assert.equal(env.NEWIDE_LLM_API_KEY, undefined);
+  assert.equal(env.NEWIDE_LLM_PROVIDER, undefined);
   assert.equal(env.NEWIDE_LLM_CREDENTIALLESS, undefined);
+  assert.equal(env.NEWIDE_AGENT_LLM_MODEL, undefined);
   assert.equal(env.POLARIS_MODEL_PROXY_BASE_URL, undefined);
   assert.equal(env.NEWIDE_EPHEMERAL_ACP_SESSIONS, '0');
   assert.equal(env.CLAUDE_CONFIG_DIR, undefined);
-  assert.equal(env.NEWIDE_AGENT_LLM_MODEL, 'claude-opus-5');
-  assert.equal(env.OPENAI_API_KEY, 'test-key');
-  assert.equal(env.OPENAI_BASE_URL, undefined);
+  assert.equal(env.CLAUDE_CODE_SUBAGENT_MODEL, 'claude-haiku-4-5');
   // 超时默认值
   assert.equal(env.NEWIDE_COUNCIL_ROLE_INACTIVITY_TIMEOUT_MS, '600000');
   assert.equal(env.ACP_DRIVER_INACTIVITY_TIMEOUT_MS, '300000');
@@ -228,14 +238,20 @@ test('serializes restarts, preserves API authentication and reports B Memory set
   );
   assert.equal(processes.length, 2);
   const customEnv = processes[1].spawnOptions.env;
+  // custom provider（Anthropic 兼容端点）：保留完整 baseUrl（含 /anthropic）→ BCD
+  // preferAnthropicCompat() → anthropic.messages，不会走 openai.chat
   assert.equal(customEnv.ANTHROPIC_API_KEY, undefined);
-  assert.equal(customEnv.ANTHROPIC_AUTH_TOKEN, undefined);
-  assert.equal(customEnv.ANTHROPIC_BASE_URL, undefined);
-  assert.equal(customEnv.ANTHROPIC_MODEL, undefined);
-  assert.equal(customEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL, undefined);
-  assert.equal(customEnv.NEWIDE_AGENT_LLM_MODEL, 'custom-model');
-  assert.equal(customEnv.OPENAI_API_KEY, 'custom-test-key');
-  assert.equal(customEnv.OPENAI_BASE_URL, 'https://models.example.test');
+  assert.equal(customEnv.ANTHROPIC_AUTH_TOKEN, 'custom-test-key');
+  assert.equal(customEnv.ANTHROPIC_BASE_URL, 'https://models.example.test/anthropic');
+  assert.equal(customEnv.ANTHROPIC_MODEL, 'custom-model');
+  assert.equal(customEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL, 'custom-fast-model');
+  assert.equal(customEnv.CLAUDE_CODE_SUBAGENT_MODEL, 'custom-fast-model');
+  assert.equal(customEnv.NEWIDE_LLM_API_KEY, 'custom-test-key');
+  // 不再走 OPENAI_* 通道
+  assert.equal(customEnv.OPENAI_API_KEY, undefined);
+  assert.equal(customEnv.OPENAI_BASE_URL, undefined);
+  assert.equal(customEnv.NEWIDE_AGENT_LLM_MODEL, undefined);
+  assert.equal(customEnv.NEWIDE_LLM_PROVIDER, undefined);
   const customSettings = await handlers.get('backend:getSettings')();
   assert.equal(customSettings.provider, 'custom');
   assert.equal(customSettings.configured.custom.hasKey, true);

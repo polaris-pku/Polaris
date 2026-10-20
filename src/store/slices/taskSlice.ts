@@ -496,20 +496,32 @@ export const createTaskSlice: SliceCreator<TaskSlice & TaskCouncilSlice> = (set,
     if (!target) return { ok: false, error: '任务不存在。' };
 
     // 有 contractTaskId 时先尝试调用后端 task.delete
-    if (target.contractTaskId) {
+    if (target.contractTaskId != null) {
       try {
         await taskApi.delete(target.contractTaskId);
       } catch (error: unknown) {
         // -32007：任务还在跑 → 提示用户先停止
-        if (error instanceof Error && 'code' in error && (error as { code: number }).code === -32007) {
+        if (
+          error instanceof Error &&
+          'code' in error &&
+          (error as { code: number }).code === -32007
+        ) {
           return { ok: false, error: '运行中的任务不能删除，请先停止。' };
         }
         // -32006：后端已经没有这条任务 → 按成功处理，本地照常清掉
-        if (error instanceof Error && 'code' in error && (error as { code: number }).code === -32006) {
+        if (
+          error instanceof Error &&
+          'code' in error &&
+          (error as { code: number }).code === -32006
+        ) {
           // fall through to local cleanup
         }
         // -32601：旧后端没有这个方法
-        else if (error instanceof Error && 'code' in error && (error as { code: number }).code === -32601) {
+        else if (
+          error instanceof Error &&
+          'code' in error &&
+          (error as { code: number }).code === -32601
+        ) {
           return { ok: false, error: '后端缺少 task.delete，请重新构建后端。' };
         }
         // 其他错误按原样透出
@@ -538,11 +550,12 @@ export const createTaskSlice: SliceCreator<TaskSlice & TaskCouncilSlice> = (set,
       const { activeTaskId, taskState } = pickProjectTask(remaining, target.projectId);
       set({
         tasks: remaining,
-        liveTasks: target.contractTaskId
-          ? Object.fromEntries(
-              Object.entries(latest.liveTasks).filter(([id]) => id !== target.contractTaskId),
-            )
-          : latest.liveTasks,
+        liveTasks:
+          target.contractTaskId != null
+            ? Object.fromEntries(
+                Object.entries(latest.liveTasks).filter(([id]) => id !== target.contractTaskId),
+              )
+            : latest.liveTasks,
         liveRuns,
         activeTaskId,
         currentPage: 'tasks',
@@ -552,11 +565,12 @@ export const createTaskSlice: SliceCreator<TaskSlice & TaskCouncilSlice> = (set,
     } else {
       set({
         tasks: remaining,
-        liveTasks: target.contractTaskId
-          ? Object.fromEntries(
-              Object.entries(latest.liveTasks).filter(([id]) => id !== target.contractTaskId),
-            )
-          : latest.liveTasks,
+        liveTasks:
+          target.contractTaskId != null
+            ? Object.fromEntries(
+                Object.entries(latest.liveTasks).filter(([id]) => id !== target.contractTaskId),
+              )
+            : latest.liveTasks,
         liveRuns,
       });
     }

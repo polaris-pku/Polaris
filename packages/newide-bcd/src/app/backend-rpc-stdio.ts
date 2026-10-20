@@ -837,17 +837,29 @@ export function resolveProductionLlmRuntime(
   env: NodeJS.ProcessEnv,
   driverEnv: NodeJS.ProcessEnv,
 ): ProductionLlmRuntime | undefined {
+  // NEWIDE_LLM_API_KEY 是 Polaris UI 专用模型通道的凭据信号。只有在用户通过设置页
+  // 显式配置了内部模型凭据时（custom provider 的 key），electron bridge 才会注入它。
+  // 有此信号时，Polaris 配置优先于 driver 配置；否则 fallback 到旧行为。
+  const hasDedicatedChannel = Boolean(env.NEWIDE_LLM_API_KEY?.trim());
   const model = firstNonBlank(env.NEWIDE_AGENT_LLM_MODEL, driverEnv.ANTHROPIC_MODEL);
-  const apiKey = firstNonBlank(
-    env.OPENAI_API_KEY,
-    driverEnv.ANTHROPIC_AUTH_TOKEN,
-    driverEnv.ANTHROPIC_API_KEY,
-  );
+
+  if (hasDedicatedChannel) {
+    // 专用通道：Polaris UI 配置（custom provider）优先于 driver
+    const apiKey = firstNonBlank(env.NEWIDE_LLM_API_KEY, env.ANTHROPIC_AUTH_TOKEN, env.ANTHROPIC_API_KEY);
+    // electron bridge 对 custom provider 注入 ANTHROPIC_BASE_URL（含 /anthropic 段）。
+    // 这是用户配置的 Anthropic 兼容端点，直接传给 SDK，SDK 会追加 /messages。
+    const baseUrl = firstNonBlank(env.ANTHROPIC_BASE_URL)?.replace(/\/+$/, '');
+    if (!model || !apiKey || !baseUrl) return undefined;
+    return { model, apiKey, baseUrl };
+  }
+
+  // 旧行为：优先读 host 的 OPENAI_*（兼容旧配置），没有时用 driver 的 ANTHROPIC_*。
+  // baseUrl 走 toOpenAiCompatibleBaseUrl：去掉 /anthropic 或 /v1，让 SDK 追加。
+  const apiKey = firstNonBlank(env.OPENAI_API_KEY, driverEnv.ANTHROPIC_AUTH_TOKEN, driverEnv.ANTHROPIC_API_KEY);
   const baseUrl = firstNonBlank(
     toOpenAiCompatibleBaseUrl(env.OPENAI_BASE_URL),
     toOpenAiCompatibleBaseUrl(driverEnv.ANTHROPIC_BASE_URL),
   );
-
   if (!model || !apiKey || !baseUrl) return undefined;
   return { model, apiKey, baseUrl };
 }
