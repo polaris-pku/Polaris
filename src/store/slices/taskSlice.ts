@@ -489,24 +489,43 @@ export const createTaskSlice: SliceCreator<TaskSlice & TaskCouncilSlice> = (set,
     });
   },
 
-  deleteTask: (taskId) => {
+  deleteTask: async (taskId) => {
     const state = get();
     const target = state.tasks.find((t) => t.id === taskId);
-    if (!target) return;
+    if (!target) return { ok: false, error: '任务不存在。' };
+
+    // 有 contractTaskId 时先尝试调用后端 task.delete
     if (target.contractTaskId) {
+      try {
+        await taskApi.delete(target.contractTaskId);
+      } catch (error: unknown) {
+        // -32007：任务还在跑 → 提示用户先停止
+        if (error instanceof Error && 'code' in error && (error as { code: number }).code === -32007) {
+          return { ok: false, error: '运行中的任务不能删除，请先停止。' };
+        }
+        // -32006：后端已经没有这条任务 → 按成功处理，本地照常清掉
+        if (error instanceof Error && 'code' in error && (error as { code: number }).code === -32006) {
+          // fall through to local cleanup
+        }
+        // -32601：旧后端没有这个方法
+        else if (error instanceof Error && 'code' in error && (error as { code: number }).code === -32601) {
+          return { ok: false, error: '后端缺少 task.delete，请重新构建后端。' };
+        }
+        // 其他错误按原样透出
+        else {
+          return { ok: false, error: error instanceof Error ? error.message : String(error) };
+        }
+      }
       void unwatchTask(target.contractTaskId);
-      void taskApi.cancel(target.contractTaskId).catch((error: unknown) => {
-        console.warn('[api] task.cancel 失败：', error);
-      });
     }
+
     // 先回写当前活动任务的实时状态，避免误删非活动任务时丢活动任务进度
     const synced = state.activeTaskId
       ? syncTasks(state.tasks, state.activeTaskId, extractTaskFields(state))
       : state.tasks;
     const remaining = synced.filter((t) => t.id !== taskId);
 
-    // 任务没了，它那次 run 的订阅与实时状态也要一并撤掉 —— 否则后端订阅和 liveRuns 条目
-    // 会随着建了又删的任务一直堆积。（run 本身仍在后端跑；这里只是不再关注它。）
+    // 任务没了，它那次 run 的订阅与实时状态也要一并撤掉
     const dropped = target.contractRunId;
     const liveRuns = dropRun(state.liveRuns, dropped);
     if (dropped) void unwatchRun(dropped);
@@ -539,5 +558,6 @@ export const createTaskSlice: SliceCreator<TaskSlice & TaskCouncilSlice> = (set,
         liveRuns,
       });
     }
+    return { ok: true };
   },
 });

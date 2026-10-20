@@ -127,6 +127,9 @@ function installFakeBackend(
             method === 'task.get' ? snapshot : { subscribed: true, snapshot, replay_events: [] },
         };
       }
+      if (method === 'task.delete') {
+        return { ok: true as const, result: { deleted: true } };
+      }
       if (method === 'run.getSnapshot') {
         const runId = (params as { run_id: string }).run_id;
         if (options.snapshots?.[runId])
@@ -694,7 +697,8 @@ describe('并发跑两个需求', () => {
     expect(useDemoStore.getState().liveRuns['run-1']).toBeDefined();
 
     const taskId = useDemoStore.getState().tasks[0].id;
-    useDemoStore.getState().deleteTask(taskId);
+    const result = await useDemoStore.getState().deleteTask(taskId);
+    expect(result.ok).toBe(true);
 
     expect(useDemoStore.getState().liveRuns['run-1']).toBeUndefined();
     await vi.waitFor(() =>

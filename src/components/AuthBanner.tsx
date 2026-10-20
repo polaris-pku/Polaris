@@ -40,9 +40,9 @@ export function AuthBanner({ onConfigure }: { onConfigure: () => void }) {
       <span className="min-w-0 text-body text-human-soft">
         {incomplete
           ? `${providerName} 的配置不完整：还缺端点或模型名`
-          : '还差一步：配置模型服务商与 API key'}
+          : 'Polaris 内部模型未配置，请先完成设置'}
         <span className="ml-2 text-human-soft/70">
-          Coding agent 已随应用安装，无需另外安装；配好之后 agent 才能真正干活。
+          Coding agent 使用本机 Claude Code 配置，agent 需要本机 Claude Code 已配置好。
         </span>
       </span>
       <span className="ml-auto flex shrink-0 items-center gap-1 rounded-full border border-human/40 bg-human/15 px-3 py-1 text-body text-human-soft group-hover:border-human/60">
