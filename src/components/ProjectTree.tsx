@@ -93,7 +93,8 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
     danger?: boolean;
     // 删除会打后端 RPC，可能因为「运行中」「后端过旧」等原因失败 —— 结果必须回传给弹窗，
     // 否则用户只看到弹窗关掉、任务还在，却收不到任何原因。
-    onConfirm: () => Promise<{ ok: true } | { ok: false; error: string }>;
+    // void 返回值兼容 `() => {}` 和 `() => deleteProject()` 等同步调用。
+    onConfirm: (() => void | Promise<{ ok: true } | { ok: false; error: string }>) | undefined;
   } | null>(null);
 
   /**

@@ -13,8 +13,9 @@ type Props = {
   /**
    * 确认动作。返回 Promise 时弹窗会进入 pending 状态：等待期间禁用按钮防重复提交，
    * 结果为 `{ ok: false }` 时**保持打开**并展示 error，由调用方决定后续。
+   * void 返回值（同步动作）走旧行为：立刻关闭弹窗。
    */
-  onConfirm: () => void | { ok: true } | Promise<{ ok: true } | { ok: false; error: string }>;
+  onConfirm?: (() => void | { ok: true } | Promise<{ ok: true } | { ok: false; error: string }>) | undefined;
   onClose: () => void;
 };
 
@@ -44,8 +45,9 @@ export function ConfirmDialog({
     setPending(true);
     setError(null);
     try {
-      const result = await onConfirm();
-      // 同步 void 返回值 = 旧行为（立刻关闭）；只有明确失败才留在原地。
+      const result = onConfirm ? await onConfirm() : undefined;
+      // 同步 void（onConfirm = undefined 或返回 void）：旧行为，立刻关闭；只有 Promise 且
+      // 返回 { ok: false } 时保持打开并展示 error —— 这正是破坏性操作（删除）需要的行为。
       if (result && typeof result === 'object' && 'ok' in result && !result.ok) {
         setError(result.error);
         return;
