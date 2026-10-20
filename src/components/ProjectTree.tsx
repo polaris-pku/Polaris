@@ -489,7 +489,7 @@ export function ProjectTree({ collapsed }: { collapsed: boolean }) {
         description={confirm?.description}
         confirmLabel={confirm?.confirmLabel ?? '删除'}
         danger={confirm?.danger ?? true}
-        onConfirm={() => confirm?.onConfirm()}
+        onConfirm={() => confirm?.onConfirm?.()}
         onClose={() => setConfirm(null)}
       />
     </div>
