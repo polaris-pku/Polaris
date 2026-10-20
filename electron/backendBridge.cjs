@@ -302,9 +302,9 @@ function authState() {
 /**
  * 认证环境变量。
  *
- * 返回 `unset`：走第三方端点时必须**清掉** ANTHROPIC_API_KEY 与本机登录态相关的变量 ——
- * 否则 Claude Code 可能优先拿它去打 Anthropic 官方，用户会看到一个莫名其妙的 401，
- * 而且完全想不到是因为「本机还留着旧凭据」。
+ * 只服务 Polaris 内部调用（规划 / 记忆 / 合议），不会注入 driver。
+ * driver（Claude Code）使用它自己的配置（~/.claude/settings.json、环境变量）。
+ * 不覆盖、不删除用户 shell 里已有的 ANTHROPIC_* 变量。
  */
 function readAuthEnv() {
   if (resolvedProxy) {
@@ -327,40 +327,24 @@ function readAuthEnv() {
   const llmBaseUrl = p.baseUrl
     ? `${p.baseUrl.replace(/\/+$/, '')}${p.baseUrl.replace(/\/+$/, '').endsWith('/v1') ? '' : '/v1'}`
     : '';
-  const llm = {
-    NEWIDE_LLM_PROVIDER: 'anthropic',
-    NEWIDE_LLM_MODEL: model,
-    NEWIDE_LLM_API_KEY: p.key,
-    ...(llmBaseUrl ? { NEWIDE_LLM_BASE_URL: llmBaseUrl } : {}),
-  };
-
-  if (p.def.id === 'anthropic') {
-    return {
-      set: {
-        ...llm,
-        ANTHROPIC_API_KEY: p.key,
-        ANTHROPIC_MODEL: p.model,
-        ANTHROPIC_DEFAULT_OPUS_MODEL: p.model,
-        ANTHROPIC_DEFAULT_SONNET_MODEL: p.model,
-        ANTHROPIC_DEFAULT_HAIKU_MODEL: p.fastModel,
-        CLAUDE_CODE_SUBAGENT_MODEL: p.fastModel,
-      },
-      unset: ['ANTHROPIC_BASE_URL', 'ANTHROPIC_AUTH_TOKEN'],
-    };
-  }
+  // BCD 的 LiteLLMToolCallingClient 走 @ai-sdk/openai 兼容通道，base URL 不带 /v1
+  const openAiBaseUrl = p.baseUrl
+    ? p.baseUrl.trim().replace(/\/+$/, '').replace(/\/(?:anthropic|v1)$/i, '')
+    : '';
 
   return {
     set: {
-      ...llm,
-      ANTHROPIC_BASE_URL: p.baseUrl,
-      ANTHROPIC_AUTH_TOKEN: p.key,
-      ANTHROPIC_MODEL: p.model,
-      ANTHROPIC_DEFAULT_OPUS_MODEL: p.model,
-      ANTHROPIC_DEFAULT_SONNET_MODEL: p.model,
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: p.fastModel,
-      CLAUDE_CODE_SUBAGENT_MODEL: p.fastModel,
+      // 只服务 Polaris 内部调用，不会进入 driver
+      NEWIDE_LLM_PROVIDER: 'anthropic',
+      NEWIDE_LLM_MODEL: model,
+      NEWIDE_LLM_API_KEY: p.key,
+      ...(llmBaseUrl ? { NEWIDE_LLM_BASE_URL: llmBaseUrl } : {}),
+      NEWIDE_AGENT_LLM_MODEL: model,
+      OPENAI_API_KEY: p.key,
+      ...(openAiBaseUrl ? { OPENAI_BASE_URL: openAiBaseUrl } : {}),
     },
-    unset: ['ANTHROPIC_API_KEY'],
+    // 不覆盖、不删除任何 ANTHROPIC_*：它们属于 driver 自己的环境
+    unset: [],
   };
 }
 
@@ -590,8 +574,13 @@ async function startNow({ workspace, agentId } = {}, { force = false } = {}) {
     ACP_DRIVER_ENV_FILE: path.join(stateDir, 'driver.env'),
     ACP_AGENT_ID: resolvedAgentId,
     ACP_WORKSPACE: resolvedWorkspace,
-    CLAUDE_CONFIG_DIR: path.join(stateDir, 'claude-config'),
     NEWIDE_EPHEMERAL_ACP_SESSIONS: '0',
+    // 超时默认值：覆盖 vendor 里的 120 秒限制
+    NEWIDE_COUNCIL_ROLE_INACTIVITY_TIMEOUT_MS:
+      process.env.NEWIDE_COUNCIL_ROLE_INACTIVITY_TIMEOUT_MS ?? '600000',
+    ACP_DRIVER_INACTIVITY_TIMEOUT_MS:
+      process.env.ACP_DRIVER_INACTIVITY_TIMEOUT_MS ?? '300000',
+    NEWIDE_GATE_TIMEOUT_MS: process.env.NEWIDE_GATE_TIMEOUT_MS ?? '600000',
     ...auth.set,
   };
   // Embedding 的凭据与对话模型完全分开：litellm/client.ts 的 openai 嵌入分支只认
